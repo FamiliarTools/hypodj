@@ -60,6 +60,42 @@ Subsonic library and plays the streams through mpv.
   listing cache, OpenSubsonic extension negotiation).
 - **Phase 4 - cut over.** Flip the bind to `6600` and retire mopidy.
 
+## Phase 3 feature status (honest)
+
+The 9 Python-parity features are ported and reachable through the live MPD serve
+loop (bound to `6601` in dev; mopidy still owns `6600`):
+
+- **scrobble** - now-playing + threshold-gated completed-play submission, fired
+  off the player event loop.
+- **cover art** - `albumart`/`readpicture` -> getCoverArt, chunked to
+  `binarylimit`, cached.
+- **star / love** - the synthetic `Starred` playlist: `playlistadd Starred
+  song/<id>` stars, position-based `playlistdelete` unstars.
+- **rating** - WIRED via the MPD `sticker` command (ncmpcpp's rating path):
+  `sticker set song song/<id> rating <0-5>` -> Subsonic `setRating`;
+  `sticker get`/`list` read back `userRating` as `sticker: rating=<n>`;
+  `sticker delete` clears it (setRating 0). Proven live against Navidrome: an MPD
+  `set rating 4` is confirmed by `getSong` returning `userRating=4`, and cleared
+  by `delete`. Only the `rating` sticker is backed (no generic sticker store).
+- **similar / radio / top** - `radio/random`, `radio/similar/<songId>`,
+  `radio/top/<artist>` browse dirs. LIMITATION: `similar`/`top` return only what
+  the server's last.fm-backed data provides; on a server without that data they
+  can legitimately be empty (not a client bug).
+- **smart album lists** - `Lists/{frequent,newest,recent,highest,random}`.
+- **genres** - `Genres` browse dir + `list genre`.
+- **search3** - `find`/`search` -> search3 (full-text) + client-side MPD-tag
+  post-filter for precision.
+- **listing cache** - TTL+LRU over stable listings; freshness-critical listings
+  (`Starred`, `random`) are never cached; a rating/star bust invalidates the
+  listings whose per-song flags could change.
+- **OpenSubsonic extension negotiation** - probed + logged once at connect.
+  LIMITATION: the advertised set is currently only recorded (no behaviour is
+  gated on it yet, because every shipped feature is core Subsonic).
+
+Known honest limitation in `idle`: it always emits `changed: player` on any
+change (single change-notifier; no per-subsystem tracking yet). ncmpcpp re-reads
+status/currentsong/plchanges on any `changed:` line, so its view still refreshes.
+
 ## What is BUILT vs next-phase (honest)
 
 **Built now, real, compiles, tested (Phase 0 foundation + Phase 1):**

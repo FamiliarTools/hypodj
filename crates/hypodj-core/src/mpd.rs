@@ -127,6 +127,10 @@ pub enum MpdCommand {
     Search(Vec<(String, String)>),
     /// `list <tag> [filter]` -> Subsonic list/browse (e.g. `list genre`).
     List(String),
+    /// `sticker <subcmd> song <uri> [name] [value]` - MPD's per-song key/value
+    /// store. We back ONLY the `rating` sticker (ncmpcpp's rating path) onto the
+    /// Subsonic 0..=5 `setRating`/`userRating`. See [`StickerCmd`].
+    Sticker(StickerCmd),
 
     // ── binary (distinct sub-protocol, see MpdResponse::Binary) ─────────
     /// `albumart <uri> <offset>` - raw cover bytes owned by us (get_cover_art
@@ -149,6 +153,52 @@ pub enum MpdCommand {
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
+}
+
+/// The parsed `sticker` subcommand. MPD's sticker verb is
+/// `sticker {get|set|delete|list|find} <type> <uri> [name] [value]`. We model
+/// only `type == song` and (for get/set/delete) `name == rating`; anything else
+/// dispatch answers with an empty-OK/ACK. `set` carries the parsed 0..=5 value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickerCmd {
+    /// `sticker get song <uri> rating`
+    Get { uri: String },
+    /// `sticker set song <uri> rating <0-5>`
+    Set { uri: String, value: u8 },
+    /// `sticker delete song <uri> rating` (clears -> setRating 0)
+    Delete { uri: String },
+    /// `sticker list song <uri>` - list the rating sticker if set.
+    List { uri: String },
+    /// A sticker verb/type/name we do not model. Dispatch answers empty-OK so a
+    /// client probing sticker support does not hang.
+    Unsupported,
+}
+
+/// Parse the argument vector of a `sticker` command into a [`StickerCmd`]. Only
+/// `type == song` and (where a name is required) `name == rating` are honored;
+/// everything else maps to [`StickerCmd::Unsupported`].
+fn parse_sticker(args: &[String]) -> StickerCmd {
+    let a = |i: usize| args.get(i).map(String::as_str);
+    let sub = a(0).unwrap_or("").to_lowercase();
+    let ty = a(1).unwrap_or("");
+    if ty != "song" {
+        return StickerCmd::Unsupported;
+    }
+    let uri = match a(2) {
+        Some(u) => u.to_string(),
+        None => return StickerCmd::Unsupported,
+    };
+    let name_is_rating = a(3).map(|n| n.eq_ignore_ascii_case("rating")).unwrap_or(false);
+    match sub.as_str() {
+        "get" if name_is_rating => StickerCmd::Get { uri },
+        "delete" if name_is_rating => StickerCmd::Delete { uri },
+        "list" => StickerCmd::List { uri },
+        "set" if name_is_rating => match a(4).and_then(|v| v.parse::<u8>().ok()) {
+            Some(v) => StickerCmd::Set { uri, value: v.min(5) },
+            None => StickerCmd::Unsupported,
+        },
+        _ => StickerCmd::Unsupported,
+    }
 }
 
 /// Tokenize an MPD request line, honoring double-quoted arguments (MPD quotes
@@ -266,6 +316,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "find" => MpdCommand::Find(parse_filter(&args)),
         "search" => MpdCommand::Search(parse_filter(&args)),
         "list" => MpdCommand::List(args.join(" ")),
+        "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "binarylimit" => MpdCommand::BinaryLimit(arg(0).and_then(|s| s.parse().ok()).unwrap_or(8192)),
@@ -357,6 +408,42 @@ mod parse_tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_sticker_rating_verbs() {
+        match parse("sticker set song song/so-1 rating 4") {
+            MpdCommand::Sticker(StickerCmd::Set { uri, value }) => {
+                assert_eq!(uri, "song/so-1");
+                assert_eq!(value, 4);
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("sticker get song song/so-1 rating") {
+            MpdCommand::Sticker(StickerCmd::Get { uri }) => assert_eq!(uri, "song/so-1"),
+            other => panic!("got {other:?}"),
+        }
+        match parse("sticker delete song song/so-1 rating") {
+            MpdCommand::Sticker(StickerCmd::Delete { uri }) => assert_eq!(uri, "song/so-1"),
+            other => panic!("got {other:?}"),
+        }
+        match parse("sticker list song song/so-1") {
+            MpdCommand::Sticker(StickerCmd::List { uri }) => assert_eq!(uri, "song/so-1"),
+            other => panic!("got {other:?}"),
+        }
+        // value clamps to 5; a non-song type or non-rating name is Unsupported.
+        assert!(matches!(
+            parse("sticker set song song/so-1 rating 9"),
+            MpdCommand::Sticker(StickerCmd::Set { value: 5, .. })
+        ));
+        assert!(matches!(
+            parse("sticker set song song/so-1 mood happy"),
+            MpdCommand::Sticker(StickerCmd::Unsupported)
+        ));
+        assert!(matches!(
+            parse("sticker get playlist foo rating"),
+            MpdCommand::Sticker(StickerCmd::Unsupported)
+        ));
     }
 
     #[test]

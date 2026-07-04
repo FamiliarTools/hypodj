@@ -40,6 +40,8 @@ pub struct SubsonicClient {
     /// Names of the OpenSubsonic extensions the server advertised. Filled once
     /// by [`SubsonicClient::probe_extensions`] right after connect (see below on
     /// why this is a separate async step, not part of the sync `connect`).
+    /// Currently only observed for logging; the hook for future extension-gated
+    /// behaviour (see `probe_extensions`).
     supported_exts: HashSet<String>,
 }
 
@@ -67,9 +69,14 @@ impl SubsonicClient {
     /// Fetch and cache the server's OpenSubsonic extension names (feature 9).
     /// Called ONCE, right after connect, before the client is Arc-wrapped. A
     /// server that doesn't implement the endpoint (plain Subsonic) yields an
-    /// error we swallow into an empty set - scrobble/star/etc. are all CORE
-    /// Subsonic and never gated, so an empty set only disables the optional
-    /// `playbackReport` finer-grained now-playing.
+    /// error we swallow into an empty set.
+    ///
+    /// HONEST SCOPE: today this negotiation only *records and logs* the advertised
+    /// set - nothing yet gates behaviour on it, because every feature we ship
+    /// (scrobble/star/rating/search3/cover art/genres/radio) is CORE Subsonic and
+    /// needs no extension. The cached set is the hook for a future optional path
+    /// (e.g. `playbackReport` finer-grained now-playing) to branch on; until such
+    /// a caller exists we do not pretend an extension changes anything.
     pub async fn probe_extensions(&mut self) {
         match self.inner.get_open_subsonic_extensions().await {
             Ok(exts) => {
@@ -83,11 +90,6 @@ impl SubsonicClient {
                 tracing::debug!(error = %e, "getOpenSubsonicExtensions unavailable; core-only");
             }
         }
-    }
-
-    /// Whether the server advertised the named OpenSubsonic extension.
-    pub fn supports_extension(&self, name: &str) -> bool {
-        self.supported_exts.contains(name)
     }
 
     /// Liveness + credential check. Vertical-slice step 2.
@@ -162,16 +164,6 @@ impl SubsonicClient {
             .await
             .map_err(|e| SubsonicError::Request(e.to_string()))?;
         Ok(artist.album.into_iter().map(map_album).collect())
-    }
-
-    /// Search songs (real `search3`, songs only). Backs MPD `search`/`find`.
-    pub async fn search_songs(&self, query: &str) -> Result<Vec<Song>, SubsonicError> {
-        let res = self
-            .inner
-            .search3(query, Some(0), None, Some(0), None, Some(100), None, None)
-            .await
-            .map_err(|e| SubsonicError::Request(e.to_string()))?;
-        Ok(res.song.into_iter().map(map_song).collect())
     }
 
     /// Fetch a single song's metadata (real `get_song`). Used to resolve a queued

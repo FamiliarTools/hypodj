@@ -26,7 +26,7 @@ use tokio::sync::Notify;
 
 use crate::cache::TtlLru;
 use crate::model::{AlbumId, ArtistId, Genre, Song, SongId};
-use crate::mpd::{MpdCommand, MpdHandler, MpdResponse};
+use crate::mpd::{MpdCommand, MpdHandler, MpdResponse, StickerCmd};
 use crate::player::{PlayState, PlayerHandle};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
 
@@ -204,8 +204,20 @@ const ACK_ERROR_UNKNOWN: u32 = 5;
 
 impl MpdHandler for HypodjHandler {
     async fn idle(&self, _subsystems: Vec<String>) -> Option<String> {
-        // Minimal-correct: wait for any change notification, report "player".
-        // (ncmpcpp re-issues idle after each, and re-reads status/currentsong.)
+        // HONEST LIMITATION: this always reports `changed: player`, regardless of
+        // what actually changed or which subsystems the client subscribed to.
+        //
+        // Reason: there is a SINGLE `changed: Notify` fired for every mutation
+        // (queue add/delete/clear, play/pause/stop, volume, star). We do not yet
+        // track WHICH subsystem changed, so we cannot honestly emit `playlist`
+        // vs `mixer` vs `player` separately, nor filter by the client's
+        // `_subsystems` list. We deliberately do NOT claim more than we know:
+        // `player` is the one subsystem that a re-read of status/currentsong
+        // covers, and ncmpcpp responds to any `changed:` line by re-reading
+        // status + currentsong + plchanges, so a single conservative wake still
+        // refreshes its whole view. Reporting the true per-subsystem set would
+        // mean carrying a changed-subsystem flag alongside the Notify - a real
+        // improvement left for when a client needs the granularity.
         self.changed.notified().await;
         Some("player".to_string())
     }
@@ -560,6 +572,9 @@ impl MpdHandler for HypodjHandler {
                 }
             }
 
+            // ── sticker rating (feature 3, ncmpcpp rating path) ─────────────
+            MpdCommand::Sticker(s) => self.sticker(s).await,
+
             // ── binary cover art (feature 2) ────────────────────────────────
             MpdCommand::AlbumArt(uri, offset) | MpdCommand::ReadPicture(uri, offset) => {
                 self.albumart(&uri, offset).await
@@ -580,7 +595,7 @@ impl MpdHandler for HypodjHandler {
                     "notcommands", "outputs", "pause", "ping", "play", "playid",
                     "playlistadd", "playlistclear", "playlistdelete", "playlistid",
                     "playlistinfo", "plchanges", "previous", "readpicture",
-                    "search", "seek", "seekcur", "seekid", "setvol", "stats",
+                    "search", "seek", "seekcur", "seekid", "setvol", "stats", "sticker",
                     "status", "stop", "tagtypes", "urlhandlers",
                 ];
                 let pairs = cmds
@@ -888,6 +903,87 @@ impl HypodjHandler {
             pairs.extend(browse_song_pairs(s));
         }
         MpdResponse::Pairs(pairs)
+    }
+
+    /// Back the `sticker` command for the `rating` sticker only (ncmpcpp's
+    /// rating path), bridging to Subsonic setRating/userRating. Any other
+    /// sticker (unknown verb/type/name) answers empty-OK so a probing client
+    /// does not hang. A failing Subsonic call ACKs, never panics.
+    async fn sticker(&self, cmd: StickerCmd) -> MpdResponse {
+        match cmd {
+            StickerCmd::Set { uri, value } => {
+                let id = match song_id_from_uri(&uri) {
+                    Some(id) => id,
+                    None => return ack(ACK_ERROR_NO_EXIST, "sticker", "unsupported uri"),
+                };
+                match self.client.set_rating(&id, value).await {
+                    Ok(()) => {
+                        self.bust_rating_caches();
+                        self.notify_change();
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "sticker", &e.to_string()),
+                }
+            }
+            StickerCmd::Delete { uri } => {
+                let id = match song_id_from_uri(&uri) {
+                    Some(id) => id,
+                    None => return ack(ACK_ERROR_NO_EXIST, "sticker", "unsupported uri"),
+                };
+                // Deleting the rating sticker clears it (setRating 0).
+                match self.client.set_rating(&id, 0).await {
+                    Ok(()) => {
+                        self.bust_rating_caches();
+                        self.notify_change();
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "sticker", &e.to_string()),
+                }
+            }
+            StickerCmd::Get { uri } => {
+                let id = match song_id_from_uri(&uri) {
+                    Some(id) => id,
+                    None => return ack(ACK_ERROR_NO_EXIST, "sticker", "unsupported uri"),
+                };
+                match self.client.song(&id).await {
+                    // MPD framing: `sticker: <name>=<value>`.
+                    Ok(song) => match song.user_rating {
+                        Some(r) => MpdResponse::pairs()
+                            .pair("sticker", format!("rating={r}"))
+                            .build(),
+                        // No rating set: MPD returns a "no such sticker" ACK.
+                        None => ack(ACK_ERROR_NO_EXIST, "sticker", "no such sticker"),
+                    },
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "sticker", &e.to_string()),
+                }
+            }
+            StickerCmd::List { uri } => {
+                let id = match song_id_from_uri(&uri) {
+                    Some(id) => id,
+                    None => return ack(ACK_ERROR_NO_EXIST, "sticker", "unsupported uri"),
+                };
+                match self.client.song(&id).await {
+                    Ok(song) => match song.user_rating {
+                        Some(r) => MpdResponse::pairs()
+                            .pair("sticker", format!("rating={r}"))
+                            .build(),
+                        // No stickers set: empty-OK (a valid empty list).
+                        None => MpdResponse::ok(),
+                    },
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "sticker", &e.to_string()),
+                }
+            }
+            // Unknown sticker verb/type/name: empty-OK, never hang the client.
+            StickerCmd::Unsupported => MpdResponse::ok(),
+        }
+    }
+
+    /// Invalidate cached listings whose user_rating could change after setRating.
+    /// Album/genre/list listings carry per-song `user_rating`, so bust them so a
+    /// subsequent browse reflects the new rating.
+    fn bust_rating_caches(&self) {
+        self.listings.invalidate_prefix("album/");
+        self.listings.invalidate_prefix("genre/");
     }
 
     /// Invalidate cached listings whose starred flag could change after a star.

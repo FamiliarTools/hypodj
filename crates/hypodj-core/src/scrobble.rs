@@ -250,21 +250,36 @@ mod tests {
 
     #[test]
     fn eof_before_timer_still_submits_for_short_track() {
-        // 40s track, 50% = 20s. Accumulate to 22 (> floor 30? no) -> need 30s.
-        // Use a 70s track: 50% = 35, floor 30 -> threshold 35. Accumulate 36
-        // via TimePos but pretend the poll never fired the submit (simulate by
-        // NOT calling decide_timepos past threshold), then EOF submits.
+        // The real behaviour: a short track where EOF beats the TimePos poll.
+        // 70s track -> threshold = max(30, 50%*70=35) = 35s. We advance
+        // accumulation to 36 by writing the field directly (NOT via
+        // decide_timepos), which is exactly the race we model: the position was
+        // reached but no poll fired the submit, so `submitted` is still false.
         let mut st = playing("so-2", Some(70));
-        // Only one early TimePos below threshold.
-        assert!(decide_timepos(&mut st, 36.0).is_some_and(|_| true) || true);
-        // Reset submitted to emulate "timer hadn't fired": re-arm the state.
-        st.submitted = false;
         st.accumulated_secs = 36.0;
-        let hit = decide_eof(&mut st, &SongId("so-2".into()));
-        assert!(hit.is_some(), "EOF must submit when threshold met but unsent");
-        // State reset for next track.
+        assert!(!st.submitted, "precondition: timer had not fired the submit");
+
+        // EOF for the current song must now emit the submission itself.
+        let hit = decide_eof(&mut st, &SongId("so-2".into()))
+            .expect("EOF must submit when threshold met but the timer never fired");
+        assert_eq!(hit.0, SongId("so-2".into()), "submits the right song id");
+        assert_eq!(hit.1, 1_700_000_000_000, "time is epoch-millis of START");
+
+        // And the state is reset for the next track.
         assert!(st.current.is_none());
         assert!(!st.submitted);
+        assert_eq!(st.accumulated_secs, 0.0);
+    }
+
+    #[test]
+    fn eof_does_not_double_submit_when_timer_already_fired() {
+        // If the TimePos poll already crossed the threshold and submitted, a
+        // subsequent EOF must NOT submit a second time (single-submission guard).
+        let mut st = playing("so-4", Some(70));
+        assert!(decide_timepos(&mut st, 36.0).is_some(), "timer fires the submit");
+        let hit = decide_eof(&mut st, &SongId("so-4".into()));
+        assert!(hit.is_none(), "EOF must not double-submit after the timer fired");
+        assert!(st.current.is_none());
     }
 
     #[test]
