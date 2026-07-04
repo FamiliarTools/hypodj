@@ -184,6 +184,13 @@ impl Scrobbler {
         }
     }
 
+    /// Test-only introspection: has no song latched? A raw stream (played with
+    /// no id) must never latch here, so the scrobbler stays idle.
+    #[doc(hidden)]
+    pub fn current_is_none(&self) -> bool {
+        self.state.lock().unwrap().current.is_none()
+    }
+
     fn spawn_submit(&self, id: SongId, start_epoch_ms: i64) {
         let client = self.client.clone();
         tokio::spawn(async move {

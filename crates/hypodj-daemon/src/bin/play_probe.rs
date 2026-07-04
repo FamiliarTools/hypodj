@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         MpvPlayer::spawn(AudioOut::File(std::path::PathBuf::from(&out_path)));
 
     player
-        .play_url(SongId(song.id.0.clone()), url.as_str())
+        .play_url(Some(SongId(song.id.0.clone())), url.as_str())
         .await?;
     println!("[6/7] play_url issued; mpv state = {:?}", player.state());
 

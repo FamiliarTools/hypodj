@@ -73,7 +73,9 @@ pub enum PlayerEvent {
 #[allow(dead_code)]
 enum PlayerCommand {
     PlayUrl {
-        song: SongId,
+        /// The song id to attribute playback to, or `None` for a raw stream
+        /// (internet radio) that must never be scrobbled.
+        song: Option<SongId>,
         url: String,
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
@@ -99,8 +101,10 @@ pub struct PlayerHandle {
 }
 
 impl PlayerHandle {
-    /// Load a resolved stream URL and begin playback of `song`.
-    pub async fn play_url(&self, song: SongId, url: &str) -> Result<(), PlayerError> {
+    /// Load a resolved stream URL and begin playback. `song` is `Some(id)` for a
+    /// library track (scrobbled) or `None` for a raw internet-radio stream
+    /// (never scrobbled - the player emits no id-bearing now-playing/eof for it).
+    pub async fn play_url(&self, song: Option<SongId>, url: &str) -> Result<(), PlayerError> {
         self.request(|reply| PlayerCommand::PlayUrl {
             song,
             url: url.to_string(),
@@ -176,10 +180,10 @@ impl NullPlayer {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     PlayerCommand::PlayUrl { song, url: _, reply } => {
-                        current = Some(song.clone());
+                        current = song.clone();
                         let _ = state_tx.send(PlayState::Playing);
                         let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(PlayState::Playing, Some(song)))
+                            .send(PlayerEvent::StateChanged(PlayState::Playing, song))
                             .await;
                         let _ = reply.send(Ok(()));
                     }
@@ -346,12 +350,15 @@ fn mpv_actor(
                 }
             }
             Some(Ok(Event::EndFile(_))) => {
-                if let Some(song) = current.take() {
-                    let _ = state_tx.send(PlayState::Stopped);
+                // A library track carries a SongId -> emit Eof (drives
+                // queue-advance + scrobble). A raw stream has no id -> just
+                // report Stopped, never scrobble it.
+                let song = current.take();
+                let _ = state_tx.send(PlayState::Stopped);
+                if let Some(song) = song {
                     let _ = evt_tx.blocking_send(PlayerEvent::Eof(song));
-                    let _ = evt_tx
-                        .blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
                 }
+                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
             }
             Some(Ok(_)) => {}
             Some(Err(e)) => {
@@ -380,11 +387,11 @@ fn handle_cmd(
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             match &res {
                 Ok(()) => {
-                    *current = Some(song.clone());
+                    *current = song.clone();
                     let _ = state_tx.send(PlayState::Playing);
                     let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
                         PlayState::Playing,
-                        Some(song),
+                        song,
                     ));
                 }
                 Err(e) => tracing::error!(error = %e, "mpv loadfile failed"),
@@ -467,7 +474,7 @@ mod tests {
         assert_eq!(player.state(), PlayState::Stopped);
 
         player
-            .play_url(SongId("42".into()), "http://example/stream")
+            .play_url(Some(SongId("42".into())), "http://example/stream")
             .await
             .unwrap();
         assert_eq!(player.state(), PlayState::Playing);
@@ -492,7 +499,7 @@ mod tests {
         let (player, _events) = NullPlayer::spawn();
         let other = player.clone();
         player
-            .play_url(SongId("1".into()), "http://x")
+            .play_url(Some(SongId("1".into())), "http://x")
             .await
             .unwrap();
         assert_eq!(other.state(), PlayState::Playing);

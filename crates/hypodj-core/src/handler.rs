@@ -25,17 +25,18 @@ use opensubsonic::AlbumListType;
 use tokio::sync::Notify;
 
 use crate::cache::TtlLru;
-use crate::model::{AlbumId, ArtistId, Genre, Song, SongId};
+use crate::model::{AlbumId, ArtistId, Genre, QueueEntry, Song, SongId};
 use crate::mpd::{MpdCommand, MpdHandler, MpdResponse, StickerCmd};
 use crate::player::{PlayState, PlayerHandle};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
 
-/// One queue entry: a resolved song plus its MPD song id (a monotonically
-/// increasing integer, MPD's stable per-song handle, distinct from queue pos).
+/// One queue entry: a playable [`QueueEntry`] (Subsonic song OR raw stream) plus
+/// its MPD song id (a monotonically increasing integer, MPD's stable per-song
+/// handle, distinct from queue pos).
 #[derive(Clone)]
 struct QueueItem {
     id: u64,
-    song: Song,
+    entry: QueueEntry,
 }
 
 struct State {
@@ -139,14 +140,28 @@ impl HypodjHandler {
             Some(i) => i,
             None => return Err("Bad song index".into()),
         };
-        let url = self
-            .client
-            .stream_url(&item.song.id)
-            .map_err(|e| e.to_string())?;
-        self.player
-            .play_url(item.song.id.clone(), url.as_str())
-            .await
-            .map_err(|e| e.to_string())?;
+        // A library song resolves a Subsonic stream URL and plays under its id
+        // (scrobbled). A raw stream plays its URL verbatim with no id (never
+        // scrobbled). Either way a bad/unreachable URL surfaces as a player
+        // error here and, at worst, an idle/stopped state - never a panic.
+        match &item.entry {
+            QueueEntry::Song(song) => {
+                let url = self
+                    .client
+                    .stream_url(&song.id)
+                    .map_err(|e| e.to_string())?;
+                self.player
+                    .play_url(Some(song.id.clone()), url.as_str())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            QueueEntry::Stream { url, .. } => {
+                self.player
+                    .play_url(None, url)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         {
             let mut st = self.state.lock().unwrap();
             st.current = Some(idx);
@@ -155,21 +170,33 @@ impl HypodjHandler {
         Ok(())
     }
 
-    /// Add a song by uri (`song/<id>`), resolving its metadata. Returns the
-    /// assigned MPD song id.
+    /// Add an entry by uri. A `song/<id>` uri resolves Subsonic metadata; an
+    /// absolute `http://`/`https://` uri is queued as a raw stream (internet
+    /// radio) played verbatim, with NO Subsonic call, id, rating, or scrobble -
+    /// exactly as MPD's own `add <url>` behaves. Returns the assigned MPD id.
     async fn enqueue_uri(&self, uri: &str) -> Result<u64, String> {
-        let song_id = uri
-            .strip_prefix("song/")
-            .ok_or_else(|| format!("unsupported uri: {uri}"))?;
-        let song = self
-            .client
-            .song(&SongId(song_id.to_string()))
-            .await
-            .map_err(|e| e.to_string())?;
+        let entry = if is_stream_uri(uri) {
+            // Title is the URL (a stream's icy-name is only known once mpv
+            // connects; the URL is a sensible, always-available label).
+            QueueEntry::Stream {
+                url: uri.to_string(),
+                title: uri.to_string(),
+            }
+        } else {
+            let song_id = uri
+                .strip_prefix("song/")
+                .ok_or_else(|| format!("unsupported uri: {uri}"))?;
+            let song = self
+                .client
+                .song(&SongId(song_id.to_string()))
+                .await
+                .map_err(|e| e.to_string())?;
+            QueueEntry::Song(song)
+        };
         let mut st = self.state.lock().unwrap();
         let id = st.next_id;
         st.next_id += 1;
-        st.queue.push(QueueItem { id, song });
+        st.queue.push(QueueItem { id, entry });
         st.playlist_version += 1;
         drop(st);
         self.notify_change();
@@ -177,17 +204,34 @@ impl HypodjHandler {
     }
 }
 
-/// Serialize one queued song as MPD `playlistinfo`/`currentsong` pairs.
+/// Serialize one queued entry as MPD `playlistinfo`/`currentsong` pairs. A raw
+/// stream renders with `file:` = its URL and `Title:` = the URL, and no Time /
+/// tags (duration unknown for a live stream) - MPD renders such an entry fine.
 fn song_pairs(item: &QueueItem, pos: usize) -> Vec<(String, String)> {
-    let s = &item.song;
-    let mut p = vec![
-        ("file".to_string(), format!("song/{}", s.id.0)),
-        ("Title".to_string(), s.title.clone()),
-    ];
-    push_song_tags(&mut p, s);
+    let mut p = match &item.entry {
+        QueueEntry::Song(s) => {
+            let mut p = vec![
+                ("file".to_string(), format!("song/{}", s.id.0)),
+                ("Title".to_string(), s.title.clone()),
+            ];
+            push_song_tags(&mut p, s);
+            p
+        }
+        QueueEntry::Stream { url, title } => vec![
+            ("file".to_string(), url.clone()),
+            ("Title".to_string(), title.clone()),
+        ],
+    };
     p.push(("Pos".to_string(), pos.to_string()));
     p.push(("Id".to_string(), item.id.to_string()));
     p
+}
+
+/// Is `uri` an absolute HTTP(S) stream URL (internet radio) rather than a
+/// synthetic hypodj `song/`/`album/`/`artist/` path? Such a uri is played
+/// directly, bypassing Subsonic resolution - mirroring MPD's `add <url>`.
+fn is_stream_uri(uri: &str) -> bool {
+    uri.starts_with("http://") || uri.starts_with("https://")
 }
 
 fn ack(code: u32, command: &str, message: &str) -> MpdResponse {
@@ -258,8 +302,12 @@ impl MpdHandler for HypodjHandler {
                         b = b
                             .pair("song", idx.to_string())
                             .pair("songid", item.id.to_string());
-                        if let Some(d) = item.song.duration_secs {
-                            b = b.pair("duration", format!("{d}.000"));
+                        // Duration is only known for a library song; a live
+                        // stream reports none (unknown length is valid MPD).
+                        if let QueueEntry::Song(s) = &item.entry {
+                            if let Some(d) = s.duration_secs {
+                                b = b.pair("duration", format!("{d}.000"));
+                            }
                         }
                     }
                 }
@@ -622,7 +670,10 @@ impl MpdHandler for HypodjHandler {
                 .pair("outputenabled", "1")
                 .build(),
             MpdCommand::Decoders => MpdResponse::ok(),
-            MpdCommand::UrlHandlers => MpdResponse::ok(),
+            MpdCommand::UrlHandlers => MpdResponse::pairs()
+                .pair("handler", "http")
+                .pair("handler", "https")
+                .build(),
 
             MpdCommand::Unsupported(name) => {
                 ack(ACK_ERROR_UNKNOWN, &name, &format!("unknown command \"{name}\""))
@@ -1078,5 +1129,107 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song) {
     if let Some(d) = s.duration_secs {
         p.push(("Time".to_string(), d.to_string()));
         p.push(("duration".to_string(), format!("{d}.000")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::player::{NullPlayer, PlayState, PlayerEvent};
+    use crate::scrobble::Scrobbler;
+
+    const NTS: &str = "https://stream-mixtape-geo.ntslive.net/mixtape5";
+
+    /// A handler wired to a NON-networked Subsonic client (connect() is sync and
+    /// does no I/O) and a real NullPlayer actor. The raw-stream path never calls
+    /// the client, so no server is needed to exercise it.
+    fn handler_with_null_player() -> (HypodjHandler, tokio::sync::mpsc::Receiver<PlayerEvent>) {
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1/never-called".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            client_name: "test".to_string(),
+        };
+        let client = Arc::new(SubsonicClient::connect(&cfg).unwrap());
+        let (player, events) = NullPlayer::spawn();
+        (HypodjHandler::new(client, player), events)
+    }
+
+    #[tokio::test]
+    async fn add_stream_url_produces_stream_queue_item() {
+        let (h, _events) = handler_with_null_player();
+        let resp = h.handle(MpdCommand::Add(NTS.to_string())).await;
+        // add -> empty-OK (Pairs), never an ACK.
+        assert!(matches!(resp, MpdResponse::Pairs(_)), "add stream must succeed");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 1);
+        match &st.queue[0].entry {
+            QueueEntry::Stream { url, title } => {
+                assert_eq!(url, NTS);
+                assert_eq!(title, NTS);
+            }
+            other => panic!("expected Stream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn play_routes_stream_url_to_player_verbatim() {
+        let (h, mut events) = handler_with_null_player();
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // The NullPlayer went to Playing and, crucially, carries NO SongId for a
+        // raw stream (so nothing downstream can scrobble it).
+        assert_eq!(h.player.state(), PlayState::Playing);
+        match events.recv().await.expect("a player event") {
+            PlayerEvent::StateChanged(PlayState::Playing, song) => {
+                assert!(song.is_none(), "raw stream must carry no scrobble-able id");
+            }
+            other => panic!("expected Playing StateChanged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn currentsong_and_playlistinfo_render_stream() {
+        let (h, _events) = handler_with_null_player();
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(cur.iter().any(|(k, v)| k == "file" && v == NTS));
+        assert!(cur.iter().any(|(k, v)| k == "Title" && v == NTS));
+        // No Time / duration for a live stream, and it must not have crashed.
+        assert!(!cur.iter().any(|(k, _)| k == "Time"));
+
+        let pl = render(h.handle(MpdCommand::PlaylistInfo(None)).await);
+        assert!(pl.iter().any(|(k, v)| k == "file" && v == NTS));
+        assert!(pl.iter().any(|(k, _)| k == "Pos"));
+
+        // status must render (state: play) without a panic on the unknown-duration
+        // stream item.
+        let status = render(h.handle(MpdCommand::Status).await);
+        assert!(status.iter().any(|(k, v)| k == "state" && v == "play"));
+    }
+
+    #[tokio::test]
+    async fn scrobbler_skips_raw_stream_item() {
+        // A raw stream plays with song=None, so the player emits
+        // StateChanged(Playing, None). The scrobbler must not latch/act on it.
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1/never-called".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            client_name: "test".to_string(),
+        };
+        let scrobbler = Scrobbler::new(Arc::new(SubsonicClient::connect(&cfg).unwrap()));
+        // Feeding the exact event a raw stream produces is a no-op (no id).
+        scrobbler.on_event(&PlayerEvent::StateChanged(PlayState::Playing, None));
+        scrobbler.on_event(&PlayerEvent::TimePos(120.0));
+        // No panic, no submission possible: the scrobbler never latched a song.
+        assert!(scrobbler.current_is_none());
     }
 }

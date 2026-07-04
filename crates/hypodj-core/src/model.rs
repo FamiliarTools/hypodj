@@ -74,6 +74,34 @@ pub struct Song {
     pub user_rating: Option<u8>,
 }
 
+/// One thing that can sit in the play queue: either a resolved Subsonic [`Song`]
+/// or a raw internet-radio / HTTP stream URL added directly (MPD's `add <url>`).
+///
+/// A raw stream has no Subsonic song id, no rating, and is never scrobbled - it
+/// is played by handing its URL straight to the player. Keeping this as an enum
+/// (rather than an `Option<SongId>` bolted onto `Song`) means the stream case
+/// carries only what it actually has: a URL and a display title.
+#[derive(Debug, Clone)]
+pub enum QueueEntry {
+    /// A library track resolved from Subsonic. Playing it resolves a stream URL
+    /// via the client and scrobbles on the usual threshold.
+    Song(Song),
+    /// A raw HTTP(S) stream (internet radio). `url` is played verbatim by the
+    /// player; `title` is what MPD renders (defaults to the URL). No song id,
+    /// no scrobble.
+    Stream { url: String, title: String },
+}
+
+impl QueueEntry {
+    /// The MPD `file:` / display title for this entry.
+    pub fn title(&self) -> &str {
+        match self {
+            QueueEntry::Song(s) => &s.title,
+            QueueEntry::Stream { title, .. } => title,
+        }
+    }
+}
+
 /// A genre with its song/album counts (wire `data::Genre`; `name` is the
 /// renamed `value` field). Backs the `Genres` browse dir and `list genre`.
 #[derive(Debug, Clone)]

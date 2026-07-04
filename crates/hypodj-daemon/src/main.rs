@@ -82,6 +82,11 @@ async fn main() -> anyhow::Result<()> {
     use hypodj_core::player::{AudioOut, MpvPlayer};
     let audio = match std::env::var("HYPODJ_AUDIO").as_deref() {
         Ok("device") => AudioOut::Device,
+        // `file:<path>` decodes to a WAV (headless proof path; no device). Any
+        // other value (incl. "null"/unset) stays fully headless via ao=null.
+        Ok(v) if v.starts_with("file:") => {
+            AudioOut::File(PathBuf::from(v.trim_start_matches("file:")))
+        }
         _ => AudioOut::Null,
     };
     let (player, mut player_events) = MpvPlayer::spawn(audio);
