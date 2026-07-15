@@ -3044,7 +3044,15 @@ impl MpdHandler for HypodjHandler {
                     secs
                 };
                 match self.player.seek(target).await {
-                    Ok(()) => MpdResponse::ok(),
+                    Ok(()) => {
+                        // Advance the lockless position to where we just seeked, so
+                        // rapid successive relative scrubs (Space/Backspace held or
+                        // tapped between Ticks) accumulate from the new playhead
+                        // instead of collapsing onto the same stale Tick base. The
+                        // next TimePos Tick corrects any drift.
+                        self.note_elapsed_ms((target * 1000.0) as u64);
+                        MpdResponse::ok()
+                    }
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
                 }
             }
@@ -4272,14 +4280,16 @@ mod tests {
             other => panic!("got {other:?}"),
         }
 
-        // Relative forward 10 -> absolute 40.
+        // Relative forward 10 ACCUMULATES from the new position (20), not the
+        // stale Tick base (30): 20 -> 30. This is the rapid-scrub case - no Tick
+        // arrived between the two seeks, so the second must build on the first.
         handler.handle(MpdCommand::SeekCur { secs: 10.0, relative: true }).await;
         match events.recv().await {
-            Some(PlayerEvent::TimePos { pos, .. }) => assert_eq!(pos, 40.0),
+            Some(PlayerEvent::TimePos { pos, .. }) => assert_eq!(pos, 30.0),
             other => panic!("got {other:?}"),
         }
 
-        // Overshoot below 0 clamps to 0.
+        // Overshoot below 0 clamps to 0 (from the current 30 - 100).
         handler.handle(MpdCommand::SeekCur { secs: -100.0, relative: true }).await;
         match events.recv().await {
             Some(PlayerEvent::TimePos { pos, .. }) => assert_eq!(pos, 0.0),
