@@ -1,3 +1,5 @@
 /target
 /subsonity.local.toml
 /subsonity.validate.toml
+.direnv/
+.envrc
