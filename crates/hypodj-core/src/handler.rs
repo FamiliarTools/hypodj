@@ -396,6 +396,11 @@ enum Terminal {
         play: ResolvedPlay,
         resume_spec: FadeSpec,
         resume_vol: u8,
+        /// The dB level the dip bottomed out at (the deck sits here when the target
+        /// loads, and the ResumeIn rises FROM here). A shallow dip (see
+        /// [`SKIP_DIP_DB`]) keeps a skip snappy: the dip/resume step count scales
+        /// with this depth, so a shallower floor means far fewer 250ms steps.
+        dip_floor_db: f64,
     },
 }
 
@@ -651,23 +656,24 @@ fn fade_task(
                     // widget refresh) and MPD `idle` wakes.
                     changed.notify_waiters();
                 }
-                Terminal::SkipLoad { idx, play, resume_spec, resume_vol } => {
-                    // The dip reached silence AND this is still the current epoch, so
+                Terminal::SkipLoad { idx, play, resume_spec, resume_vol, dip_floor_db } => {
+                    // The dip reached its floor AND this is still the current epoch, so
                     // no superseding skip/setvol/stop got here first: it is SAFE to
-                    // load the target. mpv's softvol (~0) persists across the loadfile
-                    // (the play_index_from_silence contract), so the new track starts
-                    // silent and the follow-on ResumeIn owns the rise.
+                    // load the target. mpv's softvol (at the dip floor) persists across
+                    // the loadfile, so the new track starts at that shallow-duck level
+                    // and the follow-on ResumeIn owns the rise back to the baseline.
                     let _ = sink.play_url(play.song_id, Some(play.qid), &play.url).await;
                     // Commit the target as the real current, clear the reported-target
-                    // override, force the live gain to the synth floor (silence) and
-                    // keep `fading` true - the follow-on ResumeIn continues the envelope
-                    // without a gap. Bump the epoch so the follow-on is tagged strictly
-                    // newer than this (now-finished) dip.
+                    // override, pin the live gain to the dip floor (where the deck and
+                    // the ResumeIn's from_db agree) and keep `fading` true - the
+                    // follow-on ResumeIn continues the envelope without a gap. Bump the
+                    // epoch so the follow-on is tagged strictly newer than this
+                    // (now-finished) dip.
                     let epoch2 = {
                         let mut st = state.lock().unwrap();
                         st.current = Some(idx);
                         st.pending_skip = None;
-                        st.live_gain_db = synth_floor_db;
+                        st.live_gain_db = dip_floor_db;
                         st.fading = true;
                         st.fade_epoch += 1;
                         st.fade_epoch
@@ -813,6 +819,16 @@ struct PendingNl {
 
 /// How long an echoed `nl` token stays confirmable (single-use + TTL-bounded).
 const NL_TOKEN_TTL: Duration = Duration::from_secs(300);
+
+/// The dB floor a USER-skip dip bottoms out at (a shallow duck, NOT full
+/// `synth_floor` silence). A deliberate fade costs one >= 250ms step per 3 dB
+/// (the startle-safe minimum step interval), so dipping all the way to the -60 dB
+/// synth floor and back takes ~20 steps each way (~5s each, ~10s round trip) - far
+/// too long for a skip. A shallow -18 dB duck is ~6 steps each way (~1.5s each),
+/// so a skip stays snappy while remaining a smooth, startle-safe transition (the
+/// old track ducks to ~1/8 loudness, the new track loads there and rises back to
+/// the baseline). Closer to 0 = shallower + faster; deeper = slower.
+const SKIP_DIP_DB: f64 = -18.0;
 
 /// PURE re-rank for the `Calmer` selector. Given a `seed`, a candidate `pool`, and
 /// the desired `want`, sort candidates ASCENDING by energy (via the injected
@@ -2528,16 +2544,16 @@ impl HypodjHandler {
         // (b) Baseline + the resume target dB.
         let baseline = self.state.lock().unwrap().target_volume;
         let resume_db = mpv_volume_to_db(baseline as f64);
-        let synth_floor = self.fade_cfg.synth_floor_db;
         let dur = self.skip_fade_dur();
 
-        // (d) Pre-build the ResumeIn spec (synth_floor -> baseline), deliberate,
-        // clamp-up: the dip forces genuine silence, so the follow-on always rises
-        // from the floor. Built here (from a fixed from_db) so the dip terminal
-        // does no handler-side work under the slot lock. A build failure degrades
-        // to the plain path.
+        // (d) Pre-build the ResumeIn spec (SKIP_DIP_DB -> baseline), deliberate,
+        // clamp-up: the dip bottoms out at the shallow skip floor, so the follow-on
+        // rises FROM that floor (not full silence) - which is what keeps the skip
+        // short. Built here (from a fixed from_db) so the dip terminal does no
+        // handler-side work under the slot lock. A build failure degrades to the
+        // plain path.
         let resume_spec =
-            match self.build_deliberate_spec(synth_floor, FadeTarget::Db(resume_db), dur) {
+            match self.build_deliberate_spec(SKIP_DIP_DB, FadeTarget::Db(resume_db), dur) {
                 Ok(s) => s,
                 Err(_) => return self.play_index(idx).await,
             };
@@ -2588,14 +2604,22 @@ impl HypodjHandler {
                     // Read the live gain AFTER the outgoing fade is aborted+joined
                     // (validate-before-abort keeps this untouched on rejection).
                     let from_db = state_read.lock().unwrap().live_gain_db;
-                    let target = FadeTarget::Silence;
+                    // A shallow duck to SKIP_DIP_DB (not full silence) so the dip
+                    // is a few 250ms steps, not ~20 - what keeps a skip snappy.
+                    let target = FadeTarget::Db(SKIP_DIP_DB);
                     let step_interval = tick.max(min_slew);
                     let eff_dur =
                         dur.max(min_deliberate_dur(from_db, target, step_interval, synth_floor));
                     let bounds = startle_bounds(&cfg, false);
                     let spec =
                         FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)?;
-                    let terminal = Terminal::SkipLoad { idx, play, resume_spec, resume_vol };
+                    let terminal = Terminal::SkipLoad {
+                        idx,
+                        play,
+                        resume_spec,
+                        resume_vol,
+                        dip_floor_db: SKIP_DIP_DB,
+                    };
                     Ok((spec, terminal))
                 },
                 move |(spec, terminal)| {
@@ -4265,6 +4289,23 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    #[test]
+    fn skip_dip_is_far_shorter_than_a_full_silence_dip() {
+        // A skip ducks to SKIP_DIP_DB, not the -60 dB synth floor. At the startle-
+        // safe 250ms minimum step interval, a deliberate fade costs one step per
+        // 3 dB, so the cost scales with the dB span: the shallow duck is a handful
+        // of steps (~1.5s) versus ~20 steps (~5s) all the way to silence. This is
+        // exactly why the skip now feels snappy.
+        let step = std::time::Duration::from_millis(250);
+        let shallow = min_deliberate_dur(0.0, FadeTarget::Db(SKIP_DIP_DB), step, -60.0);
+        let full = min_deliberate_dur(0.0, FadeTarget::Silence, step, -60.0);
+        assert!(
+            shallow <= std::time::Duration::from_millis(1600),
+            "shallow skip dip stays snappy, got {shallow:?}"
+        );
+        assert!(shallow * 2 < full, "shallow dip is well under the full-silence dip");
     }
 
     #[tokio::test]
