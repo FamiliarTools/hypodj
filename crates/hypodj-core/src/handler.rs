@@ -531,6 +531,9 @@ async fn fade_task(
                         let mut st = state.lock().unwrap();
                         st.live_gain_db = mpv_volume_to_db(baseline as f64);
                         st.fading = false;
+                        // The real pause has landed (mpv is Paused): the pending
+                        // intent is fulfilled and the raw state now carries it.
+                        st.pending_pause = false;
                     }
                     // Fire the change signal AFTER the Paused state edge, so the MPRIS
                     // property-update loop re-emits PlaybackStatus = Paused (the GNOME
