@@ -7,7 +7,12 @@
 /// 1-arg `nl "<phrase>"` translate can never be mistaken for the 2-arg
 /// keyword_form.
 pub fn nl_request(phrase: &str) -> String {
-    let escaped = phrase.replace('\\', "\\\\").replace('"', "\\\"");
+    // Collapse newlines/CR to spaces first (MPD is line-based, no newline
+    // escape), then escape backslash + quote.
+    let escaped = phrase
+        .replace(['\n', '\r'], " ")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     format!("nl \"{escaped}\"")
 }
 

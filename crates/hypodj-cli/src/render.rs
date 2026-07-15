@@ -97,7 +97,7 @@ pub fn render_queue(pairs: &[(String, String)]) -> String {
     for (i, b) in blocks.iter().enumerate() {
         let pos = find(b, "Pos")
             .and_then(|v| v.parse::<usize>().ok())
-            .map(|p| p + 1)
+            .map(|p| p.saturating_add(1))
             .unwrap_or(i + 1);
         let title = find(b, "Title").unwrap_or("(unknown)");
         let artist = find(b, "Artist");

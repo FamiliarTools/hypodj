@@ -31,8 +31,9 @@ pub fn resolve(
     if let Some(h) = env.v("HYPODJ_HOST") {
         host = Some(h);
     } else if let Some(h) = env.v("MPD_HOST") {
-        // MPD_HOST may carry a "host:port" (or "pass@host") form; split port off
-        // the LAST colon so an IPv-less "host:port" resolves both fields.
+        // MPD_HOST may carry "[password@]host[:port]". Drop the password prefix
+        // (everything up to and including the last '@'), then split host:port.
+        let h = h.rsplit('@').next().map(str::to_string).unwrap_or(h);
         if let Some((h, p)) = split_hostspec(&h) {
             host = Some(h);
             port_from_hostspec = p.parse::<u16>().ok();
