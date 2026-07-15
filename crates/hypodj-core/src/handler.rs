@@ -361,6 +361,14 @@ async fn fade_task(
     // state otherwise). On completion, run the terminal action AND clear `fading`;
     // on a sink error, settle the baseline to the last-good level and clear
     // `fading` too so the reported volume stops deriving from a stalled envelope.
+    //
+    // NOTE on the FadeSlot handle: `fading` (in State) is the single source of
+    // truth for "a fade is active" and is cleared below. This task does NOT remove
+    // its own FadeHandle from the slot on natural completion (doing so would drop
+    // the handle and abort this task mid-terminal). So after a fade completes the
+    // slot may still hold a FINISHED handle until the next `start_fade`/cancel
+    // reclaims it - and aborting/joining an already-finished task there is a
+    // harmless no-op. Read `fading`, never slot-occupancy, to test "fade active".
     let still_current = state.lock().unwrap().fade_epoch == epoch;
     if still_current {
         match &outcome {
@@ -466,8 +474,6 @@ impl HypodjHandler {
     fn notify_change(&self) {
         self.changed.notify_waiters();
     }
-
-    /// Build the startle bounds from config for a given sub-JND policy.
 
     /// THE MPD-facing fade entry point: convert the parsed [`FadeArgs`] DSL into a
     /// fade-native [`FadeRequest`] (resolving the per-kind default duration and
