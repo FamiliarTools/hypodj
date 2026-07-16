@@ -35,7 +35,8 @@ daemon's idle-push socket with worker-thread IO so the UI never blocks on networ
 - Now-playing card with dithered album-art cover, up-next preview, and a physical
   volume fader
 - Three screens: `1`/`2`/`3` = Queue / Albums / Playlists
-- Vim-like navigation: `j`/`k`, `g`/`G`, scrolloff
+- Vim-like navigation: `j`/`k`, `g`/`G`, scrolloff; `Shift`+`P` jumps the Queue
+  cursor to the currently-playing song
 - `/` incremental search with `n`/`N` match cycling and matched-substring highlight
 - `:` command line - verbs plus natural language with echo-before-arm confirm
 - Physical-potentiometer volume knob: perceptual dB detents, off-click pause
