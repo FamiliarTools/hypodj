@@ -626,6 +626,12 @@ impl TuiState {
                 self.go_bottom();
                 None
             }
+            // Shift+P jumps the Queue cursor to the currently-playing song (browse
+            // screens have no now-playing row, so it no-ops there).
+            KeyCode::Char('P') => {
+                self.go_current();
+                None
+            }
             // `s` stars the SELECTED row; `f` is freed (vim find idiom now on `/`).
             KeyCode::Char('s') => self.favorite_selected(),
             KeyCode::Char('f') => None,
@@ -728,6 +734,27 @@ impl TuiState {
                 if !self.queue.is_empty() {
                     self.selected = self.queue.len() - 1;
                 }
+            }
+        }
+    }
+
+    /// Jump the Queue cursor to the currently-playing song. Queue only (browse
+    /// screens have no now-playing row); no-op when nothing is playing or the
+    /// current index is out of range. `now.song` is the 0-based queue index of the
+    /// current track; the queue is pos-ordered so it normally equals the row index,
+    /// but we match on `pos` and fall back to the index directly to be safe.
+    fn go_current(&mut self) {
+        if self.screen != Screen::Queue || self.queue.is_empty() {
+            return;
+        }
+        if let Some(song) = self.now.song {
+            let idx = self
+                .queue
+                .iter()
+                .position(|it| it.pos == song)
+                .unwrap_or(song);
+            if idx < self.queue.len() {
+                self.selected = idx;
             }
         }
     }
@@ -1184,6 +1211,34 @@ mod tests {
         assert_eq!(s.handle_key(ch('N')), None);
         assert_eq!(s.handle_key(ch('b')), None);
         assert_eq!(s.handle_key(ch('f')), None);
+    }
+
+    #[test]
+    fn shift_p_jumps_queue_cursor_to_current_song() {
+        let mut s = TuiState::new();
+        let now = NowPlaying {
+            song: Some(2),
+            ..NowPlaying::default()
+        };
+        s.apply_snapshot(now, vec![item(0), item(1), item(2), item(3), item(4)]);
+        s.selected = 4;
+        // Shift+P (Char 'P') moves the cursor to the playing row (index 2).
+        assert_eq!(s.handle_key(ch('P')), None);
+        assert_eq!(s.selected, 2);
+        // Idempotent.
+        s.handle_key(ch('P'));
+        assert_eq!(s.selected, 2);
+        // Nothing playing -> cursor unchanged.
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1)]);
+        s.selected = 1;
+        s.handle_key(ch('P'));
+        assert_eq!(s.selected, 1);
+        // On a browse screen it no-ops (no now-playing row there).
+        s.screen = Screen::Albums;
+        s.albums.rows = vec![brow("A", "album/1", true), brow("B", "album/2", true)];
+        s.albums.selected = 1;
+        s.handle_key(ch('P'));
+        assert_eq!(s.albums.selected, 1);
     }
 
     #[test]
