@@ -362,12 +362,13 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     };
     let title = np.title.clone().unwrap_or_else(|| "(unknown)".to_string());
     let title_span = Span::styled(title, Style::default().add_modifier(Modifier::BOLD));
-    // A heart marks a Subsonic favorite (U+2665, cell-width 1, terminal-safe).
-    // Prepended only when the current track is starred, so the layout is unchanged
-    // otherwise. Colored red, subtle against the theme.
+    // A heart marks a Subsonic favorite. U+2665 is East-Asian-Width ambiguous, so it
+    // is followed by U+FE0E (text-presentation selector) to force a single cell on
+    // emoji-presentation terminals (else the title shifts and the border corrupts).
+    // Prepended only when starred, so the layout is unchanged otherwise. Red, subtle.
     let title_line = if np.starred {
         Line::from(vec![
-            Span::styled("\u{2665} ", Style::default().fg(Color::Red)),
+            Span::styled("\u{2665}\u{FE0E} ", Style::default().fg(Color::Red)),
             title_span,
         ])
     } else {

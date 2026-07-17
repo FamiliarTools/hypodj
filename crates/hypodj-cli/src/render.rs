@@ -21,10 +21,11 @@ pub fn render_card(np: &NowPlaying) -> String {
     }
     let mut lines = Vec::new();
     if let Some(t) = &np.title {
-        // A heart marks a Subsonic favorite (U+2665, cell-width 1, terminal-safe),
-        // prepended to the title only when the current track is starred.
+        // A heart marks a Subsonic favorite. U+2665 is East-Asian-Width ambiguous,
+        // so it is followed by U+FE0E (text-presentation selector) to force a single
+        // cell on emoji-presentation terminals. Prepended only when starred.
         if np.starred {
-            lines.push(format!("\u{2665} {t}"));
+            lines.push(format!("\u{2665}\u{FE0E} {t}"));
         } else {
             lines.push(t.clone());
         }
@@ -155,7 +156,7 @@ mod tests {
             ("X-Starred", "1"),
         ]);
         let card = render_card(&now_playing(&status, &current));
-        assert!(card.contains("\u{2665} Blue in Green"));
+        assert!(card.contains("\u{2665}\u{FE0E} Blue in Green"));
         // Without the pair the heart is absent (plain title).
         let plain = render_card(&now_playing(&status, &p(&[
             ("file", "song/42"),
