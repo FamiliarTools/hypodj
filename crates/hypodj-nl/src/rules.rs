@@ -283,11 +283,28 @@ fn calmer_similar(tv: &[&str], calmer: bool, ctx: &NlContext) -> Result<RawPlan,
         .ok_or_else(|| NlError::Unresolvable("nothing playing to match".into()))?;
     let count = leading_count(tv).unwrap_or(DEFAULT_ENQUEUE_COUNT);
     let selector = if calmer { Selector::Calmer(id) } else { Selector::Similar(id) };
+    // A "play" ask must START playback, never silently append (the play_now
+    // correction): "play something calmer" enqueue-then-starts NOW, matching
+    // "play something calm" (no -er, which reaches the model and play_now-starts).
+    // A bare "something calmer" / "more like this" stays append-only after current.
+    if leads_with_play(tv) {
+        return Ok(plan(
+            RawTrigger::Immediate,
+            Action::PlayNow { selector, count },
+            true,
+        ));
+    }
     Ok(plan(
         RawTrigger::TrackAfterCurrent,
         Action::Enqueue { selector, count },
         true,
     ))
+}
+
+/// A leading start-playback verb ("play"/"put on"/"throw on"/"start"). Present ->
+/// the ask STARTS playback (Action::PlayNow) rather than appending after current.
+fn leads_with_play(tv: &[&str]) -> bool {
+    matches!(tv.first(), Some(&"play") | Some(&"put") | Some(&"throw") | Some(&"start"))
 }
 
 /// A leading small count in "play 3 calmer tracks"; None -> use the default.

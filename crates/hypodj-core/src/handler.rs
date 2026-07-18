@@ -1690,6 +1690,27 @@ impl HypodjHandler {
         Ok(n)
     }
 
+    /// Play a specific LIBRARY song NOW: resolve `selector` from the library, APPEND
+    /// it (via [`Self::plan_enqueue`], which stays literally append-only), then START
+    /// playback on the first newly-appended track. This is the enqueue-then-start
+    /// path behind [`crate::plan::Action::PlayNow`] - the honest "play X now" that
+    /// [`crate::plan::Action::Enqueue`] (append-only) and [`crate::plan::Action::Play`]
+    /// (in-queue jump only) could not express. Non-destructive: it only appends and
+    /// starts, never deletes. Returns the number of tracks enqueued.
+    pub async fn plan_play_now(&self, selector: &Selector, count: u32) -> Result<usize, String> {
+        // Index the first newly-appended track will land at. std Mutex dropped
+        // immediately, never held across the await below.
+        let start_idx = self.state.lock().unwrap().queue.len();
+        let n = self.plan_enqueue(selector, count).await?;
+        if n > 0 {
+            // Jump to (and start) the just-enqueued track. When a track was already
+            // playing this interrupts it (the intended "play X now"); on a stopped
+            // deck it simply starts.
+            self.play_index(start_idx).await?;
+        }
+        Ok(n)
+    }
+
     /// Snapshot the currently-playing library [`Song`] (a clone), or `None` when
     /// nothing is playing or the current entry is a stream. Short lock scope, no
     /// `.await` held.
@@ -8608,5 +8629,80 @@ mod tests {
         );
         let resp = h.handle(MpdCommand::Field(FieldCmd::Status)).await;
         assert_eq!(pair(&resp, "field"), Some("no pulls active"), "field unchanged by a genre ask");
+    }
+
+    // LIVE proof of the enqueue-then-start "play a specific library song NOW" path
+    // (PlayNow) and the strictly append-only enqueue, against a REAL backend. Uses a
+    // NullPlayer so nothing plays through the speakers (silent by construction);
+    // the SubsonicClient is real so search3/random_songs resolve genuine songs and
+    // play_index resolves a real stream URL. `#[ignore]` (certless/no-network
+    // sandbox skips it): run with
+    //   HYPODJ_TEST_URL/USER/PASS set, `cargo test -p hypodj-core -- --ignored
+    //   live_play_now_enqueues_and_starts`.
+    #[tokio::test]
+    #[ignore = "requires a live Navidrome (HYPODJ_TEST_URL/USER/PASS)"]
+    async fn live_play_now_enqueues_and_starts() {
+        let (url, username, password) = match (
+            std::env::var("HYPODJ_TEST_URL"),
+            std::env::var("HYPODJ_TEST_USER"),
+            std::env::var("HYPODJ_TEST_PASS"),
+        ) {
+            (Ok(u), Ok(n), Ok(p)) => (u, n, p),
+            _ => {
+                eprintln!("skipping live play_now: HYPODJ_TEST_URL/USER/PASS not set");
+                return;
+            }
+        };
+        let cfg = ServerConfig { url, username, password, client_name: "hypodj-selftest".into() };
+        let client = Arc::new(SubsonicClient::connect(&cfg).expect("connect"));
+        client.ping().await.expect("ping");
+        // A real title to demand NOW (never a hardcoded id).
+        let seed = client.random_songs(Some(1)).await.expect("random song");
+        let title = seed.first().map(|s| s.title.clone()).expect("at least one song");
+
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(Arc::clone(&client), player);
+
+        // (0) STRICTLY APPEND-ONLY: enqueue onto a STOPPED, EMPTY deck appends WITHOUT
+        // starting playback (the append-only contract the confirm/prompt promise).
+        assert!(h.state.lock().unwrap().queue.is_empty());
+        assert!(h.state.lock().unwrap().current.is_none(), "deck starts stopped");
+        let n0 = h.plan_enqueue(&Selector::Radio, 1).await.expect("append-only enqueue");
+        assert!(n0 >= 1, "enqueue appended the resolved song");
+        assert!(!h.state.lock().unwrap().queue.is_empty(), "and it was enqueued");
+        assert!(
+            h.state.lock().unwrap().current.is_none(),
+            "append-only enqueue NEVER starts playback, even on an empty stopped deck"
+        );
+
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(client, player);
+
+        // (1) STOPPED empty deck: play_now enqueues the song AND starts on it.
+        assert!(h.state.lock().unwrap().queue.is_empty());
+        assert!(h.state.lock().unwrap().current.is_none(), "deck starts stopped");
+        let n = h
+            .plan_play_now(&Selector::Query(title.clone()), 1)
+            .await
+            .expect("play_now");
+        assert!(n >= 1, "play_now enqueued the resolved song");
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "playback STARTED on it");
+        assert!(!h.state.lock().unwrap().queue.is_empty(), "and it was enqueued");
+
+        // (2) play_now while a track is already playing JUMPS to the new one (never a
+        // silent append-and-ignore): the just-enqueued track becomes current.
+        let before = h.state.lock().unwrap().queue.len();
+        let n = h.plan_play_now(&Selector::Radio, 1).await.expect("play_now radio");
+        assert!(n >= 1);
+        assert_eq!(
+            h.state.lock().unwrap().current,
+            Some(before),
+            "jumped to the just-enqueued track at the old tail"
+        );
+
+        // (3) append-only enqueue onto a NON-empty/live deck does NOT move current.
+        let cur = h.state.lock().unwrap().current;
+        h.plan_enqueue(&Selector::Radio, 1).await.expect("enqueue");
+        assert_eq!(h.state.lock().unwrap().current, cur, "append-only never jumps");
     }
 }

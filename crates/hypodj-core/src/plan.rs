@@ -149,6 +149,14 @@ pub enum Action {
     /// Jump playback to the FIRST entry the selector resolves. A no-match is a
     /// clean no-op (playback is left exactly where it was).
     Play { sel: QueueSelector },
+    /// Resolve a LIBRARY [`Selector`] (search3/genre/radio, NOT the live-queue
+    /// [`QueueSelector`] that [`Action::Play`] uses), APPEND the resolved songs
+    /// (append-only + count-clamped, exactly like [`Action::Enqueue`]), then START
+    /// playback on the first newly-appended track. This is the honest "play this
+    /// specific library song NOW" operation: enqueue-then-start. Non-destructive
+    /// (never deletes); the label resolves to ids at EXECUTE time, never from the
+    /// model. Distinct from [`Action::Enqueue`], which stays APPEND-ONLY.
+    PlayNow { selector: Selector, count: u32 },
     /// No operation: an off-topic / non-music / non-queue / non-playback request
     /// that maps to NO valid action. Emitting this (honest "no action") is how the
     /// model avoids fabricating a wrong enqueue for a request it cannot express.
@@ -424,6 +432,12 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
             count: (*count).min(bounds.max_enqueue),
         },
         Action::Wake { selector, count } => Action::Wake {
+            selector: selector.clone(),
+            count: (*count).min(bounds.max_enqueue),
+        },
+        // PlayNow shares Enqueue's exact bounded-hole justification: a count-clamped
+        // string Selector resolved label->id at execute (never an id from the model).
+        Action::PlayNow { selector, count } => Action::PlayNow {
             selector: selector.clone(),
             count: (*count).min(bounds.max_enqueue),
         },
@@ -863,6 +877,14 @@ mod tests {
         assert!(matches!(clamp_action(&Action::SetVolume(200), &b), Action::SetVolume(100)));
         match clamp_action(&Action::Enqueue { selector: Selector::Radio, count: 9999 }, &b) {
             Action::Enqueue { count, .. } => assert_eq!(count, MAX_ENQUEUE),
+            other => panic!("got {other:?}"),
+        }
+        // PlayNow clamps count exactly like Enqueue (shared bounded hole).
+        match clamp_action(
+            &Action::PlayNow { selector: Selector::Query("x".into()), count: 9999 },
+            &b,
+        ) {
+            Action::PlayNow { count, .. } => assert_eq!(count, MAX_ENQUEUE),
             other => panic!("got {other:?}"),
         }
         // SpanElapsed secs clamps into [min_dur, max_dur].

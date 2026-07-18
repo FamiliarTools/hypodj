@@ -318,13 +318,26 @@ mod tests {
     #[test]
     fn corpus_calmer_similar_and_unresolvable() {
         let c = ctx(Some("song-42"), 5);
-        // "something calmer" -> Enqueue{Calmer(current)}.
-        match &tr("play something calmer", &c).unwrap()[0].action {
+        // A bare "something calmer" (no start verb) stays append-only after current.
+        let calmer = &tr("something calmer", &c).unwrap()[0];
+        match &calmer.action {
             Action::Enqueue { selector: Selector::Calmer(id), .. } => {
                 assert_eq!(id, &SongId("song-42".into()))
             }
             other => panic!("got {other:?}"),
         }
+        assert!(matches!(calmer.trigger, RawTrigger::TrackAfterCurrent), "append-only");
+        // A "play" ask STARTS playback: "play something calmer" -> immediate PlayNow,
+        // never a silent append (the play_now correction). Matches "play something
+        // calm" (no -er), which reaches the model and play_now-starts.
+        let play_calmer = &tr("play something calmer", &c).unwrap()[0];
+        match &play_calmer.action {
+            Action::PlayNow { selector: Selector::Calmer(id), .. } => {
+                assert_eq!(id, &SongId("song-42".into()))
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(matches!(play_calmer.trigger, RawTrigger::Immediate), "starts now");
         // "more like this" -> Enqueue{Similar(current)}.
         match &tr("more like this", &c).unwrap()[0].action {
             Action::Enqueue { selector: Selector::Similar(id), .. } => {

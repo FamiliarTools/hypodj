@@ -79,20 +79,31 @@ pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music pl
     Translate the DJ request into EXACTLY ONE JSON plan object matching the provided \
     JSON schema, and output nothing else (no prose, no code fence). The object is FLAT: \
     a required \"type\" (one of fade_out, fade_in, stop, pause, set_volume, enqueue, \
-    remove, move, clear, play, noop), an \
+    play_now, remove, move, clear, play, noop), an \
     optional \"when\" (one of now, after_current, after_secs, album_boundary, \
     queue_position, time_remaining; omit it for an immediate action), and only the flat \
     scalars the action needs: \"secs\" for a fade, \"level\" for set_volume, \
     \"query\"/\"genre\"/\"radio\" plus \"count\" for enqueue, \"when_secs\" for \
     after_secs/time_remaining, \"slot\" for queue_position. Do NOT nest a trigger or a \
     selector object.\n\
+    play_now vs enqueue - THE key distinction: use \"play_now\" (same flat \
+    \"query\"/\"genre\"/\"radio\"+\"count\" fields as enqueue) whenever the user wants to HEAR \
+    music NOW - ANY \"play <X>\" or \"put on <X>\", whether X is a specific title (\"play at \
+    the door\"), a genre (\"play some jazz\"), a mood/descriptive phrase (\"play something \
+    calm\"), or a station (\"play a radio station\"). play_now resolves X from the LIBRARY \
+    (query for a title/phrase/mood, genre for a genre, radio for a station), enqueues it, \
+    AND starts playback on it. Use \"enqueue\" (APPEND-ONLY, never starts/jumps) ONLY when \
+    the user is explicitly STACKING the queue rather than starting playback - \"queue X\", \
+    \"add X\", \"queue up X\", \"throw X on the end\". Enqueue does NOT start playback. When in \
+    doubt between play and play_now for a named/genre/mood ask, choose play_now.\n\
     Queue-edit actions (remove, move, clear, play) target entries with a FLAT \
     selector: \"sel\" is one of current, position, range, query, last. sel=position uses \
     \"slot\" (1-based); sel=last uses \"count\"; sel=range uses \"range_start\"+\"range_end\" \
     (1-based inclusive); sel=query uses \"query\" (a title/artist substring). For move add \
     \"dest\" (position -> \"dest_slot\", relative -> \"dest_rel\"). For clear add \"scope\" \
     (all, after_current, or range with range_start/range_end). play jumps to the first \
-    match. NOTE: favoriting/starring and the bare transport verbs (clear, next, prev, \
+    match ALREADY IN THE QUEUE (a queue position or a title already queued) - to hear a \
+    NEW library song, use play_now, not play. NOTE: favoriting/starring and the bare transport verbs (clear, next, prev, \
     pause, play with no target) are handled BEFORE you and never reach you. If the \
     request is NOT about music, the queue, or playback (e.g. trivia, chit-chat, an \
     off-topic question), emit {\"type\":\"noop\"} - do NOT fabricate an enqueue. Otherwise \
@@ -112,13 +123,15 @@ pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music pl
     trigger timing, not a fade length). Emit only ONE placement; never mix an append with a \
     trigger.\n\
     Examples:\n\
-    Request: play some jazz -> {\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":5}\n\
+    Request: play some jazz -> {\"type\":\"play_now\",\"genre\":\"jazz\",\"count\":5}\n\
+    Request: play something calm -> {\"type\":\"play_now\",\"query\":\"calm\",\"count\":1}\n\
+    Request: play a radio station -> {\"type\":\"play_now\",\"radio\":true,\"count\":5}\n\
     Request: queue a couple of bossa nova tracks -> {\"type\":\"enqueue\",\"genre\":\"bossa nova\",\"count\":2}\n\
-    Request: play a few ambient tracks -> {\"type\":\"enqueue\",\"genre\":\"ambient\",\"count\":3}\n\
+    Request: play a few ambient tracks -> {\"type\":\"play_now\",\"genre\":\"ambient\",\"count\":3}\n\
     Request: queue five calmer tracks at the end -> {\"type\":\"enqueue\",\"query\":\"calmer tracks\",\"count\":5}\n\
     Request: queue some jazz tracks next -> {\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":5}\n\
     Request: add three upbeat songs after the current track -> {\"type\":\"enqueue\",\"query\":\"upbeat songs\",\"count\":3,\"when\":\"after_current\"}\n\
-    Request: put on a radio station -> {\"type\":\"enqueue\",\"radio\":true,\"count\":5}\n\
+    Request: put on a radio station -> {\"type\":\"play_now\",\"radio\":true,\"count\":5}\n\
     Request: queue a jazz track after 3 songs -> {\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":1,\"when\":\"queue_position\",\"slot\":3}\n\
     Request: fade out the current track over 30 seconds -> {\"type\":\"fade_out\",\"secs\":30}\n\
     Request: fade out 2 minutes before the track ends -> {\"type\":\"fade_out\",\"when\":\"time_remaining\",\"when_secs\":120}\n\
@@ -131,7 +144,11 @@ pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music pl
     Request: clear the whole queue -> {\"type\":\"clear\",\"scope\":\"all\"}\n\
     Request: move the last track to the top -> {\"type\":\"move\",\"sel\":\"last\",\"count\":1,\"dest\":\"position\",\"dest_slot\":1}\n\
     Request: move track 4 up two spots -> {\"type\":\"move\",\"sel\":\"position\",\"slot\":4,\"dest\":\"relative\",\"dest_rel\":-2}\n\
-    Request: play the track called so what -> {\"type\":\"play\",\"sel\":\"query\",\"query\":\"so what\"}\n\
+    Request: play the track called so what -> {\"type\":\"play_now\",\"query\":\"so what\"}\n\
+    Request: play at the door -> {\"type\":\"play_now\",\"query\":\"at the door\"}\n\
+    Request: put on blue in green -> {\"type\":\"play_now\",\"query\":\"blue in green\"}\n\
+    Request: queue the track called so what -> {\"type\":\"enqueue\",\"query\":\"so what\",\"count\":1}\n\
+    Request: add so what to the queue -> {\"type\":\"enqueue\",\"query\":\"so what\",\"count\":1}\n\
     Request: jump to track 6 -> {\"type\":\"play\",\"sel\":\"position\",\"slot\":6}\n\
     Request: what is the airspeed of an unladen swallow -> {\"type\":\"noop\"}\n\
     GROUNDING: if the user prompt carries an \"Available in the library:\" block, PREFER a \

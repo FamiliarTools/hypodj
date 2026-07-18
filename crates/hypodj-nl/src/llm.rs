@@ -42,6 +42,10 @@ pub enum LlmActionKind {
     Clear,
     /// Jump playback to the selected track.
     Play,
+    /// Resolve a LIBRARY song (query/genre/radio), enqueue it, and START playback
+    /// on it: the "play this specific song NOW" path (enqueue-then-start), distinct
+    /// from the append-only Enqueue.
+    PlayNow,
     /// Honest "no action": an off-topic / non-music / non-queue request. Prevents
     /// fabricating a wrong enqueue for a request that has no valid action.
     Noop,
@@ -239,6 +243,20 @@ impl TryFrom<LlmRawPlan> for RawPlan {
                     return Err("enqueue needs query, genre, or radio".into());
                 };
                 Action::Enqueue { selector, count: p.count.unwrap_or(1) }
+            }
+            LlmActionKind::PlayNow => {
+                // Same presence-only inference as Enqueue (radio > genre > query);
+                // no SongId path exists, so only Query/Genre/Radio are reachable.
+                let selector = if p.radio {
+                    Selector::Radio
+                } else if let Some(g) = p.genre {
+                    Selector::Genre(g)
+                } else if let Some(q) = p.query {
+                    Selector::Query(q)
+                } else {
+                    return Err("play_now needs query, genre, or radio".into());
+                };
+                Action::PlayNow { selector, count: p.count.unwrap_or(1) }
             }
             LlmActionKind::Remove => Action::Remove { sel: build_qsel(&p)? },
             LlmActionKind::Play => Action::Play { sel: build_qsel(&p)? },
@@ -529,6 +547,42 @@ mod tests {
         ));
         // noop: honest no-action for an off-topic ask (never a fabricated enqueue).
         assert!(matches!(parse_llm_output(r#"{"type":"noop"}"#).unwrap().action, Action::Noop));
+    }
+
+    // play_now (enqueue-then-start) parses from the SAME flat query/genre/radio
+    // surface as enqueue, but builds the distinct Action::PlayNow. "queue X" stays
+    // append-only Action::Enqueue - the two are never conflated.
+    #[test]
+    fn parse_distinguishes_play_now_from_append_only_enqueue() {
+        // "play <specific title>" -> play_now (query), count defaults to 1.
+        let p = parse_llm_output(r#"{"type":"play_now","query":"at the door"}"#).unwrap();
+        match p.action {
+            Action::PlayNow { selector: Selector::Query(q), count } => {
+                assert_eq!(q, "at the door");
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected play_now(query), got {other:?}"),
+        }
+        // play_now by genre / radio also reachable (same presence inference).
+        assert!(matches!(
+            parse_llm_output(r#"{"type":"play_now","genre":"jazz"}"#).unwrap().action,
+            Action::PlayNow { selector: Selector::Genre(_), .. }
+        ));
+        assert!(matches!(
+            parse_llm_output(r#"{"type":"play_now","radio":true}"#).unwrap().action,
+            Action::PlayNow { selector: Selector::Radio, .. }
+        ));
+        // play_now with no selector fails loud (never a fabricated SongId path).
+        assert!(parse_llm_output(r#"{"type":"play_now"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"play_now","id":"song-42"}"#).is_err());
+
+        // The SAME title under "enqueue" stays append-only Enqueue, NOT PlayNow.
+        assert!(matches!(
+            parse_llm_output(r#"{"type":"enqueue","query":"at the door","count":1}"#)
+                .unwrap()
+                .action,
+            Action::Enqueue { selector: Selector::Query(_), .. }
+        ));
     }
 
     // A queue-edit action with a MISSING required scalar fails loud (no fabricated

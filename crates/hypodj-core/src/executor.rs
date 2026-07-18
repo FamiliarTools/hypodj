@@ -396,8 +396,16 @@ async fn run_action(handler: Arc<HypodjHandler>, id: PlanId, action: Action) {
             handler.handle(MpdCommand::SetVol(*v)).await;
             Ok(())
         }
+        // Strictly append-only: adds to the END of the queue and NEVER starts or
+        // jumps playback, matching the confirm/prompt contract ("append-only",
+        // "never starts/jumps"). Use Action::PlayNow to enqueue-then-start.
         Action::Enqueue { selector, count } => {
             handler.plan_enqueue(selector, *count).await.map(|_| ())
+        }
+        // Play a specific LIBRARY song NOW: enqueue-then-start (append + jump to the
+        // just-enqueued track). Non-destructive.
+        Action::PlayNow { selector, count } => {
+            handler.plan_play_now(selector, *count).await.map(|_| ())
         }
         // ONE atomic effect: enqueue? -> start-from-silence -> play -> WakeTo ramp.
         // A single Action (not three timers) is what guarantees this order.
