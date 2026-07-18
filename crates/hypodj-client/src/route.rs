@@ -85,6 +85,9 @@ fn route_one(verb: &str, args: &[String]) -> Action {
         "queue" => Action::Queue,
         "play" => Action::Command("play".into()),
         "pause" => Action::Command("pause".into()),
+        // Resume the CURRENT track from where it was paused. `pause 0` hits the
+        // startle-safe resume_with_fade path; `play`/Play would restart from 0.
+        "resume" | "unpause" | "continue" => Action::Command("pause 0".into()),
         "stop" => Action::Command("stop".into()),
         "next" | "skip" => Action::Command("next".into()),
         "prev" | "previous" | "back" => Action::Command("previous".into()),
@@ -147,6 +150,10 @@ mod tests {
         assert_eq!(r("queue"), Action::Queue);
         assert_eq!(r("play"), Action::Command("play".into()));
         assert_eq!(r("pause"), Action::Command("pause".into()));
+        // resume/unpause map to `pause 0` (resume from position), NOT the AI/NL.
+        assert_eq!(r("resume"), Action::Command("pause 0".into()));
+        assert_eq!(r("unpause"), Action::Command("pause 0".into()));
+        assert_eq!(r("continue"), Action::Command("pause 0".into()));
         assert_eq!(r("stop"), Action::Command("stop".into()));
         assert_eq!(r("next"), Action::Command("next".into()));
         assert_eq!(r("prev"), Action::Command("previous".into()));
