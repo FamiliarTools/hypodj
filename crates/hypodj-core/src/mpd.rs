@@ -611,6 +611,17 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
             Some(Action::Enqueue { selector: sel.0, count })
         }
+        // Library play-now (enqueue + start); mirrors `enqueue` but starts playback.
+        "playnow" => {
+            let sel = match toks.get(1)?.to_lowercase().as_str() {
+                "radio" => (Selector::Radio, 2),
+                "query" => (Selector::Query(toks.get(2)?.clone()), 3),
+                "genre" => (Selector::Genre(toks.get(2)?.clone()), 3),
+                _ => return None,
+            };
+            let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+            Some(Action::PlayNow { selector: sel.0, count })
+        }
         // ── queue-edit actions (echo-before-arm round-trip; see echo.rs) ──────
         "remove" => Some(Action::Remove { sel: parse_qselector(&toks[1..])? }),
         "play" => Some(Action::Play { sel: parse_qselector(&toks[1..])? }),
