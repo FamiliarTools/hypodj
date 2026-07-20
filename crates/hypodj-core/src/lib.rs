@@ -27,6 +27,7 @@ pub mod mpris;
 pub mod nl;
 pub mod plan;
 pub mod player;
+pub mod recognize;
 pub mod resume;
 pub mod scrobble;
 pub mod subsonic;

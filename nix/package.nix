@@ -3,6 +3,13 @@
 , pkg-config
 , mpv-unwrapped
 , makeWrapper
+# Runtime tools for on-demand now-playing recognition (task f7vnd3i): ffmpeg
+# captures a short side-band clip of the stream, songrec (open-source Shazam)
+# fingerprints it. Put on the daemon's PATH by the wrapper below so the feature is
+# self-contained (no os-configurations change). ffmpeg-headless is the leaner
+# closure and is sufficient - only wav capture is used.
+, songrec
+, ffmpeg-headless
 # DISPLAY-only enrichment (from flake.nix): the semver read from Cargo.toml and
 # the HYPODJ_BUILD_INFO grammar baked into the runtime env (the nix sandbox has
 # no .git, so this is what `hypodj --version` shows).
@@ -49,6 +56,7 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     wrapProgram $out/bin/hypodj \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
+      --prefix PATH : ${lib.makeBinPath [ songrec ffmpeg-headless ]} \
       --set-default HYPODJ_BUILD_INFO ${lib.escapeShellArg buildInfo}
   '';
 

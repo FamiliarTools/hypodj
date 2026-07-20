@@ -229,6 +229,15 @@ pub enum MpdCommand {
     /// mutates the queue, never arms. See [`FieldCmd`] and [`parse_field`].
     Field(FieldCmd),
 
+    /// `identify` - ON-DEMAND now-playing RECOGNITION for the current raw
+    /// stream (task f7vnd3i). Captures a short side-band clip of the SAME stream
+    /// URL and fingerprints it with `songrec` (open-source Shazam), then surfaces
+    /// the recognized artist / title into the same MPD `Name`/`Title` path as ICY
+    /// metadata. On-demand only (never continuous), so the Shazam endpoint is not
+    /// hammered. NOT a standard MPD command; a hypodj extension. See
+    /// [`crate::handler::HypodjHandler::identify`].
+    Identify,
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
@@ -1103,6 +1112,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "winddown" => parse_winddown(&args, line),
         "wake" => parse_wake(&args, line),
         "field" => parse_field(&args, line),
+        "identify" => MpdCommand::Identify,
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -1166,6 +1176,13 @@ mod parse_tests {
             MpdCommand::AddId(uri, None) => assert_eq!(uri, "song/so-1"),
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_identify_verb() {
+        // The `identify` custom verb (task f7vnd3i) parses to its own command, never
+        // Unsupported, so dispatch cannot forget the on-demand recognition path.
+        assert!(matches!(parse("identify"), MpdCommand::Identify));
     }
 
     #[test]

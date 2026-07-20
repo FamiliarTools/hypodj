@@ -21,7 +21,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -214,6 +214,15 @@ struct State {
     /// song never inherits a station's label and a stale slot from a prior stream
     /// never leaks onto a new entry. EPHEMERAL: never persisted to resume.toml.
     stream_meta: Option<(QueueId, StreamMeta)>,
+    /// The recognized Shazam cover-art URL for the current raw stream (task
+    /// f7vnd3i), keyed by the LATCHED [`QueueId`] it belongs to, or `None` when no
+    /// on-demand `identify` has matched the current entry. Surfaced toward the
+    /// dj-gui art pane as the `X-CoverArt` currentsong extension field. Separate
+    /// from [`Self::stream_meta`] (which carries only the ICY-shaped Name/Title) so
+    /// the recognition cover rides its own qid-gated slot without reshaping the ICY
+    /// type. EPHEMERAL: never persisted to resume.toml; cleared on every play edge
+    /// alongside `stream_meta` so a stale cover can never leak onto a new track.
+    recognized_cover: Option<(QueueId, String)>,
 }
 
 /// Which pertinence branch a [`Handler::seed_source`] resolution landed on - the
@@ -324,6 +333,8 @@ impl Default for State {
             vol_dither_state: 0x8B7F_A1C2_D3E4_F506,
             // No live stream metadata until a stream connects and pushes ICY tags.
             stream_meta: None,
+            // No recognized cover until an on-demand `identify` matches.
+            recognized_cover: None,
         }
     }
 }
@@ -1074,6 +1085,11 @@ pub struct HypodjHandler {
     /// happens on cloned values. Empty by default: with no pull the selection path is
     /// byte-identical to today.
     pulls: Mutex<PullField>,
+    /// In-flight guard for on-demand `identify` (task f7vnd3i): `true` while a
+    /// capture + `songrec` recognition is running, so rapid repeat triggers are
+    /// debounced to ONE at a time and the Shazam endpoint is never hammered.
+    /// Reset by an RAII guard on every exit path (including a panic/timeout).
+    recognizing: AtomicBool,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -1311,6 +1327,7 @@ impl HypodjHandler {
             last_elapsed_ms: Arc::new(AtomicU64::new(0)),
             store: Arc::new(MetadataStore),
             pulls: Mutex::new(PullField::new()),
+            recognizing: AtomicBool::new(false),
         }
     }
 
@@ -2923,6 +2940,20 @@ impl HypodjHandler {
         self.notify_change();
     }
 
+    /// Store the recognized Shazam cover-art URL for the raw stream identified by
+    /// `queue_id` (task f7vnd3i), then wake idling clients so the dj-gui art pane can
+    /// re-read the `X-CoverArt` currentsong field. Keyed by the latched identity so
+    /// the slot can only ever decorate the entry it came from. The std lock is held
+    /// ONLY for the field write and dropped BEFORE `notify_change` (never across an
+    /// await); mutated through `&self` interior mutability, never `&mut self`.
+    pub(crate) fn set_recognized_cover(&self, queue_id: QueueId, url: String) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.recognized_cover = Some((queue_id, url));
+        }
+        self.notify_change();
+    }
+
     /// Drop any stored live stream metadata that does NOT belong to `keep`, called on
     /// every play edge / stop so a station's Name/Title can never linger onto the next
     /// track. Passing `Some(qid)` keeps the slot when it matches (a mid-stream ICY
@@ -2935,6 +2966,117 @@ impl HypodjHandler {
                 st.stream_meta = None;
             }
         }
+        // Drop the recognized cover on the same edge (task f7vnd3i) so a Shazam
+        // cover from a prior stream can never linger onto the next entry.
+        if let Some((qid, _)) = &st.recognized_cover {
+            if keep != Some(*qid) {
+                st.recognized_cover = None;
+            }
+        }
+    }
+
+    /// ON-DEMAND now-playing RECOGNITION for the current raw stream (task f7vnd3i).
+    ///
+    /// The gap: sibling jmrwr99 surfaces a stream's ICY tags, but some real streams
+    /// (the NTS mixtapes) carry NO ICY, so the now-playing text must come from
+    /// OUTSIDE the stream. This captures a short SIDE-BAND clip of the SAME stream
+    /// URL and fingerprints it with `songrec` (open-source Shazam), then surfaces the
+    /// recognized artist / title into the exact same `Name`/`Title` path ICY rides
+    /// (via [`Self::set_stream_meta`]) and the cover URL toward the dj-gui art pane
+    /// (via the qid-gated `recognized_cover` slot -> currentsong `X-CoverArt`).
+    ///
+    /// LOCK/ASYNC DISCIPLINE: the stream URL + qid are read under ONE short std lock
+    /// which is DROPPED before the recognition await (the Mutex-never-across-await
+    /// invariant); the heavy capture + subprocess work happens off the reactor in
+    /// [`crate::recognize::recognize_stream_url`]. An in-flight [`AtomicBool`] guard
+    /// (reset by RAII) debounces rapid repeats to one recognition at a time.
+    ///
+    /// Only a raw [`QueueEntry::Stream`] is recognized: a library song already
+    /// carries metadata, and nothing playing has nothing to identify - both
+    /// short-circuit WITHOUT capturing. On a hit the qid is RE-CHECKED before
+    /// surfacing so a late result only decorates the entry it came from (mirroring
+    /// the currentsong qid gate); a no-match leaves any prior stream_meta untouched.
+    async fn identify(&self) -> MpdResponse {
+        // Debounce: one recognition at a time (protects the Shazam endpoint).
+        if self.recognizing.swap(true, Ordering::AcqRel) {
+            return MpdResponse::pairs()
+                .pair("identify", "already identifying")
+                .build();
+        }
+        // RAII: reset the in-flight flag on EVERY exit path (hit / miss / error / early
+        // return), so a failed or short-circuited identify can never wedge the guard.
+        let _guard = RecognizingGuard(&self.recognizing);
+
+        // Read the current entry's stream URL + latched qid under ONE lock, then DROP
+        // the lock before any await. A library song / nothing-playing short-circuits.
+        enum Target {
+            Stream(QueueId, String),
+            LibrarySong,
+            Nothing,
+        }
+        let target = {
+            let st = self.state.lock().unwrap();
+            match st.reported_current().and_then(|i| st.queue.get(i)) {
+                Some(item) => match &item.entry {
+                    QueueEntry::Stream { url, .. } => Target::Stream(QueueId(item.id), url.clone()),
+                    QueueEntry::Song(_) => Target::LibrarySong,
+                },
+                None => Target::Nothing,
+            }
+        };
+        let (qid, url) = match target {
+            Target::Stream(qid, url) => (qid, url),
+            Target::LibrarySong => {
+                return MpdResponse::pairs()
+                    .pair("identify", "current track is already known")
+                    .build();
+            }
+            Target::Nothing => {
+                return MpdResponse::pairs().pair("identify", "nothing playing").build();
+            }
+        };
+
+        // Heavy work off the reactor; no std lock is held across this await.
+        let track = match crate::recognize::recognize_stream_url(url).await {
+            Ok(Some(track)) => track,
+            Ok(None) => {
+                // Clean no-match: leave any prior ICY stream_meta untouched.
+                return MpdResponse::pairs().pair("identify", "no match").build();
+            }
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, "identify", &e.to_string()),
+        };
+
+        let now_playing = crate::recognize::now_playing_title(&track);
+
+        // Re-check the qid + preserve any existing ICY station Name under ONE lock, so
+        // a track that advanced during the capture is NOT clobbered by a stale result.
+        let existing_name = {
+            let st = self.state.lock().unwrap();
+            let still_current = st
+                .reported_current()
+                .and_then(|i| st.queue.get(i))
+                .is_some_and(|it| QueueId(it.id) == qid);
+            if !still_current {
+                // The stream advanced away from what we captured: report the hit but
+                // do NOT decorate the now-different entry.
+                return identify_hit_response(&track, now_playing.as_deref());
+            }
+            st.stream_meta
+                .as_ref()
+                .and_then(|(q, m)| (*q == qid).then(|| m.name.clone()))
+                .flatten()
+        };
+
+        // Surface the recognized cover toward the dj-gui pane (qid-gated slot).
+        if let Some(url) = &track.cover_url {
+            self.set_recognized_cover(qid, url.clone());
+        }
+        // Surface artist/title into the same Name/Title path as ICY. Preserve the
+        // station Name if one was already latched; the recognized now-playing rides
+        // Title. set_stream_meta wakes idling clients (notify_change).
+        self.set_stream_meta(qid, existing_name, now_playing.clone());
+
+        identify_hit_response(&track, now_playing.as_deref())
     }
 
     fn notify_change(&self) {
@@ -4648,6 +4790,46 @@ fn prune_expired_nl(map: &mut HashMap<String, PendingNl>) {
     map.retain(|_, p| now.duration_since(p.created) < NL_TOKEN_TTL);
 }
 
+/// Resets the handler's in-flight `identify` debounce flag on drop (task f7vnd3i),
+/// so a recognition that short-circuits, errors, panics, or times out ALWAYS
+/// releases the guard - a hung Shazam call can never wedge the trigger forever.
+struct RecognizingGuard<'a>(&'a AtomicBool);
+
+impl Drop for RecognizingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Build the `identify` HIT response as nl_echo-style pairs so a caller sees the
+/// recognized track immediately. The recognized `Title` also rides `currentsong`
+/// via `stream_meta` (so the dj CLI now-playing card reflects it with no client
+/// change); these structured pairs additionally give programmatic callers (dj-gui)
+/// the split artist / title / album / cover fields. Only the present fields are
+/// emitted (a partial Shazam hit stays honest).
+fn identify_hit_response(
+    track: &crate::recognize::RecognizedTrack,
+    now_playing: Option<&str>,
+) -> MpdResponse {
+    let mut b = MpdResponse::pairs();
+    if let Some(np) = now_playing {
+        b = b.pair("identify", np);
+    }
+    if let Some(a) = &track.artist {
+        b = b.pair("identify_artist", a.as_str());
+    }
+    if let Some(t) = &track.title {
+        b = b.pair("identify_title", t.as_str());
+    }
+    if let Some(al) = &track.album {
+        b = b.pair("identify_album", al.as_str());
+    }
+    if let Some(c) = &track.cover_url {
+        b = b.pair("identify_cover", c.as_str());
+    }
+    b.build()
+}
+
 fn ack(code: u32, command: &str, message: &str) -> MpdResponse {
     MpdResponse::Ack {
         code,
@@ -4801,6 +4983,14 @@ impl MpdHandler for HypodjHandler {
                                     apply_stream_meta(&mut pairs, meta);
                                 }
                             }
+                            // Surface a recognized Shazam cover toward the dj-gui art
+                            // pane as an `X-CoverArt` extension, ONLY when the stored
+                            // slot's identity matches this exact entry (task f7vnd3i).
+                            if let Some((qid, url)) = &st.recognized_cover {
+                                if *qid == QueueId(item.id) {
+                                    pairs.push(("X-CoverArt".to_string(), url.clone()));
+                                }
+                            }
                         }
                         MpdResponse::Pairs(pairs)
                     }
@@ -4877,6 +5067,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Winddown(cmd) => self.handle_winddown(cmd),
             MpdCommand::Wake(cmd) => self.handle_wake(cmd),
             MpdCommand::Field(cmd) => self.handle_field(cmd),
+            MpdCommand::Identify => self.identify().await,
             MpdCommand::Next => {
                 // A manual `next` always advances (single governs only auto-advance);
                 // random/repeat/consume are honored via plan_next. The transition
@@ -8158,6 +8349,100 @@ mod tests {
         );
         assert!(cur.iter().any(|(k, v)| k == "file" && v == "song/lib"));
         assert!(!cur.iter().any(|(k, _)| k == "Name"), "a library song never inherits a station Name");
+    }
+
+    // ── on-demand recognition (identify, task f7vnd3i) ─────────────────────
+
+    #[tokio::test]
+    async fn identify_skips_library_song() {
+        // A library song already carries metadata, so `identify` short-circuits
+        // WITHOUT capturing (no ffmpeg/songrec subprocess) and leaves stream_meta
+        // untouched, returning the 'already known' response.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("lib")).await;
+        h.play_for_test(0).await;
+
+        let resp = h.handle(MpdCommand::Identify).await;
+        match resp {
+            MpdResponse::Pairs(p) => assert!(
+                p.iter().any(|(k, v)| k == "identify" && v.contains("already known")),
+                "a library song identifies as already-known: {p:?}"
+            ),
+            other => panic!("expected Pairs, got {other:?}"),
+        }
+        // No recognition ran: nothing was surfaced into the stream slots.
+        let st = h.state.lock().unwrap();
+        assert!(st.stream_meta.is_none(), "no stream_meta set for a library song");
+        assert!(st.recognized_cover.is_none(), "no cover set for a library song");
+    }
+
+    #[tokio::test]
+    async fn identify_nothing_playing_is_a_clean_ack() {
+        // Nothing playing / stopped: a clear response, no capture attempted.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h.handle(MpdCommand::Identify).await;
+        match resp {
+            MpdResponse::Pairs(p) => assert!(
+                p.iter().any(|(k, v)| k == "identify" && v == "nothing playing"),
+                "stopped -> nothing to identify: {p:?}"
+            ),
+            other => panic!("expected Pairs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn surface_maps_hit_to_stream_meta_and_cover() {
+        // The SURFACE step (no live Shazam): a parsed hit's now-playing title rides
+        // the same Name/Title path as ICY, and its cover surfaces as X-CoverArt in
+        // currentsong - both qid-gated to the current stream entry.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+
+        let track = crate::recognize::RecognizedTrack {
+            artist: Some("Calvin Harris & Clementine Douglas".into()),
+            title: Some("Blessings".into()),
+            album: Some("Blessings".into()),
+            cover_url: Some("https://is1.example/hq.jpg".into()),
+        };
+        let np = crate::recognize::now_playing_title(&track);
+        assert_eq!(np.as_deref(), Some("Calvin Harris & Clementine Douglas - Blessings"));
+        h.set_recognized_cover(QueueId(qid), track.cover_url.clone().unwrap());
+        h.set_stream_meta(QueueId(qid), None, np.clone());
+
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(
+            cur.iter().any(|(k, v)| k == "Title"
+                && v == "Calvin Harris & Clementine Douglas - Blessings"),
+            "recognized now-playing rides the Title path: {cur:?}"
+        );
+        assert!(
+            cur.iter().any(|(k, v)| k == "X-CoverArt" && v == "https://is1.example/hq.jpg"),
+            "recognized cover surfaces toward the dj-gui pane: {cur:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recognized_cover_ignored_for_wrong_qid() {
+        // A cover keyed to a DIFFERENT qid must never leak onto the current stream's
+        // currentsong (mirrors the stream_meta qid gate).
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        // Store a cover under a qid that is NOT the current entry.
+        h.set_recognized_cover(QueueId(qid.wrapping_add(999)), "https://x/wrong.jpg".into());
+
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(
+            !cur.iter().any(|(k, _)| k == "X-CoverArt"),
+            "a wrong-qid cover must not surface: {cur:?}"
+        );
     }
 
     // ── saved internet radio stations (task cchte88) ───────────────────────

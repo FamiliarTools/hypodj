@@ -94,8 +94,44 @@ fn is_bare_resume(args: &[String]) -> bool {
     }
 }
 
+/// The natural phrasings a human uses to ask "what is this track?": the bare verb
+/// `identify` and the common questions ("what is this", "what's playing", "what
+/// song is this"). Mapped deterministically to the raw `identify` command at the
+/// CLIENT router - the NL Plan-IR path has no identify action, so keeping it out of
+/// the model surface (task f7vnd3i) is both correct and cheap. Punctuation-tolerant:
+/// a trailing `?` is stripped before matching.
+fn is_identify_phrase(args: &[String]) -> bool {
+    let norm: Vec<String> = args
+        .iter()
+        .map(|w| w.trim_end_matches('?').to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let joined = norm.join(" ");
+    matches!(
+        joined.as_str(),
+        "identify"
+            | "what is this"
+            | "whats this"
+            | "what's this"
+            | "what is playing"
+            | "whats playing"
+            | "what's playing"
+            | "what is this song"
+            | "what song is this"
+            | "what is this track"
+            | "what track is this"
+            | "what is this playing"
+            | "identify this"
+            | "identify this song"
+            | "identify this track"
+    )
+}
+
 /// Route the argument vector (already split into tokens) to an Action.
 pub fn route(args: &[String]) -> Action {
+    if is_identify_phrase(args) {
+        return Action::Command("identify".into());
+    }
     if is_bare_favorite(args) {
         return Action::FavoriteCurrent;
     }
@@ -305,6 +341,26 @@ mod tests {
         );
         assert_eq!(r("star rating 5"), Action::Nl("star rating 5".into()));
         assert_eq!(r("queue jazz"), Action::Nl("queue jazz".into()));
+    }
+
+    #[test]
+    fn route_identify_phrases_map_to_identify_command() {
+        // The bare verb and the natural "what is this" family map deterministically
+        // to the raw `identify` command (task f7vnd3i), never to the AI (the NL
+        // Plan-IR path has no identify action).
+        assert_eq!(r("identify"), Action::Command("identify".into()));
+        assert_eq!(r("what is this"), Action::Command("identify".into()));
+        assert_eq!(r("what's this"), Action::Command("identify".into()));
+        assert_eq!(r("whats playing"), Action::Command("identify".into()));
+        assert_eq!(r("what is playing"), Action::Command("identify".into()));
+        assert_eq!(r("what song is this"), Action::Command("identify".into()));
+        assert_eq!(r("what is this track"), Action::Command("identify".into()));
+        assert_eq!(r("identify this song"), Action::Command("identify".into()));
+        // Punctuation-tolerant.
+        assert_eq!(r("what is this?"), Action::Command("identify".into()));
+        // A real target is NOT an identify phrase -> stays NL.
+        assert_eq!(r("what is this jazz"), Action::Nl("what is this jazz".into()));
+        assert_eq!(r("identify miles davis"), Action::Nl("identify miles davis".into()));
     }
 
     #[test]
