@@ -39,7 +39,7 @@ use crate::fade::{
     min_deliberate_dur, run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget,
     StartleBounds,
 };
-use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
+use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot, TimerId};
 use crate::intelligence::{
     lexicon_pull, pull_reweight, FeatureStore, MetadataStore, Pull, PullField, TrackFeatures,
     LEXICON_PULL_STRENGTH,
@@ -65,7 +65,7 @@ use crate::resume::{
     RESUME_SCHEMA_VERSION,
 };
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
-use crate::timer::TimerHandle;
+use crate::timer::{TimerGuard, TimerHandle};
 
 /// One queue entry: a playable [`QueueEntry`] (Subsonic song OR raw stream) plus
 /// its MPD song id (a monotonically increasing integer, MPD's stable per-song
@@ -248,6 +248,44 @@ struct State {
     /// monotonic within a session, so a stale value can never false-match a later
     /// entry. Set on a successful cold-start; cleared on the honest stop.
     continuation_active: Option<u64>,
+    /// The PENDING continuation WARM slot (slice 2): the LEAD-scheduled prefetch of the
+    /// continuation station, armed on the shared timer wheel at
+    /// `now + (duration - elapsed - CONTINUATION_WARM_LEAD_SECS)` behind a finite
+    /// current Song, or `None` at rest. Holds its [`TimerGuard`] so DROPPING the slot
+    /// (any disarm gesture: queue edit / skip / stop / toggle-off) RAII-cancels the
+    /// timer and a late fire tombstones on the id. `warmed` flips true once the actor
+    /// accepted the background [`crate::player::PlayerCommand::PrefetchContinuation`];
+    /// only THEN do `qid`/`url`/`title` carry the resolved station identity the
+    /// [`Self::advance_on_eof`] landed-commit appends. EPHEMERAL: never persisted (a
+    /// restart re-arms from the rehydrated toggle). Warming is a best-effort accelerator
+    /// in FRONT of the slice-1 cold-start, which stays the load-bearing floor.
+    pending_continuation_warm: Option<ContinuationWarm>,
+}
+
+/// The pending continuation-warm slot (see [`State::pending_continuation_warm`]). A
+/// LEAD-scheduled prefetch of the continuation station for a gapless end-of-queue
+/// handoff. The held [`TimerGuard`] cancels the armed timer on drop (RAII disarm).
+struct ContinuationWarm {
+    /// The armed timer's id, so the fire hook can confirm the fire is THIS slot's
+    /// (not a superseded / plan timer) before acting.
+    timer_id: TimerId,
+    /// The RAII cancel-on-drop guard for the armed timer. Dropping the slot cancels
+    /// the timer; a late fire of a cancelled id tombstones (the timer live-set idiom).
+    #[allow(dead_code)]
+    guard: TimerGuard,
+    /// Whether the background prefetch actually reached the actor (the
+    /// `PrefetchContinuation` Ok). Only when `true` do the fields below carry the
+    /// resolved station identity, and only then may the landed-commit append it.
+    warmed: bool,
+    /// The queue id minted for the station at prefetch time (attributed on the landed
+    /// handoff). Meaningful only when `warmed`.
+    qid: u64,
+    /// The resolved station stream URL. Meaningful only when `warmed`.
+    url: String,
+    /// The station label (the configured station string), used as the appended
+    /// [`QueueEntry::Stream`] title exactly like the cold-start. Meaningful only when
+    /// `warmed`.
+    title: String,
 }
 
 /// Which pertinence branch a [`Handler::seed_source`] resolution landed on - the
@@ -364,6 +402,8 @@ impl Default for State {
             continuation: false,
             // No continuation stream is live until one is cold-started.
             continuation_active: None,
+            // No pending continuation warm until a finite Song play arms one.
+            pending_continuation_warm: None,
         }
     }
 }
@@ -452,6 +492,62 @@ impl State {
         // Sequential (and consume, which removes the current): drained iff the
         // current entry is the last one.
         cur + 1 >= len
+    }
+}
+
+/// Would the NEXT auto-advance (EOF) DRAIN the queue with genuinely nothing left to
+/// play - i.e. would [`HypodjHandler::advance_on_eof`] take its None-branch AND is this
+/// a [`State::is_true_drain`]? This is the shared gate the continuation-warm predicate
+/// consults at BOTH arm time and fire time, so a warm can never arm for a boundary the
+/// slice-1 drain edge would not itself treat as a drain. PURE (read-only): unlike
+/// [`HypodjHandler::plan_next`] it consumes no consume-eviction and no random walk.
+///
+/// It mirrors `plan_next(auto=true)`'s stop decision: an auto-advance returns None only
+/// at a genuine sequential/single/consume end, and `is_true_drain` already encodes
+/// exactly that boundary (false for repeat/random - which cycle forever - and true only
+/// when the current is the last entry or the queue is empty). At that boundary
+/// `plan_next(true)` always yields None (sequential-last stops, `single` stops after the
+/// current, `consume` empties the queue), so `is_true_drain` IS the drain-is-next
+/// predicate.
+fn drain_is_next(st: &State) -> bool {
+    st.is_true_drain()
+}
+
+/// The continuation-warm ARM PREDICATE, shared by arm time
+/// ([`HypodjHandler::reschedule_continuation_warm`]) and fire time
+/// ([`HypodjHandler::on_continuation_warm_fire`]). Returns the current FINITE Song's
+/// `duration_secs` when a warm is armable, else `None`. Read under the caller's `State`
+/// lock; `station_ok` (a non-empty station configured) is passed in because
+/// `continuation_station` is a SEPARATE Mutex the caller reads first (never nested).
+///
+/// Deliberately NOT [`HypodjHandler::current_can_warm`] (the SKIP near-EOF guard): the
+/// [`NEAR_EOF_GUARD_SECS`] decline exists to avoid a swallowed-EOF stall, which cannot
+/// occur for a continuation warm because the actor's `WarmKind::Continuation` ATTRIBUTES
+/// the auto-advance instead of swallowing it - so this predicate omits that guard on
+/// purpose.
+fn continuation_warm_ready(st: &State, station_ok: bool) -> Option<f64> {
+    // Armed toggle ON, a station configured, NO in-flight skip (a skip owns the warm
+    // slot and supersedes), NO live continuation stream (never warm behind the station
+    // itself), and the queue GENUINELY draining next - the SAME true-drain boundary
+    // slice-1 continuation fires on (drain_is_next), so a warm can never arm for a
+    // boundary slice-1 would not treat as a drain. Current must be a FINITE Song with a
+    // known duration (a stream has no natural EOF to warm ahead of; unknown duration
+    // cannot bound the LEAD).
+    if !(st.continuation
+        && station_ok
+        && st.pending_skip.is_none()
+        && st.continuation_active.is_none()
+        && drain_is_next(st))
+    {
+        return None;
+    }
+    let cur = st.current?;
+    match st.queue.get(cur).map(|it| &it.entry) {
+        Some(QueueEntry::Song(s)) => match s.duration_secs {
+            Some(d) if d > 0 => Some(d as f64),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1203,6 +1299,23 @@ const SKIP_DIP_DB: f64 = -18.0;
 /// queue advance for the outgoing track. Declining sidesteps that entirely; the
 /// warm has no time to pay off this near the end anyway.
 const NEAR_EOF_GUARD_SECS: f64 = 2.0;
+
+/// How far AHEAD of a finite current track's natural EOF the continuation station is
+/// LEAD-warmed (slice 2). At `duration - CONTINUATION_WARM_LEAD_SECS` the pending-warm
+/// timer fires and the station is prefetched in the background, so mpv's auto-advance
+/// at the true EOF is a gapless handoff instead of the slice-1 near-zero-gap cold-start.
+/// Deliberately NOT gated by [`NEAR_EOF_GUARD_SECS`]: that guard DECLINES a warm near
+/// the end to avoid a swallowed-EOF stall, but here the near-EOF warm IS the feature and
+/// the actor's `WarmKind::Continuation` ATTRIBUTES (never swallows) the advance, so the
+/// stall it prevents cannot occur. Warming is best-effort: if the timer never fires, the
+/// arm is declined, or the prefetch fails, the slice-1 cold-start is the floor.
+const CONTINUATION_WARM_LEAD_SECS: f64 = 45.0;
+
+/// Slack over [`CONTINUATION_WARM_LEAD_SECS`] the fire hook tolerates before deciding
+/// the deadline moved OUT (a pause-resume or backward seek grew the remaining time) and
+/// cancel-then-rearms one fresh timer instead of prefetching now. Absorbs the
+/// Tick-quantized staleness of the live-elapsed atomic without a spurious rearm.
+const CONTINUATION_WARM_REARM_SLACK_SECS: f64 = 2.0;
 
 /// The perceptual dB at which the wake/resume ramp-in first becomes HEARABLE, 20 dB
 /// above the -60 dB synth floor. The resume path reads the wall-clock LEAD - the
@@ -3704,6 +3817,11 @@ impl HypodjHandler {
         // resumed. Best-effort + idempotent; PauseOut is non-committing so start_fade_spec
         // does not do this itself. Done after the fade install (abort+join), no SkipLoad race.
         let _ = self.player.drop_warm().await;
+        // Disarm any pending continuation warm too (slice 2): a parked ICY connection
+        // through an open-ended pause is stale-warm waste, and this cancels the timer so
+        // resume re-arms cleanly from the resumed position. drop_warm above already
+        // cleared any warmed prefetch on the actor; this drops the handler slot to match.
+        self.disarm_continuation_warm().await;
         match r {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -3786,6 +3904,9 @@ impl HypodjHandler {
         let dur = self.pause_fade_dur();
         let intent = FadeIntent::ResumeIn { target_db: mpv_volume_to_db(vol as f64), vol };
         let _ = self.start_fade_spec(FadeRequest { intent, dur, commit_logical: None }).await;
+        // Re-arm the LEAD continuation warm from the resumed position (a pause dropped it;
+        // the deadline is recomputed off the now-larger remaining time). Slice 2.
+        self.reschedule_continuation_warm().await;
         r
     }
 
@@ -3805,6 +3926,10 @@ impl HypodjHandler {
             })
             .await;
         let _ = self.player.stop().await;
+        // Disarm any pending continuation warm (slice 2): a stop kills the deck, so a
+        // parked station warm must die (its timer cancelled, any prefetch dropped) rather
+        // than surprise the user by auto-advancing behind a stopped track.
+        self.disarm_continuation_warm().await;
         let v = self.state.lock().unwrap().target_volume;
         let _ = self.player.set_volume(v).await;
         self.notify_change();
@@ -3824,6 +3949,11 @@ impl HypodjHandler {
     /// The runtime toggle (`continuation on|off`) still gates whether it ever fires.
     pub fn set_continuation_station(&self, station: Option<String>) {
         *self.continuation_station.lock().unwrap() = station;
+        // Drop any pending continuation warm slot synchronously (its held TimerGuard
+        // RAII-cancels the timer): a station change invalidates a warm resolved against
+        // the OLD station. Called once at daemon startup before any play, so a warmed
+        // prefetch is never live here; a sync slot-drop is sufficient (no drop_warm await).
+        self.state.lock().unwrap().pending_continuation_warm = None;
     }
 
     /// The end-of-queue continuation status as X- extension pairs for `status`,
@@ -3864,6 +3994,9 @@ impl HypodjHandler {
                 // nothing to continue from there anyway - it persists on the next real
                 // checkpoint once a queue exists.
                 self.checkpoint(self.last_elapsed_secs()).await;
+                // Re-evaluate the continuation warm: `off` disarms a pending warm (no more
+                // handoff), `on` arms one behind a finite current that will drain. Slice 2.
+                self.reschedule_continuation_warm().await;
                 MpdResponse::ok()
             }
             ContinuationCmd::Status => {
@@ -4369,7 +4502,11 @@ impl HypodjHandler {
     /// Called by the daemon when the player reports a natural EOF: advance to the
     /// next queue entry (honoring random/repeat/single/consume via
     /// [`Self::plan_next`]), or leave the state stopped at the end of the queue.
-    pub async fn advance_on_eof(&self) {
+    /// `continuation_landed` is the actor's signal that a WARMED continuation station
+    /// AUTO-ADVANCED at this EOF (slice 2): the None-branch then ATTRIBUTES the
+    /// already-playing station instead of cold-starting. False on every ordinary EOF and
+    /// honest stop (the slice-1 cold-start / honest stop, byte-identical).
+    pub async fn advance_on_eof(&self, continuation_landed: bool) {
         // A skip dip in flight (pending_skip Some) OWNS the next load: the OLD
         // track keeps playing audibly through the dip and may reach its natural
         // EOF inside that window. Advancing here would load an unrelated track and
@@ -4420,6 +4557,49 @@ impl HypodjHandler {
                 let _ = self.play_index_inner(idx, false).await;
             }
             None => {
+                // SLICE-2 LANDED-COMMIT: a warmed continuation station AUTO-ADVANCED at
+                // this EOF (continuation_landed) - the actor is ALREADY playing it - so
+                // ATTRIBUTE it (append the Stream row, repoint current, set the slice-1
+                // one-shot latch) rather than cold-start. Gated so it can ONLY fire for a
+                // genuine drain into a SURVIVING warm that was not itself the continuation
+                // stream: require landed AND true_drain AND NOT finishing_is_continuation
+                // AND a slot that is still warmed (survived every disarm). ANY leg failing
+                // falls through to the unchanged slice-1 cold-start / honest stop.
+                let mut landed_orphan = false;
+                if continuation_landed && true_drain && !finishing_is_continuation {
+                    let committed = {
+                        let mut st = self.state.lock().unwrap();
+                        match st.pending_continuation_warm.take() {
+                            Some(w) if w.warmed => {
+                                // Append the warmed station EXACTLY like try_continuation
+                                // step 4 (a raw Stream, no song id -> never scrobbles), point
+                                // current at it, and REUSE the slice-1 one-shot latch verbatim
+                                // (set only once the stream is genuinely current). No
+                                // play_index_inner / loadfile - mpv already advanced.
+                                st.queue.push(QueueItem {
+                                    id: w.qid,
+                                    entry: QueueEntry::Stream { url: w.url, title: w.title },
+                                });
+                                st.playlist_version += 1;
+                                st.current = Some(st.queue.len() - 1);
+                                st.pending_pause = false;
+                                st.continuation_active = Some(w.qid);
+                                true
+                            }
+                            // Slot gone (a disarm raced) or never warmed: do NOT append.
+                            // The dropped slot's guard already cancelled the timer.
+                            _ => false,
+                        }
+                    };
+                    if committed {
+                        self.notify_change();
+                        return;
+                    }
+                    // landed=true but nothing appended: the actor auto-advanced into an
+                    // ORPHAN station (a disarm raced the attribution). Remember to kill it
+                    // if we take the honest stop below, so no surprise audio survives.
+                    landed_orphan = true;
+                }
                 // Continuation is a ONE-SHOT flow into radio at a GENUINE end-of-queue
                 // drain. Two guards keep it from becoming the old silent-drain bug in a
                 // new hat:
@@ -4441,7 +4621,15 @@ impl HypodjHandler {
                         "continuation stream ended (dropped / finite / unreachable); stopping honestly - one-shot, no re-fire"
                     );
                 } else if true_drain && self.try_continuation().await {
+                    // A fresh cold-start (loadfile-replace) kicks any orphan station out,
+                    // so no landed_orphan can survive this branch.
                     return;
+                }
+                // A landed warm orphaned an auto-advanced station and we did NOT re-fire:
+                // stop the player so the surprise audio dies and the reported stop is
+                // honest (the user's gesture won; the station never surprises).
+                if landed_orphan {
+                    let _ = self.player.stop().await;
                 }
                 let mut st = self.state.lock().unwrap();
                 st.current = None;
@@ -4547,6 +4735,182 @@ impl HypodjHandler {
             }
         }
         false
+    }
+
+    // ── continuation WARM: LEAD prefetch of the station (slice 2) ────────────
+
+    /// Disarm any pending continuation warm: take the slot (its held [`TimerGuard`]
+    /// drop RAII-CANCELS the armed timer; a late fire tombstones on the id) and, if a
+    /// background prefetch had already landed (`warmed`), drop that warm on the actor so
+    /// a stale station entry can never sit parked behind the current track. Idempotent.
+    /// The player await runs with NO std lock held (the slot is taken first). This is
+    /// the user's gesture always winning: every disarm gesture (queue edit / skip / stop
+    /// / clear / toggle off / pause) routes here so the station never surprises.
+    async fn disarm_continuation_warm(&self) {
+        let slot = self.state.lock().unwrap().pending_continuation_warm.take();
+        if let Some(w) = slot {
+            if w.warmed {
+                // playlist-clear + keep-open restore; harmlessly idempotent for a
+                // continuation warm that never flipped keep-open.
+                let _ = self.player.drop_warm().await;
+            }
+            // `w` (and its TimerGuard) drops here, cancelling the armed timer.
+        }
+    }
+
+    /// (Re)arm the LEAD continuation warm at the end of a successful play / resume /
+    /// seek. (1) DISARM any existing slot (this IS the disarm at the play_index_inner
+    /// funnel, so a manual play/next/prev supersedes a pending warm); (2) evaluate the
+    /// arm predicate; (3) arm ONE fresh timer at `now + (duration - elapsed -
+    /// CONTINUATION_WARM_LEAD_SECS)` (clamped to now when already inside the LEAD).
+    /// Fully fake-clocked (the shared timer wheel over clock.rs). Best-effort: no timer
+    /// source, no station, or a non-drain boundary simply arms nothing.
+    async fn reschedule_continuation_warm(&self) {
+        // (1) Disarm any prior slot first (RAII-cancel + drop a live prefetch).
+        self.disarm_continuation_warm().await;
+        // Config outside `State` (a separate Mutex): is a non-empty station configured?
+        let station_ok = self
+            .continuation_station
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let Some(timers) = self.plan_timers.get().cloned() else { return };
+        let elapsed = self.last_elapsed_secs();
+        // (2) Predicate + finite-Song duration under one short lock.
+        let dur = {
+            let st = self.state.lock().unwrap();
+            match continuation_warm_ready(&st, station_ok) {
+                Some(d) => d,
+                None => return,
+            }
+        };
+        // (3) Arm one absolute timer. Clamp the delay to 0 when already inside the LEAD
+        // window (a short current track); the fire-time predicate still gates it.
+        let delay = (dur - elapsed - CONTINUATION_WARM_LEAD_SECS).max(0.0);
+        let deadline = Instant::now() + Duration::from_secs_f64(delay);
+        let (timer_id, guard) = timers.arm(deadline);
+        let mut st = self.state.lock().unwrap();
+        st.pending_continuation_warm = Some(ContinuationWarm {
+            timer_id,
+            guard,
+            warmed: false,
+            qid: 0,
+            url: String::new(),
+            title: String::new(),
+        });
+    }
+
+    /// The continuation-warm timer FIRE hook, called by the director's fire arm BEFORE
+    /// the WallClock edge (bounded by `ADVANCE_TIMEOUT` so a hung station resolve cannot
+    /// pin the spine). A stale / non-warm / plan-timer id no-ops (the tombstone). For
+    /// our timer: re-check the predicate; PAUSED -> drop the slot (resume re-arms - a
+    /// parked ICY connection through an open-ended pause is stale-warm waste); the
+    /// remaining grown past LEAD + slack (pause-resume / backward seek) -> cancel-then-
+    /// rearm ONE fresh timer, never a poller; otherwise resolve the station URL (no lock
+    /// across the await), mint a qid, and issue the background PrefetchContinuation. On
+    /// Ok flip the slot `warmed` (only if it is still THIS timer and no skip crept in);
+    /// any failure drops the slot so the slice-1 cold-start stays the load-bearing floor.
+    pub async fn on_continuation_warm_fire(&self, id: TimerId) {
+        // (a) Is this fire ours? A stale id (a superseded / plan timer) tombstones.
+        {
+            let st = self.state.lock().unwrap();
+            if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
+                return;
+            }
+        }
+        // Paused at fire -> the warm is stale-waste through an open-ended pause; drop it.
+        // Resume re-arms via reschedule.
+        if self.reported_play_state() == PlayState::Paused {
+            self.disarm_continuation_warm().await;
+            return;
+        }
+        let station = self.continuation_station.lock().unwrap().clone();
+        let station_ok = station.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let elapsed = self.last_elapsed_secs();
+        // (b) Re-check the predicate + still-ours under one short lock; capture a DECISION
+        // (never hold the std guard across the disarm await - the Send invariant).
+        enum FireDecision {
+            Prefetch(f64),
+            Disarm,
+            Bail,
+        }
+        let decision = {
+            let st = self.state.lock().unwrap();
+            if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
+                FireDecision::Bail
+            } else {
+                match continuation_warm_ready(&st, station_ok) {
+                    Some(d) => FireDecision::Prefetch(d),
+                    None => FireDecision::Disarm,
+                }
+            }
+        };
+        let dur = match decision {
+            FireDecision::Bail => return,
+            FireDecision::Disarm => {
+                self.disarm_continuation_warm().await;
+                return;
+            }
+            FireDecision::Prefetch(d) => d,
+        };
+        // The remaining moved OUT past the LEAD (pause-resumed or a backward seek):
+        // cancel-then-rearm ONE fresh timer at the new deadline, never a polling loop.
+        let remaining = dur - elapsed;
+        if remaining > CONTINUATION_WARM_LEAD_SECS + CONTINUATION_WARM_REARM_SLACK_SECS {
+            self.reschedule_continuation_warm().await;
+            return;
+        }
+        // (c) Resolve the station URL with NO lock held, then mint a qid + prefetch.
+        let Some(station) = station else {
+            self.disarm_continuation_warm().await;
+            return;
+        };
+        let Some(url) = self.resolve_continuation_url(&station).await else {
+            self.disarm_continuation_warm().await;
+            return;
+        };
+        let qid = {
+            let mut st = self.state.lock().unwrap();
+            if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
+                return;
+            }
+            // A skip owns the warm slot in both directions: refuse while pending_skip.
+            if st.pending_skip.is_some() {
+                return;
+            }
+            let minted = st.next_id;
+            st.next_id += 1;
+            minted
+        };
+        // Background prefetch (best-effort). No std lock across the await.
+        let ok = self.player.prefetch_continuation(&url, QueueId(qid)).await.is_ok();
+        // Decide under a short lock whether to KEEP (flip warmed) or DISCARD the slot.
+        let discard_landed_prefetch = {
+            let mut st = self.state.lock().unwrap();
+            let ours = matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id);
+            let skip_pending = st.pending_skip.is_some();
+            if ours && ok && !skip_pending {
+                if let Some(w) = st.pending_continuation_warm.as_mut() {
+                    w.warmed = true;
+                    w.qid = qid;
+                    w.url = url;
+                    w.title = station;
+                }
+                false
+            } else {
+                // Not ours, prefetch failed, or a skip crept in: drop OUR slot if ours.
+                if ours {
+                    st.pending_continuation_warm = None;
+                }
+                // If the prefetch actually landed on the actor, clear it below (no orphan).
+                ok
+            }
+        };
+        if discard_landed_prefetch {
+            let _ = self.player.drop_warm().await;
+        }
     }
 
     // ── startle-safe USER skip (skip-fade) ──────────────────────────────────
@@ -4662,6 +5026,12 @@ impl HypodjHandler {
     /// through the ONE active [`FadeSlot`]. A rejected/unresolvable spec degrades
     /// to a plain [`Self::play_index`] so a skip never gets stuck.
     async fn skip_with_fade(&self, idx: usize) -> Result<(), String> {
+        // Disarm any pending continuation warm FIRST (slice 2), before this skip installs
+        // its OWN skip warm: the handler slot must die so the EOF attribution can never
+        // claim a skip warm as the station, and so a Skip warm and a Continuation warm can
+        // never coexist. The skip's own near-EOF decline + drop_warm then degrade it for
+        // free; PrefetchContinuation is refused while pending_skip is set.
+        self.disarm_continuation_warm().await;
         // (a) Pre-resolve the target's play args (sync). A resolution failure
         // degrades to the plain path rather than dipping into a dead end.
         let item = {
@@ -4883,6 +5253,12 @@ impl HypodjHandler {
             st.fresh_enqueue_anchor = None;
         }
         self.notify_change();
+        // (Re)arm the LEAD continuation warm behind the freshly-playing entry (slice 2).
+        // This is the funnel EVERY fresh play / EOF auto-advance / PlayNow passes through,
+        // and step 1 DISARMS any prior pending warm - so a manual play/next/prev supersedes
+        // a parked warm here. Declines (arms nothing) unless the new current is a finite
+        // Song that will drain next into an armed, configured continuation station.
+        self.reschedule_continuation_warm().await;
         Ok(())
     }
 
@@ -5386,7 +5762,13 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::Seek { secs, .. } => match self.player.seek(secs).await {
-                Ok(()) => MpdResponse::ok(),
+                Ok(()) => {
+                    // A seek moves the playhead: re-arm the LEAD continuation warm from
+                    // the new position (the deadline is recomputed off the new remaining).
+                    self.note_elapsed_ms((secs.max(0.0) * 1000.0) as u64);
+                    self.reschedule_continuation_warm().await;
+                    MpdResponse::ok()
+                }
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
             },
             MpdCommand::SeekCur { secs, relative } => {
@@ -5405,13 +5787,19 @@ impl MpdHandler for HypodjHandler {
                         // instead of collapsing onto the same stale Tick base. The
                         // next TimePos Tick corrects any drift.
                         self.note_elapsed_ms((target * 1000.0) as u64);
+                        // Re-arm the LEAD continuation warm from the new playhead. Slice 2.
+                        self.reschedule_continuation_warm().await;
                         MpdResponse::ok()
                     }
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
                 }
             }
             MpdCommand::SeekId { secs, .. } => match self.player.seek(secs).await {
-                Ok(()) => MpdResponse::ok(),
+                Ok(()) => {
+                    self.note_elapsed_ms((secs.max(0.0) * 1000.0) as u64);
+                    self.reschedule_continuation_warm().await;
+                    MpdResponse::ok()
+                }
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "seekid", &e.to_string()),
             },
             MpdCommand::SetVol(v) => {
@@ -5432,21 +5820,27 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Random(on) => {
                 self.state.lock().unwrap().random = on;
                 self.notify_change();
+                // A mode toggle changes drain_is_next: re-evaluate the continuation warm
+                // (disarm if it no longer drains, re-arm if it now does). Slice 2.
+                self.reschedule_continuation_warm().await;
                 MpdResponse::ok()
             }
             MpdCommand::Repeat(on) => {
                 self.state.lock().unwrap().repeat = on;
                 self.notify_change();
+                self.reschedule_continuation_warm().await;
                 MpdResponse::ok()
             }
             MpdCommand::Single(on) => {
                 self.state.lock().unwrap().single = on;
                 self.notify_change();
+                self.reschedule_continuation_warm().await;
                 MpdResponse::ok()
             }
             MpdCommand::Consume(on) => {
                 self.state.lock().unwrap().consume = on;
                 self.notify_change();
+                self.reschedule_continuation_warm().await;
                 MpdResponse::ok()
             }
             MpdCommand::Continuation(cmd) => self.handle_continuation(cmd).await,
@@ -5455,11 +5849,20 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Add(uri) => match self.enqueue_uri(&uri).await {
                 // enqueue_uri itself arms the fresh-enqueue anchor on a fresh idle
                 // enqueue, so the hint/seed moves to what was just added.
-                Ok(_) => MpdResponse::ok(),
+                Ok(_) => {
+                    // A queue add changes drain_is_next (a track now follows the current):
+                    // re-evaluate the continuation warm so a parked station can never play
+                    // over the freshly queued track ("user queues during LEAD"). Slice 2.
+                    self.reschedule_continuation_warm().await;
+                    MpdResponse::ok()
+                }
                 Err(e) => ack(ACK_ERROR_NO_EXIST, "add", &e),
             },
             MpdCommand::AddId(uri, _pos) => match self.enqueue_uri(&uri).await {
-                Ok(id) => MpdResponse::pairs().pair("Id", id.to_string()).build(),
+                Ok(id) => {
+                    self.reschedule_continuation_warm().await;
+                    MpdResponse::pairs().pair("Id", id.to_string()).build()
+                }
                 Err(e) => ack(ACK_ERROR_NO_EXIST, "addid", &e),
             },
             MpdCommand::Clear => {
@@ -5478,6 +5881,9 @@ impl MpdHandler for HypodjHandler {
                     .await;
                 let v = self.state.lock().unwrap().target_volume;
                 let _ = self.player.stop().await;
+                // A clear empties the queue: disarm any pending continuation warm so a
+                // parked station cannot auto-advance behind the stopped deck. Slice 2.
+                self.disarm_continuation_warm().await;
                 // Re-assert the real mpv gain to the baseline (F4): a cancelled
                 // fade must not leave mpv faded-down under a baseline report.
                 let _ = self.player.set_volume(v).await;
@@ -5485,22 +5891,26 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::Delete(spec) => {
-                let mut st = self.state.lock().unwrap();
-                if let Some(pos) = spec.and_then(|s| s.split(':').next().and_then(|p| p.parse::<usize>().ok())) {
-                    if pos < st.queue.len() {
-                        st.queue.remove(pos);
-                        st.playlist_version += 1;
-                        if let Some(c) = st.current {
-                            if c == pos {
-                                st.current = None;
-                            } else if c > pos {
-                                st.current = Some(c - 1);
+                {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some(pos) = spec.and_then(|s| s.split(':').next().and_then(|p| p.parse::<usize>().ok())) {
+                        if pos < st.queue.len() {
+                            st.queue.remove(pos);
+                            st.playlist_version += 1;
+                            if let Some(c) = st.current {
+                                if c == pos {
+                                    st.current = None;
+                                } else if c > pos {
+                                    st.current = Some(c - 1);
+                                }
                             }
                         }
                     }
                 }
-                drop(st);
                 self.notify_change();
+                // A delete changes drain_is_next (deleting the tail can make the current
+                // the last entry, or deleting the current stops it): re-evaluate the warm.
+                self.reschedule_continuation_warm().await;
                 MpdResponse::ok()
             }
             MpdCommand::PlaylistInfo(_) => {
@@ -6642,6 +7052,9 @@ impl HypodjHandler {
         // Funnel through enqueue_songs (ONE atomic push + the shared fresh-enqueue
         // anchor arm), so findadd/searchadd cannot forget the fresh-enqueue seed move.
         self.enqueue_songs(matches);
+        // A queue add changes drain_is_next: re-evaluate the continuation warm so a parked
+        // station never plays over freshly findadd/searchadd-ed tracks. Slice 2.
+        self.reschedule_continuation_warm().await;
         MpdResponse::ok()
     }
 
@@ -7154,7 +7567,7 @@ mod tests {
         }
         // The track reaches its natural EOF: end of queue -> current becomes None,
         // and the finishing track is latched as the recency seed.
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.current, None, "end of queue stops the deck");
@@ -7227,7 +7640,7 @@ mod tests {
             st.current = Some(0);
             st.last_finished = Some(playlist_test_song("real"));
         }
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         assert_eq!(
             h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
             Some(&SongId("real".into())),
@@ -7251,7 +7664,7 @@ mod tests {
         h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
 
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 2, "the continuation stream is appended after the drained song");
@@ -7280,7 +7693,7 @@ mod tests {
         h.set_continuation_station(Some(NTS.to_string()));
         assert!(!h.state.lock().unwrap().continuation, "continuation defaults OFF");
 
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "disarmed => the deck ends stopped as today");
@@ -7298,7 +7711,7 @@ mod tests {
         // No station set (None). Also an empty/whitespace station must be inert.
         h.set_continuation_station(None);
 
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "no station => inert, deck ends stopped");
@@ -7318,7 +7731,7 @@ mod tests {
         // the never-called client, so resolution yields None.
         h.set_continuation_station(Some("No Such Station".to_string()));
 
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "unresolvable station => inert, deck ends stopped");
@@ -7336,7 +7749,7 @@ mod tests {
         h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
 
-        h.advance_on_eof().await; // drains -> continuation stream now current+playing
+        h.advance_on_eof(false).await; // drains -> continuation stream now current+playing
 
         // The continuation stream carries no library id, so the id sources that back
         // scrobbling / similar-seeding see ONLY the real song, never the stream.
@@ -7352,7 +7765,7 @@ mod tests {
         );
         // A SECOND drain (the stream 'ends') must still not latch the id-less stream -
         // and, still ARMED, the one-shot guard must stop it honestly WITHOUT re-firing.
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         assert_eq!(
             h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
             Some(&SongId("seed".into())),
@@ -7399,7 +7812,7 @@ mod tests {
         h.set_continuation_station(Some(NTS.to_string()));
 
         // Drain -> continuation cold-starts: the stream is appended + becomes current.
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 2, "the continuation stream is appended once");
@@ -7414,7 +7827,7 @@ mod tests {
         // spine (on real mpv this Eof is synthesized by the actor from the top-level
         // load-failure error; NullPlayer cannot raise that, so we drive the re-entry
         // directly). STILL ARMED, the guard must stop honestly, NOT re-fire.
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "a dead continuation stream ends the deck STOPPED (honest)");
         assert_eq!(
@@ -7443,7 +7856,7 @@ mod tests {
         h.state.lock().unwrap().single = true;
         h.set_continuation_station(Some(NTS.to_string()));
 
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "single stops the deck after the current track (its semantics)");
@@ -7502,6 +7915,352 @@ mod tests {
         assert_eq!(pair(&rep, "continuation"), Some("on"));
     }
 
+    // ── end-of-queue CONTINUATION WARM (slice 2) ─────────────────────────────
+
+    // Build a probing handler with a REAL fake-clocked timer source wired in, plus the
+    // fire receiver a test drains. `None` in the certless sandbox (same guard as the
+    // other live-client helpers).
+    fn warm_rig() -> Option<(
+        HypodjHandler,
+        std::sync::Arc<crate::player::WarmProbe>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::event::TimerId>,
+    )> {
+        let (h, _events, probe) = handler_with_probe_player()?;
+        let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<crate::event::TimerId>();
+        let timers = crate::timer::spawn_timer_source(crate::clock::TokioClock, fire_tx);
+        h.set_plan_timers(timers);
+        // Keep _events alive so the NullPlayer actor's evt sends never wedge (drop-on-full).
+        std::mem::forget(_events);
+        Some((h, probe, fire_rx))
+    }
+
+    // Directly install a WARMED slot (bypassing the LEAD timer) for the landed-commit /
+    // disarm tests: they exercise the attribution + disarm, not the timer arithmetic.
+    // Needs a real TimerGuard, so an idle throwaway timer is armed far in the future.
+    fn install_warmed_slot(h: &HypodjHandler, qid: u64, url: &str) {
+        let (fire_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::event::TimerId>();
+        std::mem::forget(rx);
+        let timers = crate::timer::spawn_timer_source(crate::clock::TokioClock, fire_tx);
+        let (timer_id, guard) = timers.arm(Instant::now() + Duration::from_secs(9_999));
+        h.state.lock().unwrap().pending_continuation_warm = Some(ContinuationWarm {
+            timer_id,
+            guard,
+            warmed: true,
+            qid,
+            url: url.to_string(),
+            title: "Station".to_string(),
+        });
+    }
+
+    // ARM at LEAD + FIRE on the fake clock: a finite Song draining into an armed station
+    // arms a warm timer at duration-LEAD; advancing virtual time past it fires exactly
+    // one timer, the fire hook issues ONE PrefetchContinuation, and the slot flips warmed
+    // carrying the resolved station url for the landed-commit.
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_arms_at_lead_and_fires_on_fake_clock() {
+        let Some((h, probe, mut fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.note_elapsed_ms(10_000); // 10s in -> LEAD deadline at 200 - 10 - 45 = 145s
+        h.reschedule_continuation_warm().await;
+        {
+            let st = h.state.lock().unwrap();
+            let w = st.pending_continuation_warm.as_ref().expect("a warm is armed");
+            assert!(!w.warmed, "not warmed until the timer fires + the prefetch lands");
+        }
+        // Before the LEAD deadline: no fire.
+        tokio::time::advance(Duration::from_secs(100)).await;
+        tokio::task::yield_now().await;
+        assert!(fire_rx.try_recv().is_err(), "timer must not fire before the LEAD deadline");
+        // Cross the LEAD deadline: exactly one fire.
+        tokio::time::advance(Duration::from_secs(50)).await;
+        tokio::task::yield_now().await;
+        let id = fire_rx.recv().await.expect("the warm timer fired at the LEAD deadline");
+        // The live-elapsed atomic is driven by TimePos ticks in production; here advance it
+        // by hand to reflect the ~145s that elapsed, so the fire is inside the LEAD (not the
+        // "remaining grew -> rearm" branch).
+        h.note_elapsed_ms(155_000);
+        h.on_continuation_warm_fire(id).await;
+        assert_eq!(
+            probe.prefetch_continuation.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the fire issues exactly one background PrefetchContinuation"
+        );
+        let st = h.state.lock().unwrap();
+        let w = st.pending_continuation_warm.as_ref().expect("the slot survives the fire");
+        assert!(w.warmed, "the slot flips warmed after the prefetch Ok");
+        assert_eq!(w.url, NTS, "the resolved station url is recorded for the landed-commit");
+    }
+
+    // DECLINE without a true drain: a track still queued after the current, or a cycling
+    // mode (repeat), or no current -> no warm arms (the SAME true-drain boundary slice-1
+    // fires on, so a warm can never arm where the drain edge would not).
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_declines_without_true_drain() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "a track still follows the current -> not a drain -> no warm"
+        );
+        // Delete the tail so the current becomes the last entry: now it drains -> arms.
+        h.delete_for_test(1);
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "the sole remaining finite Song drains next -> a warm arms"
+        );
+        // repeat cycles the queue forever: never a drain -> disarms.
+        h.state.lock().unwrap().repeat = true;
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "repeat cycles -> not a drain -> no warm"
+        );
+    }
+
+    // DISARM by a queue ADD: warming, then the user queues a track -> the warm is dropped
+    // (slot gone + drop_warm probed) so the station never plays over the queued track.
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_disarmed_by_queue_add() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 500, NTS);
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "a queue add disarms the pending warm"
+        );
+        assert_eq!(
+            probe.drop.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the warmed prefetch is dropped on the actor"
+        );
+    }
+
+    // DISARM by STOP.
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_disarmed_by_stop() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        install_warmed_slot(&h, 500, NTS);
+        h.handle(MpdCommand::Stop).await;
+        assert!(h.state.lock().unwrap().pending_continuation_warm.is_none(), "stop disarms the warm");
+        assert_eq!(probe.drop.load(std::sync::atomic::Ordering::Relaxed), 1, "stop drops the prefetch");
+    }
+
+    // DISARM by the continuation toggle OFF.
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_disarmed_by_toggle_off() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 500, NTS);
+        h.handle(MpdCommand::Continuation(ContinuationCmd::Off)).await;
+        assert!(h.state.lock().unwrap().pending_continuation_warm.is_none(), "toggle off disarms the warm");
+        assert_eq!(probe.drop.load(std::sync::atomic::Ordering::Relaxed), 1, "toggle off drops the prefetch");
+    }
+
+    // PAUSE drops the warm (a parked ICY connection through an open-ended pause is stale),
+    // and RESUME re-arms it (the deadline recomputed off the resumed position).
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_pause_drops_and_resume_rearms() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        // Play for real so pause/resume have a live deck to act on.
+        h.play_for_test(0).await;
+        install_warmed_slot(&h, 500, NTS);
+        h.pause_with_fade().await.unwrap();
+        assert!(h.state.lock().unwrap().pending_continuation_warm.is_none(), "pause disarms the warm");
+        assert!(probe.drop.load(std::sync::atomic::Ordering::Relaxed) >= 1, "pause drops the prefetch");
+        // Resume re-arms a fresh warm behind the still-finite draining Song.
+        h.resume_with_fade().await.unwrap();
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "resume re-arms the continuation warm from the resumed position"
+        );
+    }
+
+    // FIRE RE-ARMS when the remaining GREW past LEAD + slack (a backward seek / pause-
+    // resume moved the deadline out): the fire cancels-then-rearms ONE fresh timer instead
+    // of prefetching now, and never issues a PrefetchContinuation on that stale fire.
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_fire_rearms_when_remaining_grew() {
+        let Some((h, probe, mut fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.note_elapsed_ms(150_000); // 150s in -> deadline at 200 - 150 - 45 = 5s
+        h.reschedule_continuation_warm().await;
+        let first_id = {
+            let st = h.state.lock().unwrap();
+            st.pending_continuation_warm.as_ref().unwrap().timer_id
+        };
+        // Simulate a backward seek: the playhead jumped back, so at fire the remaining is
+        // large again (well past LEAD + slack).
+        h.note_elapsed_ms(10_000); // 10s in -> remaining 190s >> LEAD 45 + slack 2
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        let id = fire_rx.recv().await.expect("the first timer fired");
+        assert_eq!(id, first_id, "the fired id is the first-armed timer");
+        h.on_continuation_warm_fire(id).await;
+        assert_eq!(
+            probe.prefetch_continuation.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a stale-remaining fire re-arms instead of prefetching"
+        );
+        let st = h.state.lock().unwrap();
+        let w = st.pending_continuation_warm.as_ref().expect("a FRESH timer is re-armed");
+        assert_ne!(w.timer_id, first_id, "cancel-then-rearm mints a new timer id");
+        assert!(!w.warmed, "the re-armed slot is not warmed");
+    }
+
+    // LANDED attribution: a warmed station auto-advanced at EOF (continuation_landed=true)
+    // -> the None-branch appends the Stream row (by the slot's minted qid), repoints
+    // current at it, bumps playlist_version, sets the slice-1 one-shot latch, and issues
+    // NO cold-load (mpv already advanced).
+    #[tokio::test]
+    async fn eof_landed_attributes_stream_row_sets_one_shot_latch() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 777, NTS);
+        let ver_before = h.state.lock().unwrap().playlist_version;
+
+        h.advance_on_eof(true).await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 2, "the warmed station is appended as the tail Stream");
+        assert!(
+            matches!(&st.queue[1].entry, QueueEntry::Stream { url, .. } if url == NTS),
+            "the appended entry is the warmed station url"
+        );
+        assert_eq!(st.queue[1].id, 777, "the appended row carries the slot's minted qid");
+        assert_eq!(st.current, Some(1), "current repoints at the already-playing station");
+        assert_eq!(st.continuation_active, Some(777), "the slice-1 one-shot latch is set to the station");
+        assert!(st.playlist_version > ver_before, "the queue edit bumps playlist_version");
+        assert!(st.pending_continuation_warm.is_none(), "the slot is consumed by the commit");
+    }
+
+    // LANDED but the slot was DISARMED (raced): landed=true with no surviving warm never
+    // appends; with continuation NOW off the deck reaches the honest stop (no orphan).
+    #[tokio::test]
+    async fn eof_landed_with_disarmed_slot_never_appends_and_stops_honestly() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            // Continuation toggled OFF (the disarm gesture that dropped the slot): a
+            // landed=true with no slot must NOT append, and try_continuation must not fire.
+            st.continuation = false;
+            st.pending_continuation_warm = None;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+
+        h.advance_on_eof(true).await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 1, "a landed=true with a disarmed slot appends nothing");
+        assert_eq!(st.current, None, "the deck stops honestly (the orphan is killed)");
+        assert_eq!(st.continuation_active, None, "no continuation stream is latched");
+    }
+
+    // LANDED attribution keeps last_finished at the REAL finishing song and never lets the
+    // station contribute a scrobble/seed id (the station is a raw Stream).
+    #[tokio::test]
+    async fn landed_attribution_keeps_last_finished_at_real_song_and_never_scrobbles_station() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 888, NTS);
+
+        h.advance_on_eof(true).await;
+
+        assert_eq!(
+            h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
+            Some(&SongId("seed".into())),
+            "the finishing library song stays the recency seed"
+        );
+        assert_eq!(
+            h.queue_song_ids(),
+            vec![SongId("seed".into())],
+            "the landed station contributes no song id (never scrobbles / seeds)"
+        );
+    }
+
+    // DEAD station AFTER a landed handoff reaches the slice-1 honest stop, one-shot, no
+    // re-fire: the follow-up Eof (station qid) matches continuation_active -> honest stop,
+    // the latch clears, and no SECOND continuation is appended.
+    #[tokio::test]
+    async fn dead_station_after_handoff_reaches_slice1_honest_stop_no_refire() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 999, NTS);
+        // First EOF: the warmed station lands (attributed).
+        h.advance_on_eof(true).await;
+        assert_eq!(h.state.lock().unwrap().continuation_active, Some(999), "the station is latched active");
+        // The station dies: on real mpv the actor synthesizes an honest-stop Eof
+        // (landed=false). The one-shot guard must stop honestly, NOT re-fire.
+        h.advance_on_eof(false).await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "a dead landed station ends the deck STOPPED (honest)");
+        assert_eq!(st.queue.len(), 2, "no SECOND continuation appended - the queue does not grow");
+        assert_eq!(st.continuation_active, None, "the active-continuation latch clears on the honest stop");
+        assert!(st.continuation, "the arming toggle itself is untouched (one-shot is per-stream)");
+    }
+
     // Helper: the ambient hint's title (if any) names the SAME song the enqueue seed
     // resolves to. The deterministic test title is "Song <id>", so tying the title back
     // to `similar_seed_id`'s id proves the hint can never name a seed the DJ would not
@@ -7550,7 +8309,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("finished")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof().await; // natural end-of-queue EOF, nothing playing after
+        h.advance_on_eof(false).await; // natural end-of-queue EOF, nothing playing after
         let status = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&status, "X-hypodj-hint-kind"), Some("just-finished"));
         assert_eq!(pair(&status, "X-hypodj-hint-title"), Some("Song finished"));
@@ -7608,7 +8367,7 @@ mod tests {
         // consume OFF: A LINGERS at pos0 (state stop, current None, last_finished A).
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 1, "A lingers at the queue head (consume off)");
@@ -7809,7 +8568,7 @@ mod tests {
         // A single real song plays, then reaches natural EOF: consume off, so A LINGERS.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 1, "A lingers (consume off)");
@@ -7862,7 +8621,7 @@ mod tests {
             assert!(st.fresh_enqueue_anchor.is_none(), "play cleared the anchor");
         }
         // A finishes single: deck stops, current None, both lingering, last_finished A.
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.current, None, "single stops after A");
@@ -7911,7 +8670,7 @@ mod tests {
         // A lingering at pos0 after a real EOF.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         // Fresh idle enqueue D arms the anchor at D (pos1).
         h.enqueue_songs(vec![playlist_test_song("D")]);
         assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "sanity: G-state seeds D");
@@ -7982,7 +8741,7 @@ mod tests {
         // A lingering at pos0 after a real EOF.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         // Simulate the append-only action: snapshot the first-appended qid, append the
         // tail, then arm on append. The tail lands at pos1, behind lingering A.
         let first = h.enqueue_song_for_test(playlist_test_song("tail")).await;
@@ -10539,7 +11298,7 @@ mod tests {
 
         // Natural EOF advance to the next track: the fade must survive, not be wiped
         // and the gain re-asserted to the baseline.
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         assert_eq!(h.state.lock().unwrap().current, Some(1), "advanced to next track");
         assert!(h.fade_active().await, "winddown must survive the track boundary");
         assert!(
@@ -11481,7 +12240,7 @@ mod tests {
         h.handle(MpdCommand::Add(NTS.to_string())).await;
         h.handle(MpdCommand::Play(Some(0))).await;
 
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         assert_eq!(h.state.lock().unwrap().current, Some(1));
         assert!(!h.fade_active().await, "eof advance never dips");
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
@@ -11552,7 +12311,7 @@ mod tests {
 
         // The OLD track (idx0) reaches its natural EOF mid-dip: must be a no-op, NOT
         // an advance to idx2 (current+1). current + pending_skip stay put.
-        h.advance_on_eof().await;
+        h.advance_on_eof(false).await;
         assert_eq!(h.state.lock().unwrap().current, Some(0), "eof did not advance mid-skip");
         assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "skip intent intact");
 
@@ -11989,7 +12748,7 @@ mod tests {
         let seed = seed.into_iter().next().expect("a real track in the library");
         h.enqueue_song_for_test(seed.clone()).await;
         h.handle(MpdCommand::Play(Some(0))).await;
-        h.advance_on_eof().await; // natural end-of-queue EOF
+        h.advance_on_eof(false).await; // natural end-of-queue EOF
         assert_eq!(h.state.lock().unwrap().current, None, "deck stopped after EOF");
         assert_eq!(
             h.similar_seed_id(),

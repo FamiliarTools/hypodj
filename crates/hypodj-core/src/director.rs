@@ -218,6 +218,14 @@ impl<C: Clock> Publisher<C> {
     /// preceding `Eof`, so the outgoing id is still latched) emits `TrackEnd`
     /// (outgoing) BEFORE `TrackStart(new)`, so a skip is never a bare Start.
     fn on_playing(&mut self, qid: QueueId, song: Option<SongId>) {
+        // A Playing edge means the gap (if any) never materialized: clear any pending
+        // suppress so it can only ever swallow a Stopped that arrives BEFORE the next
+        // Playing. A GAPLESS continuation handoff (a warmed station auto-advancing at
+        // EOF) emits NO transient Stopped yet the Eof arm calls mark_advanced (the
+        // station qid differs from the finishing qid), which would otherwise leave
+        // suppress_next_stopped latched forever and swallow the user's NEXT real stop.
+        // Clearing it here on the Playing edge fixes that generally.
+        self.suppress_next_stopped = false;
         if self.latch == Some(qid) {
             // Same track already current: a resume or a duplicate Playing. Surface
             // ONLY a real state transition (never a spurious TrackStart).
@@ -436,7 +444,7 @@ async fn spine<C: Clock>(
                             });
                         }
                     }
-                    PlayerEvent::Eof { song, queue_id } => {
+                    PlayerEvent::Eof { song, queue_id, continuation_landed } => {
                         if let Some(qid) = queue_id {
                             // (a)+(b): build the finishing ref and publish TrackEnd
                             // BEFORE advance repoints current (End before Start).
@@ -447,10 +455,13 @@ async fn spine<C: Clock>(
                         // StateChanged(Playing); clear the latch now (End is done).
                         pubr.clear_latch();
                         // (c): network, inline, must-not-drop, but bounded so a hung
-                        // stream_url cannot pin the spine.
+                        // stream_url cannot pin the spine. `continuation_landed` threads
+                        // the actor's warmed-station-auto-advanced signal so the None-branch
+                        // ATTRIBUTES the already-playing station (append the Stream row,
+                        // repoint current, set the one-shot latch) instead of cold-starting.
                         let _ = tokio::time::timeout(
                             ADVANCE_TIMEOUT,
-                            handler.advance_on_eof(),
+                            handler.advance_on_eof(continuation_landed),
                         )
                         .await;
                         // Swallow the trailing transient mpv Stopped ONLY if the
@@ -507,7 +518,21 @@ async fn spine<C: Clock>(
                 // (and mirror to broadcast). time_pos/time_remaining are absent on
                 // a WallClock DjEvent by construction.
                 match fired {
-                    Some(id) => pubr.edge(DjEventKind::WallClock(id)),
+                    Some(id) => {
+                        // CONTINUATION-WARM fire hook: a fired timer id may be the
+                        // pending continuation warm's. Resolve + issue the background
+                        // prefetch INLINE (so the warm is armed against the finishing
+                        // track), bounded by ADVANCE_TIMEOUT so a hung station resolve
+                        // cannot pin the spine. A stale / non-warm id no-ops. Runs
+                        // BEFORE the WallClock edge so a plan timer sharing the id space
+                        // still fans out unchanged.
+                        let _ = tokio::time::timeout(
+                            ADVANCE_TIMEOUT,
+                            handler.on_continuation_warm_fire(id),
+                        )
+                        .await;
+                        pubr.edge(DjEventKind::WallClock(id));
+                    }
                     // Timer source ended: FUSE the branch (drop the receiver) so it
                     // is no longer polled. A closed fire channel is not a
                     // spine-terminal condition; keep serving player events.
@@ -913,6 +938,61 @@ mod tests {
             }
             other => panic!("expected TrackStart, got {other:?}"),
         }
+    }
+
+    // SLICE-2 (Part E): a GAPLESS continuation handoff emits no transient Stopped, but
+    // the Eof arm calls mark_advanced (the station qid differs from the finishing qid),
+    // latching suppress_next_stopped. Without the on_playing clear, that latch would
+    // swallow the user's NEXT real stop. The Playing edge (the station starting) must
+    // clear it so the later real stop surfaces.
+    #[tokio::test]
+    async fn playing_edge_clears_suppress_next_stopped() {
+        let Some(client) = maybe_client() else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let (player, _ev) = NullPlayer::spawn();
+        let handler = Arc::new(HypodjHandler::new(client.clone(), player));
+        handler.enqueue_song_for_test(song("s0", Some(100), Some("A"))).await;
+        let (bcast, _br) = broadcast::channel(16);
+        let (viz, _vr) = broadcast::channel(16);
+        let (watch_tx, _wr) = watch::channel(handler.queue_snapshot());
+        let triggers: Triggers = Arc::new(StdMutex::new(Vec::new()));
+        let mut trig = {
+            let (tx, rx) = mpsc::unbounded_channel();
+            triggers.lock().unwrap().push(tx);
+            rx
+        };
+        let mut pubr = Publisher {
+            clock: TokioClock,
+            bcast,
+            viz,
+            watch: watch_tx,
+            triggers,
+            handler: handler.clone(),
+            seq: 0,
+            latch: None,
+            latched_duration: None,
+            version: 0,
+            last_state: PlayState::Playing,
+            suppress_next_stopped: false,
+        };
+        // A gapless advance marked advanced: suppress is latched.
+        pubr.mark_advanced();
+        assert!(pubr.suppress_next_stopped, "mark_advanced latches the suppress");
+        // The station's Playing edge arrives (no transient Stopped preceded it): it clears
+        // the pending suppress.
+        pubr.on_playing(QueueId(0), Some(SongId("s0".into())));
+        assert!(!pubr.suppress_next_stopped, "a Playing edge clears the pending suppress");
+        // A later REAL stop must now surface (not be swallowed).
+        pubr.on_stopped();
+        let mut saw_stop = false;
+        while let Ok(ev) = trig.try_recv() {
+            if is_stopped_state(&ev.kind) {
+                saw_stop = true;
+            }
+        }
+        assert!(saw_stop, "the real stop after a cleared suppress surfaces as StateChanged(Stopped)");
     }
 
     // RESYNC CORRECTNESS (C): an OFF-spine queue mutation (not a player-event

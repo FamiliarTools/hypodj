@@ -83,6 +83,13 @@ pub enum PlayerEvent {
     Eof {
         song: Option<SongId>,
         queue_id: Option<QueueId>,
+        /// True ONLY when a warmed continuation station AUTO-ADVANCED at this finishing
+        /// track's natural EOF - the gapless handoff LANDED. The actor has already
+        /// repointed its own latches onto the (now playing) station; the handler then
+        /// ATTRIBUTES it as continuation-started (append the Stream row, repoint current,
+        /// set the one-shot latch) instead of cold-starting. False on EVERY ordinary Eof
+        /// and honest stop, where the handler cold-starts (or stops honestly) as slice 1.
+        continuation_landed: bool,
     },
     /// Play state changed (e.g. paused, stopped). Carries the id of the song the
     /// state applies to so the scrobbler is self-describing: it can start a
@@ -183,6 +190,22 @@ enum PlayerCommand {
     /// entry can never sit parked behind the still-playing current track. Idempotent
     /// and best-effort: with no warm entry it is a harmless no-op.
     DropWarm {
+        reply: oneshot::Sender<Result<(), PlayerError>>,
+    },
+    /// Warm (prefetch) the end-of-queue CONTINUATION station behind a finite current
+    /// track for a GAPLESS handoff. Same `playlist-clear` + `loadfile ... append` chain
+    /// as [`PrefetchWarm`](PlayerCommand::PrefetchWarm) EXCEPT keep-open stays `no`: the
+    /// skip warm sets keep-open=always to PREVENT the current's EOF auto-advancing into
+    /// the appended entry, but here that auto-advance IS the feature (the gapless
+    /// continuation handoff). On Ok the actor latches
+    /// [`WarmKind::Continuation`] with the station's queue id + url so the `EndFile(Eof)`
+    /// arm can ATTRIBUTE the landed advance (emit the finishing track's Eof with
+    /// `continuation_landed: true` and repoint its own latches onto the station). Purely
+    /// best-effort: an append failure leaves NO warm so `advance_on_eof`'s slice-1
+    /// cold-start remains the load-bearing floor.
+    PrefetchContinuation {
+        url: String,
+        queue_id: QueueId,
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
     /// TEST-ONLY: make the actor emit a natural `Eof` for the latched entry
@@ -322,6 +345,23 @@ impl PlayerHandle {
         self.request(|reply| PlayerCommand::DropWarm { reply }).await
     }
 
+    /// Warm the end-of-queue CONTINUATION station for a gapless handoff (see
+    /// [`PlayerCommand::PrefetchContinuation`]). `queue_id` is the identity the
+    /// handler will attribute the landed advance to. Best-effort: an Err just leaves
+    /// the slice-1 cold-start as the floor.
+    pub async fn prefetch_continuation(
+        &self,
+        url: &str,
+        queue_id: QueueId,
+    ) -> Result<(), PlayerError> {
+        self.request(|reply| PlayerCommand::PrefetchContinuation {
+            url: url.to_string(),
+            queue_id,
+            reply,
+        })
+        .await
+    }
+
     /// TEST-ONLY: drive a natural end-of-file for the latched entry.
     #[cfg(test)]
     pub(crate) async fn test_emit_eof(&self) -> Result<(), PlayerError> {
@@ -415,6 +455,9 @@ pub(crate) struct WarmProbe {
     pub prefetch: std::sync::atomic::AtomicUsize,
     pub switch: std::sync::atomic::AtomicUsize,
     pub drop: std::sync::atomic::AtomicUsize,
+    /// Counts `PrefetchContinuation` commands so a fake-clock handler test can assert
+    /// the continuation warm actually reached the actor at fire time.
+    pub prefetch_continuation: std::sync::atomic::AtomicUsize,
 }
 
 impl NullPlayer {
@@ -497,6 +540,18 @@ impl NullPlayer {
                         }
                         let _ = reply.send(Ok(()));
                     }
+                    PlayerCommand::PrefetchContinuation { url: _, queue_id: _, reply } => {
+                        // Headless: no mpv to warm. A no-op keeps the command total; the
+                        // handler still flips its slot warmed=true on this Ok, and a
+                        // fake-clock test drives the landed attribution via advance_on_eof
+                        // directly (NullPlayer never auto-advances).
+                        #[cfg(test)]
+                        if let Some(p) = &probe {
+                            p.prefetch_continuation
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let _ = reply.send(Ok(()));
+                    }
                     PlayerCommand::Pause(reply) => {
                         let _ = state_tx.send(PlayState::Paused);
                         let _ = reply.send(Ok(()));
@@ -550,7 +605,11 @@ impl NullPlayer {
                         let _ = state_tx.send(PlayState::Stopped);
                         if qid.is_some() {
                             let _ = evt_tx
-                                .send(PlayerEvent::Eof { song, queue_id: qid })
+                                .send(PlayerEvent::Eof {
+                                    song,
+                                    queue_id: qid,
+                                    continuation_landed: false,
+                                })
                                 .await;
                         }
                         let _ = evt_tx
@@ -778,9 +837,35 @@ fn emit_honest_stop(
     let _ = evt_tx.try_send(resting_viz(cur_vol));
     let _ = state_tx.send(PlayState::Stopped);
     if qid.is_some() {
-        let _ = evt_tx.blocking_send(PlayerEvent::Eof { song, queue_id: qid });
+        let _ = evt_tx.blocking_send(PlayerEvent::Eof {
+            song,
+            queue_id: qid,
+            continuation_landed: false,
+        });
     }
     let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
+}
+
+/// The actor-local warm latch: what (if anything) sits prefetched at playlist index
+/// 1 behind the current entry. Widened from the original bare `warmed: bool` so the
+/// `EndFile(Eof)` arm can distinguish a SKIP warm (swallow the current's EOF; the
+/// pending [`SwitchWarmed`](PlayerCommand::SwitchWarmed) owns the transition) from a
+/// CONTINUATION warm (the current's natural EOF AUTO-ADVANCES mpv into the warmed
+/// station - that advance IS the gapless handoff, attributed by the arm, never
+/// swallowed). Both suppress the top-level load-failure honest-stop gate while parked
+/// (a warm-target open failure must not stop the audible current track).
+enum WarmKind {
+    /// Nothing warmed: the current entry is the sole playlist entry (a fresh play
+    /// cleared any leftover), so its natural EOF advances the queue normally.
+    None,
+    /// A prefetched SKIP target. keep-open=always is set so the current PAUSES at its
+    /// EOF instead of auto-advancing; `SwitchWarmed` consumes it at the dip trough.
+    Skip,
+    /// A prefetched CONTINUATION station appended behind a FINITE current track with
+    /// keep-open=no, so mpv auto-advances into it at the current's natural EOF. Carries
+    /// the station's queue identity + url so the `EndFile(Eof)` arm can attribute the
+    /// landed advance and repoint the actor's own latches onto the station.
+    Continuation { queue_id: QueueId, url: String },
 }
 
 /// The mpv actor body, running on its own OS thread. Owns the `Mpv` handle and
@@ -827,16 +912,16 @@ fn mpv_actor(
     let mut cur_vol: f64 = 100.0;
     // Whether the deck is currently playing, for the Viz `playing` flag.
     let mut playing = false;
-    // Whether an appended, prefetched skip-target entry currently sits at playlist
-    // index 1 (warmed by PrefetchWarm and not yet consumed). SwitchWarmed reads this
-    // to choose the near-instant playlist switch vs the loadfile-replace fallback.
-    let mut warmed = false;
+    // What (if anything) sits prefetched at playlist index 1 behind the current entry
+    // (see [`WarmKind`]): a SKIP target consumed by SwitchWarmed, or a CONTINUATION
+    // station the current's natural EOF auto-advances into. None during plain playback.
+    let mut warm = WarmKind::None;
 
     loop {
         // 1. Drain any pending commands without blocking.
         match cmd_rx.try_recv() {
             Ok(cmd) => {
-                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, &mut cur_vol, &mut playing, &mut warmed, cmd) {
+                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, &mut cur_vol, &mut playing, &mut warm, cmd) {
                     // Stop requested with shutdown intent is not modeled;
                     // channel close is the only exit. Continue.
                 }
@@ -939,29 +1024,106 @@ fn mpv_actor(
                 // target via loadfile-replace. A SUPERSEDED dip clears `warmed` via
                 // DropWarm (and restores keep-open=no), so the current track's later
                 // natural EOF then advances normally through this arm.
-                if warmed {
-                    // Nothing to do: the skip machinery (SwitchWarmed) advances the queue.
-                } else {
-                match end_reason(reason) {
-                    EndReason::Eof | EndReason::Error => {
-                        // Emit Eof for the LATCHED entry so the queue advances, then
-                        // clear the play latch and publish Stopped. The top-level
-                        // load-failure arm below routes a cold-load open failure onto
-                        // this exact same path (one honest stop, one drain edge).
-                        emit_honest_stop(
-                            &state_tx,
-                            &evt_tx,
-                            &mut current,
-                            &mut current_qid,
-                            &mut playing,
-                            cur_vol,
-                        );
+                // Take the warm latch by value (leaving None) so each arm can freely
+                // re-latch: Skip restores itself (a swallowed EOF does not consume it),
+                // Continuation and None stay consumed.
+                match std::mem::replace(&mut warm, WarmKind::None) {
+                    // SKIP warm parked (findings 1b/4): swallow the current's EOF exactly
+                    // as today - the pending SwitchWarmed owns the transition to the
+                    // target. Restore the latch so SwitchWarmed still sees it.
+                    WarmKind::Skip => {
+                        warm = WarmKind::Skip;
                     }
-                    // Stop/Quit/Redirect/Other: do NOTHING. Critically do NOT take
-                    // `current` (handle_cmd already repointed it), which preserves
-                    // the phantom-skip cascade fix.
-                    _ => {}
-                }
+                    // CONTINUATION warm parked: the current track's natural EOF
+                    // AUTO-ADVANCES mpv into the warmed station (keep-open=no here; the
+                    // auto-advance is the FEATURE, not a hazard). Attribute the landed
+                    // handoff rather than swallow it. A structural re-check (mirroring
+                    // SwitchWarmed's can_switch) trusts the handoff ONLY if the warmed
+                    // station url is still present in the playlist as the entry mpv
+                    // advances into - a disarm (DropWarm / playlist-clear) removed it, so
+                    // the re-check fails and we take the honest-stop body -> the handler's
+                    // slice-1 cold-start is the belt-and-braces.
+                    WarmKind::Continuation { queue_id: station_qid, url: station_url } => {
+                        let is_eof = matches!(end_reason(reason), EndReason::Eof);
+                        let landed = is_eof && {
+                            let count: i64 = mpv.get_property("playlist-count").unwrap_or(0);
+                            (0..count).any(|i| {
+                                mpv.get_property::<String>(&format!("playlist/{i}/filename"))
+                                    .map(|f| f == station_url)
+                                    .unwrap_or(false)
+                            })
+                        };
+                        if landed {
+                            // ATTRIBUTE: emit the FINISHING track's ordinary Eof (its song
+                            // id still drives TrackEnd + scrobble + last_finished, all
+                            // unchanged) carrying continuation_landed=true, then repoint the
+                            // actor's latches onto the already-playing station. `current`
+                            // stays id-less (the station never scrobbles); `current_qid`
+                            // becomes the station's so a LATER open failure of a dead
+                            // station hits the is_active_load_failure gate (WarmKind is None
+                            // again) and reaches the slice-1 honest loud stop.
+                            let finishing_song = current.take();
+                            let finishing_qid = current_qid.take();
+                            current_qid = Some(station_qid);
+                            // playing stays true: mpv never stopped across the gapless
+                            // advance. The Eof rides the guaranteed blocking_send.
+                            let _ = evt_tx.blocking_send(PlayerEvent::Eof {
+                                song: finishing_song,
+                                queue_id: finishing_qid,
+                                continuation_landed: true,
+                            });
+                            // The station's own Playing edge: the director's on_playing
+                            // surfaces its TrackStart AND clears any suppress_next_stopped
+                            // (the on_playing fix) so this gapless handoff never swallows
+                            // the user's next real stop. Ordered AFTER the Eof on the same
+                            // lossless channel, so the spine commits the Stream row before
+                            // the station's metadata can arrive.
+                            let _ = state_tx.send(PlayState::Playing);
+                            let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
+                                PlayState::Playing,
+                                None,
+                                Some(station_qid),
+                            ));
+                        } else {
+                            // Re-check failed (disarmed / removed) or a non-Eof reason:
+                            // take the ordinary honest-stop body (landed=false) so
+                            // advance_on_eof runs the slice-1 cold-start / honest stop. A
+                            // Stop/Quit/Redirect must NOT take `current` (handle_cmd already
+                            // repointed it), exactly like the None arm.
+                            match end_reason(reason) {
+                                EndReason::Eof | EndReason::Error => emit_honest_stop(
+                                    &state_tx,
+                                    &evt_tx,
+                                    &mut current,
+                                    &mut current_qid,
+                                    &mut playing,
+                                    cur_vol,
+                                ),
+                                _ => {}
+                            }
+                        }
+                    }
+                    // No warm: today's body unchanged.
+                    WarmKind::None => match end_reason(reason) {
+                        EndReason::Eof | EndReason::Error => {
+                            // Emit Eof for the LATCHED entry so the queue advances, then
+                            // clear the play latch and publish Stopped. The top-level
+                            // load-failure arm below routes a cold-load open failure onto
+                            // this exact same path (one honest stop, one drain edge).
+                            emit_honest_stop(
+                                &state_tx,
+                                &evt_tx,
+                                &mut current,
+                                &mut current_qid,
+                                &mut playing,
+                                cur_vol,
+                            );
+                        }
+                        // Stop/Quit/Redirect/Other: do NOTHING. Critically do NOT take
+                        // `current` (handle_cmd already repointed it), which preserves
+                        // the phantom-skip cascade fix.
+                        _ => {}
+                    },
                 }
             }
             Some(Ok(_)) => {}
@@ -980,7 +1142,7 @@ fn mpv_actor(
                 // machinery owns that transition, exactly like the EndFile arm above,
                 // and a warm-target open failure must not stop the audible current
                 // track). Any OTHER event error is unrelated / transient - only logged.
-                if !warmed && current_qid.is_some() && is_active_load_failure(&e) {
+                if matches!(warm, WarmKind::None) && current_qid.is_some() && is_active_load_failure(&e) {
                     tracing::warn!(error = %e, "mpv load/open failed for the active entry; stopping honestly");
                     emit_honest_stop(
                         &state_tx,
@@ -1013,9 +1175,10 @@ fn handle_cmd(
     // volume + play-state actually change) and read by the af-metadata arm.
     cur_vol: &mut f64,
     playing: &mut bool,
-    // Whether an appended prefetched skip-target sits at playlist index 1. Set by
-    // PrefetchWarm, cleared once consumed/replaced so SwitchWarmed picks the right path.
-    warmed: &mut bool,
+    // What (if anything) sits prefetched at playlist index 1 (see [`WarmKind`]): a SKIP
+    // target (PrefetchWarm) or a CONTINUATION station (PrefetchContinuation). Cleared /
+    // re-latched here so the EndFile arm and SwitchWarmed pick the right path.
+    warm: &mut WarmKind,
     cmd: PlayerCommand,
 ) -> bool {
     match cmd {
@@ -1031,7 +1194,7 @@ fn handle_cmd(
                 .and_then(|_| mpv.set_property("keep-open", "no"))
                 .and_then(|_| mpv.set_property("pause", false))
                 .map_err(|e| PlayerError::Backend(e.to_string()));
-            *warmed = false;
+            *warm = WarmKind::None;
             match &res {
                 Ok(()) => {
                     *current = song.clone();
@@ -1074,9 +1237,31 @@ fn handle_cmd(
                 // track paused at its own EOF (it must advance normally).
                 let _ = mpv.set_property("keep-open", "no");
             }
-            *warmed = res.is_ok();
+            *warm = if res.is_ok() { WarmKind::Skip } else { WarmKind::None };
             if let Err(e) = &res {
                 tracing::warn!(error = %e, "mpv prefetch-warm failed; skip will fall back to trough loadfile");
+            }
+            let _ = reply.send(res);
+        }
+        PlayerCommand::PrefetchContinuation { url, queue_id, reply } => {
+            // Same warm chain as PrefetchWarm but keep-open stays `no`: the auto-advance
+            // into the appended station at the current track's natural EOF IS the gapless
+            // continuation handoff (attributed by the EndFile arm), not a hazard to guard.
+            // playlist-clear drops any prior appended target (keeps the current entry),
+            // keep-open=no is re-asserted (a prior skip warm may have flipped it), then the
+            // station is appended; prefetch-playlist=yes warms it in the background. On ANY
+            // failure leave NO warm so advance_on_eof's slice-1 cold-start is the floor.
+            let res = mpv
+                .command("playlist-clear", &[])
+                .and_then(|_| mpv.set_property("keep-open", "no"))
+                .and_then(|_| mpv.command("loadfile", &[&quote(&url), "append"]))
+                .map_err(|e| PlayerError::Backend(e.to_string()));
+            match &res {
+                Ok(()) => *warm = WarmKind::Continuation { queue_id, url: url.clone() },
+                Err(e) => {
+                    *warm = WarmKind::None;
+                    tracing::warn!(error = %e, "mpv prefetch-continuation failed; continuation falls back to the cold-start");
+                }
             }
             let _ = reply.send(res);
         }
@@ -1103,7 +1288,7 @@ fn handle_cmd(
             // mismatch we FALL BACK to `loadfile <url> replace`: today's proven trough
             // behavior loading the INTENDED target (latched identity always matches the
             // url actually loaded), never worse, never the wrong entry.
-            let can_switch = *warmed && {
+            let can_switch = matches!(warm, WarmKind::Skip) && {
                 let count: i64 = mpv.get_property("playlist-count").unwrap_or(0);
                 let pos: i64 = mpv.get_property("playlist-pos").unwrap_or(-1);
                 // Read the appended entry's filename; if unreadable, rely on structure.
@@ -1130,7 +1315,7 @@ fn handle_cmd(
                     .and_then(|_| mpv.set_property("pause", false))
                     .map_err(|e| PlayerError::Backend(e.to_string()))
             };
-            *warmed = false;
+            *warm = WarmKind::None;
             match &res {
                 Ok(()) => {
                     *current = song.clone();
@@ -1164,7 +1349,7 @@ fn handle_cmd(
             if let Err(e) = &res {
                 tracing::warn!(error = %e, "mpv drop-warm failed");
             }
-            *warmed = false;
+            *warm = WarmKind::None;
             let _ = reply.send(res);
         }
         PlayerCommand::Pause(reply) => {
@@ -1213,7 +1398,7 @@ fn handle_cmd(
             *current_qid = None;
             *playing = false;
             // mpv `stop` empties the playlist, so any warmed entry is gone too.
-            *warmed = false;
+            *warm = WarmKind::None;
             // Resting frame so the level field settles instead of freezing at the
             // pre-stop loudness (the af-metadata arm goes silent once decode stops).
             let _ = evt_tx.try_send(resting_viz(*cur_vol));
@@ -2052,5 +2237,241 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.state(), PlayState::Playing);
+    }
+
+    // ── LIVE continuation-warm proofs (slice 2), #[ignore] (need real libmpv) ──
+
+    // LOAD-BEARING EMPIRICAL PROBE: does mpv `prefetch-playlist=yes` actually PRE-CONNECT
+    // an http stream at loadfile-append time, or merely QUEUE the URL and connect at the
+    // advance? A tiny local HTTP server logs each accept() timestamp and injects an ~800ms
+    // delay before responding. We play a short finite local WAV, then PrefetchContinuation
+    // the http station well before the finite file's EOF. If an accept lands near the
+    // prefetch, mpv PRE-CONNECTS (warming buys the gapless win); if the accept only lands
+    // at the finite file's natural EOF, prefetch merely QUEUES and warming is a NON-
+    // improvement -> the feature HONESTLY degrades to the slice-1 cold-start. The test
+    // PRINTS the decisive timing; run and read it to record the finding:
+    //   cargo test -p hypodj-core -- --ignored live_continuation_prefetch_preconnect_probe
+    #[test]
+    #[ignore = "needs a real libmpv runtime + a local socket; run manually to answer the pre-connect question"]
+    fn live_continuation_prefetch_preconnect_probe() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir();
+        let cur = dir.join("hypodj_cont_probe_cur.wav");
+        write_tone_wav(&cur, 220.0, 4.0);
+
+        // A minimal HTTP/1.0 server streaming a long WAV, logging accept timestamps and
+        // injecting a delay before the response so a pre-connect is temporally distinct.
+        let accepts: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe server");
+        let port = listener.local_addr().unwrap().port();
+        let accepts_srv = accepts.clone();
+        let t_start = Instant::now();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                accepts_srv.lock().unwrap().push(Instant::now());
+                // Drain the request line(s) so mpv's GET completes.
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                // Injected latency before we respond at all.
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                // A big WAV body so mpv keeps reading (the station "plays").
+                let mut body: Vec<u8> = Vec::new();
+                {
+                    let sr = 44100u32;
+                    let n = (sr as f64 * 30.0) as usize;
+                    let mut pcm: Vec<u8> = Vec::with_capacity(n * 2);
+                    for i in 0..n {
+                        let t = i as f64 / sr as f64;
+                        let s = (2.0 * std::f64::consts::PI * 660.0 * t).sin() * 0.5;
+                        pcm.extend_from_slice(&((s * i16::MAX as f64) as i16).to_le_bytes());
+                    }
+                    let data_len = pcm.len() as u32;
+                    body.extend_from_slice(b"RIFF");
+                    body.extend_from_slice(&(36 + data_len).to_le_bytes());
+                    body.extend_from_slice(b"WAVE");
+                    body.extend_from_slice(b"fmt ");
+                    body.extend_from_slice(&16u32.to_le_bytes());
+                    body.extend_from_slice(&1u16.to_le_bytes());
+                    body.extend_from_slice(&1u16.to_le_bytes());
+                    body.extend_from_slice(&sr.to_le_bytes());
+                    body.extend_from_slice(&(sr * 2).to_le_bytes());
+                    body.extend_from_slice(&2u16.to_le_bytes());
+                    body.extend_from_slice(&16u16.to_le_bytes());
+                    body.extend_from_slice(b"data");
+                    body.extend_from_slice(&data_len.to_le_bytes());
+                    body.extend_from_slice(&pcm);
+                }
+                let header = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+
+        let station_url = format!("http://127.0.0.1:{port}/stream");
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+            player
+                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy())
+                .await
+                .expect("play the finite current");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            // WARM the station well before the finite file's ~4s EOF.
+            let t_prefetch = t_start.elapsed();
+            player
+                .prefetch_continuation(&station_url, QueueId(2))
+                .await
+                .expect("prefetch the continuation station");
+
+            // Observe until the finite file's natural EOF drives the auto-advance handoff.
+            let mut landed = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+            while std::time::Instant::now() < deadline && !landed {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+                    Ok(Some(PlayerEvent::Eof { continuation_landed, .. })) if continuation_landed => {
+                        landed = true;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+
+            let accepts = accepts.lock().unwrap().clone();
+            eprintln!("prefetch issued at ~{t_prefetch:?} after start");
+            for (i, a) in accepts.iter().enumerate() {
+                eprintln!("  accept[{i}] at ~{:?} after start", a.duration_since(t_start));
+            }
+            // DECISIVE: an accept close to the prefetch time (well before the ~4s EOF) means
+            // mpv PRE-CONNECTS -> warming is load-bearing-useful. An accept only near ~4s
+            // means prefetch merely QUEUES -> warming is a NON-improvement (degrade to
+            // slice-1). This assert only proves the handoff happened; READ the printed
+            // timings to record which world we are in.
+            assert!(landed, "the warmed station auto-advanced and was attributed (continuation_landed)");
+            assert!(!accepts.is_empty(), "the station was connected at least once");
+        });
+
+        let _ = std::fs::remove_file(&cur);
+    }
+
+    // The gapless handoff over the REAL actor with two local files: the finite current
+    // reaches its natural EOF, mpv auto-advances into the warmed "station", and the actor
+    // ATTRIBUTES it - emitting the finishing track's Eof with continuation_landed=true and
+    // repointing its latch onto the station qid, then StateChanged(Playing, None, station).
+    //   cargo test -p hypodj-core -- --ignored live_continuation_warm_gapless_handoff_attributes
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the gapless attribution"]
+    fn live_continuation_warm_gapless_handoff_attributes() {
+        let dir = std::env::temp_dir();
+        let cur = dir.join("hypodj_cont_cur.wav");
+        let station = dir.join("hypodj_cont_station.wav");
+        write_tone_wav(&cur, 220.0, 1.5); // short so it EOFs quickly
+        write_tone_wav(&station, 660.0, 8.0);
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+            player
+                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy())
+                .await
+                .expect("play the finite current");
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            // Warm the station behind it (keep-open=no, so mpv auto-advances at EOF).
+            player
+                .prefetch_continuation(&station.to_string_lossy(), QueueId(2))
+                .await
+                .expect("warm the station");
+
+            // Within a window, the finite file EOFs and the actor attributes the handoff:
+            // a landed Eof for the finishing entry AND a Playing edge for the station qid.
+            let mut saw_landed = false;
+            let mut saw_station_playing = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline && !(saw_landed && saw_station_playing) {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+                    Ok(Some(PlayerEvent::Eof { queue_id, continuation_landed, .. })) => {
+                        if continuation_landed {
+                            assert_eq!(queue_id, Some(QueueId(1)), "the landed Eof names the FINISHING entry");
+                            saw_landed = true;
+                        }
+                    }
+                    Ok(Some(PlayerEvent::StateChanged(PlayState::Playing, song, qid))) => {
+                        if qid == Some(QueueId(2)) {
+                            assert_eq!(song, None, "the station is id-less (never scrobbled)");
+                            saw_station_playing = true;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            assert!(saw_landed, "the finishing track's Eof carried continuation_landed=true");
+            assert!(saw_station_playing, "the station surfaced a Playing edge under its own qid");
+            assert_eq!(player.state(), PlayState::Playing, "the deck keeps playing across the gapless handoff");
+        });
+
+        let _ = std::fs::remove_file(&cur);
+        let _ = std::fs::remove_file(&station);
+    }
+
+    // A DEAD warmed station still reaches the honest LOUD stop: the finite current EOFs and
+    // mpv auto-advances into the (dead) warmed url; the actor attributes the landed handoff
+    // (WarmKind -> None, current_qid -> station), then the station's open failure hits the
+    // unchanged is_active_load_failure gate -> a single honest stop. No phantom-play, no
+    // retry loop. Port 1 (privileged) is refused fast.
+    //   cargo test -p hypodj-core -- --ignored live_continuation_warm_dead_station_honest_stop
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the dead-station honest stop"]
+    fn live_continuation_warm_dead_station_honest_stop() {
+        let dir = std::env::temp_dir();
+        let cur = dir.join("hypodj_cont_dead_cur.wav");
+        write_tone_wav(&cur, 220.0, 1.5);
+        let dead = "http://127.0.0.1:1/dead-station";
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+            player
+                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy())
+                .await
+                .expect("play the finite current");
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            player
+                .prefetch_continuation(dead, QueueId(2))
+                .await
+                .expect("warm the (dead) station");
+
+            // The finite file EOFs, mpv auto-advances into the dead station, and its open
+            // failure converges on the honest stop: a StateChanged(Stopped) and the watch
+            // settling to Stopped. Never a wedge, never a retry loop.
+            let mut saw_stopped = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline && !saw_stopped {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+                    Ok(Some(PlayerEvent::StateChanged(PlayState::Stopped, ..))) => saw_stopped = true,
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            assert!(saw_stopped, "a dead warmed station reaches the honest StateChanged(Stopped)");
+            assert_eq!(
+                player.state(),
+                PlayState::Stopped,
+                "the watch settles to Stopped so MPD reports stop, never a phantom play over silence"
+            );
+        });
+
+        let _ = std::fs::remove_file(&cur);
     }
 }
