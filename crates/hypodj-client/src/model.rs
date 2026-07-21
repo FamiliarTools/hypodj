@@ -23,6 +23,14 @@ pub struct NowPlaying {
     /// non-standard `X-Starred` pair on `currentsong`), so the clients can show a
     /// heart. Parsed from `currentsong`, coexisting with the `armed` status pairs.
     pub starred: bool,
+    /// A RECOGNIZED remote cover URL for the current raw stream, surfaced by the
+    /// daemon as the non-standard `X-CoverArt` pair on `currentsong` (task
+    /// kmrhj8m). Present ONLY for a stream whose songrec identify yielded a cover;
+    /// a library song and a coverless stream leave it `None`. The tui uses it as
+    /// the second half of the art-request key so a stream lights the now-playing
+    /// art pane and a re-identify refetches, while the bytes still arrive over the
+    /// plain MPD albumart protocol (the client gains no HTTP dependency).
+    pub cover: Option<String>,
     /// The armed human-features, surfaced by the daemon as X- status pairs and
     /// present ONLY when armed. Startle-safe equals trust only if the machine's
     /// hold on the night is VISIBLE - these back that render.
@@ -213,6 +221,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         album: find(current, "Album").map(str::to_string),
         file: find(current, "file").map(str::to_string),
         starred: find(current, "X-Starred").is_some(),
+        cover: find(current, "X-CoverArt").map(str::to_string),
         armed: ArmedFeatures::parse(status),
         field: FieldState::parse(status),
         hint: AmbientHint::parse(status),
@@ -345,6 +354,23 @@ mod tests {
         let np2 = now_playing(&status, &p(&[("file", "song/7"), ("Title", "X")]));
         assert!(!np2.starred);
         assert!(np2.armed.any());
+    }
+
+    #[test]
+    fn nowplaying_parses_x_coverart() {
+        // A recognized stream cover surfaces as the currentsong X-CoverArt pair
+        // (task kmrhj8m); its absence leaves cover None.
+        let status = p(&[("state", "play")]);
+        let current = p(&[
+            ("file", "https://stream.example/live"),
+            ("Title", "Some Artist - Some Track"),
+            ("X-CoverArt", "https://is1.example/hq.jpg"),
+        ]);
+        let np = now_playing(&status, &current);
+        assert_eq!(np.cover.as_deref(), Some("https://is1.example/hq.jpg"));
+        // Absent pair -> no cover (a library song or a coverless stream).
+        let np2 = now_playing(&status, &p(&[("file", "song/7"), ("Title", "X")]));
+        assert_eq!(np2.cover, None);
     }
 
     #[test]

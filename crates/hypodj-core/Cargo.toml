@@ -46,6 +46,12 @@ mpris-server = "0.8"
 # the single zbus instance onto the tokio reactor, so the MPRIS connection and its
 # handlers run inside the tokio runtime and the fade spawns cleanly.
 zbus = { version = "4.4", features = ["tokio"] }
+# Direct, BOUNDED fetch of a RECOGNIZED remote stream cover URL (task kmrhj8m).
+# Pinned to the EXACT version + features opensubsonic 0.3.0 already enables, so
+# this adds ZERO new nodes to the build graph (Cargo.lock already resolves
+# reqwest 0.13.4). Only ever fetches the state-held cover URL gated by the
+# current stream entry - never an arbitrary client-supplied URL.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 
 [dev-dependencies]
 # Deserialize the exact camelCase wire JSON in the wire->model mapping tests,

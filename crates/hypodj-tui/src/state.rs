@@ -445,9 +445,12 @@ pub struct TuiState {
     /// The connection epoch, bumped on every worker reconnect. A response tagged
     /// with an older epoch is stale and dropped (see [`resp_is_stale`]).
     pub epoch: u64,
-    /// The track uri the art thread was last asked to fetch, so the render thread
-    /// only sends one art request per track change.
-    pub art_req_uri: Option<String>,
+    /// The art-request KEY the art thread was last asked to fetch: `(file uri,
+    /// recognized cover url)`. The render thread sends one art request per KEY
+    /// change, so a stream gaining a cover (`None` -> `Some(url)`) or a re-identify
+    /// swapping the cover on the same uri each fires exactly one fetch, never per
+    /// frame (task kmrhj8m).
+    pub art_req_key: Option<(String, Option<String>)>,
     /// The ambient-visualizer clock, in seconds. The render loop advances this by
     /// the wall-clock frame delta ONLY while playback is `play` (so it freezes when
     /// paused/stopped) and writes it here before each draw; the idle bottom-bar wave
@@ -543,7 +546,7 @@ impl Default for TuiState {
             refresh_in_flight: false,
             refresh_dirty: false,
             epoch: 0,
-            art_req_uri: None,
+            art_req_key: None,
             anim_secs: 0.0,
             spin_secs: 0.0,
             dj_input: String::new(),

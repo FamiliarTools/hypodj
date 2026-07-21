@@ -80,8 +80,10 @@ pub enum Inbound {
     Resp { epoch: u64, kind: RespKind },
     /// An `idle` push: the changed subsystems (empty on a bare-OK / catch-up wake).
     Wake(Vec<String>),
-    /// A fetched cover for `uri` (None for a stream / missing art / decode failure).
-    Art { uri: String, art: Option<AlbumArt> },
+    /// A fetched cover for the art-request `key` (`(file uri, cover url)`), carried
+    /// back so the render thread can reject a late response for a since-changed key
+    /// (task kmrhj8m). `art` is None on missing art / decode failure / a no-exist ACK.
+    Art { key: (String, Option<String>), art: Option<AlbumArt> },
     /// The command socket reconnected; epoch bumped. Followed by a catch-up Snapshot.
     Connected { epoch: u64 },
     /// The command socket dropped; the worker is reconnecting.
@@ -118,7 +120,7 @@ pub struct Workers {
     /// from `req_tx` so a multi-second `claude` call never blocks the command socket.
     pub cc_tx: Sender<Req>,
     pub inbound_rx: Receiver<Inbound>,
-    pub art_tx: Sender<String>,
+    pub art_tx: Sender<(String, Option<String>)>,
     pub stop: Arc<AtomicBool>,
     /// Cloned command-socket handle: `shutdown(Both)` unblocks a parked read at quit.
     pub cmd_shutdown: TcpStream,
@@ -150,7 +152,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
 
     let (req_tx, req_rx) = mpsc::channel::<Req>();
     let (in_tx, in_rx) = mpsc::channel::<Inbound>();
-    let (art_tx, art_rx) = mpsc::channel::<String>();
+    let (art_tx, art_rx) = mpsc::channel::<(String, Option<String>)>();
     let stop = Arc::new(AtomicBool::new(false));
 
     // Command worker.
@@ -732,12 +734,18 @@ fn viz_worker(
     }
 }
 
-/// The art worker: fetch a cover per track-uri change (the last blocking IO off the
-/// render thread). A non-`song/` uri (a raw stream) has no cover.
-fn art_worker(rx: Receiver<String>, tx: Sender<Inbound>, host: &str, port: u16) {
-    while let Ok(uri) = rx.recv() {
-        let art = if uri.starts_with("song/") { AlbumArt::load(host, port, &uri) } else { None };
-        if tx.send(Inbound::Art { uri, art }).is_err() {
+/// The art worker: fetch a cover per art-KEY change (the last blocking IO off the
+/// render thread). The render thread already decided what wants art (via `art_want`),
+/// so the worker unconditionally loads over the MPD albumart binary protocol using
+/// the key's `file:` value - a library `song/<id>` resolves its Subsonic cover and a
+/// raw stream with a recognized cover resolves the daemon-fetched remote bytes; a
+/// coverless stream never reaches here (task kmrhj8m). A no-exist ACK degrades to
+/// `None` inside `AlbumArt::load`. The key rides back so a late response for a
+/// since-changed key is rejected by the render thread's adoption gate.
+fn art_worker(rx: Receiver<(String, Option<String>)>, tx: Sender<Inbound>, host: &str, port: u16) {
+    while let Ok(key) = rx.recv() {
+        let art = AlbumArt::load(host, port, &key.0);
+        if tx.send(Inbound::Art { key, art }).is_err() {
             break;
         }
     }

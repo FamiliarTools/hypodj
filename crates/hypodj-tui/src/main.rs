@@ -463,10 +463,11 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
                 state.refresh_dirty = true;
             }
         }
-        Inbound::Art { uri, art } => {
-            // Adopt only if it is still the current track's cover (a late fetch for a
-            // since-changed track is discarded).
-            if state.now.file.as_deref() == Some(uri.as_str()) {
+        Inbound::Art { key, art } => {
+            // Adopt only if it is still the art the current now-playing wants (a late
+            // fetch for a since-changed track OR a stale cover of the same stream uri
+            // is discarded).
+            if art_want(&state.now) == Some(key) {
                 state.art = art;
             }
         }
@@ -551,27 +552,35 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
     }
 }
 
-/// On a track-uri change, ask the art worker to fetch the new cover once. Clears the
-/// stale cover immediately so the old art never lingers during the fetch; a stream /
-/// nothing-playing clears art. The art worker posts the decoded cover back as an
-/// [`Inbound::Art`].
-fn request_art(art_tx: &Sender<String>, state: &mut TuiState) {
-    match state.now.file.clone() {
-        Some(uri) => {
-            if state.art_req_uri.as_deref() != Some(uri.as_str()) {
-                state.art_req_uri = Some(uri.clone());
-                if state.art.as_ref().map(|a| a.uri.as_str()) != Some(uri.as_str()) {
-                    state.art = None;
-                }
-                let _ = art_tx.send(uri);
-            }
-        }
-        None => {
-            if state.art_req_uri.is_some() {
-                state.art_req_uri = None;
-                state.art = None;
-            }
-        }
+/// The art the current now-playing WANTS, as a `(file uri, cover url)` key, or
+/// `None` when nothing wants art (task kmrhj8m). A library `song/<id>` wants its
+/// Subsonic cover keyed `(uri, None)` - byte-identical to before. Any other uri
+/// (a raw stream) wants art ONLY when a cover was recognized (`now.cover` is
+/// `Some`), keyed `(uri, Some(cover))`; a coverless stream or nothing playing
+/// wants nothing. This is the single source of truth the render thread and the
+/// late-response adoption gate both consult, so a fetch fires exactly once per key.
+fn art_want(now: &hypodj_client::model::NowPlaying) -> Option<(String, Option<String>)> {
+    let uri = now.file.as_ref()?;
+    if uri.starts_with("song/") {
+        return Some((uri.clone(), None));
+    }
+    now.cover.as_ref().map(|c| (uri.clone(), Some(c.clone())))
+}
+
+/// On an art-KEY change, ask the art worker to fetch the new cover once. Clears the
+/// stale cover immediately so the old art never lingers during the fetch; a coverless
+/// stream / nothing-playing clears art. The art worker posts the decoded cover back
+/// as an [`Inbound::Art`] carrying the key so a late response for a since-changed key
+/// is rejected.
+fn request_art(art_tx: &Sender<(String, Option<String>)>, state: &mut TuiState) {
+    let want = art_want(&state.now);
+    if state.art_req_key == want {
+        return;
+    }
+    state.art_req_key = want.clone();
+    state.art = None; // clear stale art on any key change
+    if let Some(key) = want {
+        let _ = art_tx.send(key);
     }
 }
 
@@ -699,6 +708,92 @@ mod tests {
             1,
             "armed once through the same Req::Arm path"
         );
+    }
+
+    // ── art-request key gating (task kmrhj8m) ───────────────────────────────
+
+    fn np(file: Option<&str>, cover: Option<&str>) -> hypodj_client::model::NowPlaying {
+        hypodj_client::model::NowPlaying {
+            file: file.map(str::to_string),
+            cover: cover.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn pal() -> crate::album_color::Palette {
+        crate::album_color::Palette { vibrant: [1, 2, 3], muted: [4, 5, 6], swatches: vec![[1, 2, 3]] }
+    }
+
+    #[test]
+    fn art_want_keys_library_stream_and_coverless() {
+        // A library song wants its Subsonic cover keyed (uri, None) - unchanged.
+        assert_eq!(art_want(&np(Some("song/42"), None)), Some(("song/42".into(), None)));
+        // The song/ path is cover-less by key, ignoring any stray cover pair.
+        assert_eq!(
+            art_want(&np(Some("song/42"), Some("https://x/y.jpg"))),
+            Some(("song/42".into(), None))
+        );
+        // A stream WITH a recognized cover wants (uri, Some(cover)).
+        assert_eq!(
+            art_want(&np(Some("https://s/live"), Some("https://x/y.jpg"))),
+            Some(("https://s/live".into(), Some("https://x/y.jpg".into())))
+        );
+        // A coverless stream wants nothing; nothing playing wants nothing.
+        assert_eq!(art_want(&np(Some("https://s/live"), None)), None);
+        assert_eq!(art_want(&np(None, None)), None);
+    }
+
+    #[test]
+    fn request_art_fires_once_per_key_transition() {
+        let (tx, rx) = mpsc::channel::<(String, Option<String>)>();
+        let mut state = TuiState::new();
+
+        // A coverless stream sends nothing and stores no key.
+        state.now = np(Some("https://s/live"), None);
+        request_art(&tx, &mut state);
+        assert!(rx.try_iter().next().is_none(), "a coverless stream sends nothing");
+        assert_eq!(state.art_req_key, None);
+
+        // Cover appears mid-track: exactly one request, key stored, stale art cleared.
+        state.art = Some(crate::art::AlbumArt::for_test(pal()));
+        state.now = np(Some("https://s/live"), Some("https://x/a.jpg"));
+        request_art(&tx, &mut state);
+        let sent: Vec<_> = rx.try_iter().collect();
+        assert_eq!(sent, vec![("https://s/live".into(), Some("https://x/a.jpg".into()))]);
+        assert!(state.art.is_none(), "art is cleared on a key change");
+
+        // The same key again fires no new request (never per frame).
+        request_art(&tx, &mut state);
+        assert!(rx.try_iter().next().is_none(), "no refetch on an unchanged key");
+
+        // A re-identify swaps the cover on the SAME uri: exactly one new request.
+        state.now = np(Some("https://s/live"), Some("https://x/b.jpg"));
+        request_art(&tx, &mut state);
+        let sent2: Vec<_> = rx.try_iter().collect();
+        assert_eq!(sent2, vec![("https://s/live".into(), Some("https://x/b.jpg".into()))]);
+    }
+
+    #[test]
+    fn late_art_with_stale_key_is_rejected() {
+        let (tx, _rx) = mpsc::channel::<Req>();
+        let mut state = TuiState::new();
+        state.now = np(Some("https://s/live"), Some("https://x/b.jpg"));
+        // A late response for the OLD cover of the same stream uri is discarded.
+        let stale = ("https://s/live".to_string(), Some("https://x/a.jpg".to_string()));
+        apply_inbound(
+            &tx,
+            &mut state,
+            Inbound::Art { key: stale, art: Some(crate::art::AlbumArt::for_test(pal())) },
+        );
+        assert!(state.art.is_none(), "a stale-key art is not adopted");
+        // The response for the CURRENT key is adopted.
+        let cur = ("https://s/live".to_string(), Some("https://x/b.jpg".to_string()));
+        apply_inbound(
+            &tx,
+            &mut state,
+            Inbound::Art { key: cur, art: Some(crate::art::AlbumArt::for_test(pal())) },
+        );
+        assert!(state.art.is_some(), "the current-key art is adopted");
     }
 
     /// Pressing `n` on the DJ confirm echoes the cancellation into the chat and cancels

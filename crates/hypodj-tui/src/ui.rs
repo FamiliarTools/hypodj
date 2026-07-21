@@ -634,6 +634,26 @@ mod tests {
     }
 
     #[test]
+    fn stream_cover_renders_halfblocks_in_art_pane() {
+        // A playing STREAM with a recognized cover and a decoded AlbumArt lights the
+        // now-playing art pane (task kmrhj8m): the pane renders U+2580 half-block
+        // cells, not the image-less placeholder text.
+        use crate::album_color::Palette;
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Some Artist - Some Track".into());
+        s.now.file = Some("https://stream.example/live".into());
+        s.now.cover = Some("https://is1.example/hq.jpg".into());
+        let pal = Palette { vibrant: [220, 40, 40], muted: [80, 30, 30], swatches: vec![[220, 40, 40]] };
+        s.art = Some(crate::art::AlbumArt::for_test(pal));
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(
+            out.contains('\u{2580}'),
+            "the art pane renders half-block cover cells for a stream:\n{out}"
+        );
+    }
+
+    #[test]
     fn now_playing_pane_at_rest_absent_and_layout_unchanged() {
         // A resting field draws no line AND does not perturb the layout: the whole
         // rendered buffer is byte-identical to a state with no field at all.
@@ -968,7 +988,7 @@ mod tests {
         s.truecolor = true;
         // A vivid album palette -> the waveform is colored via the INFO policy.
         let pal = Palette { vibrant: [220, 40, 40], muted: [80, 30, 30], swatches: vec![[220, 40, 40]] };
-        s.art = Some(crate::art::AlbumArt::for_test("song/1", pal.clone()));
+        s.art = Some(crate::art::AlbumArt::for_test(pal.clone()));
         let expect = info_color(pal.vibrant, s.term_bg, true);
         let colors = render_fg_colors(&s, 60, 24);
         assert!(

@@ -1081,6 +1081,13 @@ pub struct HypodjHandler {
     /// albumart in many small offset chunks; caching avoids re-fetching the whole
     /// image per chunk. Longer TTL (art rarely changes).
     cover_cache: TtlLru<String, Vec<u8>>,
+    /// Dedicated HTTP client for a RECOGNIZED remote stream cover (task kmrhj8m).
+    /// Built once in the constructor with connect 2s / total 2.5s (strictly under
+    /// the tui 3s ART_TIMEOUT so the daemon never outlives the client's patience)
+    /// and redirect Policy::limited(4). Only ever fetches the state-held cover URL
+    /// gated by the current stream entry - not a Subsonic concern, so it lives
+    /// here rather than being borrowed through the base-url-bound SubsonicClient.
+    cover_http: reqwest::Client,
 
     // ── P2 plan registry ───────────────────────────────────────────────────
     /// The armed-plan registry, SHARED with the [`crate::executor::Executor`]
@@ -1386,6 +1393,12 @@ impl HypodjHandler {
             listings: TtlLru::new(256, Duration::from_secs(60)),
             dir_cache: TtlLru::new(256, Duration::from_secs(60)),
             cover_cache: TtlLru::new(64, Duration::from_secs(600)),
+            cover_http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_millis(2500))
+                .redirect(reqwest::redirect::Policy::limited(4))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             plan_pending: Arc::new(Mutex::new(Vec::new())),
             next_plan_id: AtomicU64::new(0),
             plan_timers: OnceLock::new(),
@@ -6342,7 +6355,10 @@ impl HypodjHandler {
     async fn albumart(&self, uri: &str, offset: usize) -> MpdResponse {
         let song_id = match song_id_from_uri(uri) {
             Some(id) => id,
-            None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
+            // Not a library `song/<id>`: a raw stream row. If the current stream
+            // carries a RECOGNIZED cover, serve its bytes (task kmrhj8m); else the
+            // usual no-exist ACK falls out of stream_cover's gate.
+            None => return self.stream_cover(uri, offset).await,
         };
         // Resolve the cover id: prefer the song's coverArt, else the song id.
         let cover_id = match self.client.song(&song_id).await {
@@ -6362,6 +6378,15 @@ impl HypodjHandler {
                 _ => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
             },
         };
+        self.binary_tail(&bytes, offset)
+    }
+
+    /// Frame ONE binary cover chunk: clamp the offset, slice
+    /// [offset..offset+binary_limit] and emit [`MpdResponse::Binary`]. Shared by
+    /// the library `albumart` path and the stream-cover path (task kmrhj8m) so
+    /// both chunk identically under the negotiated `binarylimit`. Re-locks state
+    /// ONLY for the limit read, never across an await.
+    fn binary_tail(&self, bytes: &[u8], offset: usize) -> MpdResponse {
         let total = bytes.len();
         if offset >= total {
             return ack(ACK_ERROR_NO_EXIST, "albumart", "Bad file offset");
@@ -6370,6 +6395,95 @@ impl HypodjHandler {
         let end = (offset + limit).min(total);
         let chunk = bytes[offset..end].to_vec();
         MpdResponse::Binary { total, chunk }
+    }
+
+    /// Serve one binary cover chunk for a PLAYING RAW STREAM (task kmrhj8m). The
+    /// tui/ncmpcpp issue plain `albumart "<stream url>" <offset>` with the
+    /// currentsong `file:` value; when that uri is not a library `song/<id>` this
+    /// runs. Double-gates (uri + qid, mirroring the currentsong `X-CoverArt` gate
+    /// exactly) under ONE short std lock DROPPED before any await: the reported
+    /// current entry must be a [`QueueEntry::Stream`] whose url equals the request
+    /// uri AND `recognized_cover` must be keyed to that entry's [`QueueId`]. So a
+    /// stale client asking for a previous stream's art gets no-exist, and the
+    /// daemon only ever fetches the state-held URL (no open-proxy surface). Fetches
+    /// ONCE per recognized cover (cache-first, key `remote/<cover_url>` -
+    /// collision-free vs the library `cover/{id}`, and a re-identify is a natural
+    /// cache miss). Any gate miss / fetch failure degrades to the same no-exist ACK
+    /// the library path uses, then frames identically via [`Self::binary_tail`].
+    async fn stream_cover(&self, uri: &str, offset: usize) -> MpdResponse {
+        // ONE short std lock, dropped before any await (the fade-slot discipline).
+        let cover_url = {
+            let st = self.state.lock().unwrap();
+            let matched = st
+                .reported_current()
+                .and_then(|i| st.queue.get(i))
+                .and_then(|item| match &item.entry {
+                    QueueEntry::Stream { url, .. } if url == uri => Some(QueueId(item.id)),
+                    _ => None,
+                })
+                .and_then(|qid| {
+                    st.recognized_cover
+                        .as_ref()
+                        .and_then(|(q, url)| (*q == qid).then(|| url.clone()))
+                });
+            match matched {
+                Some(u) => u,
+                None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
+            }
+        };
+        let cache_key = format!("remote/{cover_url}");
+        let bytes = match self.cover_cache.get(&cache_key) {
+            Some(b) => b,
+            None => match self.fetch_remote_cover(&cover_url).await {
+                Some(b) => {
+                    self.cover_cache.put(cache_key, b.clone());
+                    b
+                }
+                // Fetch failed/timed out/rejected: same no-exist as the library path.
+                None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
+            },
+        };
+        self.binary_tail(&bytes, offset)
+    }
+
+    /// Bounded, defensive remote cover fetch (task kmrhj8m). https-only (plus http
+    /// loopback for tests / local dev); rejects non-2xx, non-`image/*`
+    /// Content-Type, and a declared Content-Length over 2 MiB, with a hard 2 MiB
+    /// running cap while accumulating chunks. Returns `None` on any error /
+    /// timeout / empty body. NO spawned task: the fetch lives and dies inside this
+    /// request future, bounded by the client's 2.5s timeout, so it can never leak
+    /// or wedge the art worker.
+    async fn fetch_remote_cover(&self, url: &str) -> Option<Vec<u8>> {
+        const MAX_COVER_BYTES: u64 = 2 * 1024 * 1024;
+        let loopback_http = url.starts_with("http://127.0.0.1")
+            || url.starts_with("http://localhost")
+            || url.starts_with("http://[::1]");
+        if !url.starts_with("https://") && !loopback_http {
+            return None;
+        }
+        let mut resp = self.cover_http.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let is_image = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.trim_start().starts_with("image/"));
+        if !is_image {
+            return None;
+        }
+        if resp.content_length().is_some_and(|n| n > MAX_COVER_BYTES) {
+            return None;
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await.ok()? {
+            if buf.len() as u64 + chunk.len() as u64 > MAX_COVER_BYTES {
+                return None;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        (!buf.is_empty()).then_some(buf)
     }
 
     /// Full search3 with client-side MPD-tag post-filtering (feature 7). `exact`
@@ -8987,6 +9101,231 @@ mod tests {
             !cur.iter().any(|(k, _)| k == "X-CoverArt"),
             "a wrong-qid cover must not surface: {cur:?}"
         );
+    }
+
+    // ── stream cover-art serving (albumart Stream branch, task kmrhj8m) ─────
+
+    // A tiny stand-in "cover" payload. The daemon serves raw bytes and only checks
+    // the Content-Type is image/*; it never decodes, so these bytes need not be a
+    // real PNG for the byte-layer proof.
+    const FAKE_PNG: &[u8] = b"\x89PNG\r\n\x1a\nFAKECOVERBYTES0123456789";
+
+    /// LIVE end-to-end proof (task kmrhj8m), manual-only like the live-mpv test: a
+    /// REAL songrec identify of the NTS mixtape stream yields a REAL Shazam/Apple CDN
+    /// cover URL, which the daemon then FETCHES over real HTTPS and SERVES as albumart
+    /// bytes - proving the whole identify -> X-CoverArt -> albumart Stream branch ->
+    /// remote fetch chain against live external services. Needs internet + `ffmpeg`
+    /// and `songrec` on PATH (bundled in the nix daemon wrapper); run it with:
+    ///   PATH=<songrec-bin>:<ffmpeg-bin>:$PATH cargo test -p hypodj-core -- --ignored stream_cover_live
+    /// Recognition is probabilistic (the stream must be playing identifiable music):
+    /// a clean NO MATCH soft-skips rather than failing, so re-run until NTS plays a
+    /// track. Does NOT need Navidrome (the handler is built with a never-called client).
+    #[tokio::test]
+    #[ignore = "live: needs internet + songrec/ffmpeg on PATH; recognition is probabilistic"]
+    async fn stream_cover_live_identify_and_serve() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+
+        // Real capture + Shazam fingerprint of the live stream.
+        match h.handle(MpdCommand::Identify).await {
+            MpdResponse::Pairs(p) => eprintln!("identify -> {p:?}"),
+            other => panic!("identify should return Pairs, got {other:?}"),
+        }
+
+        // The cover only surfaces on a match; a niche/talk segment is a clean no-match.
+        let cover_url = {
+            let st = h.state.lock().unwrap();
+            match &st.recognized_cover {
+                Some((q, url)) if *q == QueueId(qid) => url.clone(),
+                _ => {
+                    eprintln!("no cover recognized this run (NO MATCH) - soft skip; re-run");
+                    return;
+                }
+            }
+        };
+        eprintln!("recognized cover url: {cover_url}");
+        assert!(cover_url.starts_with("https://"), "a real remote https cover url");
+
+        // currentsong must carry it as X-CoverArt.
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(
+            cur.iter().any(|(k, v)| k == "X-CoverArt" && v == &cover_url),
+            "X-CoverArt surfaces the recognized cover: {cur:?}"
+        );
+
+        // The daemon fetches + serves the real cover as albumart Binary bytes.
+        let served = match h.handle(MpdCommand::AlbumArt(NTS.into(), 0)).await {
+            MpdResponse::Binary { total, chunk } => {
+                assert!(total > 0, "a non-empty cover object");
+                assert_eq!(chunk.len().min(total), chunk.len());
+                // Reassemble across chunks under the negotiated binarylimit.
+                let mut buf = chunk;
+                while buf.len() < total {
+                    match h.handle(MpdCommand::AlbumArt(NTS.into(), buf.len())).await {
+                        MpdResponse::Binary { chunk, .. } => buf.extend_from_slice(&chunk),
+                        other => panic!("mid-stream chunk should be Binary, got {other:?}"),
+                    }
+                }
+                buf
+            }
+            other => panic!("albumart should serve Binary for the recognized stream, got {other:?}"),
+        };
+        eprintln!("daemon served {} cover bytes", served.len());
+        assert!(served.len() > 1000, "a real cover image is more than a few bytes");
+        // It is a real image: JPEG or PNG magic (the Apple CDN serves JPEG).
+        let is_image =
+            served.starts_with(&[0xFF, 0xD8, 0xFF]) || served.starts_with(b"\x89PNG\r\n\x1a\n");
+        assert!(is_image, "served bytes start with a JPEG/PNG signature");
+
+        // Independent fetch of the SAME url must match the daemon's served bytes.
+        let independent = reqwest::Client::new()
+            .get(&cover_url)
+            .send()
+            .await
+            .expect("independent fetch")
+            .bytes()
+            .await
+            .expect("independent body");
+        assert_eq!(
+            served.len(),
+            independent.len(),
+            "daemon-served size matches an independent fetch of the same url"
+        );
+        assert_eq!(&served[..], &independent[..], "byte-identical to the source cover");
+        eprintln!("PROOF OK: {} bytes, byte-identical to an independent fetch", served.len());
+    }
+
+    #[tokio::test]
+    async fn stream_cover_serves_cached_remote_bytes() {
+        // A recognized cover already in the cover_cache under `remote/<url>` is
+        // served as MpdResponse::Binary for the current stream's `albumart` request,
+        // with NO network: proves the gate + cache path + shared binary framing.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        let cover_url = "https://is1.example/hq.jpg";
+        h.set_recognized_cover(QueueId(qid), cover_url.into());
+        h.cover_cache
+            .put(format!("remote/{cover_url}"), FAKE_PNG.to_vec());
+
+        // Offset 0 returns the whole (small) object.
+        match h.handle(MpdCommand::AlbumArt(NTS.into(), 0)).await {
+            MpdResponse::Binary { total, chunk } => {
+                assert_eq!(total, FAKE_PNG.len(), "total is the full cover size");
+                assert_eq!(chunk, FAKE_PNG, "serves the exact cached cover bytes");
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+        // A later offset chunks identically to the library path (offset..end slice).
+        match h.handle(MpdCommand::AlbumArt(NTS.into(), 4)).await {
+            MpdResponse::Binary { total, chunk } => {
+                assert_eq!(total, FAKE_PNG.len());
+                assert_eq!(chunk, &FAKE_PNG[4..], "offset slices from the byte offset");
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+        // readpicture dispatches to the same path, so a stream cover is served there too.
+        match h.handle(MpdCommand::ReadPicture(NTS.into(), 0)).await {
+            MpdResponse::Binary { chunk, .. } => assert_eq!(chunk, FAKE_PNG),
+            other => panic!("expected Binary from readpicture, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_cover_fetches_from_local_listener() {
+        // End-to-end fetch: a throwaway 127.0.0.1 listener serves the cover ONCE with
+        // Content-Type image/png; the daemon fetches + caches it, then a second
+        // request is served from cache with the listener already dead.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut scratch = [0u8; 1024];
+                let _ = sock.read(&mut scratch); // drain the request line/headers
+                let body = FAKE_PNG;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(header.as_bytes());
+                let _ = sock.write_all(body);
+                let _ = sock.flush();
+            }
+            // Listener drops here -> the port is closed for the second request.
+        });
+
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        let cover_url = format!("http://{addr}/x.png");
+        h.set_recognized_cover(QueueId(qid), cover_url.clone());
+
+        // First request fetches over the socket.
+        match h.handle(MpdCommand::AlbumArt(NTS.into(), 0)).await {
+            MpdResponse::Binary { total, chunk } => {
+                assert_eq!(total, FAKE_PNG.len());
+                assert_eq!(chunk, FAKE_PNG, "fetched cover bytes match the served body");
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+        server.join().unwrap();
+        // Second request: listener is dead, so this proves the cache serve.
+        match h.handle(MpdCommand::AlbumArt(NTS.into(), 0)).await {
+            MpdResponse::Binary { chunk, .. } => {
+                assert_eq!(chunk, FAKE_PNG, "second request served from cache, no network");
+            }
+            other => panic!("expected cached Binary, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_cover_no_recognized_cover_acks_no_exist() {
+        // A current stream with NO recognized cover -> no-exist ACK (never a crash).
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        match h.handle(MpdCommand::AlbumArt(NTS.into(), 0)).await {
+            MpdResponse::Ack { code, .. } => assert_eq!(code, ACK_ERROR_NO_EXIST),
+            other => panic!("expected no-exist ACK, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_cover_wrong_qid_acks_no_exist() {
+        // A cover keyed to a DIFFERENT qid must not serve for the current stream.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_recognized_cover(QueueId(qid.wrapping_add(999)), "https://x/wrong.jpg".into());
+        match h.handle(MpdCommand::AlbumArt(NTS.into(), 0)).await {
+            MpdResponse::Ack { code, .. } => assert_eq!(code, ACK_ERROR_NO_EXIST),
+            other => panic!("expected no-exist ACK, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_cover_uri_mismatch_acks_no_exist() {
+        // A request uri that is not the current stream's url must not serve its cover
+        // (a stale client asking for a previous stream's art gets no-exist).
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_recognized_cover(QueueId(qid), "https://is1.example/hq.jpg".into());
+        // Even with a cover cached, a mismatched uri gates out before any lookup.
+        h.cover_cache
+            .put("remote/https://is1.example/hq.jpg".into(), FAKE_PNG.to_vec());
+        match h
+            .handle(MpdCommand::AlbumArt("https://other.example/live".into(), 0))
+            .await
+        {
+            MpdResponse::Ack { code, .. } => assert_eq!(code, ACK_ERROR_NO_EXIST),
+            other => panic!("expected no-exist ACK, got {other:?}"),
+        }
     }
 
     // ── saved internet radio stations (task cchte88) ───────────────────────
