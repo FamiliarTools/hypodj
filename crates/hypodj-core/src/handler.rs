@@ -3605,17 +3605,26 @@ impl HypodjHandler {
         // never races a SkipLoad. Intent no longer gates this drop - the install closure
         // still distinguishes the baseline-commit behavior separately above.
         if res.is_ok() {
-            // Also drop a now-stale continuation-warm SLOT (slice 2): the drop_warm below
-            // is one actor playlist-clear that discards ANY parked entry, the superseded
-            // skip target AND a prefetched continuation station alike. A continuation slot
-            // left marked `warmed` here would then claim a warm this drop just cleared, so
-            // take the slot (its held TimerGuard RAII-cancels the armed timer) under a
-            // short lock BEFORE the await, keeping the handler slot honest with the actor.
-            // A resume re-arms via its follow-on reschedule; other fades (setvol / knob /
-            // wake / wind-down) fall back to the slice-1 cold-start on the next drain.
-            let stale = self.state.lock().unwrap().pending_continuation_warm.take();
-            drop(stale);
+            // One actor playlist-clear discards ANY parked entry: the superseded skip
+            // target (pending_skip was cleared above) AND, if a continuation warm had
+            // already landed, its prefetched station alike. Done FIRST so no stale entry
+            // sits parked to auto-advance behind the still-playing current track.
             let _ = self.player.drop_warm().await;
+            // Then RE-EVALUATE the continuation warm (slice 2) rather than merely dropping
+            // it. A bare slot-take here (the earlier funnel) killed a still-PENDING warm
+            // (`warmed` == false, nothing parked on the actor) with NO re-arm, so a single
+            // mid-track volume gesture - setvol glide / knob, which have no follow-on
+            // reschedule of their own and BOTH route through here - turned the next EOF into
+            // a cold ICY-connect gap instead of the gapless warmed handoff. reschedule
+            // disarms first (its TimerGuard RAII-cancels the armed timer; drops a warm the
+            // drop_warm above already cleared - idempotent - keeping the handler honest with
+            // the actor for the `warmed` == true case) then race-safely RE-ARMS a fresh
+            // timer when the predicate still holds. So a volume gesture PRESERVES gaplessness
+            // on a pending warm while a warmed slot is still correctly superseded and re-armed.
+            // Self-gating: a non-drain / paused / stream boundary (or a follow-on disarm, as
+            // in pause_with_fade) arms nothing. Holds no std lock across the await and never
+            // touches the FadeSlot, so it is re-entrancy-safe from this post-supersede path.
+            self.reschedule_continuation_warm().await;
         }
         res
     }
@@ -8314,6 +8323,132 @@ mod tests {
             h.state.lock().unwrap().pending_continuation_warm.is_some(),
             "resume re-arms the continuation warm from the resumed position"
         );
+    }
+
+    // REGRESSION (fade-install funnel): a mid-track SETVOL glide during a PENDING warm
+    // (armed but not yet warmed - nothing parked on the actor) must RE-ARM the warm, not
+    // silently kill it. The earlier funnel took the slot unconditionally with NO re-arm, so
+    // a single volume gesture (setvol / knob have no follow-on reschedule of their own)
+    // turned the next EOF into a cold ICY-connect gap. The re-armed slot is a FRESH un-warmed
+    // timer that stays LIVE and still fires at its LEAD deadline -> the handoff stays gapless.
+    #[tokio::test(start_paused = true)]
+    async fn setvol_glide_preserves_and_rearms_pending_continuation_warm() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((h, probe, mut fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.note_elapsed_ms(10_000); // 10s in -> LEAD deadline at 200 - 10 - 45 = 145s (pending)
+        h.reschedule_continuation_warm().await;
+        let first_id = {
+            let st = h.state.lock().unwrap();
+            let w = st.pending_continuation_warm.as_ref().expect("a pending warm is armed");
+            assert!(!w.warmed, "pending, not warmed (nothing parked on the actor yet)");
+            w.timer_id
+        };
+
+        // A mid-track volume gesture: glide to 30. The fade installs and, at the funnel,
+        // reschedule RE-ARMS the pending warm instead of dropping it (the regression).
+        h.handle(MpdCommand::SetVol(30)).await;
+        h.wait_for_fade().await;
+        let second_id = {
+            let st = h.state.lock().unwrap();
+            let w = st
+                .pending_continuation_warm
+                .as_ref()
+                .expect("the pending warm SURVIVES the volume gesture (re-armed, not killed)");
+            assert!(!w.warmed, "still a fresh un-warmed timer");
+            w.timer_id
+        };
+        assert_ne!(second_id, first_id, "the funnel re-armed a FRESH timer (race-safe reschedule)");
+
+        // The re-armed timer is genuinely LIVE: cross the LEAD deadline and it fires (the old
+        // cancelled id tombstones off the live-set and never fires), the fire hook prefetches,
+        // the slot flips warmed -> the EOF handoff is gapless, not a cold ICY connect.
+        tokio::time::advance(Duration::from_secs(150)).await;
+        tokio::task::yield_now().await;
+        let id = fire_rx.recv().await.expect("the re-armed warm timer fires at its LEAD deadline");
+        assert_eq!(id, second_id, "only the LIVE re-armed timer fires (the killed one tombstoned)");
+        h.note_elapsed_ms(155_000); // inside the LEAD, not the "remaining grew" rearm branch
+        h.on_continuation_warm_fire(id).await;
+        assert_eq!(
+            probe.prefetch_continuation.load(Relaxed),
+            1,
+            "the re-armed timer prefetches the station -> gapless landing, not a cold start"
+        );
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.as_ref().is_some_and(|w| w.warmed),
+            "the slot flips warmed after the prefetch Ok"
+        );
+    }
+
+    // REGRESSION (fade-install funnel), KNOB variant: the volume Knob routes through the SAME
+    // start_fade_spec funnel as setvol, so a knob detent during a PENDING warm must likewise
+    // RE-ARM it (fresh un-warmed timer), never leave the next EOF a cold start.
+    #[tokio::test(start_paused = true)]
+    async fn knob_step_preserves_and_rearms_pending_continuation_warm() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.note_elapsed_ms(10_000);
+        h.reschedule_continuation_warm().await;
+        let first_id = h.state.lock().unwrap().pending_continuation_warm.as_ref().unwrap().timer_id;
+
+        // A knob detent DOWN from the default 0 dB steps to the -3 dB rung via knob_step_to,
+        // through start_fade_spec -> the funnel.
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        h.wait_for_fade().await;
+        let st = h.state.lock().unwrap();
+        let w = st
+            .pending_continuation_warm
+            .as_ref()
+            .expect("the pending warm SURVIVES the knob detent (re-armed, not killed)");
+        assert!(!w.warmed, "a fresh un-warmed timer");
+        assert_ne!(w.timer_id, first_id, "the funnel re-armed a FRESH timer");
+    }
+
+    // WARMED slot handled correctly by the funnel: a mid-track volume gesture over a slot
+    // that had ALREADY warmed (a station prefetched + parked on the actor) drops that stale
+    // actor prefetch (honesty vs the actor) AND re-arms a FRESH un-warmed timer - never a
+    // stale parked warm left to bleed, never a dishonest `warmed` slot claiming an entry the
+    // drop just cleared. This preserves the actor-honesty fix e68980f landed for warmed slots.
+    #[tokio::test(start_paused = true)]
+    async fn setvol_glide_over_warmed_slot_drops_actor_prefetch_and_rearms() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 500, NTS);
+        let drops_before = probe.drop.load(Relaxed);
+
+        h.handle(MpdCommand::SetVol(30)).await;
+        h.wait_for_fade().await;
+
+        assert!(
+            probe.drop.load(Relaxed) > drops_before,
+            "the stale warmed prefetch is dropped on the actor (no bleed behind the current)"
+        );
+        let st = h.state.lock().unwrap();
+        let w = st
+            .pending_continuation_warm
+            .as_ref()
+            .expect("the funnel re-arms a fresh warm behind the still-draining current");
+        assert!(!w.warmed, "the re-armed slot is a FRESH un-warmed timer, not the stale landed one");
+        assert_ne!(w.qid, 500, "the re-armed slot is not the stale warm's qid");
     }
 
     // FIRE RE-ARMS when the remaining GREW past LEAD + slack (a backward seek / pause-
