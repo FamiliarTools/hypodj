@@ -56,6 +56,17 @@ pub struct RecognizedTrack {
     pub title: Option<String>,
     /// The album name, read from the `SONG` section's `Album` metadata row.
     pub album: Option<String>,
+    /// The release date, read from the `SONG` section's `Released` row. Shazam emits
+    /// either a bare year ("1999") or a full date; passed through verbatim because
+    /// MPD's `Date` tag accepts both.
+    pub released: Option<String>,
+    /// The record label, read from the `SONG` section's `Label` row.
+    pub label: Option<String>,
+    /// The primary genre (`track.genres.primary`).
+    pub genre: Option<String>,
+    /// The recording's ISRC (`track.isrc`), the stable identifier that lets a caller
+    /// match the hit back to a library entry.
+    pub isrc: Option<String>,
     /// The Shazam/Apple cover-art HTTPS URL (prefers the HQ variant). A remote URL,
     /// not local bytes; surfaced toward the dj-gui art pane as an extension field.
     pub cover_url: Option<String>,
@@ -215,6 +226,15 @@ struct TrackJson {
     sections: Vec<SectionJson>,
     /// Cover-art URLs.
     images: Option<ImagesJson>,
+    /// Genre block; only `primary` is a plain string worth surfacing.
+    genres: Option<GenresJson>,
+    /// The recording's ISRC.
+    isrc: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct GenresJson {
+    primary: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -261,19 +281,28 @@ pub fn parse_recognize_json(stdout: &str) -> Option<RecognizedTrack> {
     let resp: RecognizeResponse = serde_json::from_str(trimmed).ok()?;
     let track = resp.track?;
 
-    // Album = the `text` of the "Album" row inside the SONG-typed section.
-    let album = track
-        .sections
-        .iter()
-        .filter(|s| s.section_type.as_deref() == Some("SONG"))
-        .flat_map(|s| &s.metadata)
-        .find(|m| m.title.as_deref() == Some("Album"))
-        .and_then(|m| non_blank(m.text.clone()));
+    // The SONG-typed section carries the Album / Label / Released rows as
+    // title/text pairs; look each one up by its row label.
+    let song_row = |label: &str| {
+        track
+            .sections
+            .iter()
+            .filter(|s| s.section_type.as_deref() == Some("SONG"))
+            .flat_map(|s| &s.metadata)
+            .find(|m| m.title.as_deref() == Some(label))
+            .and_then(|m| non_blank(m.text.clone()))
+    };
+    let album = song_row("Album");
+    let label = song_row("Label");
+    let released = song_row("Released");
 
     // Prefer the HQ cover, fall back to the standard one.
     let cover_url = track
         .images
         .and_then(|i| non_blank(i.coverarthq).or_else(|| non_blank(i.coverart)));
+
+    let genre = track.genres.and_then(|g| non_blank(g.primary));
+    let isrc = non_blank(track.isrc);
 
     let title = non_blank(track.title);
     let artist = non_blank(track.subtitle);
@@ -281,7 +310,7 @@ pub fn parse_recognize_json(stdout: &str) -> Option<RecognizedTrack> {
         // A track object with no usable text is not a real hit.
         return None;
     }
-    Some(RecognizedTrack { artist, title, album, cover_url })
+    Some(RecognizedTrack { artist, title, album, released, label, genre, isrc, cover_url })
 }
 
 /// The now-playing `Title` line for a recognized track, mirroring the ICY
@@ -323,6 +352,8 @@ mod tests {
           "coverart": "https://is1.example/400x400.jpg",
           "coverarthq": "https://is1.example/hq.jpg"
         },
+        "genres": { "primary": "Dance" },
+        "isrc": "GBARL2400123",
         "key": "12345",
         "share": { "subject": "Blessings - Calvin Harris & Clementine Douglas" }
       }
@@ -336,6 +367,70 @@ mod tests {
         assert_eq!(t.album.as_deref(), Some("Blessings"));
         // Prefers the HQ cover URL over the standard one.
         assert_eq!(t.cover_url.as_deref(), Some("https://is1.example/hq.jpg"));
+        // The rest of the SONG-section rows and the top-level blocks (task 5578wi6):
+        // every field Shazam offers is carried, not just Album.
+        assert_eq!(t.label.as_deref(), Some("Columbia"));
+        assert_eq!(t.released.as_deref(), Some("2024"));
+        assert_eq!(t.genre.as_deref(), Some("Dance"));
+        assert_eq!(t.isrc.as_deref(), Some("GBARL2400123"));
+    }
+
+    #[test]
+    fn parse_recognize_missing_extended_fields_stay_none() {
+        // A minimal hit (no sections / genres / isrc) must degrade to `None` per
+        // field rather than fabricating a label.
+        let t = parse_recognize_json(r#"{"track":{"title":"X","subtitle":"Y"}}"#)
+            .expect("title + artist is a hit");
+        assert_eq!(t.album, None);
+        assert_eq!(t.label, None);
+        assert_eq!(t.released, None);
+        assert_eq!(t.genre, None);
+        assert_eq!(t.isrc, None);
+    }
+
+    /// A VERBATIM (field-for-field, only trimmed of blocks the mapper ignores) songrec
+    /// 0.7.4 payload captured LIVE off SomaFM Seventies on 2026-07-29. Guards the wire
+    /// contract for the extended fields (task 5578wi6) against REAL Shazam output
+    /// rather than a hand-written guess: the `Album`/`Label`/`Released` row labels,
+    /// `genres.primary`, and top-level `isrc` are all exactly as Shazam emits them.
+    const REAL_LIVE_HIT: &str = r#"{"track":{"title":"Hold On","subtitle":"Steve Winwood",
+      "isrc":"GBAAN7700019","genres":{"primary":"Rock"},
+      "images":{"coverart":"https://is1-ssl.mzstatic.com/c/400x400cc.jpg",
+                "coverarthq":"https://is1-ssl.mzstatic.com/hq/400x400cc.jpg"},
+      "sections":[{"type":"SONG","metadata":[
+        {"text":"Steve Winwood","title":"Album"},
+        {"text":"UMC (Universal Music Catalogue)","title":"Label"},
+        {"text":"1977","title":"Released"}]}]}}"#;
+
+    #[test]
+    fn parse_recognize_json_matches_live_shazam_payload() {
+        let t = parse_recognize_json(REAL_LIVE_HIT).expect("a hit");
+        assert_eq!(t.title.as_deref(), Some("Hold On"));
+        assert_eq!(t.artist.as_deref(), Some("Steve Winwood"));
+        assert_eq!(t.album.as_deref(), Some("Steve Winwood"));
+        assert_eq!(t.label.as_deref(), Some("UMC (Universal Music Catalogue)"));
+        assert_eq!(t.released.as_deref(), Some("1977"));
+        assert_eq!(t.genre.as_deref(), Some("Rock"));
+        assert_eq!(t.isrc.as_deref(), Some("GBAAN7700019"));
+        assert_eq!(t.cover_url.as_deref(), Some("https://is1-ssl.mzstatic.com/hq/400x400cc.jpg"));
+    }
+
+    #[test]
+    fn parse_recognize_json_handles_live_hit_with_empty_song_rows() {
+        // ALSO REAL (SomaFM Underground 80s, same capture run): a genuine hit whose
+        // SONG section carries an EMPTY metadata array and a null isrc. Shazam does
+        // this for obscure tracks, so the album/label/released/isrc fields must
+        // degrade to `None` while the hit itself still stands on title + artist.
+        let json = r#"{"track":{"title":"First, Last for Everything (Club Version)",
+          "subtitle":"Endgames","isrc":null,"genres":{"primary":"Dance"},
+          "sections":[{"type":"SONG","metadata":[]}]}}"#;
+        let t = parse_recognize_json(json).expect("still a hit");
+        assert_eq!(t.artist.as_deref(), Some("Endgames"));
+        assert_eq!(t.genre.as_deref(), Some("Dance"));
+        assert_eq!(t.album, None);
+        assert_eq!(t.label, None);
+        assert_eq!(t.released, None);
+        assert_eq!(t.isrc, None);
     }
 
     #[test]

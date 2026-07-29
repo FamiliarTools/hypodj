@@ -179,6 +179,11 @@ pub fn item_metadata(item: &CurrentItem, client: &SubsonicClient) -> Metadata {
 /// is the recognized/ICY now-playing when present, else the queued title, else the URL;
 /// the station (icy-name / recognized station) rides `xesam:artist`; a recognized cover
 /// URL passes straight through as `mpris:artUrl`. `xesam:url` is always the raw URL.
+/// Trim-empty overlay fields never become a visible MPRIS label.
+fn non_blank(s: Option<&str>) -> Option<&str> {
+    s.filter(|v| !v.trim().is_empty())
+}
+
 fn stream_metadata(
     m: &mut Metadata,
     url: &str,
@@ -186,11 +191,26 @@ fn stream_metadata(
     meta: Option<&StreamMeta>,
     cover_url: Option<&str>,
 ) {
-    let now_playing = meta.and_then(|mm| mm.title.as_deref()).filter(|t| !t.trim().is_empty());
-    let shown = now_playing.unwrap_or(if title.is_empty() { url } else { title });
+    // A RECOGNIZED hit carries split tags (task 5578wi6): prefer the bare track title
+    // over the crammed "Artist - Title" line and put the real artist in xesam:artist,
+    // so the GNOME widget stops reading "Unknown artist" next to a hyphenated title.
+    let recognized_title = non_blank(meta.and_then(|mm| mm.track_title.as_deref()));
+    let now_playing = non_blank(meta.and_then(|mm| mm.title.as_deref()));
+    let shown = recognized_title
+        .or(now_playing)
+        .unwrap_or(if title.is_empty() { url } else { title });
     m.set_title(Some(shown.to_string()));
-    if let Some(station) = meta.and_then(|mm| mm.name.as_deref()).filter(|n| !n.trim().is_empty()) {
-        m.set_artist(Some([station.to_string()]));
+    // xesam:artist is the recognized performer when known, else the station identity
+    // (icy-name), which is the best "who is playing this" a bare stream can offer.
+    let station = non_blank(meta.and_then(|mm| mm.name.as_deref()));
+    if let Some(artist) = non_blank(meta.and_then(|mm| mm.artist.as_deref())).or(station) {
+        m.set_artist(Some([artist.to_string()]));
+    }
+    if let Some(album) = non_blank(meta.and_then(|mm| mm.album.as_deref())) {
+        m.set_album(Some(album.to_string()));
+    }
+    if let Some(genre) = non_blank(meta.and_then(|mm| mm.genre.as_deref())) {
+        m.set_genre(Some([genre.to_string()]));
     }
     m.set_url(Some(url.to_string()));
     if let Some(cover) = cover_url {
@@ -649,6 +669,7 @@ mod tests {
             stream_meta: Some(StreamMeta {
                 name: Some("NTS 1".to_string()),
                 title: Some("Floating Points - Track".to_string()),
+                ..Default::default()
             }),
             cover_url: Some("https://is1.example/hq.jpg".to_string()),
         };
@@ -669,5 +690,65 @@ mod tests {
             "mpris:artUrl passes the recognized Shazam cover through"
         );
         assert_eq!(m.url().as_deref(), Some(url), "xesam:url stays the raw stream URL");
+    }
+
+    #[test]
+    fn recognized_split_tags_beat_the_crammed_line_and_station() {
+        // THE screenshot bug (task 5578wi6): the widget showed title
+        // "Ron Trent - YNF (You Need Faith)" beside "Unknown artist", because the
+        // recognized artist was crammed into the title line and xesam:artist only ever
+        // carried the station (absent for a no-ICY mixtape). With the split tags the
+        // bare track title rides xesam:title and the REAL artist rides xesam:artist.
+        let Some(client) = test_client() else { return };
+        let url = "https://stream-mixtape-geo.ntslive.net/mixtape5";
+        let item = CurrentItem {
+            mpd_id: 4,
+            entry: QueueEntry::Stream { url: url.to_string(), title: url.to_string() },
+            stream_meta: Some(StreamMeta {
+                name: None,
+                title: Some("Ron Trent - YNF (You Need Faith)".to_string()),
+                artist: Some("Ron Trent".to_string()),
+                track_title: Some("YNF (You Need Faith)".to_string()),
+                album: Some("Prescription Classics".to_string()),
+                genre: Some("House".to_string()),
+                ..Default::default()
+            }),
+            cover_url: None,
+        };
+        let m = item_metadata(&item, &client);
+        assert_eq!(
+            m.title(),
+            Some("YNF (You Need Faith)"),
+            "xesam:title is the BARE recognized title, not the crammed artist - title line"
+        );
+        assert_eq!(
+            m.artist(),
+            Some(vec!["Ron Trent".to_string()]),
+            "xesam:artist is the recognized performer, never 'Unknown artist'"
+        );
+        assert_eq!(m.album().as_deref(), Some("Prescription Classics"));
+        assert_eq!(m.genre(), Some(vec!["House".to_string()]));
+    }
+
+    #[test]
+    fn station_still_fills_artist_when_nothing_was_recognized() {
+        // Regression guard: with only ICY (no recognized artist) the station keeps
+        // riding xesam:artist exactly as before.
+        let Some(client) = test_client() else { return };
+        let url = "https://stream.example/icy";
+        let item = CurrentItem {
+            mpd_id: 5,
+            entry: QueueEntry::Stream { url: url.to_string(), title: url.to_string() },
+            stream_meta: Some(StreamMeta {
+                name: Some("SomaFM".to_string()),
+                title: Some("Some Band - Some Song".to_string()),
+                ..Default::default()
+            }),
+            cover_url: None,
+        };
+        let m = item_metadata(&item, &client);
+        assert_eq!(m.title(), Some("Some Band - Some Song"));
+        assert_eq!(m.artist(), Some(vec!["SomaFM".to_string()]));
+        assert!(m.album().is_none(), "ICY carries no album");
     }
 }
