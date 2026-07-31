@@ -148,10 +148,29 @@ pub enum PlayerEvent {
 /// current now-playing line (icy-title, an "Artist - Track" string). Either may be
 /// absent - a stream can advertise one without the other. Mirrors real MPD, which
 /// puts the station in `Name:` and the now-playing in `Title:`.
+///
+/// The SPLIT tag fields below carry a RECOGNIZED hit's structured metadata (task
+/// 5578wi6). ICY only ever yields `name`/`title`, so they stay `None` on that path;
+/// a songrec hit fills them so `currentsong` can emit real `Artist`/`Album`/`Date`/
+/// `Genre` tags instead of collapsing the artist into the `Title` line (which is
+/// what left MPRIS clients showing "Unknown artist").
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StreamMeta {
     pub name: Option<String>,
     pub title: Option<String>,
+    /// The recognized performing artist, for the `Artist` tag.
+    pub artist: Option<String>,
+    /// The recognized track title WITHOUT the artist prefix, for the `Title` tag
+    /// when a split rendering is wanted.
+    pub track_title: Option<String>,
+    /// The recognized album, for the `Album` tag.
+    pub album: Option<String>,
+    /// The recognized release year/date, for the `Date` tag.
+    pub date: Option<String>,
+    /// The recognized primary genre, for the `Genre` tag.
+    pub genre: Option<String>,
+    /// The recognized record label, for the `Label` tag.
+    pub label: Option<String>,
 }
 
 /// Commands sent INTO the player actor. Each carries a `oneshot` for its reply,
@@ -1698,7 +1717,7 @@ where
     }
     match (name, title) {
         (None, None) => None,
-        (name, title) => Some(StreamMeta { name, title }),
+        (name, title) => Some(StreamMeta { name, title, ..Default::default() }),
     }
 }
 
@@ -2117,7 +2136,7 @@ mod tests {
                     Ok(Some(PlayerEvent::StreamMetadata { queue_id, name, title })) => {
                         assert_eq!(queue_id, Some(QueueId(1)), "metadata is stamped with the latched qid");
                         if name.is_some() || title.is_some() {
-                            got = Some(StreamMeta { name, title });
+                            got = Some(StreamMeta { name, title, ..Default::default() });
                             break;
                         }
                     }

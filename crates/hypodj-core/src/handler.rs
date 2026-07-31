@@ -3658,9 +3658,20 @@ impl HypodjHandler {
     /// interior mutability (`&self`), never `&mut self`. Keyed by the latched
     /// identity so the slot can only ever decorate the entry it came from.
     pub(crate) fn set_stream_meta(&self, queue_id: QueueId, name: Option<String>, title: Option<String>) {
+        self.set_stream_meta_full(queue_id, StreamMeta { name, title, ..Default::default() });
+    }
+
+    /// Store a FULL [`StreamMeta`] overlay (station + now-playing line + the split
+    /// Artist/Album/Date/Genre/Label tags a songrec hit carries, task 5578wi6) for the
+    /// raw stream identified by `queue_id`. The ICY path goes through the narrower
+    /// [`Self::set_stream_meta`], which leaves the split tags `None`. Same lock
+    /// discipline as that method: the std state lock is held ONLY for the field write
+    /// and dropped BEFORE `notify_change`, never across an await; mutated through
+    /// `&self` interior mutability.
+    pub(crate) fn set_stream_meta_full(&self, queue_id: QueueId, meta: StreamMeta) {
         {
             let mut st = self.state.lock().unwrap();
-            st.stream_meta = Some((queue_id, StreamMeta { name, title }));
+            st.stream_meta = Some((queue_id, meta));
         }
         self.notify_change();
     }
@@ -3955,10 +3966,25 @@ impl HypodjHandler {
         if let Some(url) = &track.cover_url {
             self.set_recognized_cover(qid, url.clone());
         }
-        // Surface artist/title into the same Name/Title path as ICY. Preserve the
-        // station Name if one was already latched; the recognized now-playing rides
-        // Title. set_stream_meta wakes idling clients (notify_change).
-        self.set_stream_meta(qid, existing_name, now_playing.clone());
+        // Surface the hit into the same Name/Title path as ICY, PLUS the split
+        // Artist/Album/Date/Genre/Label tags the recognition carries (task 5578wi6) so
+        // clients get a real artist instead of "Unknown artist" beside a crammed
+        // "Artist - Title" line. Preserve the station Name if one was already latched;
+        // the recognized now-playing still rides Title (the ICY convention every
+        // existing client already reads). Wakes idling clients (notify_change).
+        self.set_stream_meta_full(
+            qid,
+            StreamMeta {
+                name: existing_name,
+                title: now_playing.clone(),
+                artist: track.artist.clone(),
+                track_title: track.title.clone(),
+                album: track.album.clone(),
+                date: track.released.clone(),
+                genre: track.genre.clone(),
+                label: track.label.clone(),
+            },
+        );
         // Rearm the cadence at the interval and record own-hit provenance (so the next
         // fire does not mistake the title WE wrote for a fresh ICY title and disarm).
         self.rearm_auto_identify_after_attempt(qid, true, now_playing.clone());
@@ -7358,16 +7384,45 @@ fn song_pairs(item: &QueueItem, pos: usize) -> Vec<(String, String)> {
 /// only one of the two still surfaces what it has. The caller gates this to a
 /// [`QueueEntry::Stream`] whose id matches the stored slot, so a library song can
 /// never inherit a station's label.
+/// A trim-empty overlay field is not a usable label, so it never reaches a pair.
+fn non_blank_str(s: Option<&str>) -> Option<&str> {
+    s.filter(|v| !v.trim().is_empty())
+}
+
 fn apply_stream_meta(pairs: &mut Vec<(String, String)>, meta: &StreamMeta) {
-    if let Some(title) = &meta.title {
+    // A RECOGNIZED hit emits its own `Artist` pair below, so `Title` must be the BARE
+    // track title - otherwise every client that composes "Artist - Title" (ncmpcpp's
+    // default format, the dj now card, the dj-gui headline) prints the artist TWICE.
+    // ICY leaves `track_title` None, so the crammed icy-title rides `Title` unchanged.
+    let shown = non_blank_str(meta.track_title.as_deref())
+        .or_else(|| non_blank_str(meta.title.as_deref()));
+    if let Some(title) = shown {
         if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == "Title") {
-            slot.1 = title.clone();
+            slot.1 = title.to_string();
         } else {
-            pairs.push(("Title".to_string(), title.clone()));
+            pairs.push(("Title".to_string(), title.to_string()));
         }
     }
     if let Some(name) = &meta.name {
         pairs.push(("Name".to_string(), name.clone()));
+    }
+    // The SPLIT tags a recognized hit carries (task 5578wi6). ICY leaves these `None`,
+    // so an ICY-only stream renders exactly as before. Each replaces the `song_pairs`
+    // placeholder when one exists, else is appended - so a stream stops reporting
+    // "Unknown artist" once songrec has named the track.
+    for (key, value) in [
+        ("Artist", &meta.artist),
+        ("Album", &meta.album),
+        ("Date", &meta.date),
+        ("Genre", &meta.genre),
+        ("Label", &meta.label),
+    ] {
+        let Some(value) = value else { continue };
+        if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == key) {
+            slot.1 = value.clone();
+        } else {
+            pairs.push((key.to_string(), value.clone()));
+        }
     }
 }
 
@@ -7590,6 +7645,18 @@ fn identify_hit_response(
     }
     if let Some(al) = &track.album {
         b = b.pair("identify_album", al.as_str());
+    }
+    if let Some(d) = &track.released {
+        b = b.pair("identify_date", d.as_str());
+    }
+    if let Some(g) = &track.genre {
+        b = b.pair("identify_genre", g.as_str());
+    }
+    if let Some(l) = &track.label {
+        b = b.pair("identify_label", l.as_str());
+    }
+    if let Some(i) = &track.isrc {
+        b = b.pair("identify_isrc", i.as_str());
     }
     if let Some(c) = &track.cover_url {
         b = b.pair("identify_cover", c.as_str());
@@ -13028,6 +13095,7 @@ mod tests {
             title: Some("Blessings".into()),
             album: Some("Blessings".into()),
             cover_url: Some("https://is1.example/hq.jpg".into()),
+            ..Default::default()
         };
         let np = crate::recognize::now_playing_title(&track);
         assert_eq!(np.as_deref(), Some("Calvin Harris & Clementine Douglas - Blessings"));
@@ -13764,6 +13832,100 @@ mod tests {
         assert!(!is_loopback_http_url("not a url"));
     }
 
+    // ── recognized split tags on currentsong (task 5578wi6) ────────────────
+
+    #[test]
+    fn apply_stream_meta_emits_recognized_split_tags() {
+        // A songrec hit fills the split fields, so currentsong reports a REAL Artist/
+        // Album/Date/Genre/Label instead of collapsing the artist into Title (what
+        // left the MPRIS widget showing "Unknown artist").
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), NTS.to_string()),
+        ];
+        apply_stream_meta(
+            &mut pairs,
+            &StreamMeta {
+                name: Some("NTS".to_string()),
+                title: Some("Ron Trent - YNF".to_string()),
+                artist: Some("Ron Trent".to_string()),
+                track_title: Some("YNF".to_string()),
+                album: Some("Warm".to_string()),
+                date: Some("1999".to_string()),
+                genre: Some("House".to_string()),
+                label: Some("Prescription".to_string()),
+            },
+        );
+        let get = |k: &str| {
+            pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
+        };
+        // Title is the BARE track title, NOT the crammed "Artist - Title" line: the
+        // Artist pair below carries the performer, so a client composing "Artist -
+        // Title" (ncmpcpp's default) must not end up printing the artist twice.
+        assert_eq!(get("Title").as_deref(), Some("YNF"));
+        assert_eq!(get("Name").as_deref(), Some("NTS"));
+        // The split tags are the new surface.
+        assert_eq!(get("Artist").as_deref(), Some("Ron Trent"));
+        assert_eq!(get("Album").as_deref(), Some("Warm"));
+        assert_eq!(get("Date").as_deref(), Some("1999"));
+        assert_eq!(get("Genre").as_deref(), Some("House"));
+        assert_eq!(get("Label").as_deref(), Some("Prescription"));
+    }
+
+    #[test]
+    fn apply_stream_meta_icy_only_emits_no_split_tags() {
+        // The ICY path leaves the split fields None, so an ICY-only stream renders
+        // EXACTLY as before this change (no empty Artist/Album pairs invented).
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), NTS.to_string()),
+        ];
+        apply_stream_meta(
+            &mut pairs,
+            &StreamMeta {
+                name: Some("NTS".to_string()),
+                title: Some("Live Show".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !pairs.iter().any(|(k, _)| matches!(
+                k.as_str(),
+                "Artist" | "Album" | "Date" | "Genre" | "Label"
+            )),
+            "ICY-only overlay must not invent split tags: {pairs:?}"
+        );
+        // And the crammed icy-title still rides Title verbatim - ICY has no bare
+        // track title to fall back to, so nothing about that path changes.
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some("Live Show")
+        );
+    }
+
+    #[test]
+    fn apply_stream_meta_falls_back_to_crammed_line_without_track_title() {
+        // A hit that yielded an ARTIST but no title: `now_playing_title` returns the
+        // artist alone and `track_title` is None, so Title falls back to the stored
+        // line rather than dropping out of the response entirely.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), NTS.to_string()),
+        ];
+        apply_stream_meta(
+            &mut pairs,
+            &StreamMeta {
+                title: Some("Ron Trent".to_string()),
+                artist: Some("Ron Trent".to_string()),
+                track_title: None,
+                ..Default::default()
+            },
+        );
+        let get = |k: &str| pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("Title"), Some("Ron Trent"));
+        assert_eq!(get("Artist"), Some("Ron Trent"));
+    }
+
     // ── saved internet radio stations (task cchte88) ───────────────────────
 
     #[test]
@@ -13776,7 +13938,7 @@ mod tests {
         };
         let meta = (
             QueueId(7),
-            StreamMeta { name: Some("NTS 1".to_string()), title: Some("Floating Points".to_string()) },
+            StreamMeta { name: Some("NTS 1".to_string()), title: Some("Floating Points".to_string()), ..Default::default() },
         );
         assert_eq!(resolve_station_name(NTS, Some(&item), Some(&meta)), "NTS 1");
     }
@@ -13790,11 +13952,11 @@ mod tests {
             id: 7,
             entry: QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
         };
-        let no_name = (QueueId(7), StreamMeta { name: None, title: None });
+        let no_name = (QueueId(7), StreamMeta { name: None, title: None, ..Default::default() });
         assert_eq!(resolve_station_name(NTS, Some(&item), Some(&no_name)), NTS);
         assert_eq!(resolve_station_name(NTS, Some(&item), None), NTS);
         // An empty/whitespace icy-name must not become the label either.
-        let blank = (QueueId(7), StreamMeta { name: Some("   ".to_string()), title: None });
+        let blank = (QueueId(7), StreamMeta { name: Some("   ".to_string()), title: None, ..Default::default() });
         assert_eq!(resolve_station_name(NTS, Some(&item), Some(&blank)), NTS);
     }
 
@@ -13807,12 +13969,12 @@ mod tests {
             id: 7,
             entry: QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
         };
-        let wrong_qid = (QueueId(99), StreamMeta { name: Some("Wrong".to_string()), title: None });
+        let wrong_qid = (QueueId(99), StreamMeta { name: Some("Wrong".to_string()), title: None, ..Default::default() });
         assert_eq!(resolve_station_name(NTS, Some(&stream), Some(&wrong_qid)), NTS);
 
         // A library-song current never yields a station name.
         let song = QueueItem { id: 7, entry: QueueEntry::Song(playlist_test_song("lib")) };
-        let meta = (QueueId(7), StreamMeta { name: Some("X".to_string()), title: None });
+        let meta = (QueueId(7), StreamMeta { name: Some("X".to_string()), title: None, ..Default::default() });
         assert_eq!(resolve_station_name(NTS, Some(&song), Some(&meta)), NTS);
 
         // A stream playing a DIFFERENT url than the one being saved falls back.
