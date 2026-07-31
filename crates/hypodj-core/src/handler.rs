@@ -7384,12 +7384,23 @@ fn song_pairs(item: &QueueItem, pos: usize) -> Vec<(String, String)> {
 /// only one of the two still surfaces what it has. The caller gates this to a
 /// [`QueueEntry::Stream`] whose id matches the stored slot, so a library song can
 /// never inherit a station's label.
+/// A trim-empty overlay field is not a usable label, so it never reaches a pair.
+fn non_blank_str(s: Option<&str>) -> Option<&str> {
+    s.filter(|v| !v.trim().is_empty())
+}
+
 fn apply_stream_meta(pairs: &mut Vec<(String, String)>, meta: &StreamMeta) {
-    if let Some(title) = &meta.title {
+    // A RECOGNIZED hit emits its own `Artist` pair below, so `Title` must be the BARE
+    // track title - otherwise every client that composes "Artist - Title" (ncmpcpp's
+    // default format, the dj now card, the dj-gui headline) prints the artist TWICE.
+    // ICY leaves `track_title` None, so the crammed icy-title rides `Title` unchanged.
+    let shown = non_blank_str(meta.track_title.as_deref())
+        .or_else(|| non_blank_str(meta.title.as_deref()));
+    if let Some(title) = shown {
         if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == "Title") {
-            slot.1 = title.clone();
+            slot.1 = title.to_string();
         } else {
-            pairs.push(("Title".to_string(), title.clone()));
+            pairs.push(("Title".to_string(), title.to_string()));
         }
     }
     if let Some(name) = &meta.name {
@@ -13848,8 +13859,10 @@ mod tests {
         let get = |k: &str| {
             pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone())
         };
-        // The ICY-convention lines are unchanged.
-        assert_eq!(get("Title").as_deref(), Some("Ron Trent - YNF"));
+        // Title is the BARE track title, NOT the crammed "Artist - Title" line: the
+        // Artist pair below carries the performer, so a client composing "Artist -
+        // Title" (ncmpcpp's default) must not end up printing the artist twice.
+        assert_eq!(get("Title").as_deref(), Some("YNF"));
         assert_eq!(get("Name").as_deref(), Some("NTS"));
         // The split tags are the new surface.
         assert_eq!(get("Artist").as_deref(), Some("Ron Trent"));
@@ -13882,6 +13895,35 @@ mod tests {
             )),
             "ICY-only overlay must not invent split tags: {pairs:?}"
         );
+        // And the crammed icy-title still rides Title verbatim - ICY has no bare
+        // track title to fall back to, so nothing about that path changes.
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some("Live Show")
+        );
+    }
+
+    #[test]
+    fn apply_stream_meta_falls_back_to_crammed_line_without_track_title() {
+        // A hit that yielded an ARTIST but no title: `now_playing_title` returns the
+        // artist alone and `track_title` is None, so Title falls back to the stored
+        // line rather than dropping out of the response entirely.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), NTS.to_string()),
+        ];
+        apply_stream_meta(
+            &mut pairs,
+            &StreamMeta {
+                title: Some("Ron Trent".to_string()),
+                artist: Some("Ron Trent".to_string()),
+                track_title: None,
+                ..Default::default()
+            },
+        );
+        let get = |k: &str| pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("Title"), Some("Ron Trent"));
+        assert_eq!(get("Artist"), Some("Ron Trent"));
     }
 
     // ── saved internet radio stations (task cchte88) ───────────────────────
