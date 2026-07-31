@@ -28,6 +28,7 @@ pub enum Act {
     ScreenAlbums,
     ScreenPlaylists,
     ScreenDj,
+    ScreenFind,
     Down,
     Up,
     Top,
@@ -147,6 +148,7 @@ pub const KEYMAP: &[Binding] = &[
     Binding { matchers: &[Code(KeyCode::F(2))], keys: "F2", group: View, scope: Scope::Global, act: ScreenAlbums, help: "Albums screen" },
     Binding { matchers: &[Code(KeyCode::F(3))], keys: "F3", group: View, scope: Scope::Global, act: ScreenPlaylists, help: "Playlists screen" },
     Binding { matchers: &[Code(KeyCode::F(4))], keys: "F4", group: View, scope: Scope::Global, act: ScreenDj, help: "DJ (Claude Code) screen" },
+    Binding { matchers: &[Code(KeyCode::F(5))], keys: "F5", group: View, scope: Scope::Global, act: ScreenFind, help: "Search screen (library query)" },
     // Navigation.
     Binding { matchers: &[Char('j'), Code(KeyCode::Down), Ctrl('n')], keys: "j / down / C-n", group: Navigation, scope: Scope::Global, act: Down, help: "move cursor down" },
     Binding { matchers: &[Char('k'), Code(KeyCode::Up), Ctrl('p')], keys: "k / up / C-p", group: Navigation, scope: Scope::Global, act: Up, help: "move cursor up" },
@@ -282,7 +284,7 @@ mod tests {
                 "missing a keymap row for {c:?}"
             );
         }
-        for f in 1..=4u8 {
+        for f in 1..=5u8 {
             assert!(
                 KEYMAP.iter().any(|b| b.matchers.iter().any(|m| matches!(m, KeyMatch::Code(KeyCode::F(n)) if *n == f))),
                 "missing F{f}"

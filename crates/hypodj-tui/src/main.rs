@@ -11,6 +11,7 @@
 
 mod album_color;
 mod art;
+mod find;
 mod keymap;
 mod sigil;
 mod state;
@@ -362,6 +363,9 @@ fn show_screen(tx: &Sender<Req>, state: &mut TuiState, screen: Screen) {
     match screen {
         // The DJ pane shows the queue alongside; keep it live-refreshed like Queue.
         Screen::Queue | Screen::Dj => request_refresh(tx, state),
+        // Find sends NOTHING on entry: a query surface with no query has nothing to
+        // ask, so opening the tab is instant and never touches a socket.
+        Screen::Find => {}
         Screen::Albums => {
             if !state.albums.loaded {
                 // Seed Albums from the `newest` smart list (no flat A-Z album index
