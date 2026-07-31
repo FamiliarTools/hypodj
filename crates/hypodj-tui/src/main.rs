@@ -411,6 +411,30 @@ fn show_screen(tx: &Sender<Req>, state: &mut TuiState, screen: Screen) {
 /// Browse response, applied to the target screen's list.
 fn browse_into(tx: &Sender<Req>, state: &mut TuiState, path: String) {
     let target = state.screen;
+    // ENTERING a Find drill from a hit row. The drill is a SEPARATE Browse layered
+    // over the frozen hits, started at depth 0 with an EMPTY stack and pushing
+    // nothing: at depth 0 the "parent path" would be "", and browse_back would
+    // re-fetch that as `lsinfo ""` - the whole artist root - instead of returning to
+    // the hits. The hits are never overwritten, so backing out is free.
+    if state.screen == Screen::Find && !state.find.drilling {
+        state.find.drilling = true;
+        state.find.drill_loading = true;
+        state.find.drill.rows.clear();
+        state.find.drill.stack.clear();
+        state.find.drill.selected = 0;
+        state.find.drill.offset.set(0);
+        state.find.drill.path = path.clone();
+        state.find.drill.title = browse_title(&path);
+        let title = state.find.drill.title.clone();
+        let _ = tx.send(Req::Browse {
+            target,
+            command: format!("lsinfo {}", quote_arg(&path)),
+            path,
+            title,
+            restore_sel: None,
+        });
+        return;
+    }
     let (cur_path, cur_sel) = match state.active_browse() {
         Some(b) => (b.path.clone(), b.selected),
         None => return,
@@ -585,6 +609,15 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             }
         }
         RespKind::Browse { target, rows, path, title, restore_sel } => {
+            // browse_for(Find) returns the drill ONLY while `drilling`, which is the
+            // staleness gate: a drill response that lands after the user already
+            // backed out is dropped here rather than left as stale rows waiting to
+            // flash under the NEXT drill's title. Req::Browse carries no request
+            // identity and Browse::apply latches `loaded`, so without this gate the
+            // late response would silently win.
+            if target == Screen::Find {
+                state.find.drill_loading = false;
+            }
             if let Some(b) = state.browse_for(target) {
                 b.apply(rows, path, title);
                 if let Some(sel) = restore_sel {

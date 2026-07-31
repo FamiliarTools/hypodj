@@ -1122,6 +1122,41 @@ mod tests {
     }
 
     #[test]
+    fn find_drill_keeps_the_query_visible_above_the_browse_list() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.query = "c418".into();
+        s.find.drilling = true;
+        s.find.drill.title = "C418".into();
+        s.find.drill.rows = vec![crate::state::BrowseRow {
+            label: "Minecraft - Volume Alpha".into(), uri: "album/9".into(),
+            is_dir: true, song_count: Some(24),
+        }];
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("find> c418"), "the query that produced this branch stays visible:\n{out}");
+        assert!(out.contains("back to hits"), "and the way back is stated:\n{out}");
+        assert!(out.contains("C418"), "the drill is titled:\n{out}");
+        assert!(out.contains("Minecraft - Volume Alpha"), "and renders as a plain browse list:\n{out}");
+    }
+
+    #[test]
+    fn find_drill_in_flight_shows_a_spinner_not_an_empty_box() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.drilling = true;
+        s.find.drill_loading = true;
+        s.find.drill.title = "C418".into();
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("C418"), "titled while loading:\n{out}");
+        // An empty bordered box carrying the artist name reads as "no albums"
+        // rather than "still loading", which is the one state the inventory missed.
+        assert!(
+            out.contains('|') || out.contains('/') || out.contains('-') || out.contains('\\'),
+            "a spinner frame is drawn:\n{out}"
+        );
+    }
+
+    #[test]
     fn find_tab_is_in_the_strip_and_the_cold_screen_is_typeable() {
         // The tab strip is a hardcoded ARRAY, not a match, so nothing forces a new
         // screen into it: a missed edit ships a working tab that is invisible. This
@@ -2040,6 +2075,18 @@ fn render_find(f: &mut Frame, area: Rect, state: &TuiState) {
     // The drill borrows the ordinary browse renderer, so a drilled-in Find is
     // indistinguishable from the Albums tab.
     if find.drilling {
+        // A drill with nothing yet would otherwise render an empty bordered box
+        // carrying the artist's name for the whole round trip, which reads as "this
+        // artist has no albums" rather than "still loading".
+        if find.drill_loading && find.drill.rows.is_empty() {
+            let frames = ['|', '/', '-', '\\'];
+            let spin = frames[((state.spin_secs * 6.0) as usize) % 4];
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{spin} {}", find.drill.title));
+            f.render_widget(block, list_row);
+            return;
+        }
         render_browse(f, list_row, &find.drill, state, true);
         return;
     }

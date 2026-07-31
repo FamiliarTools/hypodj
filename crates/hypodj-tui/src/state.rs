@@ -946,6 +946,16 @@ impl TuiState {
 
     /// Back out one browse level; only on a browse screen with a non-empty stack.
     fn browse_back(&mut self) -> Option<Intent> {
+        // Backing out of a Find drill returns to the hits, which are still in memory
+        // and were never overwritten - so it costs NO round trip and the query is
+        // preserved by construction. Sending a BrowseBack here would re-fetch
+        // `lsinfo ""`, the whole artist root, because the drill starts at depth 0
+        // with an empty stack.
+        if self.screen == Screen::Find && self.find.drilling && self.find.drill.stack.is_empty() {
+            self.find.drilling = false;
+            self.find.drill_loading = false;
+            return None;
+        }
         match self.active_browse() {
             Some(b) if !b.stack.is_empty() => Some(Intent::BrowseBack),
             _ => None,
@@ -1010,6 +1020,17 @@ impl TuiState {
     /// `o`: OPEN (drill into) the selected browse directory. A song row or the Queue
     /// screen is a no-op (Enter is the play verb there).
     fn open_selected(&mut self) -> Option<Intent> {
+        // A hit row is not a `Browse` row, so claim it before active_browse(). Album
+        // and artist hits drill; a song has nothing to open.
+        if self.screen == Screen::Find && !self.find.drilling {
+            let row = self.find.current_row()?;
+            return match row.kind {
+                crate::find::FindKind::Album | crate::find::FindKind::Artist => {
+                    Some(Intent::BrowseInto(row.uri.clone()))
+                }
+                crate::find::FindKind::Song => None,
+            };
+        }
         let b = self.active_browse()?;
         let row = b.rows.get(b.selected)?;
         if row.is_dir {
@@ -1296,6 +1317,13 @@ impl TuiState {
                     self.find.focus = Focus::Query;
                     None
                 }
+                // Esc in the results half steps UP the ladder to the query line
+                // (out of a drill first). Falling through to the shared BrowseBack
+                // would be a silent no-op here, leaving the key feeling dead.
+                KeyCode::Esc if !self.find.drilling => {
+                    self.find.focus = Focus::Query;
+                    None
+                }
                 _ => None,
             };
         }
@@ -1303,8 +1331,11 @@ impl TuiState {
             // The Esc ladder: out of a drill, then off the query line to the results,
             // then off the screen. Each press makes progress rather than ping-ponging.
             KeyCode::Esc => {
+                // The ladder: out of a drill, then off the screen. Each press makes
+                // progress rather than ping-ponging between two states.
                 if self.find.drilling {
                     self.find.drilling = false;
+                    self.find.drill_loading = false;
                     return None;
                 }
                 self.screen = Screen::Queue;
@@ -1622,6 +1653,94 @@ mod tests {
         }
     }
 
+
+
+    #[test]
+    fn open_drills_an_album_hit_but_a_song_hit_has_nothing_to_open() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![
+            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
+        ];
+        assert_eq!(s.handle_key(ch('o')), Some(Intent::BrowseInto("album/9".into())));
+        s.find.selected = 1;
+        assert_eq!(s.handle_key(ch('o')), None, "a song row has nothing to drill into");
+    }
+
+    #[test]
+    fn backing_out_of_a_drill_costs_no_round_trip_and_keeps_the_hits() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.submitted = "c418".into();
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        s.find.drilling = true;
+        s.find.drill.rows = vec![crate::state::BrowseRow {
+            label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None,
+        }];
+        // `h` must NOT emit a BrowseBack: the drill sits at depth 0 with an empty
+        // stack, so that would re-fetch `lsinfo ""` - the whole artist root.
+        assert_eq!(s.handle_key(ch('h')), None, "no round trip on the way back");
+        assert!(!s.find.drilling);
+        assert_eq!(s.find.hits.rows.len(), 1, "the hits were never overwritten");
+        assert_eq!(s.find.submitted, "c418", "and the query that produced them survives");
+    }
+
+    #[test]
+    fn a_drill_response_that_lands_after_backing_out_is_dropped() {
+        // Req::Browse carries no request identity and Browse::apply latches `loaded`,
+        // so without the `drilling` gate a late response would silently win and sit
+        // there waiting to flash under the NEXT drill's title.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.drilling = false;
+        assert!(s.browse_for(Screen::Find).is_none(), "no drill target while not drilling");
+        s.find.drilling = true;
+        assert!(s.browse_for(Screen::Find).is_some());
+    }
+
+    #[test]
+    fn cursor_keys_move_the_drill_while_drilling_and_the_hits_otherwise() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![
+            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None },
+        ];
+        s.find.drill.rows = vec![
+            crate::state::BrowseRow { label: "x".into(), uri: "song/8".into(), is_dir: false, song_count: None },
+            crate::state::BrowseRow { label: "y".into(), uri: "song/9".into(), is_dir: false, song_count: None },
+        ];
+        s.find.drilling = true;
+        s.handle_key(ch('j'));
+        assert_eq!(s.find.drill.selected, 1, "the DRILL cursor moved");
+        assert_eq!(s.find.selected, 0, "the hit cursor stayed put");
+        assert_eq!(s.selected, 0, "and the queue cursor never moved");
+        s.find.drilling = false;
+        s.handle_key(ch('j'));
+        assert_eq!(s.find.selected, 1, "off-drill, `j` moves the hits again");
+    }
+
+    #[test]
+    fn slash_inside_a_drill_searches_the_drill_rows() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.hits.rows = vec![];
+        s.find.drill.rows = vec![
+            crate::state::BrowseRow { label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None },
+        ];
+        s.find.drilling = true;
+        assert_eq!(s.active_labels(), vec!["Sweden".to_string()]);
+    }
 
     #[test]
     fn typing_in_the_find_query_produces_no_intent_at_all() {
