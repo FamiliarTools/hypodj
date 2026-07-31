@@ -590,27 +590,41 @@ impl NullPlayer {
                         }
                         let _ = reply.send(Ok(()));
                     }
+                    // Both transport arms mirror the mpv actor's [`holds_entry`] gate:
+                    // pausing / resuming an actor that holds NOTHING publishes no play
+                    // state at all, so the headless backend cannot claim Paused or
+                    // Playing over an empty deck either.
                     PlayerCommand::Pause(reply) => {
-                        let _ = state_tx.send(PlayState::Paused);
+                        let holds = holds_entry(&current, &current_qid);
+                        if holds {
+                            let _ = state_tx.send(PlayState::Paused);
+                        }
                         let _ = reply.send(Ok(()));
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(
-                                PlayState::Paused,
-                                current.clone(),
-                                current_qid,
-                            ))
-                            .await;
+                        if holds {
+                            let _ = evt_tx
+                                .send(PlayerEvent::StateChanged(
+                                    PlayState::Paused,
+                                    current.clone(),
+                                    current_qid,
+                                ))
+                                .await;
+                        }
                     }
                     PlayerCommand::Resume(reply) => {
-                        let _ = state_tx.send(PlayState::Playing);
+                        let holds = holds_entry(&current, &current_qid);
+                        if holds {
+                            let _ = state_tx.send(PlayState::Playing);
+                        }
                         let _ = reply.send(Ok(()));
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(
-                                PlayState::Playing,
-                                current.clone(),
-                                current_qid,
-                            ))
-                            .await;
+                        if holds {
+                            let _ = evt_tx
+                                .send(PlayerEvent::StateChanged(
+                                    PlayState::Playing,
+                                    current.clone(),
+                                    current_qid,
+                                ))
+                                .await;
+                        }
                     }
                     PlayerCommand::Stop(reply) => {
                         current = None;
@@ -852,6 +866,24 @@ fn is_active_load_failure(e: &libmpv2::Error) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Does the actor currently HOLD an entry - i.e. is there something loaded that a
+/// pause could freeze and a resume could un-freeze?
+///
+/// The pair of identity latches IS that fact: both are set together by the two load
+/// commands and taken together by [`emit_honest_stop`] / `Stop`. Either alone would be
+/// partial - a raw stream latches no [`SongId`], and the `play_probe` bin loads with no
+/// [`QueueId`] - so the honest predicate is their disjunction. The same latch already
+/// gates the top-level load-failure route (see [`is_active_load_failure`]'s call site),
+/// so this is the actor's ONE notion of "something is loaded", not a second one.
+///
+/// It exists because mpv's `pause` property is a property of the CORE, not of a track:
+/// setting it true/false over an idle core succeeds and reports nothing. Publishing a
+/// play state off that success alone is how a resume with nothing loaded came to claim
+/// Playing over silence.
+fn holds_entry(current: &Option<SongId>, current_qid: &Option<QueueId>) -> bool {
+    current.is_some() || current_qid.is_some()
 }
 
 /// Publish the LOSSLESS honest-stop signal for the currently latched entry and
@@ -1455,7 +1487,12 @@ fn handle_cmd(
             let res = mpv
                 .set_property("pause", true)
                 .map_err(|e| PlayerError::Backend(e.to_string()));
-            if res.is_ok() {
+            // mpv's `pause` property flips happily over an IDLE core, so the property
+            // write succeeding says nothing about whether anything is loaded (see
+            // [`holds_entry`]). Publish the Paused edge only when an entry is actually
+            // latched; over an empty core the honest state is the Stopped already
+            // published, and claiming Paused would invent a track to un-pause.
+            if res.is_ok() && holds_entry(current, current_qid) {
                 *playing = false;
                 // The af-metadata arm stops firing once decode halts, so without a
                 // trailing resting frame the client's latest-wins viz slot would keep
@@ -1472,10 +1509,17 @@ fn handle_cmd(
             let _ = reply.send(res);
         }
         PlayerCommand::Resume(reply) => {
+            // The property write still runs unconditionally: clearing mpv's `pause`
+            // flag over an idle core is what keeps a LATER load from starting frozen.
             let res = mpv
                 .set_property("pause", false)
                 .map_err(|e| PlayerError::Backend(e.to_string()));
-            if res.is_ok() {
+            // But only a resume that has something to resume may publish Playing. An
+            // idle core un-paused is still silent, and publishing Playing there is the
+            // PHANTOM: `status`/MPRIS report playback over silence, and the handler's
+            // whole nothing-loaded terminal (which keys off a raw Stopped under a
+            // reported Paused) loses the very signal it reads.
+            if res.is_ok() && holds_entry(current, current_qid) {
                 *playing = true;
                 let _ = state_tx.send(PlayState::Playing);
                 let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
@@ -1783,6 +1827,40 @@ mod tests {
 
         player.stop().await.unwrap();
         assert_eq!(player.state(), PlayState::Stopped);
+    }
+
+    // A transport command over a deck that HOLDS NOTHING must publish no play state at
+    // all. mpv's `pause` property belongs to the CORE, not to a track: setting it
+    // true/false over an idle core SUCCEEDS, and publishing a state off that success is
+    // how a resume with nothing loaded came to claim Playing over silence - a `status`
+    // and an MPRIS widget both reporting playback that does not exist. The handler
+    // additionally READS this raw state to recognise its nothing-loaded terminal (a raw
+    // Stopped under a reported Paused), so the lie destroyed that signal too.
+    #[tokio::test]
+    async fn transport_over_an_empty_deck_never_publishes_a_play_state() {
+        let (player, _events) = NullPlayer::spawn();
+        assert_eq!(player.state(), PlayState::Stopped);
+
+        // Nothing has ever been loaded: neither transport may invent a state.
+        player.resume().await.unwrap();
+        assert_eq!(player.state(), PlayState::Stopped, "an empty deck un-paused is still silent");
+        player.pause().await.unwrap();
+        assert_eq!(player.state(), PlayState::Stopped, "and pausing it freezes nothing");
+
+        // With an entry latched, both transports publish exactly as before.
+        player
+            .play_url(Some(SongId("7".into())), Some(QueueId(3)), "http://example/s", false)
+            .await
+            .unwrap();
+        player.pause().await.unwrap();
+        assert_eq!(player.state(), PlayState::Paused, "a real pause still lands");
+        player.resume().await.unwrap();
+        assert_eq!(player.state(), PlayState::Playing, "and a real resume still plays");
+
+        // Once the deck drops its entry, the pair goes quiet again.
+        player.stop().await.unwrap();
+        player.resume().await.unwrap();
+        assert_eq!(player.state(), PlayState::Stopped, "a stopped deck stays honestly stopped");
     }
 
     // The `local` fact rides the LOAD into the actor and rides back out on the
@@ -2733,5 +2811,57 @@ mod tests {
         });
 
         let _ = std::fs::remove_file(&rotten);
+    }
+
+    // THE EMPIRICAL CLAIM the transport gate rests on, which only a real libmpv can
+    // settle: mpv's `pause` property belongs to the CORE, so setting it over an IDLE
+    // core (nothing loaded) SUCCEEDS. The actor therefore cannot read a play state off
+    // that success - it published Playing and MPD/MPRIS reported playback over silence.
+    // The positive half is here too, on the same real core: with a track loaded the
+    // pause/resume pair still publishes exactly as before. Silent throughout
+    // (AudioOut::Null).
+    //   cargo test -p hypodj-core -- --ignored live_mpv_transport_over_an_idle_core
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the idle-core transport gate"]
+    fn live_mpv_transport_over_an_idle_core_publishes_no_play_state() {
+        let dir = std::env::temp_dir();
+        let tone = dir.join("hypodj_idle_core_transport.wav");
+        // Long enough that the pause/resume pair lands well before its natural end.
+        write_tone_wav(&tone, 220.0, 10.0);
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, _events) = MpvPlayer::spawn(AudioOut::Null);
+            assert_eq!(player.state(), PlayState::Stopped, "a fresh core holds nothing");
+
+            // THE PREMISE: both property writes SUCCEED over an idle core...
+            player.resume().await.expect("mpv accepts pause=false with nothing loaded");
+            assert_eq!(
+                player.state(),
+                PlayState::Stopped,
+                "...and an un-paused idle core is still silence, so no Playing is published"
+            );
+            player.pause().await.expect("mpv accepts pause=true with nothing loaded");
+            assert_eq!(player.state(), PlayState::Stopped, "nor any Paused");
+
+            // With a real track loaded, the pair publishes exactly as before.
+            player
+                .play_url(Some(SongId("tone".into())), Some(QueueId(1)), &tone.to_string_lossy(), true)
+                .await
+                .expect("play the local tone");
+            assert_eq!(player.state(), PlayState::Playing);
+            player.pause().await.expect("pause a loaded track");
+            assert_eq!(player.state(), PlayState::Paused, "a real pause still lands");
+            player.resume().await.expect("resume a loaded track");
+            assert_eq!(player.state(), PlayState::Playing, "and a real resume still plays");
+
+            // And once the core drops the entry, the pair goes quiet again - the exact
+            // state the handler's nothing-loaded terminal reads.
+            player.stop().await.expect("stop");
+            player.resume().await.expect("resume over the emptied core");
+            assert_eq!(player.state(), PlayState::Stopped, "no phantom Playing over silence");
+        });
+
+        let _ = std::fs::remove_file(&tone);
     }
 }

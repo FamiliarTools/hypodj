@@ -520,13 +520,26 @@ impl State {
 
     /// Set the baseline AND live gain together (a manual volume change) and clear
     /// the `fading` switch: manual wins, so `reported_volume()` returns exactly
-    /// `v` afterward. Also clears `pending_pause`: a manual volume commit
-    /// (setvol/mpris/clear/stop/fade-terminal) reconciles the deck to a concrete
-    /// baseline, so it must never leave the reported state stuck at Paused. In
-    /// particular, when a `setvol` supersedes an in-flight PauseOut fade before its
-    /// Terminal::Pause runs (mpv still Playing), clearing here is what keeps the
-    /// reported state from lying Paused forever while audio keeps playing.
-    fn set_manual_volume(&mut self, v: u8) {
+    /// `v` afterward.
+    ///
+    /// `deck_loaded` is whether the PLAYER still holds something (its raw state is not
+    /// Stopped - see [`HypodjHandler::deck_loaded`]), and it GATES the `pending_pause`
+    /// clear. The clear exists for ONE lie: when a `setvol` supersedes an in-flight
+    /// PauseOut fade before its [`Terminal::Pause`] runs, mpv is still PLAYING, so
+    /// leaving the intent set would report Paused forever while audio keeps coming out.
+    /// That lie can only exist over a loaded deck.
+    ///
+    /// Over a player holding NOTHING the same clear INVENTS the opposite lie.
+    /// `pending_pause` there is not a transient intent but the standing
+    /// nothing-loaded TERMINAL ([`HypodjHandler::halt_failed_advance`] and the offline
+    /// [`HypodjHandler::restore`]): reported Paused, holding the entry, one play
+    /// gesture away from picking up. Clearing it drops the report to Stopped, the
+    /// checkpoint then persists a stopped session over the saved position, and the next
+    /// resume gesture takes the Stopped arm and un-pauses an idle player into a phantom
+    /// Playing over silence. So the rule is: a pending-pause intent is retired by a
+    /// TRANSPORT event (a pause that really landed, a resume, a fresh play, an explicit
+    /// stop, an end-of-queue drain) - never by a volume commit over an empty deck.
+    fn set_manual_volume(&mut self, v: u8, deck_loaded: bool) {
         self.target_volume = v;
         self.live_gain_db = mpv_volume_to_db(v as f64);
         // Keep the committed logical target in lockstep with every baseline
@@ -537,7 +550,9 @@ impl State {
         // A concrete baseline is now committed: the knob steps from it directly.
         self.baseline_committed = true;
         self.fading = false;
-        self.pending_pause = false;
+        if deck_loaded {
+            self.pending_pause = false;
+        }
         // A manual volume commit also supersedes any in-flight skip: the deck is
         // being reconciled to a concrete baseline on the STILL-loaded current
         // track, so the reported current must revert from the (never-loaded) skip
@@ -1198,14 +1213,39 @@ fn fade_task(
                     if warm.is_some_and(|w| w.warmed) {
                         let _ = sink.drop_warm().await;
                     }
-                    state.lock().unwrap().set_manual_volume(restore);
+                    {
+                        let mut st = state.lock().unwrap();
+                        // The deck is stopped, so the baseline commit itself cannot
+                        // retire a pending pause (see State::set_manual_volume).
+                        st.set_manual_volume(restore, false);
+                        // But THIS terminal is a transport STOP, and a stop retires the
+                        // intent outright - exactly as `stop_playback` does for the
+                        // MPD/MPRIS stop. A `fade out` says "wind down and stop", and
+                        // honoring it means reporting Stopped, not Paused-holding-an-entry.
+                        st.pending_pause = false;
+                    }
                     changed.notify_waiters();
                 }
                 Terminal::SetBaseline(v) => {
                     // Re-assert the real mpv gain to the committed baseline (the
                     // fade drove the fractional seam; snap the u8 seam to match).
                     let _ = sink.set_volume(v).await;
-                    state.lock().unwrap().set_manual_volume(v);
+                    // A pure VOLUME commit (the setvol glide / knob / resume-in landing,
+                    // the wake ramp, the wind-down to floor): it may retire a pending
+                    // pause only over a deck that still holds something. Over a player
+                    // holding nothing - the halt / offline-restore terminal - a landing
+                    // wake or wind-down ramp would otherwise drop the reported state to
+                    // Stopped and the next checkpoint would persist a stopped session.
+                    // Read the gating player state INSIDE the lock scope, never before
+                    // it: halt_failed_advance raises pending_pause under the State lock
+                    // WITHOUT taking the fade slot, so a read-then-lock here could see a
+                    // loaded deck, be preempted while the halt raises the flag, then win
+                    // the lock and clobber it - the exact lost update this gate exists
+                    // to prevent. Mirrors the Terminal::Pause site below.
+                    let mut st = state.lock().unwrap();
+                    let deck_loaded = !matches!(sink.state(), PlayState::Stopped);
+                    st.set_manual_volume(v, deck_loaded);
+                    drop(st);
                     changed.notify_waiters();
                 }
                 Terminal::Pause => {
@@ -1235,8 +1275,17 @@ fn fade_task(
                         // more steps from the committed logical target.
                         st.baseline_committed = true;
                         // The real pause has landed (mpv is Paused): the pending
-                        // intent is fulfilled and the raw state now carries it.
-                        st.pending_pause = false;
+                        // intent is fulfilled and the raw state now carries it. Gated
+                        // on the deck ACTUALLY holding something, because the pause
+                        // only landed if there was something to freeze: a track that
+                        // died mid-fade (a failed load, an EOF) leaves the player
+                        // Stopped, and the intent standing over it is then the
+                        // nothing-loaded terminal, whose whole promise is that a play
+                        // gesture picks the held entry up. Retiring it here would drop
+                        // the report to Stopped over a deck that never paused.
+                        if !matches!(sink.state(), PlayState::Stopped) {
+                            st.pending_pause = false;
+                        }
                     }
                     // Fire the change signal AFTER the Paused state edge, so the MPRIS
                     // property-update loop re-emits PlaybackStatus = Paused (the GNOME
@@ -4348,7 +4397,16 @@ impl HypodjHandler {
                             // knob keeps stepping from logical_gain_db (rapid presses
                             // each advance a detent).
                             st.baseline_committed = true;
-                            st.pending_pause = false;
+                            // Gated exactly like set_manual_volume's clear, and for the
+                            // same reason: the Paused-while-audible lie this fixes can
+                            // only exist over a loaded deck, while over a player holding
+                            // nothing the intent is the standing nothing-loaded terminal
+                            // that a setvol / MPRIS drag / knob press must not retire.
+                            // Read under THIS slot lock so the decision is atomic with
+                            // the install (the fade/volume atomicity invariant).
+                            if !matches!(sink.state(), PlayState::Stopped) {
+                                st.pending_pause = false;
+                            }
                         } else {
                             // A non-committing fade (resume-in, wind-down, wake, skip
                             // dip) leaves logical_gain_db at the stale pre-fade level
@@ -4420,6 +4478,21 @@ impl HypodjHandler {
     }
 
     // ── startle-safe transport (pause / resume) ─────────────────────────────
+
+    /// Does the PLAYER still hold something - a loaded entry a pause could freeze and
+    /// a resume could un-freeze? The raw player state is the whole answer: the actor
+    /// publishes Stopped exactly when it drops its identity latch (an honest stop, an
+    /// explicit stop) and never claims Playing/Paused over an empty core (see
+    /// `player::holds_entry`), so `!= Stopped` IS "the deck holds something".
+    ///
+    /// This is the SAME discriminator [`Self::set_pause`]'s resume arm already uses to
+    /// recognise the nothing-loaded terminal (a raw Stopped under a reported Paused),
+    /// and it is what gates every volume commit's `pending_pause` clear (see
+    /// [`State::set_manual_volume`]). Cheap and lock-free (a `watch` borrow), so it is
+    /// safe to call from inside the fade slot lock.
+    fn deck_loaded(&self) -> bool {
+        !matches!(self.player.state(), PlayState::Stopped)
+    }
 
     /// The play state to REPORT outward (MPD `status`, MPRIS `PlaybackStatus`,
     /// resume checkpoints). Layers TWO guards over the raw mpv state:
@@ -4815,9 +4888,12 @@ impl HypodjHandler {
             .cancel_with(|| {
                 let mut st = self.state.lock().unwrap();
                 let v = st.target_volume;
-                st.set_manual_volume(v);
+                st.set_manual_volume(v, self.deck_loaded());
                 // A stop clears any pending-pause intent (the deck is stopping, not
-                // paused): the reported state must not stick at Paused.
+                // paused): the reported state must not stick at Paused. Explicit and
+                // UNGATED, because a stop is a TRANSPORT gesture - the one thing that
+                // retires the intent no matter what the player currently holds (the
+                // baseline commit above deliberately cannot).
                 st.pending_pause = false;
             })
             .await;
@@ -5093,6 +5169,13 @@ impl HypodjHandler {
     /// persists, the next failure stops immediately instead of walking two more entries;
     /// a fresh-play gesture re-arms it, and so does the first position tick of the first
     /// entry that plays again once the cause clears.
+    ///
+    /// This intent is LONG-LIVED - it stands until a transport gesture picks the entry
+    /// up, possibly for hours - which is why no volume commit may retire it. That is
+    /// enforced where the clears are, keyed on the player holding nothing (see
+    /// [`State::set_manual_volume`] and [`Self::deck_loaded`]), and it is what makes the
+    /// write here safe WITHOUT taking the fade slot: a fade terminal racing this write
+    /// re-reads the same player state and declines to clear, in either interleaving.
     fn halt_failed_advance(&self) {
         let held = {
             let mut st = self.state.lock().unwrap();
@@ -5577,18 +5660,26 @@ impl HypodjHandler {
         } else {
             // Paused/Stopped: restore the baseline volume, leave playback stopped.
             let v = s.volume.min(100);
-            self.state.lock().unwrap().set_manual_volume(v);
+            {
+                // ONE lock scope for the baseline commit AND the degraded terminal, so
+                // no reader can ever observe the pair half-applied. The commit is told
+                // the deck holds nothing (nothing was loaded on this path), which is
+                // exactly what keeps it from retiring the intent asserted beside it -
+                // and what keeps a LATER volume commit (a setvol, an MPRIS drag, a
+                // wake/wind-down ramp landing) from retiring it either.
+                let mut st = self.state.lock().unwrap();
+                st.set_manual_volume(v, self.deck_loaded());
+                if offline_paused {
+                    st.pending_pause = true;
+                }
+            }
             let _ = self.player.set_volume(v).await;
             if offline_paused {
-                // Asserted HERE, after the baseline commit: `set_manual_volume` clears
-                // `pending_pause` on principle (a concrete baseline must never leave the
-                // reported state stuck at Paused), so setting it with the queue install
-                // above would be silently undone. Seeding the live-elapsed atomic with
-                // the saved position completes the pair the checkpoint reads - Paused
-                // plus a real elapsed - so the playhead survives an offline start the
-                // way it survives a pause. Notify so a client watching `idle` sees the
-                // Paused edge rather than the momentary Stopped published above.
-                self.state.lock().unwrap().pending_pause = true;
+                // Seeding the live-elapsed atomic with the saved position completes the
+                // pair the checkpoint reads - Paused plus a real elapsed - so the
+                // playhead survives an offline start the way it survives a pause. Notify
+                // so a client watching `idle` sees the Paused edge rather than the
+                // momentary Stopped published above.
                 self.note_elapsed_ms((s.elapsed_secs.max(0.0) * 1000.0) as u64);
                 self.notify_change();
             }
@@ -6775,8 +6866,29 @@ impl HypodjHandler {
     /// (`live_gain_db = synth_floor`, `player.set_volume(0)`) before the first
     /// buffer and owns the rise via a following wake ramp. Resyncing here would
     /// clobber that silence and defeat the ramp.
+    ///
+    /// It is still a fresh-play GESTURE, so a load that LANDS retires any standing
+    /// `pending_pause` - which for a wake means the long-lived nothing-loaded terminal
+    /// ([`Self::halt_failed_advance`], the offline [`Self::restore`]) an alarm can fire
+    /// hours into. [`Self::play_index`] retires it inside the resync branch this path
+    /// deliberately skips, so the retirement lives HERE rather than in
+    /// [`Self::play_index_inner`]: the EOF advance and the drain-edge
+    /// continuation/autofill refills call the inner with the same `false` DIRECTLY and
+    /// are NOT gestures - a PauseOut fade still descending across a track boundary must
+    /// keep its intent until its own [`Terminal::Pause`] lands. Retired only AFTER the
+    /// load lands, so a wake that could not load leaves the held terminal standing.
     async fn play_index_from_silence(&self, idx: usize) -> Result<(), String> {
-        self.play_index_inner(idx, false).await
+        self.play_index_inner(idx, false).await?;
+        let retired = {
+            let mut st = self.state.lock().unwrap();
+            std::mem::replace(&mut st.pending_pause, false)
+        };
+        if retired {
+            // The reported state just moved Paused -> Playing with no transport command
+            // of its own, so wake the `idle` / MPRIS watchers on that edge.
+            self.notify_change();
+        }
+        Ok(())
     }
 
     /// Resolve and start playing the queue item at `idx`. When `resync_volume` is
@@ -6814,11 +6926,13 @@ impl HypodjHandler {
                 .cancel_with(|| {
                     let mut st = self.state.lock().unwrap();
                     let v = st.target_volume;
-                    st.set_manual_volume(v);
+                    st.set_manual_volume(v, self.deck_loaded());
                     // A fresh-play gesture supersedes any pending pause: the deck is
                     // playing a track now, so the reported state must be Playing, and
                     // a superseded PauseOut fade must never freeze this new track
-                    // Paused.
+                    // Paused. Explicit and UNGATED - a play is a TRANSPORT gesture, and
+                    // it is precisely how the nothing-loaded terminal is meant to be
+                    // picked up (the deck holds nothing right up until the load below).
                     st.pending_pause = false;
                 })
                 .await;
@@ -7735,7 +7849,12 @@ impl MpdHandler for HypodjHandler {
                         st.current = None;
                         st.playlist_version += 1;
                         let v = st.target_volume;
-                        st.set_manual_volume(v);
+                        st.set_manual_volume(v, self.deck_loaded());
+                        // A clear is a TRANSPORT gesture (the queue is gone and the
+                        // deck stops below), so it retires the pending-pause intent
+                        // outright - the gated baseline commit above cannot, and a
+                        // stale intent must never outlive the entry it was held for.
+                        st.pending_pause = false;
                     })
                     .await;
                 let v = self.state.lock().unwrap().target_volume;
@@ -8381,7 +8500,9 @@ impl HypodjHandler {
             // let a setvol become a silent no-op - fall back to the old instant
             // cancel_with + set_manual_volume snap (still manual-wins, atomic).
             self.fade
-                .cancel_with(|| self.state.lock().unwrap().set_manual_volume(landing_vol))
+                .cancel_with(|| {
+                    self.state.lock().unwrap().set_manual_volume(landing_vol, self.deck_loaded())
+                })
                 .await;
             // This defensive cancel_with also SUPERSEDES a live skip dip (its SkipLoad
             // never runs), so drop any parked warm target - else the still-playing
@@ -14081,7 +14202,7 @@ mod tests {
             // Start at 70, pin the dither seed, then glide down to 50.
             {
                 let mut st = h.state.lock().unwrap();
-                st.set_manual_volume(70);
+                st.set_manual_volume(70, true);
                 st.vol_dither_state = 0xF00D_1357_2468_ACE0;
             }
             h.handle(MpdCommand::SetVol(50)).await;
@@ -14111,7 +14232,7 @@ mod tests {
             h.handle(MpdCommand::Play(Some(0))).await;
             {
                 let mut st = h.state.lock().unwrap();
-                st.set_manual_volume(90);
+                st.set_manual_volume(90, true);
                 st.vol_dither_state = seed;
             }
             // Draw many landings and collect the set so a seed that happens to
@@ -16689,6 +16810,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// THE LONG-LIVED-INTENT DEFECT, on the headline offline path.
+    ///
+    /// `pending_pause` was born SHORT-lived (a pause requested, its fade still
+    /// descending over an audible track), so every baseline commit retired it on
+    /// principle - otherwise a `setvol` superseding that fade would report Paused
+    /// forever while audio kept playing. The offline work made the same flag
+    /// LONG-lived: the degraded restore above and [`HypodjHandler::halt_failed_advance`]
+    /// raise it over a player holding NOTHING and leave it standing for as long as the
+    /// server is away. Every volume commit then retired the standing terminal: the
+    /// reported state fell to Stopped, the next checkpoint persisted `play_state =
+    /// "stopped"` over the saved position, and that persisted Stopped disqualified this
+    /// very arm on the NEXT offline start (it requires a non-Stopped saved state).
+    ///
+    /// So the terminal must survive EVERY route that commits a baseline: the setvol
+    /// glide's synchronous commit at INSTALL, its SetBaseline terminal at the landing,
+    /// the MPRIS slider (the same glide), a wind-down to floor, and the wake ramp the
+    /// restore itself installs - and a play gesture out of it must genuinely LOAD.
+    #[tokio::test(start_paused = true)]
+    async fn the_offline_restore_terminal_survives_every_volume_commit() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("restore-volume-commit");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        let mut s = offline_resume_state(&["v-1", "v-2"], Some(0));
+        s.elapsed_secs = 61.0;
+        h.restore(&s).await.expect("restore succeeds");
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "the degraded terminal is up");
+
+        // 1. An MPD setvol. Its commit is SYNCHRONOUS at install (that is what makes a
+        // key-mash land every rung), so the intent must survive the install itself...
+        h.handle(MpdCommand::SetVol(40)).await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "a setvol install retires nothing");
+        // ...and the SetBaseline terminal when the glide lands.
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "nor does the glide's landing");
+
+        // 2. An MPRIS volume change (a GNOME slider drag rides the same glide).
+        h.mpris_set_volume(70).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "nor an MPRIS volume change");
+
+        // 3. A sleep WIND-DOWN to the floor, run to completion.
+        h.start_fade(fade_args(FadeKind::ToFloor, 30)).await.expect("winddown installs");
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "nor a wind-down landing");
+
+        // 4. The WAKE ramp - the one actually observed live, because an offline restore
+        // installs it for itself and it runs for tens of seconds.
+        h.start_fade_spec(FadeRequest {
+            intent: FadeIntent::WakeTo { target_db: mpv_volume_to_db(50.0), vol: 50 },
+            dur: Duration::from_secs(20),
+            commit_logical: None,
+        })
+        .await
+        .expect("wake ramp installs");
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "nor a wake ramp landing");
+
+        // THE POINT: what a checkpoint (or the SIGTERM one) would write still carries
+        // the session, so the next offline start still qualifies for this arm.
+        let snap = h.resume_snapshot(h.last_elapsed_secs());
+        assert_eq!(snap.play_state, ResumePlayState::Paused, "the checkpoint persists Paused");
+        assert_eq!(snap.current, Some(0), "at the saved entry");
+        assert_eq!(snap.elapsed_secs, 61.0, "with the saved playhead");
+
+        // And the terminal's own promise holds: ONE play gesture picks the entry up.
+        h.set_pause(Some(false)).await.expect("resume gesture");
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "the held entry was LOADED");
+        assert_eq!(h.player.state(), PlayState::Playing, "by the PLAYER, not by the report");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_offline_restore_of_a_stopped_deck_stays_stopped() {
         let Some((h, _rx)) = handler_with_null_player() else { return };
@@ -16891,6 +17084,193 @@ mod tests {
         // Paused over a track that is really loaded, never the phantom toggle pair.
         h.set_pause(Some(true)).await.expect("pause");
         assert_eq!(h.reported_play_state(), PlayState::Paused);
+    }
+
+    /// The SAME long-lived-intent defect on the FUSE terminal, in the exact order it was
+    /// observed live: an offline restore's own wake ramp was still climbing when the EOF
+    /// walk halted at T+1s, and ~20s later that ramp's landing terminal retired the
+    /// intent the halt had just raised. The deck fell to Stopped over an entry it was
+    /// still holding, and the SIGTERM checkpoint persisted the stop.
+    ///
+    /// The halt writes `pending_pause` WITHOUT taking the fade slot, which is sound
+    /// precisely because the clear is gated on the player holding something: in either
+    /// interleaving the racing terminal re-reads the same raw Stopped and declines.
+    #[tokio::test(start_paused = true)]
+    async fn the_eof_halt_terminal_survives_a_landing_wake_ramp() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..4 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("w-{i}"))).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // The restore-shaped wake ramp: long, sub-JND, landing on SetBaseline.
+        h.start_fade_spec(FadeRequest {
+            intent: FadeIntent::WakeTo { target_db: mpv_volume_to_db(50.0), vol: 50 },
+            dur: Duration::from_secs(20),
+            commit_logical: None,
+        })
+        .await
+        .expect("wake ramp installs");
+        pump(200, 3).await;
+        assert!(h.fade_active().await, "the wake ramp is still climbing");
+
+        // The load that failed published its own honest stop, so the player holds
+        // NOTHING. (A NullPlayer's own loads all succeed, so the stop is explicit here.)
+        let _ = h.player.stop().await;
+        h.state.lock().unwrap().current = Some(1);
+        h.halt_failed_advance();
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "the halt reports Paused");
+
+        // The ramp lands, tens of seconds later.
+        h.wait_for_fade().await;
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Paused,
+            "and its terminal must not retire a terminal it knows nothing about"
+        );
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "still holding the failed entry");
+        assert_eq!(
+            h.resume_snapshot(12.0).play_state,
+            ResumePlayState::Paused,
+            "so the checkpoint persists the session, not a stopped deck"
+        );
+    }
+
+    /// A PAUSE FADE that outlives the track it was pausing. The pause was requested over
+    /// an audible track, but the track died mid-descent (a failed load, a dropped
+    /// source), the player published its honest stop, and the fuse halted on the entry.
+    /// The [`Terminal::Pause`] then ran anyway and retired the intent as "the real pause
+    /// has landed" - except nothing landed: there was nothing left to freeze. That is
+    /// only true over a deck that still holds something.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_fade_terminal_never_retires_the_halt_it_landed_into() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..3 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("t-{i}"))).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.set_pause(Some(true)).await.expect("pause");
+        assert!(h.fade_active().await, "the PauseOut fade is descending");
+
+        // The track dies mid-fade: the player publishes its honest stop and the fuse
+        // holds the position.
+        let _ = h.player.stop().await;
+        h.halt_failed_advance();
+
+        // The pause fade reaches silence and pauses a deck that holds nothing.
+        h.wait_for_fade().await;
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Paused,
+            "the halt terminal outlives a pause that had nothing left to freeze"
+        );
+        // And it is still the LOADABLE terminal, not a settled pause: the resume gesture
+        // must LOAD (which it only does off a raw Stopped player - so the actor must not
+        // have claimed Paused over an empty deck either).
+        h.set_pause(Some(false)).await.expect("resume gesture");
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "one gesture picks it up");
+        assert_eq!(h.player.state(), PlayState::Playing, "with the entry really loaded");
+    }
+
+    /// THE TAIL OF THE CHAIN, killed at the source. Once the deck HAS fallen to a
+    /// reported Stopped over an entry it still holds, `set_pause`'s Stopped arm calls
+    /// `player.resume()` - and mpv's `pause` property is a property of the CORE, so
+    /// un-pausing an idle core succeeds and the actor published Playing off that
+    /// success. The result was a UI lie: `status`/MPRIS reporting playback with no
+    /// audio and nothing loaded. A resume that loads nothing must not claim to play.
+    #[tokio::test]
+    async fn a_resume_gesture_over_an_empty_deck_never_reports_playing_over_silence() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("g-0")).await;
+        // A deck holding an entry whose PLAYER holds nothing, and (unlike the halt
+        // terminal) with no pending-pause intent standing: reported Stopped.
+        h.state.lock().unwrap().current = Some(0);
+        assert_eq!(h.reported_play_state(), PlayState::Stopped);
+
+        h.set_pause(Some(false)).await.expect("resume gesture");
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Stopped,
+            "nothing was loaded, so nothing is playing - and the report says so"
+        );
+        assert_eq!(h.player.state(), PlayState::Stopped, "the PLAYER never claimed otherwise");
+    }
+
+    /// THE OTHER END of the long-lived intent: it must also be RETIRED when something
+    /// finally picks the held entry up. Making the nothing-loaded terminal survive every
+    /// volume commit means it can still be standing hours later, when a scheduled ALARM
+    /// (`Action::Wake` -> [`HypodjHandler::wake_now`]) fires into it. Wake plays through
+    /// `play_index_from_silence`, which skips the resync branch where a fresh play
+    /// retires the intent - so the deck genuinely PLAYED while `status` and MPRIS both
+    /// said Paused, the checkpoint persisted a paused session over a playing track, and
+    /// every recovery gesture was hijacked: seeing Paused, a knob-up / PlayPause routes
+    /// to `resume_with_fade`, which supersedes the wake ramp with a ramp to
+    /// `target_volume` - the level a preceding wind-down may have left at the FLOOR
+    /// (wake deliberately ignores it) - i.e. pressing play during the alarm ramps the
+    /// music DOWN. The whole ramp (`wake_ramp_secs`, 8 min by default) sat in that lie.
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_alarm_out_of_the_nothing_loaded_terminal_reports_playing() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..3 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("a-{i}"))).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // The overnight terminal: the server went away, the EOF walk halted on the entry
+        // it could not load, and the player holds nothing.
+        let _ = h.player.stop().await;
+        h.state.lock().unwrap().current = Some(1);
+        h.halt_failed_advance();
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "the terminal stands");
+
+        // Hours later the alarm fires and the server is back.
+        h.wake_now(None, 0).await.expect("the alarm plays");
+        assert_eq!(h.player.state(), PlayState::Playing, "the deck REALLY plays");
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Playing,
+            "so the report must say so for the whole ramp, not just after it lands"
+        );
+        assert!(h.fade_active().await, "with the wake ramp still climbing under it");
+        assert_eq!(
+            h.resume_snapshot(3.0).play_state,
+            ResumePlayState::Playing,
+            "and the checkpoint persists a PLAYING session, not a paused one"
+        );
+
+        // And the recovery gestures are no longer hijacked: PlayPause during the ramp
+        // reads Playing, so it PAUSES - it does not take the resume arm and clobber the
+        // ramp with a descent to a wound-down target_volume.
+        h.set_pause(None).await.expect("play/pause during the alarm");
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "a PlayPause pauses it");
+    }
+
+    /// The retirement above is scoped to the GESTURE wrapper, never to
+    /// `play_index_inner` itself: the natural EOF advance rides the same
+    /// no-volume-resync load, and a PauseOut fade still descending when a track ends
+    /// must keep its intent ACROSS the boundary so its own `Terminal::Pause` freezes the
+    /// track that inherited it. Retiring there would flap the reported state
+    /// Paused -> Playing -> Paused mid-gesture - the stale-Playing-at-the-ACK lie
+    /// `reported_play_state`'s pending guard exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn an_eof_advance_under_a_descending_pause_fade_keeps_the_pause_intent() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..3 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("e-{i}"))).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.set_pause(Some(true)).await.expect("pause");
+        assert!(h.fade_active().await, "the PauseOut fade is descending");
+
+        // The track ends mid-descent and the advance loads the next one WITHOUT a
+        // volume resync (so the ramp survives the handoff).
+        h.play_index_inner(1, false).await.expect("the EOF advance loads");
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Paused,
+            "the pause the user asked for rides across the boundary"
+        );
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "and lands on the new track");
+        assert_eq!(h.player.state(), PlayState::Paused, "which the PLAYER really froze");
     }
 
     /// The skip-pin SLOT must be leak-proof under CONCURRENCY - two connections issuing
