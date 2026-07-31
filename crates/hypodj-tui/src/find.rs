@@ -188,6 +188,30 @@ impl Find {
         self.selected = next.clamp(0, last as i32) as usize;
     }
 
+    /// Jump the cursor to the first row of the next (`+1`) or previous (`-1`) KIND.
+    /// Rows are grouped by kind, so this is a section jump: it skips a kind that
+    /// returned nothing (there are no rows to land on), and clamps at both ends
+    /// rather than wrapping.
+    pub fn jump_section(&mut self, delta: i32) {
+        if self.hits.rows.is_empty() {
+            return;
+        }
+        // The distinct kinds actually present, in row order.
+        let mut kinds: Vec<FindKind> = Vec::new();
+        for row in &self.hits.rows {
+            if kinds.last() != Some(&row.kind) {
+                kinds.push(row.kind);
+            }
+        }
+        let cur = self.hits.rows[self.selected.min(self.hits.rows.len() - 1)].kind;
+        let at = kinds.iter().position(|k| *k == cur).unwrap_or(0) as i32;
+        let want = (at + delta).clamp(0, kinds.len() as i32 - 1) as usize;
+        let target = kinds[want];
+        if let Some(i) = self.hits.rows.iter().position(|r| r.kind == target) {
+            self.selected = i;
+        }
+    }
+
     /// Record a submitted query at the front of the ring, deduped, and end any walk.
     pub fn push_history(&mut self, query: &str) {
         if query.is_empty() {
@@ -522,6 +546,48 @@ mod tests {
             song_count: None,
             album_uri: None,
         }
+    }
+
+
+    #[test]
+    fn section_jump_moves_between_kinds_and_skips_absent_ones() {
+        let mut f = Find::default();
+        f.hits.rows = vec![
+            row(FindKind::Album, "alb1"),
+            row(FindKind::Album, "alb2"),
+            row(FindKind::Song, "s1"),
+            row(FindKind::Song, "s2"),
+        ];
+        // Artists returned nothing, so there is no artist section to land on and the
+        // jump goes straight from albums to songs.
+        f.jump_section(1);
+        assert_eq!(f.selected, 2, "landed on the first SONG row");
+        f.jump_section(1);
+        assert_eq!(f.selected, 2, "clamps at the last section, never wraps");
+        f.jump_section(-1);
+        assert_eq!(f.selected, 0, "back to the first album row");
+        f.jump_section(-1);
+        assert_eq!(f.selected, 0, "clamps at the first section too");
+    }
+
+    #[test]
+    fn section_jump_from_mid_section_lands_on_the_next_sections_head() {
+        let mut f = Find::default();
+        f.hits.rows = vec![
+            row(FindKind::Album, "alb1"),
+            row(FindKind::Album, "alb2"),
+            row(FindKind::Song, "s1"),
+        ];
+        f.selected = 1;
+        f.jump_section(1);
+        assert_eq!(f.selected, 2);
+    }
+
+    #[test]
+    fn section_jump_on_an_empty_hit_list_is_a_no_op() {
+        let mut f = Find::default();
+        f.jump_section(1);
+        assert_eq!(f.selected, 0);
     }
 
     #[test]

@@ -640,6 +640,15 @@ impl TuiState {
         // re-fetches on the next screen visit.
         self.albums.loaded = false;
         self.playlists.loaded = false;
+        self.find.drill.loaded = false;
+        // A query outstanding on the dead socket will never land, so the spinner
+        // would turn forever. Fall back to Done and KEEP the hits: they are a
+        // truthful snapshot of a question the user asked, and re-running is one
+        // Enter away.
+        if matches!(self.find.phase, crate::find::Phase::Loading(_)) {
+            self.find.phase = crate::find::Phase::Done;
+        }
+        self.find.drill_loading = false;
         self.status_msg = Some("connection lost - reconnecting...".to_string());
     }
 
@@ -732,6 +741,20 @@ impl TuiState {
         match act {
             // Screen switch: main.rs lazily fetches the target view.
             Act::ScreenFind => self.switch_screen(Screen::Find),
+            // Section jumps are Find-only: elsewhere they are a deliberate no-op
+            // rather than a surprise, since no other screen has kinds to jump between.
+            Act::SectionNext => {
+                if self.screen == Screen::Find && !self.find.drilling {
+                    self.find.jump_section(1);
+                }
+                None
+            }
+            Act::SectionPrev => {
+                if self.screen == Screen::Find && !self.find.drilling {
+                    self.find.jump_section(-1);
+                }
+                None
+            }
             Act::ScreenQueue => self.switch_screen(Screen::Queue),
             Act::ScreenAlbums => self.switch_screen(Screen::Albums),
             Act::ScreenPlaylists => self.switch_screen(Screen::Playlists),
@@ -1119,6 +1142,13 @@ impl TuiState {
     pub fn highlight_query(&self) -> &str {
         match self.mode {
             Mode::Search => &self.input,
+            // On Find, the query that produced the visible hits is what the eye is
+            // looking for, so it underlines even with no standing `/` search. A live
+            // `/` still wins: it is the more recent intent, and `/` inside a drill
+            // must highlight what it is stepping through.
+            Mode::Normal if self.screen == Screen::Find && self.last_search.is_empty() => {
+                &self.find.submitted
+            }
             Mode::Normal => &self.last_search,
             _ => "",
         }
@@ -1654,6 +1684,44 @@ mod tests {
     }
 
 
+
+
+    #[test]
+    fn a_lost_connection_stops_the_find_spinner_but_keeps_the_hits() {
+        use crate::find::{FindKind, FindRow};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.phase = crate::find::Phase::Loading("c418".into());
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        s.mark_disconnected();
+        // The outstanding query can never land on the dead socket, so the spinner
+        // would otherwise turn forever.
+        assert!(matches!(s.find.phase, crate::find::Phase::Done), "spinner stopped");
+        assert_eq!(s.find.hits.rows.len(), 1, "the hits are a truthful snapshot - kept");
+        assert!(!s.find.drill.loaded, "the drill was fetched on the dead socket");
+    }
+
+    #[test]
+    fn the_find_query_underlines_its_own_hits_without_a_standing_slash_search() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.submitted = "c418".into();
+        assert_eq!(s.highlight_query(), "c418");
+        // A live `/` is the more recent intent and still wins.
+        s.last_search = "sweden".into();
+        assert_eq!(s.highlight_query(), "sweden");
+    }
+
+    #[test]
+    fn section_jumps_are_a_no_op_off_the_find_screen() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Queue;
+        assert_eq!(s.handle_key(ch('}')), None);
+        assert_eq!(s.selected, 0, "the queue cursor must not move");
+    }
 
     #[test]
     fn open_drills_an_album_hit_but_a_song_hit_has_nothing_to_open() {

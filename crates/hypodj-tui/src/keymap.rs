@@ -29,6 +29,8 @@ pub enum Act {
     ScreenPlaylists,
     ScreenDj,
     ScreenFind,
+    SectionNext,
+    SectionPrev,
     Down,
     Up,
     Top,
@@ -155,6 +157,8 @@ pub const KEYMAP: &[Binding] = &[
     Binding { matchers: &[Char('g')], keys: "g", group: Navigation, scope: Scope::Global, act: Top, help: "jump to top" },
     Binding { matchers: &[Char('G')], keys: "G", group: Navigation, scope: Scope::Global, act: Bottom, help: "jump to bottom" },
     Binding { matchers: &[Char('P')], keys: "P", group: Navigation, scope: Scope::Queue, act: JumpCurrent, help: "jump to the playing song" },
+    Binding { matchers: &[Char('}')], keys: "}", group: Navigation, scope: Scope::Browse, act: SectionNext, help: "next result section (Search)" },
+    Binding { matchers: &[Char('{')], keys: "{", group: Navigation, scope: Scope::Browse, act: SectionPrev, help: "previous result section (Search)" },
     // Playback.
     Binding { matchers: &[Char('p')], keys: "p", group: Playback, scope: Scope::Global, act: Pause, help: "play / pause" },
     Binding { matchers: &[Char('>')], keys: ">", group: Playback, scope: Scope::Global, act: Next, help: "next track" },

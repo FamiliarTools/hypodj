@@ -2142,7 +2142,9 @@ fn render_find(f: &mut Frame, area: Rect, state: &TuiState) {
         .enumerate()
         .skip(start)
         .take(height)
-        .map(|(i, row)| find_row_line(row, i == find.selected, stale, inner.width))
+        .map(|(i, row)| {
+            find_row_line(row, i == find.selected, stale, inner.width, state.highlight_query())
+        })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -2150,14 +2152,19 @@ fn render_find(f: &mut Frame, area: Rect, state: &TuiState) {
 /// One hit row: a three-column gutter (`<kind sigil><queue mark><space>`), the
 /// label, and a right-aligned trailer. The label is what truncates when the row is
 /// too narrow, so the trailer never eats the name the user is reading.
-fn find_row_line(row: &FindRow, selected: bool, stale: bool, width: u16) -> Line<'static> {
+fn find_row_line(
+    row: &FindRow,
+    selected: bool,
+    stale: bool,
+    width: u16,
+    query: &str,
+) -> Line<'static> {
     let gutter = format!("{}{} ", row.kind.sigil(), ' ');
     let width = width as usize;
     let trailer = row.trailer.clone();
     let room = width.saturating_sub(gutter.chars().count() + trailer.chars().count() + 1);
     let label: String = row.label.chars().take(room).collect();
     let pad = room.saturating_sub(label.chars().count()) + 1;
-    let text = format!("{gutter}{label}{}{trailer}", " ".repeat(pad));
     let mut style = Style::default();
     if selected {
         style = style.add_modifier(Modifier::REVERSED);
@@ -2165,5 +2172,11 @@ fn find_row_line(row: &FindRow, selected: bool, stale: bool, width: u16) -> Line
     if stale {
         style = style.add_modifier(Modifier::DIM);
     }
-    Line::from(Span::styled(text, style))
+    // Underline the query inside the label, so the eye lands on WHY this row
+    // matched - the same treatment the browse lists already give a `/` search.
+    let hit = style.add_modifier(Modifier::UNDERLINED);
+    let mut spans = vec![Span::styled(gutter, style)];
+    spans.extend(match_spans(&label, query, style, hit));
+    spans.push(Span::styled(format!("{}{trailer}", " ".repeat(pad)), style));
+    Line::from(spans)
 }
