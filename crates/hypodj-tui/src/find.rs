@@ -276,9 +276,242 @@ impl Find {
     }
 }
 
+/// Parse a stage-one `search any "<q>"` response into hits.
+///
+/// The daemon's search surface emits ONLY song rows (`search_filtered` calls
+/// `browse_song_pairs`; the paging loop reads `hits.songs` and discards `search3`'s
+/// artists and albums), so there is nothing to key an artist row on: there is no
+/// `X-ArtistUri` on the wire, and a derived artist would be a display string that
+/// cannot drill, cannot be starred, and would merge two same-named artists.
+/// Shipping a fake artist row is worse than shipping none, so stage one has none.
+///
+/// Albums ARE derivable, because `push_song_tags` already puts `X-AlbumUri:
+/// album/<id>` on every song row - a real id that `add`, `lsinfo` and
+/// `Favorite::from_uri` all already understand. A derived album row carries
+/// `song_count: None`, which is exactly right: `album_mark` documents that an
+/// unknown count degrades to Partial for any queued track and can never claim a
+/// false Full.
+///
+/// Pure: no clock, no I/O. `pairs` is the raw key/value frame.
+pub fn parse_song_hits(pairs: &[(String, String)]) -> FindHits {
+    let mut songs: Vec<FindRow> = Vec::new();
+    // Insertion-ordered album accumulation, so albums keep the server's relevance
+    // order rather than being re-sorted into something arbitrary.
+    let mut album_order: Vec<String> = Vec::new();
+    let mut albums: Vec<(String, String, String, usize)> = Vec::new();
+
+    let mut cur: Option<SongAcc> = None;
+    for (k, v) in pairs {
+        match k.as_str() {
+            "file" => {
+                if let Some(acc) = cur.take() {
+                    push_song(acc, &mut songs, &mut album_order, &mut albums);
+                }
+                cur = Some(SongAcc { uri: v.clone(), ..SongAcc::default() });
+            }
+            "Title" => {
+                if let Some(a) = cur.as_mut() {
+                    a.title = v.clone();
+                }
+            }
+            "Artist" => {
+                if let Some(a) = cur.as_mut() {
+                    a.artist = v.clone();
+                }
+            }
+            "Album" => {
+                if let Some(a) = cur.as_mut() {
+                    a.album = v.clone();
+                }
+            }
+            "X-AlbumUri" => {
+                if let Some(a) = cur.as_mut() {
+                    a.album_uri = Some(v.clone());
+                }
+            }
+            "Time" => {
+                if let Some(a) = cur.as_mut() {
+                    a.secs = v.parse().ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(acc) = cur.take() {
+        push_song(acc, &mut songs, &mut album_order, &mut albums);
+    }
+
+    let album_rows: Vec<FindRow> = album_order
+        .iter()
+        .filter_map(|uri| albums.iter().find(|(u, ..)| u == uri))
+        .map(|(uri, title, artist, n)| FindRow {
+            kind: FindKind::Album,
+            label: title.clone(),
+            uri: uri.clone(),
+            trailer: if artist.is_empty() {
+                format!("{n} matching")
+            } else {
+                format!("{artist}   {n} matching")
+            },
+            // NEVER Some(n) here: n is how many of this album's tracks MATCHED, not
+            // how many it has. Claiming it as the total would make album_mark render
+            // a false "fully queued" marker.
+            song_count: None,
+            album_uri: None,
+        })
+        .collect();
+
+    let tallies = vec![
+        (FindKind::Album, album_rows.len(), None),
+        (FindKind::Song, songs.len(), None),
+    ];
+    let mut rows = album_rows;
+    rows.extend(songs);
+    FindHits { rows, tallies }
+}
+
+#[derive(Default)]
+struct SongAcc {
+    uri: String,
+    title: String,
+    artist: String,
+    album: String,
+    album_uri: Option<String>,
+    secs: Option<u32>,
+}
+
+fn push_song(
+    acc: SongAcc,
+    songs: &mut Vec<FindRow>,
+    album_order: &mut Vec<String>,
+    albums: &mut Vec<(String, String, String, usize)>,
+) {
+    if let Some(uri) = acc.album_uri.clone() {
+        match albums.iter_mut().find(|(u, ..)| *u == uri) {
+            Some((.., n)) => *n += 1,
+            None => {
+                album_order.push(uri.clone());
+                albums.push((uri, acc.album.clone(), acc.artist.clone(), 1));
+            }
+        }
+    }
+    let mut trailer = String::new();
+    if !acc.artist.is_empty() {
+        trailer.push_str(&acc.artist);
+    }
+    if !acc.album.is_empty() {
+        if !trailer.is_empty() {
+            trailer.push_str("   ");
+        }
+        trailer.push_str(&acc.album);
+    }
+    if let Some(secs) = acc.secs {
+        if !trailer.is_empty() {
+            trailer.push_str("   ");
+        }
+        trailer.push_str(&format!("{}:{:02}", secs / 60, secs % 60));
+    }
+    songs.push(FindRow {
+        kind: FindKind::Song,
+        label: if acc.title.is_empty() { acc.uri.clone() } else { acc.title },
+        uri: acc.uri,
+        trailer,
+        song_count: None,
+        album_uri: acc.album_uri,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn pairs(raw: &[(&str, &str)]) -> Vec<(String, String)> {
+        raw.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn songs_parse_and_albums_are_derived_from_x_album_uri() {
+        let p = pairs(&[
+            ("file", "song/1"), ("Title", "Sweden"), ("Artist", "C418"),
+            ("Album", "Volume Alpha"), ("X-AlbumUri", "album/9"), ("Time", "183"),
+            ("file", "song/2"), ("Title", "Wet Hands"), ("Artist", "C418"),
+            ("Album", "Volume Alpha"), ("X-AlbumUri", "album/9"), ("Time", "90"),
+            ("file", "song/3"), ("Title", "Dead Voxel"), ("Artist", "C418"),
+            ("Album", "Volume Beta"), ("X-AlbumUri", "album/10"), ("Time", "245"),
+        ]);
+        let hits = parse_song_hits(&p);
+        // Albums come FIRST so a long song list cannot bury them.
+        assert_eq!(hits.rows[0].kind, FindKind::Album);
+        assert_eq!(hits.rows[0].label, "Volume Alpha");
+        assert_eq!(hits.rows[0].uri, "album/9", "the real album id, usable by add/lsinfo");
+        assert!(hits.rows[0].trailer.contains("2 matching"), "grouped count: {:?}", hits.rows[0].trailer);
+        assert_eq!(hits.rows[1].label, "Volume Beta");
+        assert!(hits.rows[1].trailer.contains("1 matching"));
+        // Then the songs, in server order.
+        assert_eq!(hits.rows[2].kind, FindKind::Song);
+        assert_eq!(hits.rows[2].label, "Sweden");
+        assert_eq!(hits.rows[2].uri, "song/1");
+        assert!(hits.rows[2].trailer.contains("3:03"), "duration: {:?}", hits.rows[2].trailer);
+        assert_eq!(hits.tallies, vec![(FindKind::Album, 2, None), (FindKind::Song, 3, None)]);
+    }
+
+    #[test]
+    fn a_derived_album_row_never_claims_a_song_count() {
+        // The grouped count is how many tracks MATCHED, not how many the album has.
+        // Reporting it as song_count would make album_mark render a false "fully
+        // queued" marker for an album the queue only partly holds.
+        let p = pairs(&[
+            ("file", "song/1"), ("Title", "Sweden"), ("X-AlbumUri", "album/9"),
+        ]);
+        let hits = parse_song_hits(&p);
+        assert_eq!(hits.rows[0].kind, FindKind::Album);
+        assert_eq!(hits.rows[0].song_count, None);
+    }
+
+    #[test]
+    fn a_song_row_keeps_its_album_uri_so_the_queue_gutter_can_mark_it() {
+        let p = pairs(&[("file", "song/1"), ("Title", "Sweden"), ("X-AlbumUri", "album/9")]);
+        let hits = parse_song_hits(&p);
+        let song = hits.rows.iter().find(|r| r.kind == FindKind::Song).unwrap();
+        assert_eq!(song.album_uri.as_deref(), Some("album/9"));
+    }
+
+    #[test]
+    fn a_song_with_no_album_uri_produces_no_album_row_and_does_not_panic() {
+        // A stream has no album handle. It must still be a playable song row.
+        let p = pairs(&[("file", "song/7"), ("Title", "NTS 1")]);
+        let hits = parse_song_hits(&p);
+        assert_eq!(hits.rows.len(), 1);
+        assert_eq!(hits.rows[0].kind, FindKind::Song);
+        assert_eq!(hits.tallies[0], (FindKind::Album, 0, None));
+    }
+
+    #[test]
+    fn a_song_with_no_title_falls_back_to_its_uri_rather_than_rendering_blank() {
+        let hits = parse_song_hits(&pairs(&[("file", "song/42")]));
+        assert_eq!(hits.rows[0].label, "song/42");
+    }
+
+    #[test]
+    fn an_empty_frame_parses_to_no_rows_with_both_kinds_stated() {
+        let hits = parse_song_hits(&[]);
+        assert!(hits.rows.is_empty());
+        // Both kinds still reported, so the title can say "no albums / no songs"
+        // rather than being silently indistinguishable from "nothing asked yet".
+        assert_eq!(hits.tallies.len(), 2);
+    }
+
+    #[test]
+    fn albums_keep_the_servers_relevance_order_not_an_arbitrary_resort() {
+        let p = pairs(&[
+            ("file", "song/1"), ("Album", "Zebra"), ("X-AlbumUri", "album/z"),
+            ("file", "song/2"), ("Album", "Alpha"), ("X-AlbumUri", "album/a"),
+        ]);
+        let hits = parse_song_hits(&p);
+        assert_eq!(hits.rows[0].label, "Zebra", "first seen stays first");
+        assert_eq!(hits.rows[1].label, "Alpha");
+    }
 
     fn row(kind: FindKind, label: &str) -> FindRow {
         FindRow {

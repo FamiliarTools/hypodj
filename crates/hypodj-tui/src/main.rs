@@ -192,7 +192,7 @@ fn event_loop(
             // Convert the coalesced intents into worker Reqs; the worker runs them off
             // the render path so a Subsonic-backed browse/enqueue never blocks input
             // or draw.
-            dispatch(req_tx, &workers.cc_tx, state, coalesce_intents(intents));
+            dispatch(req_tx, &workers.cc_tx, &workers.find_tx, state, coalesce_intents(intents));
             sync_title(terminal, state, &mut last_title);
         }
 
@@ -270,7 +270,13 @@ fn update_viz(state: &mut TuiState, workers: &Workers, dt: f64) {
 /// after them (so a held-key burst costs N cheap commands + a single refresh). The
 /// confirm/cancel handshake is applied to local state here but relies on the worker
 /// running `nl confirm`/`nl cancel` on the ONE command socket, in order.
-fn dispatch(tx: &Sender<Req>, cc_tx: &Sender<Req>, state: &mut TuiState, intents: Vec<Intent>) {
+fn dispatch(
+    tx: &Sender<Req>,
+    cc_tx: &Sender<Req>,
+    find_tx: &Sender<Req>,
+    state: &mut TuiState,
+    intents: Vec<Intent>,
+) {
     let mut sent_mutation = false;
     for intent in intents {
         match intent {
@@ -280,6 +286,12 @@ fn dispatch(tx: &Sender<Req>, cc_tx: &Sender<Req>, state: &mut TuiState, intents
             }
             Intent::Nl(phrase) => {
                 let _ = tx.send(Req::Nl(phrase));
+            }
+            // Routed to the DEDICATED find socket, never `tx` (the FIFO command
+            // socket). Deliberately does NOT set `sent_mutation`: a query changes
+            // nothing, so the trailing batch refresh must not fire for it.
+            Intent::Find(query) => {
+                let _ = find_tx.send(Req::Find(query));
             }
             Intent::ConfirmArm => {
                 // Echo the choice INTO the DJ chat immediately so the keypress is
@@ -500,6 +512,35 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
 /// Apply a (non-stale) command-worker response to TuiState.
 fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
     match kind {
+        // THE STALENESS GATE: fold only when the echoed query is the one still in
+        // flight. There is no request cancellation anywhere in this codebase, so
+        // submitting three queries in a row lands three responses - and only the
+        // last one may be allowed to paint. Same guarantee as a generation counter,
+        // no new plumbing, and the degenerate case (the same query twice) is
+        // harmless because the two answers are identical.
+        RespKind::Find { query, result } => {
+            let awaited = matches!(&state.find.phase, crate::find::Phase::Loading(q) if *q == query);
+            if !awaited {
+                return;
+            }
+            match result {
+                Ok(hits) => {
+                    state.find.hits = hits;
+                    state.find.selected = 0;
+                    state.find.offset.set(0);
+                    state.find.phase = crate::find::Phase::Done;
+                    // Land the cursor on the results so the next keystroke acts on a
+                    // hit rather than appending to the query that produced it.
+                    if !state.find.hits.rows.is_empty() {
+                        state.find.focus = crate::find::Focus::Results;
+                    }
+                }
+                // The previous hits stay visible underneath a failure: they are a
+                // truthful answer to a question the user asked, and re-running is
+                // one Enter away.
+                Err(reason) => state.find.phase = crate::find::Phase::Failed(reason),
+            }
+        }
         RespKind::Snapshot { now, queue, version } => {
             match queue {
                 Some(q) => {
@@ -692,6 +733,7 @@ mod tests {
     fn dj_confirm_arm_echoes_choice_and_arms() {
         let (tx, rx) = mpsc::channel::<Req>();
         let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
+        let (find_tx, _find_rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Dj;
         state.enter_confirm(Pending {
@@ -701,7 +743,7 @@ mod tests {
             note: None,
             trust: None,
         });
-        dispatch(&tx, &cc_tx, &mut state, vec![Intent::ConfirmArm]);
+        dispatch(&tx, &cc_tx, &find_tx, &mut state, vec![Intent::ConfirmArm]);
         assert!(state.dj_log.iter().any(|l| l == "> y"), "choice echoed to chat");
         assert_eq!(state.mode, Mode::Normal, "confirm dismissed");
         assert!(state.pending.is_none(), "pending consumed");
@@ -806,13 +848,14 @@ mod tests {
     fn dj_confirm_cancel_echoes_cancelled() {
         let (tx, rx) = mpsc::channel::<Req>();
         let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
+        let (find_tx, _find_rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Dj;
         state.enter_confirm(Pending {
             token: Some("nl-1".into()),
             ..Default::default()
         });
-        dispatch(&tx, &cc_tx, &mut state, vec![Intent::ConfirmCancel]);
+        dispatch(&tx, &cc_tx, &find_tx, &mut state, vec![Intent::ConfirmCancel]);
         assert!(state.dj_log.iter().any(|l| l == "cancelled"), "cancellation echoed");
         assert_eq!(state.mode, Mode::Normal);
         assert!(state.pending.is_none());

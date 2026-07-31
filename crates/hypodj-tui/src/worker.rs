@@ -35,6 +35,7 @@ use hypodj_client::nl::{
 };
 
 use crate::art::AlbumArt;
+use crate::find::FindHits;
 use crate::state::{self, BrowseRow, Pending, Screen};
 
 /// Backoff ceiling for a reconnect loop: never busy-loop, never exceed 2s between
@@ -70,6 +71,16 @@ pub enum Req {
     Cc { phrase: String, queue_len: usize, is_playing: bool },
     /// Run a browse command (`lsinfo <path>` or `listplaylists`), parse rows, reply.
     Browse { target: Screen, command: String, path: String, title: String, restore_sel: Option<usize> },
+    /// A library query, run on the DEDICATED find socket - never the command
+    /// socket. Three reasons, all real: the command socket is strictly FIFO so a
+    /// search would head-of-line-block every following Refresh (freezing
+    /// now-playing and the progress bar with no UI signal, because request_refresh
+    /// arms its gate at SEND time and the 5s safety tick can then only mark it
+    /// dirty); a 5s IO_TIMEOUT on the command socket is read as a transport drop
+    /// and bounces the connection, so pressing Enter would print "connection lost";
+    /// and stage one routes into an unbounded paging path that a broad query can
+    /// keep busy. Isolated, a slow query is a slow query, not a broken player.
+    Find(String),
     /// Drain and stop the worker (quit teardown).
     Shutdown,
 }
@@ -111,6 +122,12 @@ pub enum RespKind {
     /// fallback from the last-known volume.
     KnobUnknown(String),
     Browse { target: Screen, rows: Vec<BrowseRow>, path: String, title: String, restore_sel: Option<usize> },
+    /// A library-query result. Carries the query it ANSWERS so the render thread can
+    /// drop a superseded response by echo comparison - the same guarantee as a
+    /// generation counter, with no new plumbing. The Result keeps the failure
+    /// TARGETED at the screen rather than collapsing into a targetless Banner that
+    /// the very next keypress wipes.
+    Find { query: String, result: Result<FindHits, String> },
 }
 
 /// The handles the render thread keeps to talk to (and tear down) the workers.
@@ -121,6 +138,8 @@ pub struct Workers {
     pub cc_tx: Sender<Req>,
     pub inbound_rx: Receiver<Inbound>,
     pub art_tx: Sender<(String, Option<String>)>,
+    /// The dedicated find worker's request channel (library queries).
+    pub find_tx: Sender<Req>,
     pub stop: Arc<AtomicBool>,
     /// Cloned command-socket handle: `shutdown(Both)` unblocks a parked read at quit.
     pub cmd_shutdown: TcpStream,
@@ -181,6 +200,16 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         thread::spawn(move || art_worker(art_rx, in_tx_art, &host, port));
     }
 
+    // Dedicated FIND worker: opens a SHORT-LIVED socket per query, in the same shape
+    // the art worker and the CC grounding socket already use. Owns no state, so a
+    // timeout kills only that socket and the next query reconnects lazily.
+    let (find_tx, find_rx) = mpsc::channel::<Req>();
+    {
+        let in_tx = in_tx.clone();
+        let host = host.to_string();
+        thread::spawn(move || find_worker(find_rx, in_tx, &host, port));
+    }
+
     // Dedicated CC worker: owns NO socket (it only shells out to `claude` and posts
     // progress/confirm frames), so it can block for seconds without touching the
     // command or idle sockets.
@@ -212,6 +241,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         cc_tx,
         inbound_rx: in_rx,
         art_tx,
+        find_tx,
         stop,
         cmd_shutdown,
         idle_shutdown,
@@ -514,6 +544,8 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
         // CC requests are routed to the dedicated CC worker, never here; a stray one
         // on the command socket is a no-op (the socket must not fork a subprocess).
         Req::Cc { .. } => false,
+        // Never reaches the command socket: the render thread routes it to find_tx.
+        Req::Find(_) => false,
         Req::Load(name) => match conn.command(&format!("load {}", quote_arg(&name))) {
             Ok(_) => refresh_after(conn, tx, epoch),
             Err(MpdError::Ack(m)) => {
@@ -742,6 +774,43 @@ fn viz_worker(
 /// coverless stream never reaches here (task kmrhj8m). A no-exist ACK degrades to
 /// `None` inside `AlbumArt::load`. The key rides back so a late response for a
 /// since-changed key is rejected by the render thread's adoption gate.
+/// The find worker: one short-lived socket per query, so a slow or timed-out search
+/// can never touch playback, the queue, or the command socket's ordering.
+fn find_worker(rx: Receiver<Req>, tx: Sender<Inbound>, host: &str, port: u16) {
+    while let Ok(req) = rx.recv() {
+        let query = match req {
+            Req::Find(q) => q,
+            Req::Shutdown => break,
+            _ => continue,
+        };
+        let result = run_find(host, port, &query);
+        // epoch u64::MAX: the connection epoch gates responses from the COMMAND
+        // socket across ITS reconnects, and the find socket has no relationship to
+        // that lifecycle - a command-socket reconnect must not silently swallow
+        // every future search result. Find's staleness gate is the query echo,
+        // checked where the response is folded.
+        let kind = RespKind::Find { query, result };
+        if tx.send(Inbound::Resp { epoch: u64::MAX, kind }).is_err() {
+            break;
+        }
+    }
+}
+
+/// One query round trip. Stage one asks `search any "<q>"`, which the CURRENTLY
+/// DEPLOYED daemon already answers - no rebuild, no switch, no degraded mode to
+/// explain. The artist rows arrive in stage two behind a `searchall` verb.
+fn run_find(host: &str, port: u16, query: &str) -> Result<FindHits, String> {
+    let mut conn = MpdConn::connect(host, port)
+        .map_err(|_| "search unavailable - could not reach the daemon".to_string())?;
+    match conn.command(&format!("search any {}", quote_arg(query))) {
+        Ok(pairs) => Ok(crate::find::parse_song_hits(&pairs)),
+        Err(MpdError::Ack(m)) => Err(map_ack_reason(&m)),
+        // A read timeout here is a SLOW QUERY, not a dropped player: say so, and say
+        // what to do about it, instead of bouncing a connection the user still has.
+        Err(_) => Err("search timed out - try a narrower query".to_string()),
+    }
+}
+
 fn art_worker(rx: Receiver<(String, Option<String>)>, tx: Sender<Inbound>, host: &str, port: u16) {
     while let Ok(key) = rx.recv() {
         let art = AlbumArt::load(host, port, &key.0);

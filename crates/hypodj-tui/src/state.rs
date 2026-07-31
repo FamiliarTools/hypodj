@@ -326,6 +326,9 @@ pub enum Intent {
     Enqueue { uri: String, play: bool },
     /// Load a playlist by name (`load <name>`), appending to the queue.
     LoadPlaylist(String),
+    /// Run a library query on the dedicated find socket. NOT a mutation, so it must
+    /// never set `sent_mutation` and never trail a `request_refresh`.
+    Find(String),
     /// Translate a DJ View NL query via the Claude Code backend (on the dedicated CC
     /// worker thread, never the command socket), ending in a Confirm popup.
     Cc(String),
@@ -912,10 +915,20 @@ impl TuiState {
     /// and plays; Playlists loads the selected playlist. Drilling-in moved to `o`.
     fn enter_action(&mut self) -> Option<Intent> {
         match self.screen {
-            // Dj Enter is handled in key_dj (submit the query), never here. Find
-            // Enter is likewise handled in key_find - it submits from the query line
-            // and plays from the results list.
-            Screen::Dj | Screen::Find => None,
+            // Dj Enter is handled in key_dj (submit the query), never here.
+            Screen::Dj => None,
+            // Enter ALWAYS plays the selection, on every screen (drilling-in is `o`).
+            // On an album row that enqueues the whole album and plays its first
+            // track, exactly as the Albums tab does.
+            Screen::Find if !self.find.drilling => {
+                let uri = self.find.current_row()?.uri.clone();
+                Some(Intent::Enqueue { uri, play: true })
+            }
+            Screen::Find => {
+                let b = &self.find.drill;
+                let uri = b.rows.get(b.selected).map(|r| r.uri.clone())?;
+                Some(Intent::Enqueue { uri, play: true })
+            }
             Screen::Queue => self
                 .queue
                 .get(self.selected)
@@ -944,6 +957,17 @@ impl TuiState {
     /// stream row (URL uri) is a friendly status; an empty queue is a silent
     /// no-op.
     fn favorite_selected(&mut self) -> Option<Intent> {
+        if self.screen == Screen::Find && !self.find.drilling {
+            // song/ and album/ are both starrable (Favorite::from_uri handles both);
+            // an artist row is not, and stage one never produces one.
+            let uri = self.find.current_row()?.uri.clone();
+            return if uri.starts_with("song/") || uri.starts_with("album/") {
+                Some(Intent::Command(format!("playlistadd Starred {uri}")))
+            } else {
+                self.status_msg = Some("that row can't be favorited".into());
+                None
+            };
+        }
         match self.queue.get(self.selected).and_then(|it| it.uri.as_deref()) {
             Some(uri) if uri.starts_with("song/") => {
                 Some(Intent::Command(format!("playlistadd Starred {uri}")))
@@ -962,6 +986,13 @@ impl TuiState {
     /// Albums/dir/song row enqueues with `add <uri>`. Queue has nothing to add ->
     /// no-op.
     fn enqueue_selected(&mut self) -> Option<Intent> {
+        // The Find HIT list is not a `Browse`, so it must be claimed BEFORE the
+        // active_browse() consultation below (which returns None off-drill).
+        if self.screen == Screen::Find && !self.find.drilling {
+            let uri = self.find.current_row()?.uri.clone();
+            self.find.move_selection(1);
+            return Some(Intent::Enqueue { uri, play: false });
+        }
         let intent = match self.active_browse() {
             Some(b) => {
                 let uri = b.rows.get(b.selected).map(|r| r.uri.clone())?;
@@ -1308,8 +1339,9 @@ impl TuiState {
                     return None;
                 }
                 self.find.push_history(&q);
-                self.find.submitted = q;
-                None
+                self.find.phase = crate::find::Phase::Loading(q.clone());
+                self.find.submitted = q.clone();
+                Some(Intent::Find(q))
             }
             KeyCode::Char(c) => {
                 self.find.query.push(c);
@@ -1588,6 +1620,135 @@ mod tests {
             assert_eq!(s.handle_key(key(fk)), Some(Intent::ShowScreen(want)));
             assert_eq!(s.screen, want);
         }
+    }
+
+
+    #[test]
+    fn typing_in_the_find_query_produces_no_intent_at_all() {
+        // This is the test that proves there is NO per-keystroke request path: the
+        // screen is submit-driven, so a query is one round trip, not one per letter.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        for c in "c418".chars() {
+            assert_eq!(s.handle_key(ch(c)), None, "typing {c:?} must not hit the network");
+        }
+        assert_eq!(s.find.query, "c418");
+    }
+
+    #[test]
+    fn nav_keys_type_literally_in_the_query_but_move_the_cursor_in_the_results() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        // Query focus: `j` is a letter, not a movement.
+        assert_eq!(s.handle_key(ch('j')), None);
+        assert_eq!(s.find.query, "j");
+        // Results focus: `j` moves the HIT cursor - and crucially NOT self.selected,
+        // which is the queue cursor the active_browse() fallback would have moved.
+        s.find.query.clear();
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![
+            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None },
+        ];
+        s.handle_key(ch('j'));
+        assert_eq!(s.find.selected, 1, "the hit cursor moved");
+        assert_eq!(s.selected, 0, "the QUEUE cursor must not have moved");
+        assert_eq!(s.find.query, "", "and nothing was typed");
+    }
+
+    #[test]
+    fn enter_submits_the_query_and_marks_it_in_flight() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.query = "  c418  ".into();
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert_eq!(intent, Some(Intent::Find("c418".into())), "trimmed and dispatched");
+        assert!(matches!(&s.find.phase, crate::find::Phase::Loading(q) if q == "c418"));
+        assert_eq!(s.find.history[0], "c418", "recorded for the ^v ring");
+    }
+
+    #[test]
+    fn an_empty_query_submits_nothing() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.query = "   ".into();
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), None);
+        assert!(matches!(s.find.phase, crate::find::Phase::Cold));
+    }
+
+    #[test]
+    fn enter_on_a_result_plays_it_and_space_enqueues_without_playing() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Enqueue { uri: "album/9".into(), play: true }),
+            "Enter ALWAYS plays, on every screen - drilling is `o`"
+        );
+        assert_eq!(
+            s.handle_key(ch(' ')),
+            Some(Intent::Enqueue { uri: "album/9".into(), play: false })
+        );
+    }
+
+    #[test]
+    fn favoriting_a_find_row_stars_the_row_under_the_cursor() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        assert_eq!(
+            s.handle_key(ch('s')),
+            Some(Intent::Command("playlistadd Starred song/1".into()))
+        );
+    }
+
+    #[test]
+    fn esc_leaves_the_find_screen_rather_than_ping_ponging() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), Some(Intent::ShowScreen(Screen::Queue)));
+        assert_eq!(s.screen, Screen::Queue);
+    }
+
+    #[test]
+    fn help_opens_on_an_empty_query_but_types_a_literal_question_mark_mid_query() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        assert_eq!(s.handle_key(ch('?')), None);
+        assert!(s.help_open, "? on an EMPTY query line opens help");
+        s.handle_key(ch('?'));
+        s.find.query = "who".into();
+        s.handle_key(ch('?'));
+        assert_eq!(s.find.query, "who?", "? mid-query is a literal character");
+    }
+
+    #[test]
+    fn tab_toggles_focus_only_when_there_are_results_to_move_to() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.find.focus, Focus::Query, "no results yet: focus stays put");
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Song, label: "a".into(), uri: "song/1".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.find.focus, Focus::Results);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.find.focus, Focus::Query, "and back");
     }
 
     #[test]
