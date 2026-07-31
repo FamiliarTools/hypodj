@@ -227,14 +227,19 @@ impl SubsonicClient {
     /// offset, from_year, to_year, genre, music_folder_id) -> Vec<AlbumId3>`.
     /// `AlbumListType` is re-exported from the crate root. The porting map's
     /// "smart album lists" feature is just varying `list_type` here.
+    /// `offset` pages the list (the 3rd positional arg). It was hardcoded `None`
+    /// here while its sibling [`album_list_by_genre`](Self::album_list_by_genre)
+    /// already took one, which is why no flat A-Z index could exist: a single call
+    /// can only ever return the first `size` albums.
     pub async fn album_list(
         &self,
         list_type: AlbumListType,
         size: Option<i32>,
+        offset: Option<i32>,
     ) -> Result<Vec<Album>, SubsonicError> {
         let albums = self
             .inner
-            .get_album_list2(list_type, size, None, None, None, None, None)
+            .get_album_list2(list_type, size, offset, None, None, None, None)
             .await
             .map_err(|e| SubsonicError::Request(e.to_string()))?;
         Ok(albums.into_iter().map(map_album).collect())

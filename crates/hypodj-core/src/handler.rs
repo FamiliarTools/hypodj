@@ -1773,6 +1773,44 @@ const KNOB_STEP_DB: f64 = crate::fade::DELIBERATE_STEP_CAP_DB;
 /// richness. This caps EACH keyword's contribution so resolution cost stays flat.
 const QUERY_KEYWORD_SONG_CAP: usize = 50;
 
+/// One page of the flat A-Z album index. Matches the page size the artist-albums
+/// path already uses, so the two share one idiom rather than inventing a second.
+const ALBUM_INDEX_PAGE: i32 = 500;
+/// Hard ceiling on the flat index. Paging a whole library into `dir_cache` is
+/// unbounded, and an unbounded cache entry is the kind of thing that is fine until
+/// it is suddenly not. At the ceiling the walk stops and the response says so, so a
+/// truncated index is never mistaken for a complete one. Generous: a library this
+/// size is far past where a flat alphabetical list is the right browse surface at
+/// all, which is the signal to add jump-to-letter rather than raise this.
+const ALBUM_INDEX_MAX: i32 = 10_000;
+
+/// What the album-index page walk should do after a page. Pure so the termination
+/// rules - which is where an infinite loop or a silent truncation would live - are
+/// testable without a server.
+#[derive(Debug, PartialEq, Eq)]
+enum PageStep {
+    /// A full page came back and the ceiling is not reached: ask for more.
+    More,
+    /// A SHORT read: the server had fewer than a full page left, so this is the end
+    /// of the library and the index is COMPLETE.
+    Done,
+    /// A full page came back but the ceiling is reached: stop and SAY SO.
+    Truncated,
+}
+
+/// Decide the next step after receiving `got` albums at `offset_after` (the running
+/// total INCLUDING this page). Total, and never returns `More` without progress, so
+/// a server that answers a full page forever still terminates at the ceiling.
+fn album_index_step(got: i32, offset_after: i32) -> PageStep {
+    if got < ALBUM_INDEX_PAGE {
+        PageStep::Done
+    } else if offset_after >= ALBUM_INDEX_MAX {
+        PageStep::Truncated
+    } else {
+        PageStep::More
+    }
+}
+
 /// Command/filler words that carry no library-search signal. Stripping them keeps
 /// the per-keyword full-text `search3` keyed on content (genre/mood/artist words).
 ///
@@ -8359,7 +8397,7 @@ impl MpdHandler for HypodjHandler {
                             // than silently dumping the whole library.
                             return MpdResponse::ok();
                         }
-                        match self.client.album_list(AlbumListType::AlphabeticalByName, Some(500)).await {
+                        match self.client.album_list(AlbumListType::AlphabeticalByName, Some(500), None).await {
                             Ok(albums) => {
                                 let pairs = albums
                                     .into_iter()
@@ -8724,6 +8762,67 @@ impl HypodjHandler {
                 }
                 MpdResponse::Pairs(pairs)
             }
+            // The FLAT A-Z ALBUM INDEX. `list/newest` and friends are smart lists
+            // capped at 100, so an artist whose albums never entered that window was
+            // simply unreachable by browsing - the reason this path exists.
+            //
+            // Paged because a single get_album_list2 can only return `size` albums.
+            // Bounded because paging a whole library into dir_cache is unbounded in a
+            // way the 100-cap was hiding: at ALBUM_INDEX_MAX the walk stops and the
+            // response carries an explicit marker row, so a truncated index SAYS it is
+            // truncated instead of quietly looking complete.
+            Some("albums/all") => {
+                if let Some(pairs) = self.dir_cache.get(&"albums/all".to_string()) {
+                    return MpdResponse::Pairs(pairs);
+                }
+                let mut pairs = Vec::new();
+                // The smart lists stay ONE keystroke away rather than being replaced:
+                // newest/recent/frequent are genuinely useful, they were just never
+                // the right thing to call "Albums". This row is first so it is where
+                // the cursor already is when the screen opens.
+                pairs.push(("directory".to_string(), "Lists".to_string()));
+                pairs.push(("Album".to_string(), "Smart lists (newest, recent, ...)".to_string()));
+                let mut offset = 0i32;
+                let mut truncated = false;
+                loop {
+                    let page = match self
+                        .client
+                        .album_list(
+                            AlbumListType::AlphabeticalByName,
+                            Some(ALBUM_INDEX_PAGE),
+                            Some(offset),
+                        )
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => return ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
+                    };
+                    let got = page.len() as i32;
+                    for al in &page {
+                        pairs.push(("directory".to_string(), format!("album/{}", al.id.0)));
+                        pairs.push(("Album".to_string(), al.name.clone()));
+                        pairs.push(("X-SongCount".to_string(), al.song_count.to_string()));
+                    }
+                    offset += got;
+                    match album_index_step(got, offset) {
+                        PageStep::More => {}
+                        PageStep::Done => break,
+                        PageStep::Truncated => {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                }
+                if truncated {
+                    pairs.push(("directory".to_string(), "list/newest".to_string()));
+                    pairs.push((
+                        "Album".to_string(),
+                        format!("... showing the first {offset} albums"),
+                    ));
+                }
+                self.dir_cache.put("albums/all".to_string(), pairs.clone());
+                MpdResponse::Pairs(pairs)
+            }
             Some(p) if p.starts_with("list/") => {
                 let name = p.trim_start_matches("list/");
                 match list_type_from_dirname(name) {
@@ -8737,7 +8836,7 @@ impl HypodjHandler {
                         if let Some(pairs) = cached {
                             return MpdResponse::Pairs(pairs);
                         }
-                        match self.client.album_list(list_type, Some(100)).await {
+                        match self.client.album_list(list_type, Some(100), None).await {
                             Ok(albums) => {
                                 let mut pairs = Vec::new();
                                 for al in &albums {
@@ -9623,6 +9722,48 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn album_index_stops_on_a_short_read_because_that_is_the_end_of_the_library() {
+        assert_eq!(album_index_step(0, 0), PageStep::Done, "an empty library");
+        assert_eq!(album_index_step(188, 188), PageStep::Done, "the real library today");
+        assert_eq!(
+            album_index_step(ALBUM_INDEX_PAGE - 1, 999),
+            PageStep::Done,
+            "one short of a full page is still a short read"
+        );
+    }
+
+    #[test]
+    fn album_index_keeps_paging_while_pages_come_back_full() {
+        assert_eq!(album_index_step(ALBUM_INDEX_PAGE, ALBUM_INDEX_PAGE), PageStep::More);
+        assert_eq!(
+            album_index_step(ALBUM_INDEX_PAGE, ALBUM_INDEX_MAX - 1),
+            PageStep::More,
+            "one below the ceiling still asks for more"
+        );
+    }
+
+    #[test]
+    fn album_index_truncates_at_the_ceiling_rather_than_paging_forever() {
+        // A server that answers a full page forever must still terminate, and the
+        // caller must learn that the answer is INCOMPLETE rather than being handed a
+        // truncated list that looks whole.
+        assert_eq!(album_index_step(ALBUM_INDEX_PAGE, ALBUM_INDEX_MAX), PageStep::Truncated);
+        assert_eq!(
+            album_index_step(ALBUM_INDEX_PAGE, ALBUM_INDEX_MAX + ALBUM_INDEX_PAGE),
+            PageStep::Truncated
+        );
+    }
+
+    #[test]
+    fn album_index_ceiling_is_a_whole_number_of_pages_so_the_walk_lands_on_it() {
+        assert_eq!(
+            ALBUM_INDEX_MAX % ALBUM_INDEX_PAGE,
+            0,
+            "otherwise the walk overshoots the ceiling by up to a page before noticing"
+        );
+    }
     use super::*;
     use std::collections::HashSet;
     use std::path::Path;

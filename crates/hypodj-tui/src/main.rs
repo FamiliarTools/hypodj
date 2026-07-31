@@ -380,13 +380,14 @@ fn show_screen(tx: &Sender<Req>, state: &mut TuiState, screen: Screen) {
         Screen::Find => {}
         Screen::Albums => {
             if !state.albums.loaded {
-                // Seed Albums from the `newest` smart list (no flat A-Z album index
-                // exists server-side yet - see task rglhxv1 server gaps).
+                // The flat A-Z index, not the newest-100 smart list: an artist whose
+                // albums never entered that window was otherwise unreachable by
+                // browsing. The smart lists are the first row of it.
                 let _ = tx.send(Req::Browse {
                     target: Screen::Albums,
-                    command: "lsinfo list/newest".into(),
-                    path: "list/newest".into(),
-                    title: "Albums (newest)".into(),
+                    command: "lsinfo albums/all".into(),
+                    path: "albums/all".into(),
+                    title: "Albums".into(),
                     restore_sel: None,
                 });
             }

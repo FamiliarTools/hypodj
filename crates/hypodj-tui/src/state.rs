@@ -409,7 +409,7 @@ pub struct TuiState {
     pub selected: usize,
     /// The active main view.
     pub screen: Screen,
-    /// The Albums browse screen (seeded from the `list/newest` smart list).
+    /// The Albums browse screen (the flat A-Z index; the smart lists are a row in it).
     pub albums: Browse,
     /// The Playlists browse screen (server currently exposes only `Starred`).
     pub playlists: Browse,
@@ -540,7 +540,7 @@ impl Default for TuiState {
             queue: Vec::new(),
             selected: 0,
             screen: Screen::Queue,
-            albums: Browse::new("list/newest", "Albums (newest)"),
+            albums: Browse::new("albums/all", "Albums"),
             playlists: Browse::new("", "Playlists"),
             find: Find::default(),
             offset: Cell::new(0),
