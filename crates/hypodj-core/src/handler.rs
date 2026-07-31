@@ -568,6 +568,21 @@ impl State {
         self.pending_skip.or(self.current)
     }
 
+    /// Point `current` back at the queue entry carrying MPD id `qid`, if it is still
+    /// there. Returns whether it was found. The id (not an index) is what the failed-load
+    /// walk remembers, so a delete/move that reindexed the queue in between still lands
+    /// on the RIGHT entry - and an entry that is genuinely gone leaves `current` alone
+    /// rather than pointing it at whatever took its slot.
+    fn point_current_at_qid(&mut self, qid: u64) -> bool {
+        match self.queue.iter().position(|it| it.id == qid) {
+            Some(i) => {
+                self.current = Some(i);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether the queue is GENUINELY exhausted at an EOF edge - the TRUE-DRAIN
     /// signal that gates end-of-queue continuation so it can only fire when there is
     /// genuinely nothing left to play. It asks "IGNORING the `single`
@@ -1601,8 +1616,9 @@ pub struct HypodjHandler {
     /// flowing in between. The fuse behind [`MAX_CONSECUTIVE_EOF_FAILURES`]: reset by
     /// any evidence that a track actually PLAYED - a live playback position
     /// ([`Self::note_playback_progress`], the director's identity-matched `TimePos`), a
-    /// natural (non-errored) EOF, or a fresh-play GESTURE ([`Self::play_index`]) - so it
-    /// only ever counts an unbroken run of loads that never produced sound.
+    /// natural (non-errored) EOF, or a fresh-play GESTURE
+    /// ([`Self::arm_eof_fuse_for_gesture`]) - so it only ever counts an unbroken run of
+    /// loads that never produced sound.
     ///
     /// The position tick is the LOAD-BEARING reset, because neither of the other two
     /// covers the ordinary online failures: a track that plays for minutes and THEN
@@ -1614,6 +1630,24 @@ pub struct HypodjHandler {
     /// Lockless like [`Self::last_elapsed_ms`] - it is read and written on the player
     /// event spine, never together with State.
     consecutive_eof_failures: AtomicU32,
+    /// WHERE THE CURRENT FAILED-LOAD WALK STARTED: the MPD id ([`QueueItem::id`]) of the
+    /// entry a fresh-play GESTURE chose, plus one (0 = no walk in progress), latched by
+    /// [`Self::arm_eof_fuse_for_gesture`] and cleared by the SAME two pieces of
+    /// audio evidence that re-arm the fuse. So "latched" means exactly: a gesture asked
+    /// for this entry and not one frame of sound has been produced since.
+    ///
+    /// It is what makes the walk the fuse bounds NON-DESTRUCTIVE. A gesture is allowed
+    /// its full search - a dead entry or two on the way to a playable one is what the
+    /// budget pays for, and offline with a partly mirrored queue that search is the
+    /// whole point - but a search that finds NOTHING must leave the queue exactly as it
+    /// found it: both terminals ([`Self::halt_failed_advance`] and the drain arm of
+    /// [`Self::advance_on_eof`]) point `current` back HERE, and [`Self::plan_next`]
+    /// declines to consume entries the walk never played. Kept as an id, not an index,
+    /// so it survives any reindexing in between.
+    ///
+    /// Lockless like [`Self::consecutive_eof_failures`], and level-triggered: an id no
+    /// longer in the queue simply finds nothing to return to.
+    walk_origin_qid: AtomicU64,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -1966,6 +2000,7 @@ impl HypodjHandler {
             store_skip_pin: Mutex::new(None),
             restore_placeholders: Mutex::new(Vec::new()),
             consecutive_eof_failures: AtomicU32::new(0),
+            walk_origin_qid: AtomicU64::new(0),
         }
     }
 
@@ -4854,6 +4889,12 @@ impl HypodjHandler {
     /// the deck REPORTING Paused at this exact entry rather than letting it fall to
     /// Stopped, so the position survives for the next attempt and the checkpoint keeps
     /// saving the session rather than a stopped deck.
+    ///
+    /// The gesture gets a full fuse budget from here, so a queue that is only PARTLY
+    /// mirrored still finds its next cached entry and plays - and when nothing in reach
+    /// loads, the walk's terminal puts `current` back on THIS entry
+    /// ([`Self::arm_eof_fuse_for_gesture`]), so the position is held however many times
+    /// play is pressed while the server stays away.
     async fn resume_by_loading_current(&self) -> Result<(), PlayerError> {
         // Brief lock, dropped BEFORE the load await (never hold State across `.await`).
         let held = self.state.lock().unwrap().current;
@@ -5120,6 +5161,11 @@ impl HypodjHandler {
     fn note_eof_load_outcome(&self, errored: bool) -> u32 {
         if !errored {
             self.consecutive_eof_failures.store(0, Ordering::Relaxed);
+            // A track that ended naturally PLAYED, so no walk is in progress: the
+            // advance from here is an ordinary one, free to consume and to move the
+            // position. Cleared BEFORE `plan_next` reads it, which is what makes the
+            // consume decision below correct on the very first natural EOF.
+            self.latch_walk_origin(None);
             return 0;
         }
         self.consecutive_eof_failures.fetch_add(1, Ordering::Relaxed) + 1
@@ -5147,28 +5193,67 @@ impl HypodjHandler {
         if self.consecutive_eof_failures.load(Ordering::Relaxed) != 0 {
             self.consecutive_eof_failures.store(0, Ordering::Relaxed);
         }
+        // Sound is coming out of the entry the gesture asked for, so the walk this
+        // gesture might have started is over before it began: nothing to return to,
+        // and any later cascade is an ordinary one (see [`Self::walk_origin_qid`]).
+        if self.walk_origin_qid.load(Ordering::Relaxed) != 0 {
+            self.latch_walk_origin(None);
+        }
     }
 
-    /// Clear the consecutive-failure run: a fresh-play GESTURE is the user saying try
-    /// again, so the fuse re-arms with its full budget. A latched fuse - the alternative
-    /// - would let one bad run stop the queue for the rest of the process. Only
-    /// [`Self::play_index`] resets here; every other gesture that leads to real audio
-    /// re-arms through [`Self::note_playback_progress`] once the position starts moving.
-    fn reset_eof_failures(&self) {
-        self.consecutive_eof_failures.store(0, Ordering::Relaxed);
-    }
-
-    /// The auto-advance FUSE terminal: stay on the entry that just failed rather than
-    /// walking the rest of the queue into `current: None`.
+    /// Arm the consecutive-failure run for a fresh-play GESTURE: the full budget, plus
+    /// the entry the gesture CHOSE latched as the walk's origin
+    /// ([`Self::walk_origin_qid`]). Only the two gesture wrappers arm here
+    /// ([`Self::play_index`] and [`Self::play_index_from_silence`]); every other path that
+    /// leads to real audio re-arms through [`Self::note_playback_progress`] once the
+    /// position starts moving.
     ///
-    /// `current` is deliberately NOT moved and the queue is NOT touched, so the saved
-    /// position is exactly what a checkpoint persists. `pending_pause` makes the deck
-    /// report Paused (the player is already stopped - the failed load published its own
-    /// honest stop), which is the state a `play` gesture, an MPRIS widget, or a returning
-    /// server can all pick up from. The run counter is left standing: while the cause
-    /// persists, the next failure stops immediately instead of walking two more entries;
-    /// a fresh-play gesture re-arms it, and so does the first position tick of the first
-    /// entry that plays again once the cause clears.
+    /// The full budget is the SEARCH: a gesture means try again, and one or two dead
+    /// entries on the way to a playable one is exactly what the budget pays for - offline
+    /// with a partly mirrored queue that search is the difference between music and
+    /// silence, and a latched fuse would let one bad run stop the queue for the rest of
+    /// the process. What the gesture does NOT buy is damage: the origin latched here is
+    /// what both terminals return `current` to, and what keeps `consume` from eating the
+    /// entries the walk never played, so a search that finds nothing leaves the session
+    /// exactly as it was - however many times play is pressed while the cause persists.
+    fn arm_eof_fuse_for_gesture(&self, idx: usize) {
+        self.consecutive_eof_failures.store(0, Ordering::Relaxed);
+        let qid = self.state.lock().unwrap().queue.get(idx).map(|it| it.id);
+        self.latch_walk_origin(qid);
+    }
+
+    /// Write [`Self::walk_origin_qid`]: `None` ends the walk, `Some(id)` starts one at
+    /// that queue entry. Stored plus one so 0 can mean "no walk in progress" while id 0
+    /// stays a perfectly ordinary entry (a restored queue numbers from 0).
+    fn latch_walk_origin(&self, qid: Option<u64>) {
+        let raw = qid.map_or(0, |id| id.saturating_add(1));
+        self.walk_origin_qid.store(raw, Ordering::Relaxed);
+    }
+
+    /// The entry a failed-load walk is currently searching FROM, if one is in progress.
+    fn walk_origin(&self) -> Option<u64> {
+        match self.walk_origin_qid.load(Ordering::Relaxed) {
+            0 => None,
+            raw => Some(raw - 1),
+        }
+    }
+
+    /// The auto-advance FUSE terminal: stop the walk rather than grinding the rest of the
+    /// queue down into `current: None`.
+    ///
+    /// The queue is NOT touched and the position is put back where the walk STARTED (the
+    /// gesture's own entry, [`Self::walk_origin_qid`]) rather than left wherever the
+    /// search happened to die, so what a checkpoint persists is the entry the user was
+    /// on - however many times play is pressed while the cause persists. With no walk in
+    /// progress (a cascade that began at an ordinary EOF advance, so entries genuinely
+    /// ended along the way) `current` stays put, which is the same thing said of a walk
+    /// of length zero. `pending_pause` makes the deck report Paused (the player is
+    /// already stopped - the failed load published its own honest stop), which is the
+    /// state a `play` gesture, an MPRIS widget, or a returning server can all pick up
+    /// from. The run counter is left standing: while the cause persists, the next failure
+    /// stops immediately instead of walking two more entries; a fresh gesture re-arms it
+    /// in full ([`Self::arm_eof_fuse_for_gesture`]), and so does the first position tick
+    /// of the first entry that plays again once the cause clears.
     ///
     /// This intent is LONG-LIVED - it stands until a transport gesture picks the entry
     /// up, possibly for hours - which is why no volume commit may retire it. That is
@@ -5177,8 +5262,12 @@ impl HypodjHandler {
     /// write here safe WITHOUT taking the fade slot: a fade terminal racing this write
     /// re-reads the same player state and declines to clear, in either interleaving.
     fn halt_failed_advance(&self) {
+        let origin = self.walk_origin();
         let held = {
             let mut st = self.state.lock().unwrap();
+            if let Some(qid) = origin {
+                st.point_current_at_qid(qid);
+            }
             let held = st.current.and_then(|i| st.queue.get(i)).is_some();
             if held {
                 st.pending_pause = true;
@@ -5193,6 +5282,9 @@ impl HypodjHandler {
         // Nothing is loaded any more, so the store's bulk backfill must stop deferring -
         // the same reasoning as the end-of-queue honest stop.
         self.set_store_playback_remote(false);
+        // The position is authoritative for the mirror, and the walk moved it: re-anchor
+        // the store window on the entry actually held (a no-op when it did not move).
+        self.update_store_window();
         self.notify_change();
     }
 
@@ -5872,6 +5964,12 @@ impl HypodjHandler {
     /// ([`State::random_next_index`]) makes the `random` choice deterministic and
     /// unit-testable.
     fn plan_next(&self, auto: bool) -> Option<usize> {
+        // `consume` evicts a track that PLAYED. An auto-advance taken INSIDE a
+        // failed-load walk ([`Self::walk_origin_qid`]) is stepping over an entry whose
+        // load never produced a frame, so there is nothing to have consumed - and eating
+        // it would destroy exactly the queue the walk's terminal is about to hand back
+        // intact. Read before the lock; a manual `next` always consumes, as MPD does.
+        let walking = auto && self.walk_origin().is_some();
         let mut st = self.state.lock().unwrap();
         // Anchor on the REPORTED current so a manual `next`/`prev` during an
         // in-flight skip steps past the target the user already sees, not the
@@ -5901,7 +5999,7 @@ impl HypodjHandler {
         } else {
             None
         };
-        if st.consume {
+        if st.consume && !walking {
             // Remove the just-finished entry, then remap the target index over the
             // shrink: indices AFTER the removed slot shift down by one; a target at
             // or before it is unchanged; anything now out of range stops (or wraps
@@ -6104,10 +6202,25 @@ impl HypodjHandler {
                 if landed_orphan {
                     let _ = self.player.stop().await;
                 }
+                // THE SAME TERMINAL AS THE FUSE, reached off the end of the queue
+                // instead of at the third failure: a walk that fell off a SHORT queue
+                // before the fuse could trip (three entries left, two dead loads, no
+                // third to count) must not drain the session either. When a walk is in
+                // progress ([`Self::walk_origin_qid`] - a gesture asked, and not one
+                // frame of sound followed) the position goes back to where it asked and
+                // the deck reports Paused, exactly as [`Self::halt_failed_advance`] does;
+                // an ordinary end of queue is untouched, because the track that PLAYED to
+                // get here already ended the walk.
+                let origin = self.walk_origin();
                 let mut st = self.state.lock().unwrap();
-                st.current = None;
-                // End of queue: no pending pause / skip can survive a stopped deck.
-                st.pending_pause = false;
+                let held = origin.is_some_and(|qid| st.point_current_at_qid(qid));
+                if !held {
+                    st.current = None;
+                }
+                // End of queue: no pending pause / skip can survive a stopped deck -
+                // unless an entry is still held, which is a nothing-loaded terminal and
+                // is precisely what the intent is for.
+                st.pending_pause = held;
                 st.pending_skip = None;
                 // No continuation stream is live once the deck stops honestly.
                 st.continuation_active = None;
@@ -6116,6 +6229,11 @@ impl HypodjHandler {
                 // stops deferring. This is the transition into the long idle window
                 // the mirror is meant to use.
                 self.set_store_playback_remote(false);
+                if held {
+                    // The walk moved the position and this put it back: re-anchor the
+                    // mirror window on the entry actually held.
+                    self.update_store_window();
+                }
                 self.notify_change();
             }
         }
@@ -6853,11 +6971,14 @@ impl HypodjHandler {
     /// advance) resyncs mpv's gain to the baseline first - see
     /// [`Self::play_index_inner`].
     async fn play_index(&self, idx: usize) -> Result<(), String> {
-        // A deliberate gesture re-arms the EOF failure fuse (see
-        // [`MAX_CONSECUTIVE_EOF_FAILURES`]): the EOF advance itself goes through
-        // `play_index_inner` and must NOT reset it, because mpv's premature loadfile Ok
-        // makes every failed load look like a successful play from here.
-        self.reset_eof_failures();
+        // A deliberate gesture re-arms the EOF failure fuse with its full budget (see
+        // [`MAX_CONSECUTIVE_EOF_FAILURES`]) and latches THIS entry as the walk's origin,
+        // so the search that budget pays for can find a playable entry further down while
+        // a search that finds nothing hands the position straight back
+        // ([`Self::arm_eof_fuse_for_gesture`]). The EOF advance itself goes through
+        // `play_index_inner` and must NOT arm at all, because mpv's premature loadfile
+        // Ok makes every failed load look like a successful play from here.
+        self.arm_eof_fuse_for_gesture(idx);
         self.play_index_inner(idx, true).await
     }
 
@@ -6877,7 +6998,13 @@ impl HypodjHandler {
     /// are NOT gestures - a PauseOut fade still descending across a track boundary must
     /// keep its intent until its own [`Terminal::Pause`] lands. Retired only AFTER the
     /// load lands, so a wake that could not load leaves the held terminal standing.
+    ///
+    /// Being a gesture, it arms the EOF fuse exactly as [`Self::play_index`] does. An
+    /// alarm firing hours into a nothing-loaded terminal is entitled to the same search
+    /// for something playable - and to the same guarantee that a search finding nothing
+    /// hands the saved position back rather than walking it off the end of the queue.
     async fn play_index_from_silence(&self, idx: usize) -> Result<(), String> {
+        self.arm_eof_fuse_for_gesture(idx);
         self.play_index_inner(idx, false).await?;
         let retired = {
             let mut st = self.state.lock().unwrap();
@@ -17086,6 +17213,292 @@ mod tests {
         assert_eq!(h.reported_play_state(), PlayState::Paused);
     }
 
+    /// Feed the player events a FAILING LOAD really produces, until the deck settles.
+    /// mpv's loadfile Ok is premature, so an entry that cannot open publishes its own
+    /// honest stop and comes back as an ERRORED `Eof` - which re-enters the advance,
+    /// loads the NEXT entry, and fails the same way. That cascade is the whole mechanism
+    /// the fuse bounds, so a test about the fuse has to run it rather than hand-feed one
+    /// event. The deck settles when it stops reporting Playing (the halt reports Paused,
+    /// a drained queue reports Stopped); the iteration bound only keeps a REGRESSION from
+    /// spinning here forever.
+    async fn cascade_failed_loads(h: &HypodjHandler) {
+        for _ in 0..12 {
+            let _ = h.player.stop().await;
+            h.advance_on_eof(EofSignal { errored: true, ..EofSignal::default() }).await;
+            if h.reported_play_state() != PlayState::Playing {
+                return;
+            }
+        }
+        panic!("the failed-load cascade never settled: the fuse did not stop the walk");
+    }
+
+    /// Drive the EOF walk into its halt terminal and return the entry it holds: three
+    /// loads that never produce a frame, each publishing the honest stop a failed load
+    /// publishes live, so the terminal that stands at the end is the REAL shape (a raw
+    /// Stopped player under a standing `pending_pause`), not one poked into the state.
+    async fn halt_terminal_at(h: &HypodjHandler, start: usize) -> Option<usize> {
+        h.state.lock().unwrap().current = Some(start);
+        cascade_failed_loads(h).await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "the halt reports Paused");
+        assert_eq!(h.player.state(), PlayState::Stopped, "over a player holding nothing");
+        h.state.lock().unwrap().current
+    }
+
+    /// THE DRAIN BY ANOTHER ROUTE - the gap c70beed named and left open, reproduced in
+    /// the order it was observed live.
+    ///
+    /// Every resume gesture funnels into [`HypodjHandler::resume_by_loading_current`],
+    /// which calls `play_index`, which re-armed the fuse with a FULL budget. So offline,
+    /// at the halt terminal, each press of play bought three more failed loads: the walk
+    /// went pause@3 -> pause@5 -> pause@7 and then off the end of the queue into
+    /// `current: None` + Stopped, where the drain LEGITIMATELY retires the intent - and
+    /// `resume.toml` ends up holding `play_state = "stopped"` with no current key. The
+    /// exact end state the terminal exists to prevent, and a flat contradiction of this
+    /// path's own promise that the position survives for the next attempt.
+    ///
+    /// A resume IS a genuine transport gesture: it retires the pause intent, it gets to
+    /// try the load, and it gets its full search of the queue - offline that search is
+    /// how a partly mirrored queue finds its next cached entry. What it must not do is
+    /// SPEND the session on that search. So the walk is non-destructive: when it finds
+    /// nothing, the terminal puts `current` back on the entry the gesture asked for
+    /// ([`HypodjHandler::walk_origin_qid`]), and the queue is left exactly as it was.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_resume_gestures_at_the_halt_terminal_never_walk_the_queue() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..8 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("o-{i}"))).await;
+        }
+        assert_eq!(halt_terminal_at(&h, 1).await, Some(3), "the walk halted holding entry 3");
+
+        // Press play, and keep pressing. Each gesture loads the held entry, the load
+        // fails the way every load fails while the server is away, and the deck must come
+        // back to the SAME entry - not two further down it.
+        let mut held_after_each_gesture = Vec::new();
+        for _ in 0..3 {
+            h.set_pause(Some(false)).await.expect("resume gesture");
+            cascade_failed_loads(&h).await;
+            held_after_each_gesture.push(h.state.lock().unwrap().current);
+        }
+        assert_eq!(
+            held_after_each_gesture,
+            vec![Some(3), Some(3), Some(3)],
+            "the live-observed drain (pause@3 -> pause@5 -> pause@7 -> stop/None) must not happen"
+        );
+        let qid_of_3 = h.state.lock().unwrap().queue[3].id;
+        assert_eq!(
+            h.walk_origin(),
+            Some(qid_of_3),
+            "and the entry each search returns to is the one the gesture asked for"
+        );
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.queue.len(), 8, "and the queue itself is untouched");
+        }
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Paused,
+            "the terminal still stands after all that pressing"
+        );
+
+        // THE POINT: what the checkpoint writes still carries the session, however many
+        // times play was pressed while the server stayed away.
+        let snap = h.resume_snapshot(12.5);
+        assert_eq!(snap.current, Some(3), "resume.toml keeps the position");
+        assert_eq!(snap.play_state, ResumePlayState::Paused, "and never persists a stopped deck");
+        assert_eq!(snap.queue.len(), 8);
+    }
+
+    /// The SAME rule on the OTHER nothing-loaded terminal: an offline restore of a saved
+    /// Playing state whose current entry is uncached comes up Paused holding the saved
+    /// position, with the fuse never yet armed (no load has failed - the restore declined
+    /// to try). Here NOTHING in the queue is cached, so the gesture's search finds
+    /// nothing at all - and the very first press of play must therefore leave the saved
+    /// position exactly where it was, not two entries down it.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_after_an_offline_restore_holds_the_saved_position() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("resume-offline-restore");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        // Nothing is cached and the server is away: the restore's own arm holds the
+        // saved position at entry 2 and reports Paused.
+        let s = offline_resume_state(&["q-0", "q-1", "q-2", "q-3", "q-4", "q-5"], Some(2));
+        h.restore(&s).await.expect("restore succeeds");
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+        assert_eq!(h.state.lock().unwrap().current, Some(2), "holding the saved position");
+
+        // The user presses play while the server is still away.
+        h.set_pause(Some(false)).await.expect("resume gesture");
+        cascade_failed_loads(&h).await;
+        assert_eq!(
+            h.state.lock().unwrap().current,
+            Some(2),
+            "the search found nothing, so it hands the SAME entry back - never a walk \
+             down the queue"
+        );
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+        assert_eq!(h.state.lock().unwrap().queue.len(), 6, "and nothing was consumed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE OTHER HALF OF THE SAME OFFLINE STORY, and the reason the walk may not simply
+    /// be forbidden: a partly mirrored queue. The store holds SOME of what is queued -
+    /// the everyday shape, since the mirror is the pin set plus a window - so the saved
+    /// position can easily land on an entry that is not cached while the very next one
+    /// is. Pressing play there must reach the cached entry and MAKE MUSIC; a rule that
+    /// gave the gesture a single attempt on the held entry left the user with no audio at
+    /// all, forever, with only `next` still searching (and no way to know that).
+    ///
+    /// The uncached entry's load failing is modelled the way every failing load behaves
+    /// live (the honest stop plus an errored `Eof`); a NullPlayer load that SUCCEEDS is
+    /// the cached entry opening off disk.
+    #[tokio::test(start_paused = true)]
+    async fn a_play_gesture_offline_searches_forward_to_the_cached_entry() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("resume-partial-mirror");
+        let store = open_store(&dir);
+        commit_into(&store, &store_song("p-3", 16));
+        h.set_audio_store(store.clone());
+
+        // Saved at entry 2, which is NOT in the mirror; entry 3 genuinely is.
+        let s = offline_resume_state(&["p-0", "p-1", "p-2", "p-3", "p-4"], Some(2));
+        h.restore(&s).await.expect("restore succeeds");
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "the offline terminal stands");
+        assert_eq!(h.state.lock().unwrap().current, Some(2), "on the saved position");
+
+        // Press play. Entry 2 cannot open, so the walk steps to entry 3 - which does.
+        h.set_pause(Some(false)).await.expect("resume gesture");
+        let _ = h.player.stop().await;
+        h.advance_on_eof(EofSignal { errored: true, ..EofSignal::default() }).await;
+        assert_eq!(
+            h.state.lock().unwrap().current,
+            Some(3),
+            "the search reached the next entry the store CAN serve"
+        );
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Playing,
+            "and it is playing - pressing play offline on a partly mirrored queue must \
+             produce music, not a terminal that only `next` can escape"
+        );
+        assert_eq!(h.state.lock().unwrap().queue.len(), 5, "with the queue intact behind it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed-load walk consumes NOTHING. `consume` evicts a track that PLAYED, and an
+    /// entry whose load never produced a frame did not play - so with `consume` on, the
+    /// search a play gesture buys must not eat the queue on its way past the dead
+    /// entries. Without this the walk destroyed what the terminal then had nothing left
+    /// to hand back: the origin entry itself is the FIRST thing `plan_next` would remove.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_walk_consumes_nothing_and_hands_the_queue_back() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..5 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("c-{i}"))).await;
+        }
+        h.state.lock().unwrap().consume = true;
+        let ids_before = h.resume_snapshot(0.0).queue;
+
+        // Press play on entry 1 while the server is away: three loads, none of which
+        // produces a frame.
+        h.handle(MpdCommand::Play(Some(1))).await;
+        cascade_failed_loads(&h).await;
+
+        assert_eq!(
+            h.resume_snapshot(0.0).queue,
+            ids_before,
+            "consume ate nothing: not one entry of the queue the walk stepped over"
+        );
+        assert_eq!(
+            h.state.lock().unwrap().current,
+            Some(1),
+            "so the position the gesture started from is still there to hand back"
+        );
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "under the standing terminal");
+
+        // And consume still works for a track that genuinely PLAYED: audio flowed, so
+        // this is an ordinary advance, not a walk.
+        h.set_pause(Some(false)).await.expect("resume gesture");
+        h.note_playback_progress(); // the director's identity-matched TimePos
+        h.advance_on_eof(EofSignal::default()).await;
+        assert_eq!(
+            h.state.lock().unwrap().queue.len(),
+            4,
+            "the entry that played was consumed, exactly as consume mode promises"
+        );
+    }
+
+    /// THE ALARM AT THE TERMINAL, on a queue too SHORT for the fuse to save it. A wake
+    /// plays through `play_index_from_silence`, so it must arm the same way `play_index`
+    /// does - otherwise the walk it starts belongs to no gesture, and with only two
+    /// entries left to try it falls off the END of the queue before a third failure could
+    /// ever trip the fuse. That drain arm legitimately retires the intent and drops
+    /// `current`, so an alarm firing hours into an offline restore left `resume.toml`
+    /// holding `play_state = "stopped"` with no current key: the exact end state both
+    /// nothing-loaded terminals exist to prevent, reached by the one route that skipped
+    /// the fuse entirely.
+    #[tokio::test(start_paused = true)]
+    async fn an_alarm_at_the_offline_restore_terminal_never_drains_the_session() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("wake-offline-restore");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        // Nothing cached, the server away, the saved position one from the end.
+        let s = offline_resume_state(&["w-0", "w-1", "w-2"], Some(1));
+        h.restore(&s).await.expect("restore succeeds");
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "holding the saved position");
+
+        // Hours later the alarm fires into it, and the server is STILL away.
+        h.wake_now(None, 0).await.expect("the alarm plays");
+        cascade_failed_loads(&h).await;
+
+        assert_eq!(
+            h.state.lock().unwrap().current,
+            Some(1),
+            "the walk ran off the end of a 3-entry queue and still handed the position back"
+        );
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "the terminal stands again");
+        let snap = h.resume_snapshot(7.5);
+        assert_eq!(snap.current, Some(1), "so resume.toml still carries the session");
+        assert_eq!(snap.play_state, ResumePlayState::Paused, "never a stopped deck");
+        assert_eq!(snap.queue.len(), 3, "with every saved id intact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound on all of it, so the fix cannot over-reach: the walk's origin is
+    /// FORGOTTEN the moment audio flows. A server that returns makes the held entry load,
+    /// the position tick re-arms the fuse and ends the walk, and from there the ordinary
+    /// online behavior is byte-for-byte what it always was - one dead track in a healthy
+    /// queue is still skipped past, only a RUN of three stops the walk, and the halt then
+    /// holds where that ordinary cascade ended rather than teleporting back.
+    #[tokio::test(start_paused = true)]
+    async fn a_returning_server_resumes_and_re_arms_the_full_budget() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..8 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("b-{i}"))).await;
+        }
+        assert_eq!(halt_terminal_at(&h, 1).await, Some(3), "the walk halted holding entry 3");
+
+        // The server is back, so the held entry LOADS (a NullPlayer load is a server that
+        // answered) and audio starts flowing.
+        h.set_pause(Some(false)).await.expect("resume gesture");
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "one attempt was all it needed");
+        assert_eq!(h.state.lock().unwrap().current, Some(3), "on the entry that was held");
+        h.note_playback_progress(); // the director's identity-matched TimePos
+
+        // Full budget back: two dead tracks are skipped past exactly as they always were.
+        let failed = || EofSignal { errored: true, ..EofSignal::default() };
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(4), "a single failed load still advances");
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(5), "and so does a second");
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(5), "the third is still the systemic one");
+        assert!(h.state.lock().unwrap().pending_pause, "and it halts, as it always did");
+    }
+
     /// The SAME long-lived-intent defect on the FUSE terminal, in the exact order it was
     /// observed live: an offline restore's own wake ramp was still climbing when the EOF
     /// walk halted at T+1s, and ~20s later that ramp's landing terminal retired the
@@ -17113,6 +17526,10 @@ mod tests {
         pump(200, 3).await;
         assert!(h.fade_active().await, "the wake ramp is still climbing");
 
+        // Entry 0 PLAYED - that is what makes the advance to entry 1 an ordinary one and
+        // the halt below hold entry 1 rather than hand the position back to a gesture
+        // that never got its audio (see [`HypodjHandler::walk_origin_qid`]).
+        h.note_playback_progress();
         // The load that failed published its own honest stop, so the player holds
         // NOTHING. (A NullPlayer's own loads all succeed, so the stop is explicit here.)
         let _ = h.player.stop().await;
@@ -17214,8 +17631,10 @@ mod tests {
             h.enqueue_song_for_test(playlist_test_song(&format!("a-{i}"))).await;
         }
         h.handle(MpdCommand::Play(Some(0))).await;
-        // The overnight terminal: the server went away, the EOF walk halted on the entry
-        // it could not load, and the player holds nothing.
+        // Entry 0 played (so the advance to entry 1 is an ordinary one), and then the
+        // overnight terminal: the server went away, the EOF walk halted on the entry it
+        // could not load, and the player holds nothing.
+        h.note_playback_progress();
         let _ = h.player.stop().await;
         h.state.lock().unwrap().current = Some(1);
         h.halt_failed_advance();
@@ -17414,19 +17833,43 @@ mod tests {
 
         // Play it for real. loadfile's Ok is premature; the failure arrives as an event.
         h.play_index(0).await.expect("play_index returns Ok (loadfile is premature)");
-        let mut signal: Option<EofSignal> = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while std::time::Instant::now() < deadline && signal.is_none() {
-            match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
-                Ok(Some(PlayerEvent::Eof { song, errored, was_local, continuation_landed, .. })) => {
-                    signal = Some(EofSignal { song, errored, was_local, continuation_landed });
+
+        // WHY A WALL CLOCK, uniquely here: the event being waited for is produced by a
+        // REAL libmpv core on its OWN thread, out of its demuxer's verdict on the bytes -
+        // not by any timer this runtime owns. `start_paused` advances tokio's clock, never
+        // another thread's progress, so there is nothing to fake; every other timing rule
+        // in this file still holds, because this wait contains no time-based LOGIC.
+        //
+        // So the shape is: EVENT DRIVEN, watchdog bounded. `recv()` returns the moment mpv
+        // speaks (about 0.3s in practice), the 60s is a watchdog that only fires when the
+        // path is genuinely broken, and it names what DID arrive so a failure diagnoses
+        // itself. The previous 15s poll loop also accepted the FIRST Eof whatever entry it
+        // named, so any unrelated Eof arriving first failed the run on a technicality;
+        // this waits for THIS entry's own Eof, which is what the suspect hook keys on.
+        let mut seen: Vec<String> = Vec::new();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                match events.recv().await {
+                    Some(PlayerEvent::Eof { song: ended, errored, was_local, continuation_landed, .. })
+                        if ended.as_ref() == Some(&song.id) =>
+                    {
+                        return Some(EofSignal { song: ended, errored, was_local, continuation_landed });
+                    }
+                    Some(other) => {
+                        if seen.len() < 16 {
+                            seen.push(format!("{other:?}"));
+                        }
+                    }
+                    None => return None,
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => {}
             }
-        }
-        let ev = signal.expect("the corrupt local file surfaced an Eof");
+        })
+        .await;
+        let ev = match outcome {
+            Ok(Some(ev)) => ev,
+            Ok(None) => panic!("the player event channel closed before {:?} ended; saw: {seen:?}", song.id),
+            Err(_) => panic!("no Eof for {:?} within the 60s watchdog; saw: {seen:?}", song.id),
+        };
         assert!(ev.errored && ev.was_local, "carrying the suspect signal: {ev:?}");
         // The director's exact call.
         h.advance_on_eof(ev).await;

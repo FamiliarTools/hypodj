@@ -1517,23 +1517,38 @@ impl AudioStore {
         Ok(audio)
     }
 
-    /// Drop `id` entirely: out of the index first (so playback stops being offered
-    /// it), then the SIDECAR (which de-commits the entry), then the audio.
+    /// Drop `id` entirely: the SIDECAR first (which de-commits the entry), then out
+    /// of the index, then the audio.
     ///
-    /// That order is deliberate - an interrupted delete leaves an orphan the next
-    /// scan sweeps, never a sidecar pointing at bytes that are gone.
+    /// That order is what ties the OFFER to the on-disk truth in both directions.
+    /// De-committing first means an interrupted delete leaves an orphan the next
+    /// scan sweeps, never a sidecar pointing at bytes that are gone. And because a
+    /// REFUSED sidecar unlink - a read-only remount, an immutable file, a disk gone
+    /// bad - returns before the index is touched, an entry the filesystem would not
+    /// let us delete is still whole on disk and therefore KEEPS BEING OFFERED. The
+    /// earlier index-first order de-offered it instead, so a still-valid pinned song
+    /// streamed over the network until the next FULL pass re-adopted it from disk -
+    /// up to `store.sync_interval_secs` later. Keep-until-replaced cuts both ways:
+    /// what we could not remove, we keep serving, and its bytes keep counting
+    /// against the budget because they are genuinely still there.
     ///
-    /// Returns whether the FILES actually went (see [`remove_pair`]). `false` means
-    /// the bytes are still on disk and the next full scan will re-adopt them, so a
-    /// caller counting reclaimed space must not treat it as progress. Removing an
-    /// id the store never had returns `true`: nothing is there, which is the
-    /// requested state.
+    /// Once the sidecar IS gone the entry can no longer be valid (section 2, rule 1)
+    /// whatever happens to the bytes, so it leaves the index BEFORE the unlink -
+    /// playback is never handed a path that is about to vanish.
+    ///
+    /// Returns whether the FILES actually went (see [`remove_audio`]). `false` means
+    /// bytes are still on disk, so a caller counting reclaimed space must not treat
+    /// it as progress. Removing an id the store never had returns `true`: nothing is
+    /// there, which is the requested state.
     pub fn remove_entry(&self, id: &SongId) -> bool {
+        if !remove_sidecar(&self.root, id) {
+            return false;
+        }
         let suffix = {
             let mut index = self.index.lock().expect("store index lock");
             index.remove(id).map(|e| e.suffix)
         };
-        remove_pair(&self.root, id, suffix.as_deref())
+        remove_audio(&self.root, id, suffix.as_deref())
     }
 
     /// Rewrite the sidecar's `pinned` flag and mirror it into the index. A demote
@@ -1701,14 +1716,39 @@ impl AudioStore {
 /// forever. Every refusal is warned once here, so the failure is visible rather
 /// than merely silent-but-bounded.
 fn remove_pair(root: &Path, id: &SongId, suffix: Option<&str>) -> bool {
-    let mut gone = true;
+    // Both halves always run - a refused sidecar must not leave the bytes behind
+    // as an orphan the scan would have to sweep on some later pass.
+    let sidecar_gone = remove_sidecar(root, id);
+    let audio_gone = remove_audio(root, id, suffix);
+    sidecar_gone && audio_gone
+}
+
+/// Delete an entry's SIDECAR - the COMMIT RECORD, so this alone de-commits the
+/// entry: without it the pair is no longer valid (section 2, rule 1) whatever
+/// happens to the bytes, and what is left is an orphan the next scan sweeps.
+///
+/// Returns whether it is gone. An absent sidecar counts as gone - that is the
+/// requested state - but a REFUSED unlink does not, and a refusal means the entry
+/// on disk is still whole.
+fn remove_sidecar(root: &Path, id: &SongId) -> bool {
     let sidecar = root.join(format!("{}.toml", id.0));
     if let Err(e) = std::fs::remove_file(&sidecar) {
         if e.kind() != io::ErrorKind::NotFound {
-            gone = false;
             tracing::warn!(path = %sidecar.display(), error = %e, "store: removing sidecar failed");
+            return false;
         }
     }
+    true
+}
+
+/// Delete an entry's AUDIO bytes. `suffix` names the file when known; otherwise
+/// every `<id>.<something>` left in the directory goes, which is what heals an
+/// entry left over from a suffix change.
+///
+/// Returns whether the bytes ACTUALLY went, which is the only thing that reclaims
+/// space - see [`remove_pair`].
+fn remove_audio(root: &Path, id: &SongId, suffix: Option<&str>) -> bool {
+    let mut gone = true;
     match suffix {
         Some(s) => {
             let audio = root.join(format!("{}.{}", id.0, s));
@@ -3115,6 +3155,68 @@ title = "Minimal"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A removal the FILESYSTEM REFUSES must not de-offer a song whose bytes are
+    /// still right there and still valid.
+    ///
+    /// On a read-only remount (or an immutable file) the unlink fails, the pair
+    /// survives whole, and dropping the index entry anyway would make `resolve_play`
+    /// fall through to the network for a song the disk can serve - and only a FULL
+    /// pass re-adopts it, so the regression lasted up to `sync_interval_secs`
+    /// (900s by default). Keep-until-replaced cuts both ways.
+    #[test]
+    fn a_refused_removal_keeps_serving_the_entry_it_could_not_delete() {
+        let dir = tmpdir("remove-denied");
+        place(&dir, &song("a", 16, "flac", None), true, false, 0);
+        let s = store(&dir, 1 << 30);
+        assert_eq!(s.lookup(&sid("a")), Some(dir.join("a.flac")), "offered before");
+
+        deny_unlink(&dir);
+        let reclaimed = s.remove_entry(&sid("a"));
+        let refused = dir.join("a.flac").exists() && dir.join("a.toml").exists();
+        // ALWAYS restore before asserting, so a failure still leaves nothing behind.
+        allow_unlink(&dir);
+        if !refused {
+            // A root build user unlinks inside a read-only directory anyway; the
+            // scenario cannot be built there, so do not pretend to have tested it.
+            eprintln!("skipping: this process can unlink inside a read-only directory");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(!reclaimed, "an unlink the filesystem refused reclaimed nothing");
+        assert_eq!(
+            s.lookup(&sid("a")),
+            Some(dir.join("a.flac")),
+            "the pair is still whole on disk, so it must still be OFFERED - de-offering it \
+             streams a cached song over the network until the next full pass"
+        );
+        assert_eq!(s.total_bytes(), 16, "and its bytes still count against the budget");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of that ordering: once the SIDECAR is gone the entry is
+    /// de-committed and can never be valid again (section 2, rule 1), so it leaves
+    /// the index even though the bytes could not be removed - which is also what
+    /// keeps playback from being handed a path that is about to vanish.
+    #[test]
+    fn a_de_committed_entry_leaves_the_index_even_when_its_bytes_will_not_go() {
+        let dir = tmpdir("remove-audio-stuck");
+        place(&dir, &song("a", 16, "flac", None), true, false, 0);
+        let s = store(&dir, 1 << 30);
+        // Turn the audio file into a DIRECTORY: `remove_file` then fails with EISDIR
+        // while the sidecar unlink still succeeds - the split-outcome case, with no
+        // root privileges needed to build it.
+        std::fs::remove_file(dir.join("a.flac")).expect("drop the audio file");
+        std::fs::create_dir(dir.join("a.flac")).expect("stand a directory in its place");
+
+        assert!(!s.remove_entry(&sid("a")), "nothing was reclaimed");
+        // Asserted on the INDEX itself, not through `lookup` - `lookup`'s stat would
+        // reject a directory anyway, so it could not tell the two orderings apart.
+        assert!(s.entries().is_empty(), "a de-committed entry leaves the index");
+        assert_eq!(s.lookup(&sid("a")), None, "and is never offered");
+        assert!(!dir.join("a.toml").exists(), "and its commit record is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn set_pinned_set_stale_and_flush_recency_round_trip_through_the_sidecar() {
         let dir = tmpdir("mutators");
@@ -4119,18 +4221,27 @@ title = "Minimal"
         }
     }
 
-    /// Like [`settle`] but stops as soon as `done` holds, and FAILS LOUDLY if it
-    /// never does - so a broken loop is a clear failure rather than a later
-    /// confusing assertion.
-    async fn settle_until(tag: &str, mut done: impl FnMut() -> bool) {
+    /// Like [`settle`] but stops as soon as `done` holds, REPORTING whether it ever
+    /// did. Callers that must restore state before they can fail (a tempdir left
+    /// read-only on purpose) use this and assert afterwards.
+    async fn settle_reached(mut done: impl FnMut() -> bool) -> bool {
         for _ in 0..2000 {
             if done() {
-                return;
+                return true;
             }
             tokio::task::yield_now().await;
             std::thread::sleep(Duration::from_micros(200));
         }
-        panic!("the reconciler never reached: {tag}");
+        false
+    }
+
+    /// Like [`settle`] but stops as soon as `done` holds, and FAILS LOUDLY if it
+    /// never does - so a broken loop is a clear failure rather than a later
+    /// confusing assertion.
+    async fn settle_until(tag: &str, done: impl FnMut() -> bool) {
+        if !settle_reached(done).await {
+            panic!("the reconciler never reached: {tag}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -4692,6 +4803,11 @@ title = "Minimal"
         // full pass finds the same 80-bytes-over-50 situation it just "fixed".
         let source = Arc::new(FakeSource::new(Some(Vec::new())));
         let task = tokio::spawn(run(small.clone(), source.clone(), TokioClockForTest));
+        // WAIT FOR THE STARTUP PASS FIRST. Without that floor the ceiling below is
+        // satisfied by `calls == 0`, so a loaded machine that simply never got the
+        // reconciler going would leave this test asserting nothing at all - it could
+        // only ever fail vacuously, never catch the hot loop it exists for.
+        let started = settle_reached(|| source.pins_calls() >= 1).await;
         // No virtual time passes here, so the 900s interval never elapses: EVERY
         // pass beyond the startup one is an immediate re-entry.
         settle().await;
@@ -4704,8 +4820,9 @@ title = "Minimal"
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }
+        assert!(started, "the reconciler never ran its startup pass, so nothing below was tested");
         assert!(
-            calls <= 2,
+            (1..=2).contains(&calls),
             "a store that cannot reclaim must fall back to the interval; instead {calls} full passes (each a scan plus a getStarred2) ran back to back"
         );
         let _ = std::fs::remove_dir_all(&dir);
