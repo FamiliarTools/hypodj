@@ -10,6 +10,7 @@ use ratatui::Frame;
 use hypodj_client::model::{fmt_remaining, ArmedFeatures, FieldState, HintKind, NowPlaying};
 
 use crate::keymap;
+use crate::find::{FindRow, Focus, Phase};
 use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState};
 
 /// Draw the full jukebox: the screen-tab row, the active list
@@ -34,6 +35,7 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     let list_area = chunks[2];
     match state.screen {
         Screen::Queue => render_queue(f, list_area, state),
+        Screen::Find => render_find(f, list_area, state),
         Screen::Albums => render_browse(f, list_area, &state.albums, state, true),
         Screen::Playlists => render_browse(f, list_area, &state.playlists, state, false),
         // The DJ View shares the top region: Queue on the left, the Claude Code
@@ -248,6 +250,9 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen) {
         (Screen::Albums, "[F2]Albums"),
         (Screen::Playlists, "[F3]Playlists"),
         (Screen::Dj, "[F4]DJ"),
+        // The tab says Search because that is the word a user reaches for; the code
+        // says Find because every `Search` identifier is already the `/` cursor jump.
+        (Screen::Find, "[F5]Search"),
     ];
     let mut spans = Vec::new();
     for (i, (s, label)) in labels.iter().enumerate() {
@@ -1117,6 +1122,158 @@ mod tests {
     }
 
     #[test]
+    fn find_drill_keeps_the_query_visible_above_the_browse_list() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.query = "c418".into();
+        s.find.drilling = true;
+        s.find.drill.title = "C418".into();
+        s.find.drill.rows = vec![crate::state::BrowseRow {
+            label: "Minecraft - Volume Alpha".into(), uri: "album/9".into(),
+            is_dir: true, song_count: Some(24),
+        }];
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("find> c418"), "the query that produced this branch stays visible:\n{out}");
+        assert!(out.contains("back to hits"), "and the way back is stated:\n{out}");
+        assert!(out.contains("C418"), "the drill is titled:\n{out}");
+        assert!(out.contains("Minecraft - Volume Alpha"), "and renders as a plain browse list:\n{out}");
+    }
+
+    #[test]
+    fn find_drill_in_flight_shows_a_spinner_not_an_empty_box() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.drilling = true;
+        s.find.drill_loading = true;
+        s.find.drill.title = "C418".into();
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("C418"), "titled while loading:\n{out}");
+        // An empty bordered box carrying the artist name reads as "no albums"
+        // rather than "still loading", which is the one state the inventory missed.
+        assert!(
+            out.contains('|') || out.contains('/') || out.contains('-') || out.contains('\\'),
+            "a spinner frame is drawn:\n{out}"
+        );
+    }
+
+    #[test]
+    fn find_tab_is_in_the_strip_and_the_cold_screen_is_typeable() {
+        // The tab strip is a hardcoded ARRAY, not a match, so nothing forces a new
+        // screen into it: a missed edit ships a working tab that is invisible. This
+        // is the guard.
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("[F5]Search"), "Find tab in the strip:\n{out}");
+        assert!(out.contains("find>"), "the query prompt is drawn:\n{out}");
+        assert!(
+            out.contains("type a query and press enter"),
+            "the COLD hint is drawn, and must read differently from no-results:\n{out}"
+        );
+    }
+
+    #[test]
+    fn find_renders_a_typed_query_and_its_hint() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.query = "c418".into();
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("find> c418"), "the query echoes on the prompt line:\n{out}");
+        assert!(out.contains("enter: search"), "the query-focus hint is drawn:\n{out}");
+    }
+
+    #[test]
+    fn find_no_results_echoes_the_query_and_differs_from_cold() {
+        // The protocol cannot distinguish an empty result from an empty filter, so
+        // the client - which knows what it sent - says so verbatim.
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.phase = crate::find::Phase::Done;
+        s.find.submitted = "kalabrezze".into();
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("no results for"), "no-results state:\n{out}");
+        assert!(out.contains("kalabrezze"), "the query is echoed back:\n{out}");
+        assert!(
+            !out.contains("type a query and press enter"),
+            "must NOT read as the cold state:\n{out}"
+        );
+    }
+
+    #[test]
+    fn find_hit_rows_render_with_kind_sigils_at_the_default_60x24() {
+        // The whole no-header-rows decision rests on this: the screen band is
+        // height - 16, so at 60x24 there are five content rows. A design that needs a
+        // taller terminal to show its main state fails here.
+        use crate::find::{FindKind, FindRow};
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.phase = crate::find::Phase::Done;
+        s.find.hits.tallies = vec![
+            (FindKind::Artist, 1, None),
+            (FindKind::Album, 1, None),
+            (FindKind::Song, 1, None),
+        ];
+        s.find.hits.rows = vec![
+            FindRow { kind: FindKind::Artist, label: "C418".into(), uri: "artist/1".into(), trailer: "12 albums".into(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: Some("album/2".into()) },
+        ];
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("@  C418"), "artist row with its @ sigil:\n{out}");
+        assert!(out.contains("=  Volume Alpha"), "album row with its = sigil:\n{out}");
+        assert!(out.contains("Sweden"), "song row:\n{out}");
+        assert!(out.contains("1 artist / 1 album / 1 song"), "tallies in the title:\n{out}");
+        assert!(out.contains("12 albums"), "the right-aligned trailer survives:\n{out}");
+    }
+
+    #[test]
+    fn find_states_an_absent_kind_in_the_title_and_spends_no_row_on_it() {
+        use crate::find::FindKind;
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.phase = crate::find::Phase::Done;
+        s.find.hits.tallies = vec![(FindKind::Artist, 0, Some(20)), (FindKind::Song, 47, None)];
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("no artists"), "absence is stated, not silent:\n{out}");
+    }
+
+    #[test]
+    fn find_in_flight_keeps_the_previous_rows_visible() {
+        use crate::find::{FindKind, FindRow};
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.phase = crate::find::Phase::Loading("boards".into());
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(),
+            trailer: "3:03".into(), song_count: None, album_uri: None,
+        }];
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("searching"), "the in-flight title:\n{out}");
+        assert!(
+            out.contains("Sweden"),
+            "the stale answer stays legible and actionable rather than blanking:\n{out}"
+        );
+    }
+
+    #[test]
+    fn find_ack_renders_in_the_pane_not_the_transient_bottom_bar() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.phase = crate::find::Phase::Failed("no such server".into());
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("search failed"), "the ACK is targeted at the screen:\n{out}");
+    }
+
+    #[test]
+    fn find_survives_a_short_terminal_without_panicking() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.query = "c418".into();
+        let out = render_to_lines_sized(&s, 60, 20).join("\n");
+        assert!(out.contains("find> c418"), "the query line survives a 20-row terminal:\n{out}");
+    }
+
+    #[test]
     fn render_dj_view_draws_title_phase_and_input() {
         let mut s = TuiState::new();
         s.screen = crate::state::Screen::Dj;
@@ -1879,4 +2036,147 @@ fn render_confirm_popup(f: &mut Frame, region: Rect, state: &TuiState) {
     let block = Block::default().borders(Borders::ALL).title("Confirm");
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// The Find (library query) screen: a borderless query line above a bordered
+/// results list.
+///
+/// The band this owns is `height - 16` rows, because a `Length` constraint outranks
+/// a `Min` in the outer layout, so at the 60x24 the test harness uses there are
+/// exactly five content rows here. That arithmetic is why kind is a one-character
+/// gutter sigil and the tallies live in the block title: per-kind header rows would
+/// have spent three of those five on chrome.
+fn render_find(f: &mut Frame, area: Rect, state: &TuiState) {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(area);
+    let (query_row, list_row) = (rows[0], rows[1]);
+    let find = &state.find;
+
+    // The query line, with a right-aligned hint that says what the keys do HERE.
+    let hint = if find.drilling {
+        "esc / h: back to hits".to_string()
+    } else if let Some(indicator) = find.history_indicator() {
+        indicator
+    } else if find.focus == Focus::Query {
+        "enter: search   ^v: history".to_string()
+    } else {
+        "tab: edit".to_string()
+    };
+    let prompt = format!("find> {}", find.query);
+    let pad = (query_row.width as usize)
+        .saturating_sub(prompt.chars().count() + hint.chars().count() + 1);
+    let query_line = Line::from(vec![
+        Span::styled("find> ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(find.query.clone()),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
+    ]);
+    f.render_widget(Paragraph::new(query_line), query_row);
+
+    // The drill borrows the ordinary browse renderer, so a drilled-in Find is
+    // indistinguishable from the Albums tab.
+    if find.drilling {
+        // A drill with nothing yet would otherwise render an empty bordered box
+        // carrying the artist's name for the whole round trip, which reads as "this
+        // artist has no albums" rather than "still loading".
+        if find.drill_loading && find.drill.rows.is_empty() {
+            let frames = ['|', '/', '-', '\\'];
+            let spin = frames[((state.spin_secs * 6.0) as usize) % 4];
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{spin} {}", find.drill.title));
+            f.render_widget(block, list_row);
+            return;
+        }
+        render_browse(f, list_row, &find.drill, state, true);
+        return;
+    }
+
+    let title = match &find.phase {
+        Phase::Loading(q) => {
+            // spin_secs is free-running (it advances even on a stopped deck), so the
+            // spinner turns while a query is in flight regardless of play state.
+            let frames = ['|', '/', '-', '\\'];
+            let spin = frames[((state.spin_secs * 6.0) as usize) % 4];
+            format!("{spin} searching {q:?}")
+        }
+        Phase::Failed(reason) => format!("search failed: {reason}"),
+        _ => find.tally_title(),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(list_row);
+    f.render_widget(block, list_row);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // The empty states are three DIFFERENT things and must not read alike: nothing
+    // asked yet, a query that genuinely matched nothing, and a query still in
+    // flight. The no-results line echoes the query verbatim because the protocol
+    // cannot distinguish an empty result from an empty filter - the client knows
+    // what it sent, so it says so.
+    if find.hits.rows.is_empty() {
+        let msg = match &find.phase {
+            Phase::Cold => "type a query and press enter".to_string(),
+            Phase::Loading(_) => String::new(),
+            Phase::Failed(_) => String::new(),
+            Phase::Done => format!("no results for {:?}", find.submitted),
+        };
+        if !msg.is_empty() {
+            let line = Line::from(Span::styled(msg, Style::default().add_modifier(Modifier::DIM)));
+            f.render_widget(Paragraph::new(line).centered(), inner);
+        }
+        return;
+    }
+
+    // Rows go DIM while a refine is in flight: the stale answer stays legible and
+    // still actionable rather than blanking the screen between keystrokes.
+    let stale = matches!(find.phase, Phase::Loading(_));
+    let height = inner.height as usize;
+    let start =
+        crate::state::scroll_offset(find.selected, find.hits.rows.len(), height, find.offset.get());
+    find.offset.set(start);
+    let lines: Vec<Line> = find
+        .hits
+        .rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(i, row)| {
+            find_row_line(row, i == find.selected, stale, inner.width, state.highlight_query())
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One hit row: a three-column gutter (`<kind sigil><queue mark><space>`), the
+/// label, and a right-aligned trailer. The label is what truncates when the row is
+/// too narrow, so the trailer never eats the name the user is reading.
+fn find_row_line(
+    row: &FindRow,
+    selected: bool,
+    stale: bool,
+    width: u16,
+    query: &str,
+) -> Line<'static> {
+    let gutter = format!("{}{} ", row.kind.sigil(), ' ');
+    let width = width as usize;
+    let trailer = row.trailer.clone();
+    let room = width.saturating_sub(gutter.chars().count() + trailer.chars().count() + 1);
+    let label: String = row.label.chars().take(room).collect();
+    let pad = room.saturating_sub(label.chars().count()) + 1;
+    let mut style = Style::default();
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    if stale {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    // Underline the query inside the label, so the eye lands on WHY this row
+    // matched - the same treatment the browse lists already give a `/` search.
+    let hit = style.add_modifier(Modifier::UNDERLINED);
+    let mut spans = vec![Span::styled(gutter, style)];
+    spans.extend(match_spans(&label, query, style, hit));
+    spans.push(Span::styled(format!("{}{trailer}", " ".repeat(pad)), style));
+    Line::from(spans)
 }

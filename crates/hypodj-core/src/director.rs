@@ -40,7 +40,7 @@ use tokio::task::JoinHandle;
 
 use crate::clock::Clock;
 use crate::event::{DjEvent, DjEventKind, QueueId, QueueSnapshot, TrackRef};
-use crate::handler::HypodjHandler;
+use crate::handler::{EofSignal, HypodjHandler};
 use crate::model::SongId;
 use crate::player::{PlayState, PlayerEvent};
 use crate::scrobble::Scrobbler;
@@ -456,6 +456,17 @@ async fn spine<C: Clock>(
                         // match the latch is stale (an off-spine advance drained
                         // late) and is dropped, never mis-enriched.
                         if queue_id.is_some() && queue_id == pubr.latch {
+                            // AUDIO IS FLOWING: re-arm the consecutive-failure EOF fuse.
+                            // This is the ONLY signal that a load actually produced sound
+                            // - mpv's loadfile Ok is premature, so StateChanged(Playing)
+                            // proves nothing - and it is what keeps the fuse counting
+                            // failures rather than counting errored ends (a track that
+                            // played for minutes and then dropped also ends errored). A
+                            // position of exactly 0 is a load that has not decoded yet,
+                            // so it is not yet evidence.
+                            if pos > 0.0 {
+                                handler.note_playback_progress();
+                            }
                             let p = pos_to_duration(pos);
                             let rem = pubr.time_remaining(p);
                             pubr.broadcast_only(DjEventKind::Tick {
@@ -464,24 +475,32 @@ async fn spine<C: Clock>(
                             });
                         }
                     }
-                    PlayerEvent::Eof { song, queue_id, continuation_landed } => {
+                    PlayerEvent::Eof { song, queue_id, continuation_landed, errored, was_local } => {
                         if let Some(qid) = queue_id {
                             // (a)+(b): build the finishing ref and publish TrackEnd
                             // BEFORE advance repoints current (End before Start).
-                            let finishing = pubr.track_ref(qid, song);
+                            let finishing = pubr.track_ref(qid, song.clone());
                             pubr.edge(DjEventKind::TrackEnd(finishing));
                         }
                         // The next TrackStart surfaces later from play_index's
                         // StateChanged(Playing); clear the latch now (End is done).
                         pubr.clear_latch();
                         // (c): network, inline, must-not-drop, but bounded so a hung
-                        // stream_url cannot pin the spine. `continuation_landed` threads
-                        // the actor's warmed-station-auto-advanced signal so the None-branch
+                        // stream_url cannot pin the spine. The WHOLE Eof payload is
+                        // threaded through: `continuation_landed` so the None-branch
                         // ATTRIBUTES the already-playing station (append the Stream row,
-                        // repoint current, set the one-shot latch) instead of cold-starting.
+                        // repoint current, set the one-shot latch) instead of cold-starting,
+                        // and `song`/`errored`/`was_local` so the offline store can mark
+                        // failed LOCAL bytes suspect against the EVENT's own song id (never
+                        // a re-read of `st.current`, which the advance is about to repoint).
                         let _ = tokio::time::timeout(
                             ADVANCE_TIMEOUT,
-                            handler.advance_on_eof(continuation_landed),
+                            handler.advance_on_eof(EofSignal {
+                                song,
+                                errored,
+                                was_local,
+                                continuation_landed,
+                            }),
                         )
                         .await;
                         // Swallow the trailing transient mpv Stopped ONLY if the
@@ -597,6 +616,10 @@ mod tests {
             user_rating: None,
             composer: None,
             performer: None,
+            size: None,
+            suffix: None,
+            content_type: None,
+            created: None,
         }
     }
 
@@ -732,6 +755,68 @@ mod tests {
             }
         };
         assert_eq!(tick2, None, "duration-less song -> honest None remaining");
+    }
+
+    // THE FUSE WIRING: a live position tick on the LATCHED entry re-arms the
+    // consecutive-failure EOF fuse. Without this seam the fuse counts errored ENDS
+    // rather than failed LOADS - and mpv reports `Error` for a track that played for
+    // minutes and then lost its source, and reports `Stop` (no Eof at all) for a user
+    // skip off a healthy track - so three unrelated hiccups spread over a session, or
+    // three dead tracks in a skip-heavy session, would halt a perfectly healthy queue.
+    #[tokio::test]
+    async fn a_playback_tick_rearms_the_eof_failure_fuse() {
+        let Some((handler, rt, player)) = rig(&[
+            ("s0", Some(100), Some("A")),
+            ("s1", Some(100), Some("A")),
+            ("s2", Some(100), Some("A")),
+            ("s3", Some(100), Some("A")),
+            ("s4", Some(100), Some("A")),
+        ])
+        .await
+        else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let mut triggers = rt.subscribe_triggers();
+        let mut ticks = rt.events.subscribe();
+        let errored = || EofSignal { errored: true, ..EofSignal::default() };
+
+        handler.play_for_test(0).await;
+        let first = triggers.recv().await.unwrap();
+        assert!(kind_is_track_start(&first.kind), "got {:?}", first.kind);
+
+        // Two errored ends with no audio in between: the run is at 2, one short of the
+        // fuse, and the walk has advanced twice.
+        for expected in 1..=2usize {
+            handler.advance_on_eof(errored()).await;
+            let _ = drain_to_track_start(&mut triggers).await;
+            assert_eq!(
+                handler.queue_snapshot().current.as_ref().map(|c| c.index),
+                Some(expected),
+                "a lone failed load still advances"
+            );
+        }
+
+        // The entry now playing produces a REAL position sample (the seek path emits the
+        // same identity-stamped TimePos the mpv actor does while playing).
+        player.seek(40.0).await.unwrap();
+        loop {
+            let ev = ticks.recv().await.unwrap();
+            if matches!(ev.kind, DjEventKind::Tick { .. }) {
+                break;
+            }
+        }
+
+        // So the next errored end is the FIRST of a fresh run, not the third of an old
+        // one: the queue keeps walking instead of halting on the entry that failed.
+        // Asserted on the SNAPSHOT rather than by draining triggers, because a halted
+        // walk emits no TrackStart at all - a drain would hang instead of failing.
+        handler.advance_on_eof(errored()).await;
+        assert_eq!(
+            handler.queue_snapshot().current.as_ref().map(|c| c.index),
+            Some(3),
+            "a track that PLAYED re-armed the fuse; the walk must not have halted at 2"
+        );
     }
 
     // Identity join under off-spine mutation: after an off-spine `next` repoints

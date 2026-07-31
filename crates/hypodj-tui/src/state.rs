@@ -12,6 +12,7 @@ use hypodj_client::model::{NowPlaying, QueueItem};
 use hypodj_client::nl::not_understood_hint;
 use hypodj_client::route::{route, Action};
 
+use crate::find::{Find, Focus};
 use crate::keymap;
 
 /// Vim-style scrolloff: keep this many rows of context above/below the cursor.
@@ -231,6 +232,9 @@ pub enum Screen {
     Albums,
     Playlists,
     Dj,
+    /// The library query surface. Named Find in code because every `Search`
+    /// identifier is already the `/` cursor jump; the tab strip says Search.
+    Find,
 }
 
 /// One row in a browse list. `uri` is the server browse path (`album/<id>`,
@@ -265,7 +269,7 @@ pub struct Browse {
 }
 
 impl Browse {
-    fn new(path: &str, title: &str) -> Self {
+    pub(crate) fn new(path: &str, title: &str) -> Self {
         Browse {
             rows: Vec::new(),
             selected: 0,
@@ -322,6 +326,9 @@ pub enum Intent {
     Enqueue { uri: String, play: bool },
     /// Load a playlist by name (`load <name>`), appending to the queue.
     LoadPlaylist(String),
+    /// Run a library query on the dedicated find socket. NOT a mutation, so it must
+    /// never set `sent_mutation` and never trail a `request_refresh`.
+    Find(String),
     /// Translate a DJ View NL query via the Claude Code backend (on the dedicated CC
     /// worker thread, never the command socket), ending in a Confirm popup.
     Cc(String),
@@ -402,10 +409,12 @@ pub struct TuiState {
     pub selected: usize,
     /// The active main view.
     pub screen: Screen,
-    /// The Albums browse screen (seeded from the `list/newest` smart list).
+    /// The Albums browse screen (the flat A-Z index; the smart lists are a row in it).
     pub albums: Browse,
     /// The Playlists browse screen (server currently exposes only `Starred`).
     pub playlists: Browse,
+    /// The Find (library query) screen.
+    pub find: Find,
     /// Top visible queue row, derived in render (where the viewport height is
     /// known) via [`scroll_offset`] and persisted here so scroll state survives
     /// across frames. Interior-mutable so the render (which holds `&TuiState`)
@@ -531,8 +540,9 @@ impl Default for TuiState {
             queue: Vec::new(),
             selected: 0,
             screen: Screen::Queue,
-            albums: Browse::new("list/newest", "Albums (newest)"),
+            albums: Browse::new("albums/all", "Albums"),
             playlists: Browse::new("", "Playlists"),
+            find: Find::default(),
             offset: Cell::new(0),
             mode: Mode::Normal,
             input: String::new(),
@@ -630,6 +640,15 @@ impl TuiState {
         // re-fetches on the next screen visit.
         self.albums.loaded = false;
         self.playlists.loaded = false;
+        self.find.drill.loaded = false;
+        // A query outstanding on the dead socket will never land, so the spinner
+        // would turn forever. Fall back to Done and KEEP the hits: they are a
+        // truthful snapshot of a question the user asked, and re-running is one
+        // Enter away.
+        if matches!(self.find.phase, crate::find::Phase::Loading(_)) {
+            self.find.phase = crate::find::Phase::Done;
+        }
+        self.find.drill_loading = false;
         self.status_msg = Some("connection lost - reconnecting...".to_string());
     }
 
@@ -687,6 +706,18 @@ impl TuiState {
         if self.screen == Screen::Dj {
             return self.key_dj(key);
         }
+        // Find captures typing into its own `find>` line while the QUERY half has
+        // focus, so nav/verb keys never shadow the input. With focus on the RESULTS
+        // half it falls straight through to the shared bindings, so every global key
+        // behaves exactly as it does on the other screens.
+        if self.screen == Screen::Find {
+            if let Some(intent) = self.key_find(key) {
+                return Some(intent);
+            }
+            if self.find.focus == Focus::Query {
+                return None;
+            }
+        }
         // Dispatch is DERIVED from the single-source KEYMAP: resolve the key to its
         // Act via `match_key` (which already encodes the readline-first ordering - a
         // Ctrl chord is a `Ctrl` matcher, so a plain `p`/`n`/`s` never shadows
@@ -709,6 +740,21 @@ impl TuiState {
         use keymap::Act;
         match act {
             // Screen switch: main.rs lazily fetches the target view.
+            Act::ScreenFind => self.switch_screen(Screen::Find),
+            // Section jumps are Find-only: elsewhere they are a deliberate no-op
+            // rather than a surprise, since no other screen has kinds to jump between.
+            Act::SectionNext => {
+                if self.screen == Screen::Find && !self.find.drilling {
+                    self.find.jump_section(1);
+                }
+                None
+            }
+            Act::SectionPrev => {
+                if self.screen == Screen::Find && !self.find.drilling {
+                    self.find.jump_section(-1);
+                }
+                None
+            }
             Act::ScreenQueue => self.switch_screen(Screen::Queue),
             Act::ScreenAlbums => self.switch_screen(Screen::Albums),
             Act::ScreenPlaylists => self.switch_screen(Screen::Playlists),
@@ -790,6 +836,12 @@ impl TuiState {
 
     /// Switch to `screen` (clearing any standing search); main.rs lazily fetches it.
     fn switch_screen(&mut self, screen: Screen) -> Option<Intent> {
+        // Idempotent: re-pressing the tab key you are already on must not wipe a
+        // standing `/` query or re-fetch. Without this, F2-while-on-Albums silently
+        // clears the search the user is stepping through with `n`.
+        if self.screen == screen {
+            return None;
+        }
         self.last_search.clear();
         self.screen = screen;
         Some(Intent::ShowScreen(screen))
@@ -803,6 +855,10 @@ impl TuiState {
             Screen::Queue | Screen::Dj => None,
             Screen::Albums => Some(&mut self.albums),
             Screen::Playlists => Some(&mut self.playlists),
+            // The drill is the ONLY browse list Find owns, and only while it is the
+            // visible one. Returning it off-drill would let a drill response that
+            // landed after the user backed out flash under the next drill's title.
+            Screen::Find => self.find.drilling.then(|| &mut self.find.drill),
         }
     }
 
@@ -812,11 +868,19 @@ impl TuiState {
             Screen::Queue | Screen::Dj => None,
             Screen::Albums => Some(&mut self.albums),
             Screen::Playlists => Some(&mut self.playlists),
+            Screen::Find => self.find.drilling.then(|| &mut self.find.drill),
         }
     }
 
     /// Jump the selection to the top of the active list (no-op when empty).
     fn go_top(&mut self) {
+        // The Find HIT list is not a `Browse`, so `active_browse()` returns None for
+        // it off-drill and the queue fallback below would silently move the QUEUE
+        // cursor while the visible list sat still. Claim it before that fallback.
+        if self.screen == Screen::Find && !self.find.drilling {
+            self.find.selected = 0;
+            return;
+        }
         match self.active_browse() {
             Some(b) if !b.rows.is_empty() => b.selected = 0,
             Some(_) => {}
@@ -830,6 +894,13 @@ impl TuiState {
 
     /// Jump the selection to the last row of the active list (no-op when empty).
     fn go_bottom(&mut self) {
+        // The Find HIT list is not a `Browse`, so `active_browse()` returns None for
+        // it off-drill and the queue fallback below would silently move the QUEUE
+        // cursor while the visible list sat still. Claim it before that fallback.
+        if self.screen == Screen::Find && !self.find.drilling {
+            self.find.selected = self.find.hits.rows.len().saturating_sub(1);
+            return;
+        }
         match self.active_browse() {
             Some(b) if !b.rows.is_empty() => b.selected = b.rows.len() - 1,
             Some(_) => {}
@@ -869,6 +940,18 @@ impl TuiState {
         match self.screen {
             // Dj Enter is handled in key_dj (submit the query), never here.
             Screen::Dj => None,
+            // Enter ALWAYS plays the selection, on every screen (drilling-in is `o`).
+            // On an album row that enqueues the whole album and plays its first
+            // track, exactly as the Albums tab does.
+            Screen::Find if !self.find.drilling => {
+                let uri = self.find.current_row()?.uri.clone();
+                Some(Intent::Enqueue { uri, play: true })
+            }
+            Screen::Find => {
+                let b = &self.find.drill;
+                let uri = b.rows.get(b.selected).map(|r| r.uri.clone())?;
+                Some(Intent::Enqueue { uri, play: true })
+            }
             Screen::Queue => self
                 .queue
                 .get(self.selected)
@@ -886,6 +969,16 @@ impl TuiState {
 
     /// Back out one browse level; only on a browse screen with a non-empty stack.
     fn browse_back(&mut self) -> Option<Intent> {
+        // Backing out of a Find drill returns to the hits, which are still in memory
+        // and were never overwritten - so it costs NO round trip and the query is
+        // preserved by construction. Sending a BrowseBack here would re-fetch
+        // `lsinfo ""`, the whole artist root, because the drill starts at depth 0
+        // with an empty stack.
+        if self.screen == Screen::Find && self.find.drilling && self.find.drill.stack.is_empty() {
+            self.find.drilling = false;
+            self.find.drill_loading = false;
+            return None;
+        }
         match self.active_browse() {
             Some(b) if !b.stack.is_empty() => Some(Intent::BrowseBack),
             _ => None,
@@ -897,6 +990,17 @@ impl TuiState {
     /// stream row (URL uri) is a friendly status; an empty queue is a silent
     /// no-op.
     fn favorite_selected(&mut self) -> Option<Intent> {
+        if self.screen == Screen::Find && !self.find.drilling {
+            // song/ and album/ are both starrable (Favorite::from_uri handles both);
+            // an artist row is not, and stage one never produces one.
+            let uri = self.find.current_row()?.uri.clone();
+            return if uri.starts_with("song/") || uri.starts_with("album/") {
+                Some(Intent::Command(format!("playlistadd Starred {uri}")))
+            } else {
+                self.status_msg = Some("that row can't be favorited".into());
+                None
+            };
+        }
         match self.queue.get(self.selected).and_then(|it| it.uri.as_deref()) {
             Some(uri) if uri.starts_with("song/") => {
                 Some(Intent::Command(format!("playlistadd Starred {uri}")))
@@ -915,6 +1019,13 @@ impl TuiState {
     /// Albums/dir/song row enqueues with `add <uri>`. Queue has nothing to add ->
     /// no-op.
     fn enqueue_selected(&mut self) -> Option<Intent> {
+        // The Find HIT list is not a `Browse`, so it must be claimed BEFORE the
+        // active_browse() consultation below (which returns None off-drill).
+        if self.screen == Screen::Find && !self.find.drilling {
+            let uri = self.find.current_row()?.uri.clone();
+            self.find.move_selection(1);
+            return Some(Intent::Enqueue { uri, play: false });
+        }
         let intent = match self.active_browse() {
             Some(b) => {
                 let uri = b.rows.get(b.selected).map(|r| r.uri.clone())?;
@@ -932,6 +1043,17 @@ impl TuiState {
     /// `o`: OPEN (drill into) the selected browse directory. A song row or the Queue
     /// screen is a no-op (Enter is the play verb there).
     fn open_selected(&mut self) -> Option<Intent> {
+        // A hit row is not a `Browse` row, so claim it before active_browse(). Album
+        // and artist hits drill; a song has nothing to open.
+        if self.screen == Screen::Find && !self.find.drilling {
+            let row = self.find.current_row()?;
+            return match row.kind {
+                crate::find::FindKind::Album | crate::find::FindKind::Artist => {
+                    Some(Intent::BrowseInto(row.uri.clone()))
+                }
+                crate::find::FindKind::Song => None,
+            };
+        }
         let b = self.active_browse()?;
         let row = b.rows.get(b.selected)?;
         if row.is_dir {
@@ -956,6 +1078,12 @@ impl TuiState {
             Screen::Playlists => self.playlists.rows.iter().map(|r| r.label.clone()).collect(),
             // The DJ pane has no navigable list to search.
             Screen::Dj => Vec::new(),
+            // `/` inside a drill steps the DRILL rows; over the hit list it steps
+            // the hits. Both are real lists the eye can see, so both are searchable.
+            Screen::Find if self.find.drilling => {
+                self.find.drill.rows.iter().map(|r| r.label.clone()).collect()
+            }
+            Screen::Find => self.find.hits.rows.iter().map(|r| r.label.clone()).collect(),
         }
     }
 
@@ -965,6 +1093,10 @@ impl TuiState {
             Screen::Queue | Screen::Dj => self.selected,
             Screen::Albums => self.albums.selected,
             Screen::Playlists => self.playlists.selected,
+            // Never `self.selected` here: that is the QUEUE cursor, and returning it
+            // would silently move the queue while the visible list sat still.
+            Screen::Find if self.find.drilling => self.find.drill.selected,
+            Screen::Find => self.find.selected,
         }
     }
 
@@ -974,6 +1106,8 @@ impl TuiState {
             Screen::Queue | Screen::Dj => self.selected = i,
             Screen::Albums => self.albums.selected = i,
             Screen::Playlists => self.playlists.selected = i,
+            Screen::Find if self.find.drilling => self.find.drill.selected = i,
+            Screen::Find => self.find.selected = i,
         }
     }
 
@@ -1008,6 +1142,13 @@ impl TuiState {
     pub fn highlight_query(&self) -> &str {
         match self.mode {
             Mode::Search => &self.input,
+            // On Find, the query that produced the visible hits is what the eye is
+            // looking for, so it underlines even with no standing `/` search. A live
+            // `/` still wins: it is the more recent intent, and `/` inside a drill
+            // must highlight what it is stepping through.
+            Mode::Normal if self.screen == Screen::Find && self.last_search.is_empty() => {
+                &self.find.submitted
+            }
             Mode::Normal => &self.last_search,
             _ => "",
         }
@@ -1070,6 +1211,13 @@ impl TuiState {
     /// Move the ACTIVE screen's selection with clamping (no wrap). Queue moves
     /// `self.selected`; browse screens move their own cursor.
     fn move_selection(&mut self, delta: i32) {
+        // The Find HIT list is not a `Browse`, so `active_browse()` returns None for
+        // it off-drill and the queue fallback below would silently move the QUEUE
+        // cursor while the visible list sat still. Claim it before that fallback.
+        if self.screen == Screen::Find && !self.find.drilling {
+            self.find.move_selection(delta);
+            return;
+        }
         if let Some(b) = self.active_browse() {
             b.move_selection(delta);
             return;
@@ -1166,6 +1314,105 @@ impl TuiState {
     /// instead of falling to the CC translator that has no favorite capability;
     /// anything else stays a CC translation (a DJ query is otherwise never a bare
     /// verb).
+    /// The Find screen's key handling. Returns `Some(intent)` when it acted, and
+    /// `None` when the caller should fall through to the shared keymap - which only
+    /// happens with focus on the results half.
+    ///
+    /// This deliberately does NOT introduce a fifth `Mode`. `state.mode` stays
+    /// `Mode::Normal` throughout, exactly as the Dj screen's `ask>` line does, so
+    /// `render_command`'s per-mode caret match and `handle_key`'s mode dispatch need
+    /// no new arm.
+    fn key_find(&mut self, key: KeyEvent) -> Option<Intent> {
+        // The screen-switch keys and help must work here too, resolved through the
+        // SINGLE-SOURCE keymap so this screen can never drift from KEYMAP. F-keys are
+        // never part of a query, so they switch outright. `?` opens help ONLY on an
+        // empty query line, so a literal `?` can still be typed mid-query.
+        if let Some(act) = keymap::match_key(key, self.screen) {
+            use keymap::Act;
+            match act {
+                Act::ScreenQueue
+                | Act::ScreenAlbums
+                | Act::ScreenPlaylists
+                | Act::ScreenDj
+                | Act::ScreenFind => return self.apply_act(act),
+                Act::HelpToggle if self.find.query.is_empty() => return self.apply_act(act),
+                _ => {}
+            }
+        }
+        if self.find.focus == Focus::Results {
+            // The results half is an ordinary list: everything falls through to the
+            // shared bindings. Only Tab (back to the query) is claimed here.
+            return match key.code {
+                KeyCode::Tab => {
+                    self.find.focus = Focus::Query;
+                    None
+                }
+                // Esc in the results half steps UP the ladder to the query line
+                // (out of a drill first). Falling through to the shared BrowseBack
+                // would be a silent no-op here, leaving the key feeling dead.
+                KeyCode::Esc if !self.find.drilling => {
+                    self.find.focus = Focus::Query;
+                    None
+                }
+                _ => None,
+            };
+        }
+        match key.code {
+            // The Esc ladder: out of a drill, then off the query line to the results,
+            // then off the screen. Each press makes progress rather than ping-ponging.
+            KeyCode::Esc => {
+                // The ladder: out of a drill, then off the screen. Each press makes
+                // progress rather than ping-ponging between two states.
+                if self.find.drilling {
+                    self.find.drilling = false;
+                    self.find.drill_loading = false;
+                    return None;
+                }
+                self.screen = Screen::Queue;
+                Some(Intent::ShowScreen(Screen::Queue))
+            }
+            KeyCode::Tab => {
+                if !self.find.hits.rows.is_empty() {
+                    self.find.focus = Focus::Results;
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                self.find.query.pop();
+                None
+            }
+            // Up/Down walk the query history rather than moving a cursor, because a
+            // submit-driven screen has no type-then-arrow-into-results gesture: Enter
+            // already lands the cursor on row 0.
+            KeyCode::Up => {
+                self.find.walk_history(1);
+                None
+            }
+            KeyCode::Down => {
+                self.find.walk_history(-1);
+                None
+            }
+            KeyCode::Enter => {
+                // Step 2 sends the query; step 1 only records it, so the screen is
+                // usable and the history ring is exercised without a socket.
+                let q = self.find.query.trim().to_string();
+                if q.is_empty() {
+                    return None;
+                }
+                self.find.push_history(&q);
+                self.find.phase = crate::find::Phase::Loading(q.clone());
+                self.find.submitted = q.clone();
+                Some(Intent::Find(q))
+            }
+            KeyCode::Char(c) => {
+                self.find.query.push(c);
+                self.find.history_pos = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn key_dj(&mut self, key: KeyEvent) -> Option<Intent> {
         // The Scope::Global view + help bindings must work here too, and they are
         // resolved through the SINGLE-SOURCE keymap (match_key) - NOT hand-written -
@@ -1178,7 +1425,11 @@ impl TuiState {
         if let Some(act) = keymap::match_key(key, self.screen) {
             use keymap::Act;
             match act {
-                Act::ScreenQueue | Act::ScreenAlbums | Act::ScreenPlaylists | Act::ScreenDj => {
+                Act::ScreenQueue
+                | Act::ScreenAlbums
+                | Act::ScreenPlaylists
+                | Act::ScreenDj
+                | Act::ScreenFind => {
                     return self.apply_act(act);
                 }
                 Act::HelpToggle if self.dj_input.is_empty() => {
@@ -1416,19 +1667,294 @@ mod tests {
 
     #[test]
     fn dj_screen_all_f_keys_dispatch_via_match_key() {
-        // Every F1-F4 switch resolves through the SINGLE-SOURCE keymap (match_key) even
+        // Every F1-F5 switch resolves through the SINGLE-SOURCE keymap (match_key) even
         // from the DJ screen, so the Global view keys are alive on every screen and can
         // never drift from KEYMAP.
         for (fk, want) in [
             (KeyCode::F(1), Screen::Queue),
             (KeyCode::F(2), Screen::Albums),
             (KeyCode::F(3), Screen::Playlists),
-            (KeyCode::F(4), Screen::Dj),
+            (KeyCode::F(5), Screen::Find),
         ] {
             let mut s = TuiState::new();
             s.screen = Screen::Dj;
             assert_eq!(s.handle_key(key(fk)), Some(Intent::ShowScreen(want)));
             assert_eq!(s.screen, want);
+        }
+    }
+
+
+
+
+    #[test]
+    fn a_lost_connection_stops_the_find_spinner_but_keeps_the_hits() {
+        use crate::find::{FindKind, FindRow};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.phase = crate::find::Phase::Loading("c418".into());
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        s.mark_disconnected();
+        // The outstanding query can never land on the dead socket, so the spinner
+        // would otherwise turn forever.
+        assert!(matches!(s.find.phase, crate::find::Phase::Done), "spinner stopped");
+        assert_eq!(s.find.hits.rows.len(), 1, "the hits are a truthful snapshot - kept");
+        assert!(!s.find.drill.loaded, "the drill was fetched on the dead socket");
+    }
+
+    #[test]
+    fn the_find_query_underlines_its_own_hits_without_a_standing_slash_search() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.submitted = "c418".into();
+        assert_eq!(s.highlight_query(), "c418");
+        // A live `/` is the more recent intent and still wins.
+        s.last_search = "sweden".into();
+        assert_eq!(s.highlight_query(), "sweden");
+    }
+
+    #[test]
+    fn section_jumps_are_a_no_op_off_the_find_screen() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Queue;
+        assert_eq!(s.handle_key(ch('}')), None);
+        assert_eq!(s.selected, 0, "the queue cursor must not move");
+    }
+
+    #[test]
+    fn open_drills_an_album_hit_but_a_song_hit_has_nothing_to_open() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![
+            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
+        ];
+        assert_eq!(s.handle_key(ch('o')), Some(Intent::BrowseInto("album/9".into())));
+        s.find.selected = 1;
+        assert_eq!(s.handle_key(ch('o')), None, "a song row has nothing to drill into");
+    }
+
+    #[test]
+    fn backing_out_of_a_drill_costs_no_round_trip_and_keeps_the_hits() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.submitted = "c418".into();
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        s.find.drilling = true;
+        s.find.drill.rows = vec![crate::state::BrowseRow {
+            label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None,
+        }];
+        // `h` must NOT emit a BrowseBack: the drill sits at depth 0 with an empty
+        // stack, so that would re-fetch `lsinfo ""` - the whole artist root.
+        assert_eq!(s.handle_key(ch('h')), None, "no round trip on the way back");
+        assert!(!s.find.drilling);
+        assert_eq!(s.find.hits.rows.len(), 1, "the hits were never overwritten");
+        assert_eq!(s.find.submitted, "c418", "and the query that produced them survives");
+    }
+
+    #[test]
+    fn a_drill_response_that_lands_after_backing_out_is_dropped() {
+        // Req::Browse carries no request identity and Browse::apply latches `loaded`,
+        // so without the `drilling` gate a late response would silently win and sit
+        // there waiting to flash under the NEXT drill's title.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.drilling = false;
+        assert!(s.browse_for(Screen::Find).is_none(), "no drill target while not drilling");
+        s.find.drilling = true;
+        assert!(s.browse_for(Screen::Find).is_some());
+    }
+
+    #[test]
+    fn cursor_keys_move_the_drill_while_drilling_and_the_hits_otherwise() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![
+            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None },
+        ];
+        s.find.drill.rows = vec![
+            crate::state::BrowseRow { label: "x".into(), uri: "song/8".into(), is_dir: false, song_count: None },
+            crate::state::BrowseRow { label: "y".into(), uri: "song/9".into(), is_dir: false, song_count: None },
+        ];
+        s.find.drilling = true;
+        s.handle_key(ch('j'));
+        assert_eq!(s.find.drill.selected, 1, "the DRILL cursor moved");
+        assert_eq!(s.find.selected, 0, "the hit cursor stayed put");
+        assert_eq!(s.selected, 0, "and the queue cursor never moved");
+        s.find.drilling = false;
+        s.handle_key(ch('j'));
+        assert_eq!(s.find.selected, 1, "off-drill, `j` moves the hits again");
+    }
+
+    #[test]
+    fn slash_inside_a_drill_searches_the_drill_rows() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.hits.rows = vec![];
+        s.find.drill.rows = vec![
+            crate::state::BrowseRow { label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None },
+        ];
+        s.find.drilling = true;
+        assert_eq!(s.active_labels(), vec!["Sweden".to_string()]);
+    }
+
+    #[test]
+    fn typing_in_the_find_query_produces_no_intent_at_all() {
+        // This is the test that proves there is NO per-keystroke request path: the
+        // screen is submit-driven, so a query is one round trip, not one per letter.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        for c in "c418".chars() {
+            assert_eq!(s.handle_key(ch(c)), None, "typing {c:?} must not hit the network");
+        }
+        assert_eq!(s.find.query, "c418");
+    }
+
+    #[test]
+    fn nav_keys_type_literally_in_the_query_but_move_the_cursor_in_the_results() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        // Query focus: `j` is a letter, not a movement.
+        assert_eq!(s.handle_key(ch('j')), None);
+        assert_eq!(s.find.query, "j");
+        // Results focus: `j` moves the HIT cursor - and crucially NOT self.selected,
+        // which is the queue cursor the active_browse() fallback would have moved.
+        s.find.query.clear();
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![
+            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None },
+        ];
+        s.handle_key(ch('j'));
+        assert_eq!(s.find.selected, 1, "the hit cursor moved");
+        assert_eq!(s.selected, 0, "the QUEUE cursor must not have moved");
+        assert_eq!(s.find.query, "", "and nothing was typed");
+    }
+
+    #[test]
+    fn enter_submits_the_query_and_marks_it_in_flight() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.query = "  c418  ".into();
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert_eq!(intent, Some(Intent::Find("c418".into())), "trimmed and dispatched");
+        assert!(matches!(&s.find.phase, crate::find::Phase::Loading(q) if q == "c418"));
+        assert_eq!(s.find.history[0], "c418", "recorded for the ^v ring");
+    }
+
+    #[test]
+    fn an_empty_query_submits_nothing() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.query = "   ".into();
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), None);
+        assert!(matches!(s.find.phase, crate::find::Phase::Cold));
+    }
+
+    #[test]
+    fn enter_on_a_result_plays_it_and_space_enqueues_without_playing() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Enqueue { uri: "album/9".into(), play: true }),
+            "Enter ALWAYS plays, on every screen - drilling is `o`"
+        );
+        assert_eq!(
+            s.handle_key(ch(' ')),
+            Some(Intent::Enqueue { uri: "album/9".into(), play: false })
+        );
+    }
+
+    #[test]
+    fn favoriting_a_find_row_stars_the_row_under_the_cursor() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        assert_eq!(
+            s.handle_key(ch('s')),
+            Some(Intent::Command("playlistadd Starred song/1".into()))
+        );
+    }
+
+    #[test]
+    fn esc_leaves_the_find_screen_rather_than_ping_ponging() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), Some(Intent::ShowScreen(Screen::Queue)));
+        assert_eq!(s.screen, Screen::Queue);
+    }
+
+    #[test]
+    fn help_opens_on_an_empty_query_but_types_a_literal_question_mark_mid_query() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        assert_eq!(s.handle_key(ch('?')), None);
+        assert!(s.help_open, "? on an EMPTY query line opens help");
+        s.handle_key(ch('?'));
+        s.find.query = "who".into();
+        s.handle_key(ch('?'));
+        assert_eq!(s.find.query, "who?", "? mid-query is a literal character");
+    }
+
+    #[test]
+    fn tab_toggles_focus_only_when_there_are_results_to_move_to() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.find.focus, Focus::Query, "no results yet: focus stays put");
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Song, label: "a".into(), uri: "song/1".into(),
+            trailer: String::new(), song_count: None, album_uri: None,
+        }];
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.find.focus, Focus::Results);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.find.focus, Focus::Query, "and back");
+    }
+
+    #[test]
+    fn pressing_the_tab_key_you_are_already_on_is_a_no_op() {
+        // switch_screen is IDEMPOTENT: re-pressing your current tab must not emit a
+        // ShowScreen (which re-fetches) and must not clear a standing `/` query the
+        // user is stepping through with `n`.
+        for (fk, screen) in [
+            (KeyCode::F(1), Screen::Queue),
+            (KeyCode::F(2), Screen::Albums),
+            (KeyCode::F(4), Screen::Dj),
+            (KeyCode::F(5), Screen::Find),
+        ] {
+            let mut s = TuiState::new();
+            s.screen = screen;
+            s.last_search = "sweden".to_string();
+            assert_eq!(s.handle_key(key(fk)), None, "{screen:?} re-press must not re-fetch");
+            assert_eq!(s.screen, screen);
+            assert_eq!(s.last_search, "sweden", "{screen:?} re-press must not wipe the / query");
         }
     }
 

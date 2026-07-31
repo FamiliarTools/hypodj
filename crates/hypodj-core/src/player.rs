@@ -90,6 +90,21 @@ pub enum PlayerEvent {
         /// set the one-shot latch) instead of cold-starting. False on EVERY ordinary Eof
         /// and honest stop, where the handler cold-starts (or stops honestly) as slice 1.
         continuation_landed: bool,
+        /// Whether this end was an ERROR rather than a natural end: an `EndFile(Error)`
+        /// (a track that died AFTER a successful loadfile) or a top-level open failure
+        /// (`is_active_load_failure` - where mpv actually reports a file it could not
+        /// open, since loadfile's Ok is premature). False for a natural EOF and for the
+        /// landed continuation handoff, which is a natural end by construction.
+        ///
+        /// Paired with `was_local` this is the offline store's SUSPECT signal: local
+        /// bytes that fail to play are de-offered until a verified replacement lands.
+        errored: bool,
+        /// Whether the entry that just ended was playing LOCAL STORE BYTES rather than a
+        /// network URL. Latched by the actor at load time (it rides `play_url` /
+        /// `switch_warmed` into the actor and back out here), NEVER re-derived at
+        /// processing time: the handler's `st.current` is repointed after the `play_url`
+        /// await, so an interleaved play would misattribute a re-read.
+        was_local: bool,
     },
     /// Play state changed (e.g. paused, stopped). Carries the id of the song the
     /// state applies to so the scrobbler is self-describing: it can start a
@@ -174,6 +189,10 @@ enum PlayerCommand {
         /// (TimePos/StateChanged/Eof) is attributed to this exact entry.
         queue_id: Option<QueueId>,
         url: String,
+        /// Whether `url` is a LOCAL offline-store path. LATCHED beside the identity so
+        /// a later [`PlayerEvent::Eof`] can report `was_local` without anyone re-reading
+        /// mutable handler state (see the event's doc).
+        local: bool,
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
     /// Warm (prefetch) a target stream in the background WITHOUT switching the
@@ -198,6 +217,11 @@ enum PlayerCommand {
         song: Option<SongId>,
         queue_id: Option<QueueId>,
         url: String,
+        /// Whether `url` is a LOCAL offline-store path (see
+        /// [`PlayUrl`](PlayerCommand::PlayUrl)). The skip gesture pre-resolves ONCE and
+        /// hands the same value to the warm and to this terminal, so local/remote can
+        /// never flip inside a gesture.
+        local: bool,
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
     /// Drop a parked (warmed) skip target WITHOUT switching to it: `playlist-clear`
@@ -309,16 +333,22 @@ impl PlayerHandle {
     /// Load a resolved stream URL and begin playback. `song` is `Some(id)` for a
     /// library track (scrobbled) or `None` for a raw internet-radio stream
     /// (never scrobbled - the player emits no id-bearing now-playing/eof for it).
+    ///
+    /// `local` says whether `url` is an offline-store PATH rather than a network URL;
+    /// the actor latches it beside the identity so a later [`PlayerEvent::Eof`] carries
+    /// `was_local` (the offline store's suspect attribution).
     pub async fn play_url(
         &self,
         song: Option<SongId>,
         queue_id: Option<QueueId>,
         url: &str,
+        local: bool,
     ) -> Result<(), PlayerError> {
         self.request(|reply| PlayerCommand::PlayUrl {
             song,
             queue_id,
             url: url.to_string(),
+            local,
             reply,
         })
         .await
@@ -346,11 +376,13 @@ impl PlayerHandle {
         song: Option<SongId>,
         queue_id: Option<QueueId>,
         url: &str,
+        local: bool,
     ) -> Result<(), PlayerError> {
         self.request(|reply| PlayerCommand::SwitchWarmed {
             song,
             queue_id,
             url: url.to_string(),
+            local,
             reply,
         })
         .await
@@ -512,11 +544,16 @@ impl NullPlayer {
             let probe = probe;
             let mut current: Option<SongId> = None;
             let mut current_qid: Option<QueueId> = None;
+            // Mirrors the mpv actor's latch (see `mpv_actor`): whether the loaded entry
+            // came off the offline store, so a synthesized Eof reports `was_local`
+            // exactly like the real backend.
+            let mut current_local = false;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    PlayerCommand::PlayUrl { song, queue_id, url: _, reply } => {
+                    PlayerCommand::PlayUrl { song, queue_id, url: _, local, reply } => {
                         current = song.clone();
                         current_qid = queue_id;
+                        current_local = local;
                         let _ = state_tx.send(PlayState::Playing);
                         // Reply BEFORE the (bounded) event send so a full event
                         // channel can never wedge the caller's play_url().await
@@ -535,7 +572,7 @@ impl NullPlayer {
                         }
                         let _ = reply.send(Ok(()));
                     }
-                    PlayerCommand::SwitchWarmed { song, queue_id, url: _, reply } => {
+                    PlayerCommand::SwitchWarmed { song, queue_id, url: _, local, reply } => {
                         // No real warm entry exists headless, so this is exactly a
                         // PlayUrl: latch identity, go Playing, reply before the event.
                         #[cfg(test)]
@@ -544,6 +581,7 @@ impl NullPlayer {
                         }
                         current = song.clone();
                         current_qid = queue_id;
+                        current_local = local;
                         let _ = state_tx.send(PlayState::Playing);
                         let _ = reply.send(Ok(()));
                         let _ = evt_tx
@@ -571,31 +609,46 @@ impl NullPlayer {
                         }
                         let _ = reply.send(Ok(()));
                     }
+                    // Both transport arms mirror the mpv actor's [`holds_entry`] gate:
+                    // pausing / resuming an actor that holds NOTHING publishes no play
+                    // state at all, so the headless backend cannot claim Paused or
+                    // Playing over an empty deck either.
                     PlayerCommand::Pause(reply) => {
-                        let _ = state_tx.send(PlayState::Paused);
+                        let holds = holds_entry(&current, &current_qid);
+                        if holds {
+                            let _ = state_tx.send(PlayState::Paused);
+                        }
                         let _ = reply.send(Ok(()));
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(
-                                PlayState::Paused,
-                                current.clone(),
-                                current_qid,
-                            ))
-                            .await;
+                        if holds {
+                            let _ = evt_tx
+                                .send(PlayerEvent::StateChanged(
+                                    PlayState::Paused,
+                                    current.clone(),
+                                    current_qid,
+                                ))
+                                .await;
+                        }
                     }
                     PlayerCommand::Resume(reply) => {
-                        let _ = state_tx.send(PlayState::Playing);
+                        let holds = holds_entry(&current, &current_qid);
+                        if holds {
+                            let _ = state_tx.send(PlayState::Playing);
+                        }
                         let _ = reply.send(Ok(()));
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(
-                                PlayState::Playing,
-                                current.clone(),
-                                current_qid,
-                            ))
-                            .await;
+                        if holds {
+                            let _ = evt_tx
+                                .send(PlayerEvent::StateChanged(
+                                    PlayState::Playing,
+                                    current.clone(),
+                                    current_qid,
+                                ))
+                                .await;
+                        }
                     }
                     PlayerCommand::Stop(reply) => {
                         current = None;
                         current_qid = None;
+                        current_local = false;
                         let _ = state_tx.send(PlayState::Stopped);
                         let _ = reply.send(Ok(()));
                         let _ = evt_tx
@@ -621,6 +674,7 @@ impl NullPlayer {
                         // for a raw stream; `queue_id` present for anything played.
                         let song = current.take();
                         let qid = current_qid.take();
+                        let was_local = std::mem::take(&mut current_local);
                         let _ = state_tx.send(PlayState::Stopped);
                         if qid.is_some() {
                             let _ = evt_tx
@@ -628,6 +682,9 @@ impl NullPlayer {
                                     song,
                                     queue_id: qid,
                                     continuation_landed: false,
+                                    // A synthesized NATURAL end: never an error.
+                                    errored: false,
+                                    was_local,
                                 })
                                 .await;
                         }
@@ -637,10 +694,11 @@ impl NullPlayer {
                     }
                 }
             }
-            // Channel closed: nothing more to do. `current`/`current_qid` kept
-            // only to model what the real actor tracks.
+            // Channel closed: nothing more to do. `current`/`current_qid`/
+            // `current_local` kept only to model what the real actor tracks.
             let _ = current;
             let _ = current_qid;
+            let _ = current_local;
         });
 
         (PlayerHandle { cmd_tx, state_rx }, evt_rx)
@@ -829,6 +887,24 @@ fn is_active_load_failure(e: &libmpv2::Error) -> bool {
     }
 }
 
+/// Does the actor currently HOLD an entry - i.e. is there something loaded that a
+/// pause could freeze and a resume could un-freeze?
+///
+/// The pair of identity latches IS that fact: both are set together by the two load
+/// commands and taken together by [`emit_honest_stop`] / `Stop`. Either alone would be
+/// partial - a raw stream latches no [`SongId`], and the `play_probe` bin loads with no
+/// [`QueueId`] - so the honest predicate is their disjunction. The same latch already
+/// gates the top-level load-failure route (see [`is_active_load_failure`]'s call site),
+/// so this is the actor's ONE notion of "something is loaded", not a second one.
+///
+/// It exists because mpv's `pause` property is a property of the CORE, not of a track:
+/// setting it true/false over an idle core succeeds and reports nothing. Publishing a
+/// play state off that success alone is how a resume with nothing loaded came to claim
+/// Playing over silence.
+fn holds_entry(current: &Option<SongId>, current_qid: &Option<QueueId>) -> bool {
+    current.is_some() || current_qid.is_some()
+}
+
 /// Publish the LOSSLESS honest-stop signal for the currently latched entry and
 /// clear the actor's play latches. Shared by the `EndFile(Eof|Error)` arm and the
 /// top-level load-failure arm so a track that fails to OPEN converges on the exact
@@ -837,19 +913,39 @@ fn is_active_load_failure(e: &libmpv2::Error) -> bool {
 /// one-shot stop), and the cleared latch + `StateChanged(Stopped)` make MPD report
 /// stop instead of a phantom Playing over silence. `Eof` is emitted only when
 /// something was actually latched (`queue_id` present), mirroring the EndFile arm.
+///
+/// `errored` is the parameter that carries the offline store's SUSPECT signal out of
+/// all THREE routes that reach here, and each derives it honestly:
+///
+/// - the `EndFile` arm: `EndReason::Error` (a track that died after a successful
+///   loadfile) is an error, `EndReason::Eof` is not;
+/// - the non-landed continuation arm: same derivation;
+/// - the top-level `is_active_load_failure` arm: ALWAYS an error - and that is the
+///   route where a local file replaced with garbage actually surfaces, because mpv's
+///   loadfile Ok is premature (see [`is_active_load_failure`]).
+///
+/// The landed-continuation emit does NOT come through here at all: it is a natural-EOF
+/// gapless handoff and must never carry an error.
+///
+/// `current_local` is TAKEN like the identity latches, so `was_local` describes the
+/// entry that actually ended rather than whatever is loaded by the time the event is
+/// processed downstream.
 fn emit_honest_stop(
     state_tx: &watch::Sender<PlayState>,
     evt_tx: &mpsc::Sender<PlayerEvent>,
     current: &mut Option<SongId>,
     current_qid: &mut Option<QueueId>,
+    current_local: &mut bool,
     playing: &mut bool,
     cur_vol: f64,
+    errored: bool,
 ) {
     // A library track carries a SongId (drives scrobble); a raw stream carries
     // `song: None` but still `queue_id: Some`, so a mid-queue stream end advances
     // and yields a real TrackEnd instead of silently halting.
     let song = current.take();
     let qid = current_qid.take();
+    let was_local = std::mem::take(current_local);
     *playing = false;
     // Trailing resting frame: the decode stopped, so the last live Viz would
     // otherwise stay lit at the pre-stop loudness forever.
@@ -860,6 +956,8 @@ fn emit_honest_stop(
             song,
             queue_id: qid,
             continuation_landed: false,
+            errored,
+            was_local,
         });
     }
     let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
@@ -924,6 +1022,11 @@ fn mpv_actor(
 
     let mut current: Option<SongId> = None;
     let mut current_qid: Option<QueueId> = None;
+    // Whether the LATCHED entry is playing local offline-store bytes. It rides the load
+    // in (PlayUrl/SwitchWarmed carry it) and rides back out on the entry's own
+    // [`PlayerEvent::Eof`], which is what makes suspect attribution race-free: nothing
+    // downstream ever has to re-read mutable state that may already point elsewhere.
+    let mut current_local = false;
     // The actor's current softvol volume (0..=100, fractional). The user af chain
     // runs BEFORE mpv's internal softvol, so astats measures PRE-gain; carrying the
     // live gain lets the emitted Viz recover the audible post-gain level. Seeded to
@@ -940,7 +1043,7 @@ fn mpv_actor(
         // 1. Drain any pending commands without blocking.
         match cmd_rx.try_recv() {
             Ok(cmd) => {
-                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, &mut cur_vol, &mut playing, &mut warm, cmd) {
+                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, &mut current_local, &mut cur_vol, &mut playing, &mut warm, cmd) {
                     // Stop requested with shutdown intent is not modeled;
                     // channel close is the only exit. Continue.
                 }
@@ -1083,13 +1186,22 @@ fn mpv_actor(
                             // again) and reaches the slice-1 honest loud stop.
                             let finishing_song = current.take();
                             let finishing_qid = current_qid.take();
+                            // The station is a network stream, so the local latch moves
+                            // off with the finishing track rather than carrying over.
+                            let finishing_local = std::mem::replace(&mut current_local, false);
                             current_qid = Some(station_qid);
                             // playing stays true: mpv never stopped across the gapless
                             // advance. The Eof rides the guaranteed blocking_send.
+                            // `errored: false` ALWAYS: this arm is reached only on a
+                            // natural EOF that a warmed station auto-advanced through -
+                            // the gapless handoff is the healthiest end there is, and
+                            // flagging it would de-offer perfectly good local bytes.
                             let _ = evt_tx.blocking_send(PlayerEvent::Eof {
                                 song: finishing_song,
                                 queue_id: finishing_qid,
                                 continuation_landed: true,
+                                errored: false,
+                                was_local: finishing_local,
                             });
                             // The station's own Playing edge: the director's on_playing
                             // surfaces its TrackStart AND clears any suppress_next_stopped
@@ -1110,13 +1222,15 @@ fn mpv_actor(
                             // Stop/Quit/Redirect must NOT take `current` (handle_cmd already
                             // repointed it), exactly like the None arm.
                             match end_reason(reason) {
-                                EndReason::Eof | EndReason::Error => emit_honest_stop(
+                                r @ (EndReason::Eof | EndReason::Error) => emit_honest_stop(
                                     &state_tx,
                                     &evt_tx,
                                     &mut current,
                                     &mut current_qid,
+                                    &mut current_local,
                                     &mut playing,
                                     cur_vol,
+                                    r == EndReason::Error,
                                 ),
                                 _ => {}
                             }
@@ -1124,18 +1238,23 @@ fn mpv_actor(
                     }
                     // No warm: today's body unchanged.
                     WarmKind::None => match end_reason(reason) {
-                        EndReason::Eof | EndReason::Error => {
+                        r @ (EndReason::Eof | EndReason::Error) => {
                             // Emit Eof for the LATCHED entry so the queue advances, then
                             // clear the play latch and publish Stopped. The top-level
                             // load-failure arm below routes a cold-load open failure onto
                             // this exact same path (one honest stop, one drain edge).
+                            // `Error` here means the track died AFTER a successful
+                            // loadfile, which for a local file is the store's suspect
+                            // signal; `Eof` is a natural end and never is.
                             emit_honest_stop(
                                 &state_tx,
                                 &evt_tx,
                                 &mut current,
                                 &mut current_qid,
+                                &mut current_local,
                                 &mut playing,
                                 cur_vol,
+                                r == EndReason::Error,
                             );
                         }
                         // Stop/Quit/Redirect/Other: do NOTHING. Critically do NOT take
@@ -1161,6 +1280,10 @@ fn mpv_actor(
                 // machinery owns that transition, exactly like the EndFile arm above,
                 // and a warm-target open failure must not stop the audible current
                 // track). Any OTHER event error is unrelated / transient - only logged.
+                // This is ALSO the route on which local bytes replaced by garbage
+                // surface: mpv cannot open/decode them, and because loadfile's Ok is
+                // premature that failure never becomes an EndFile(Error). So the Eof it
+                // emits carries `errored: true` - the offline store's suspect signal.
                 if matches!(warm, WarmKind::None) && current_qid.is_some() && is_active_load_failure(&e) {
                     tracing::warn!(error = %e, "mpv load/open failed for the active entry; stopping honestly");
                     emit_honest_stop(
@@ -1168,8 +1291,10 @@ fn mpv_actor(
                         &evt_tx,
                         &mut current,
                         &mut current_qid,
+                        &mut current_local,
                         &mut playing,
                         cur_vol,
+                        true,
                     );
                 } else {
                     tracing::warn!(error = %e, "mpv event error");
@@ -1189,6 +1314,10 @@ fn handle_cmd(
     evt_tx: &mpsc::Sender<PlayerEvent>,
     current: &mut Option<SongId>,
     current_qid: &mut Option<QueueId>,
+    // Whether the latched entry plays LOCAL offline-store bytes. Set by the two load
+    // commands from the value the handler resolved ONCE for the gesture, cleared by
+    // Stop, and taken by `emit_honest_stop` onto the entry's own Eof.
+    current_local: &mut bool,
     // Tracked softvol volume + play flag, so the Viz emit can report the audible
     // post-gain level and whether sound is flowing. Mutated here (the single place
     // volume + play-state actually change) and read by the af-metadata arm.
@@ -1201,7 +1330,7 @@ fn handle_cmd(
     cmd: PlayerCommand,
 ) -> bool {
     match cmd {
-        PlayerCommand::PlayUrl { song, queue_id, url, reply } => {
+        PlayerCommand::PlayUrl { song, queue_id, url, local, reply } => {
             // A fresh play REPLACES the current entry; also drop any leftover warmed
             // entry (playlist-clear keeps only the current) so a stale prefetch can
             // never auto-advance behind this track, and restore keep-open=no (a prior
@@ -1218,6 +1347,7 @@ fn handle_cmd(
                 Ok(()) => {
                     *current = song.clone();
                     *current_qid = queue_id;
+                    *current_local = local;
                     *playing = true;
                     let _ = state_tx.send(PlayState::Playing);
                     // Reply BEFORE the StateChanged blocking_send: the spine's
@@ -1284,7 +1414,7 @@ fn handle_cmd(
             }
             let _ = reply.send(res);
         }
-        PlayerCommand::SwitchWarmed { song, queue_id, url, reply } => {
+        PlayerCommand::SwitchWarmed { song, queue_id, url, local, reply } => {
             // At the dip trough: if a warmed entry exists switch to it (near-instant,
             // the ~network first-byte cost was paid during the dip); else fall back to
             // a plain loadfile-replace (today's behavior, never worse). Either branch
@@ -1339,6 +1469,7 @@ fn handle_cmd(
                 Ok(()) => {
                     *current = song.clone();
                     *current_qid = queue_id;
+                    *current_local = local;
                     *playing = true;
                     let _ = state_tx.send(PlayState::Playing);
                     // Reply BEFORE the StateChanged blocking_send (deadlock-avoidance),
@@ -1375,7 +1506,12 @@ fn handle_cmd(
             let res = mpv
                 .set_property("pause", true)
                 .map_err(|e| PlayerError::Backend(e.to_string()));
-            if res.is_ok() {
+            // mpv's `pause` property flips happily over an IDLE core, so the property
+            // write succeeding says nothing about whether anything is loaded (see
+            // [`holds_entry`]). Publish the Paused edge only when an entry is actually
+            // latched; over an empty core the honest state is the Stopped already
+            // published, and claiming Paused would invent a track to un-pause.
+            if res.is_ok() && holds_entry(current, current_qid) {
                 *playing = false;
                 // The af-metadata arm stops firing once decode halts, so without a
                 // trailing resting frame the client's latest-wins viz slot would keep
@@ -1392,10 +1528,17 @@ fn handle_cmd(
             let _ = reply.send(res);
         }
         PlayerCommand::Resume(reply) => {
+            // The property write still runs unconditionally: clearing mpv's `pause`
+            // flag over an idle core is what keeps a LATER load from starting frozen.
             let res = mpv
                 .set_property("pause", false)
                 .map_err(|e| PlayerError::Backend(e.to_string()));
-            if res.is_ok() {
+            // But only a resume that has something to resume may publish Playing. An
+            // idle core un-paused is still silent, and publishing Playing there is the
+            // PHANTOM: `status`/MPRIS report playback over silence, and the handler's
+            // whole nothing-loaded terminal (which keys off a raw Stopped under a
+            // reported Paused) loses the very signal it reads.
+            if res.is_ok() && holds_entry(current, current_qid) {
                 *playing = true;
                 let _ = state_tx.send(PlayState::Playing);
                 let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
@@ -1415,6 +1558,7 @@ fn handle_cmd(
             let _ = mpv.set_property("keep-open", "no");
             *current = None;
             *current_qid = None;
+            *current_local = false;
             *playing = false;
             // mpv `stop` empties the playlist, so any warmed entry is gone too.
             *warm = WarmKind::None;
@@ -1685,7 +1829,7 @@ mod tests {
         assert_eq!(player.state(), PlayState::Stopped);
 
         player
-            .play_url(Some(SongId("42".into())), Some(QueueId(0)), "http://example/stream")
+            .play_url(Some(SongId("42".into())), Some(QueueId(0)), "http://example/stream", false)
             .await
             .unwrap();
         assert_eq!(player.state(), PlayState::Playing);
@@ -1702,6 +1846,82 @@ mod tests {
 
         player.stop().await.unwrap();
         assert_eq!(player.state(), PlayState::Stopped);
+    }
+
+    // A transport command over a deck that HOLDS NOTHING must publish no play state at
+    // all. mpv's `pause` property belongs to the CORE, not to a track: setting it
+    // true/false over an idle core SUCCEEDS, and publishing a state off that success is
+    // how a resume with nothing loaded came to claim Playing over silence - a `status`
+    // and an MPRIS widget both reporting playback that does not exist. The handler
+    // additionally READS this raw state to recognise its nothing-loaded terminal (a raw
+    // Stopped under a reported Paused), so the lie destroyed that signal too.
+    #[tokio::test]
+    async fn transport_over_an_empty_deck_never_publishes_a_play_state() {
+        let (player, _events) = NullPlayer::spawn();
+        assert_eq!(player.state(), PlayState::Stopped);
+
+        // Nothing has ever been loaded: neither transport may invent a state.
+        player.resume().await.unwrap();
+        assert_eq!(player.state(), PlayState::Stopped, "an empty deck un-paused is still silent");
+        player.pause().await.unwrap();
+        assert_eq!(player.state(), PlayState::Stopped, "and pausing it freezes nothing");
+
+        // With an entry latched, both transports publish exactly as before.
+        player
+            .play_url(Some(SongId("7".into())), Some(QueueId(3)), "http://example/s", false)
+            .await
+            .unwrap();
+        player.pause().await.unwrap();
+        assert_eq!(player.state(), PlayState::Paused, "a real pause still lands");
+        player.resume().await.unwrap();
+        assert_eq!(player.state(), PlayState::Playing, "and a real resume still plays");
+
+        // Once the deck drops its entry, the pair goes quiet again.
+        player.stop().await.unwrap();
+        player.resume().await.unwrap();
+        assert_eq!(player.state(), PlayState::Stopped, "a stopped deck stays honestly stopped");
+    }
+
+    // The `local` fact rides the LOAD into the actor and rides back out on the
+    // entry's own Eof - the whole race-freeness of suspect attribution. Over the
+    // headless actor this pins the wiring: a local load reports was_local, a remote
+    // one does not, and a synthesized natural end is never `errored`.
+    #[tokio::test]
+    async fn eof_reports_the_local_fact_latched_at_load_time() {
+        let (player, mut events) = NullPlayer::spawn();
+        player
+            .play_url(Some(SongId("cached".into())), Some(QueueId(1)), "/store/cached.flac", true)
+            .await
+            .unwrap();
+        player.test_emit_eof().await.unwrap();
+        let mut seen = None;
+        while let Some(ev) = events.recv().await {
+            if let PlayerEvent::Eof { song, errored, was_local, .. } = ev {
+                seen = Some((song, errored, was_local));
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            Some((Some(SongId("cached".into())), false, true)),
+            "a local load ends as a NATURAL eof carrying was_local"
+        );
+
+        // And a remote load does not claim locality, so a failed stream can never
+        // de-offer a stored file.
+        player
+            .play_url(Some(SongId("streamed".into())), Some(QueueId(2)), "http://x/stream", false)
+            .await
+            .unwrap();
+        player.test_emit_eof().await.unwrap();
+        let mut seen = None;
+        while let Some(ev) = events.recv().await {
+            if let PlayerEvent::Eof { was_local, .. } = ev {
+                seen = Some(was_local);
+                break;
+            }
+        }
+        assert_eq!(seen, Some(false), "a remote load never reports was_local");
     }
 
     // The EndFile arm advances (take current + emit Eof) on exactly Eof AND
@@ -1904,7 +2124,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(None, Some(QueueId(1)), url)
+                .play_url(None, Some(QueueId(1)), url, false)
                 .await
                 .expect("play NTS stream");
 
@@ -1961,7 +2181,7 @@ mod tests {
             // loadfile Ok is premature: the play_url call itself SUCCEEDS even though
             // the URL is dead (the failure only surfaces later, over events).
             player
-                .play_url(None, Some(QueueId(1)), url)
+                .play_url(None, Some(QueueId(1)), url, false)
                 .await
                 .expect("play_url returns Ok (loadfile is premature) for a dead URL");
 
@@ -2007,7 +2227,7 @@ mod tests {
         assert_eq!(player.state(), PlayState::Stopped, "warm does not start playback");
 
         player
-            .switch_warmed(Some(SongId("7".into())), Some(QueueId(9)), "http://target/stream")
+            .switch_warmed(Some(SongId("7".into())), Some(QueueId(9)), "http://target/stream", false)
             .await
             .unwrap();
         assert_eq!(player.state(), PlayState::Playing, "switch plays the target");
@@ -2205,7 +2425,7 @@ mod tests {
             // Play the SHORT current file A as the latched entry (id present, so a real
             // EOF WOULD normally emit PlayerEvent::Eof and advance the queue).
             player
-                .play_url(Some(SongId("A".into())), Some(QueueId(1)), &a.to_string_lossy())
+                .play_url(Some(SongId("A".into())), Some(QueueId(1)), &a.to_string_lossy(), false)
                 .await
                 .expect("play A");
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -2235,7 +2455,7 @@ mod tests {
             // the collapsed playlist and takes the loadfile-replace fallback), going
             // Playing with B's identity latched.
             player
-                .switch_warmed(Some(SongId("B".into())), Some(QueueId(2)), &b.to_string_lossy())
+                .switch_warmed(Some(SongId("B".into())), Some(QueueId(2)), &b.to_string_lossy(), false)
                 .await
                 .expect("switch to B");
             assert_eq!(player.state(), PlayState::Playing, "target B is playing after the switch");
@@ -2252,7 +2472,7 @@ mod tests {
         let (player, _events) = NullPlayer::spawn();
         let other = player.clone();
         player
-            .play_url(Some(SongId("1".into())), Some(QueueId(1)), "http://x")
+            .play_url(Some(SongId("1".into())), Some(QueueId(1)), "http://x", false)
             .await
             .unwrap();
         assert_eq!(other.state(), PlayState::Playing);
@@ -2339,7 +2559,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy())
+                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
                 .await
                 .expect("play the finite current");
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2400,7 +2620,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy())
+                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
                 .await
                 .expect("play the finite current");
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -2461,7 +2681,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy())
+                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
                 .await
                 .expect("play the finite current");
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -2492,5 +2712,175 @@ mod tests {
         });
 
         let _ = std::fs::remove_file(&cur);
+    }
+
+    // ── LIVE offline-store proofs (the suspect signal), #[ignore] ────────────
+    //
+    // What no unit test can prove: that mpv really plays a STORED LOCAL PATH to a
+    // natural end without flagging it, and that a local file replaced with garbage
+    // surfaces where the design says it does. Both need a real libmpv runtime, absent
+    // in the link-isolated Nix build sandbox - hence #[ignore].
+
+    // A stored local file plays to its NATURAL EOF, and the Eof reports
+    // `was_local: true, errored: false`. The negative half matters most: a healthy
+    // local track must NEVER trip the suspect signal, or the reconciler would
+    // re-download the whole mirror one track at a time.
+    //   cargo test -p hypodj-core -- --ignored live_local_file_eof_is_never_errored
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm a healthy local play"]
+    fn live_local_file_eof_is_never_errored() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("hypodj_store_good.wav");
+        // Short: the point is reaching the natural end quickly.
+        write_tone_wav(&good, 330.0, 1.0);
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+            player
+                .play_url(
+                    Some(SongId("good".into())),
+                    Some(QueueId(1)),
+                    &good.to_string_lossy(),
+                    // Resolved from the offline store, exactly as `resolve_play` does.
+                    true,
+                )
+                .await
+                .expect("play the stored local path");
+
+            let mut eof: Option<(bool, bool)> = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline && eof.is_none() {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+                    Ok(Some(PlayerEvent::Eof { queue_id, errored, was_local, .. })) => {
+                        assert_eq!(queue_id, Some(QueueId(1)), "the Eof names the latched entry");
+                        eof = Some((errored, was_local));
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            assert_eq!(
+                eof,
+                Some((false, true)),
+                "a healthy stored file ends naturally: local, NOT errored"
+            );
+        });
+
+        let _ = std::fs::remove_file(&good);
+    }
+
+    // THE ROUTE THAT ACTUALLY CARRIES THE SUSPECT SIGNAL: a local file replaced with
+    // garbage of the SAME LENGTH (so the store's stat still accepts it and playback is
+    // still offered the path) cannot be opened by mpv - and because loadfile's Ok is
+    // premature that failure never becomes an EndFile(Error); it surfaces as a
+    // TOP-LEVEL wait_event error (is_active_load_failure). This pins that the
+    // top-level route emits an Eof carrying BOTH errored and was_local, which is the
+    // entire input to the handler's suspect hook.
+    //   cargo test -p hypodj-core -- --ignored live_corrupt_local_file_emits_an_errored_eof
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the corrupt-local suspect signal"]
+    fn live_corrupt_local_file_emits_an_errored_eof() {
+        let dir = std::env::temp_dir();
+        let rotten = dir.join("hypodj_store_rotten.wav");
+        // Same-length garbage is the realistic case: the length gate cannot see it, so
+        // only playback can.
+        write_tone_wav(&rotten, 330.0, 1.0);
+        let len = std::fs::metadata(&rotten).expect("size").len() as usize;
+        std::fs::write(&rotten, vec![0xA5u8; len]).expect("overwrite with garbage");
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+            // loadfile Ok is PREMATURE: this succeeds even though nothing is playable.
+            player
+                .play_url(
+                    Some(SongId("rotten".into())),
+                    Some(QueueId(7)),
+                    &rotten.to_string_lossy(),
+                    true,
+                )
+                .await
+                .expect("play_url returns Ok (loadfile is premature) for garbage bytes");
+
+            let mut eof: Option<(Option<SongId>, bool, bool)> = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline && eof.is_none() {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+                    Ok(Some(PlayerEvent::Eof { song, queue_id, errored, was_local, .. })) => {
+                        assert_eq!(queue_id, Some(QueueId(7)), "the Eof names the latched entry");
+                        eof = Some((song, errored, was_local));
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            assert_eq!(
+                eof,
+                Some((Some(SongId("rotten".into())), true, true)),
+                "corrupt LOCAL bytes emit an ERRORED Eof keyed on the entry's own song id"
+            );
+            assert_eq!(
+                player.state(),
+                PlayState::Stopped,
+                "and the deck stops honestly rather than wedging in a phantom play"
+            );
+        });
+
+        let _ = std::fs::remove_file(&rotten);
+    }
+
+    // THE EMPIRICAL CLAIM the transport gate rests on, which only a real libmpv can
+    // settle: mpv's `pause` property belongs to the CORE, so setting it over an IDLE
+    // core (nothing loaded) SUCCEEDS. The actor therefore cannot read a play state off
+    // that success - it published Playing and MPD/MPRIS reported playback over silence.
+    // The positive half is here too, on the same real core: with a track loaded the
+    // pause/resume pair still publishes exactly as before. Silent throughout
+    // (AudioOut::Null).
+    //   cargo test -p hypodj-core -- --ignored live_mpv_transport_over_an_idle_core
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the idle-core transport gate"]
+    fn live_mpv_transport_over_an_idle_core_publishes_no_play_state() {
+        let dir = std::env::temp_dir();
+        let tone = dir.join("hypodj_idle_core_transport.wav");
+        // Long enough that the pause/resume pair lands well before its natural end.
+        write_tone_wav(&tone, 220.0, 10.0);
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, _events) = MpvPlayer::spawn(AudioOut::Null);
+            assert_eq!(player.state(), PlayState::Stopped, "a fresh core holds nothing");
+
+            // THE PREMISE: both property writes SUCCEED over an idle core...
+            player.resume().await.expect("mpv accepts pause=false with nothing loaded");
+            assert_eq!(
+                player.state(),
+                PlayState::Stopped,
+                "...and an un-paused idle core is still silence, so no Playing is published"
+            );
+            player.pause().await.expect("mpv accepts pause=true with nothing loaded");
+            assert_eq!(player.state(), PlayState::Stopped, "nor any Paused");
+
+            // With a real track loaded, the pair publishes exactly as before.
+            player
+                .play_url(Some(SongId("tone".into())), Some(QueueId(1)), &tone.to_string_lossy(), true)
+                .await
+                .expect("play the local tone");
+            assert_eq!(player.state(), PlayState::Playing);
+            player.pause().await.expect("pause a loaded track");
+            assert_eq!(player.state(), PlayState::Paused, "a real pause still lands");
+            player.resume().await.expect("resume a loaded track");
+            assert_eq!(player.state(), PlayState::Playing, "and a real resume still plays");
+
+            // And once the core drops the entry, the pair goes quiet again - the exact
+            // state the handler's nothing-loaded terminal reads.
+            player.stop().await.expect("stop");
+            player.resume().await.expect("resume over the emptied core");
+            assert_eq!(player.state(), PlayState::Stopped, "no phantom Playing over silence");
+        });
+
+        let _ = std::fs::remove_file(&tone);
     }
 }

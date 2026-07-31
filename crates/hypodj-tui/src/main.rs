@@ -11,6 +11,7 @@
 
 mod album_color;
 mod art;
+mod find;
 mod keymap;
 mod sigil;
 mod state;
@@ -191,7 +192,7 @@ fn event_loop(
             // Convert the coalesced intents into worker Reqs; the worker runs them off
             // the render path so a Subsonic-backed browse/enqueue never blocks input
             // or draw.
-            dispatch(req_tx, &workers.cc_tx, state, coalesce_intents(intents));
+            dispatch(req_tx, &workers.cc_tx, &workers.find_tx, state, coalesce_intents(intents));
             sync_title(terminal, state, &mut last_title);
         }
 
@@ -269,7 +270,13 @@ fn update_viz(state: &mut TuiState, workers: &Workers, dt: f64) {
 /// after them (so a held-key burst costs N cheap commands + a single refresh). The
 /// confirm/cancel handshake is applied to local state here but relies on the worker
 /// running `nl confirm`/`nl cancel` on the ONE command socket, in order.
-fn dispatch(tx: &Sender<Req>, cc_tx: &Sender<Req>, state: &mut TuiState, intents: Vec<Intent>) {
+fn dispatch(
+    tx: &Sender<Req>,
+    cc_tx: &Sender<Req>,
+    find_tx: &Sender<Req>,
+    state: &mut TuiState,
+    intents: Vec<Intent>,
+) {
     let mut sent_mutation = false;
     for intent in intents {
         match intent {
@@ -279,6 +286,12 @@ fn dispatch(tx: &Sender<Req>, cc_tx: &Sender<Req>, state: &mut TuiState, intents
             }
             Intent::Nl(phrase) => {
                 let _ = tx.send(Req::Nl(phrase));
+            }
+            // Routed to the DEDICATED find socket, never `tx` (the FIFO command
+            // socket). Deliberately does NOT set `sent_mutation`: a query changes
+            // nothing, so the trailing batch refresh must not fire for it.
+            Intent::Find(query) => {
+                let _ = find_tx.send(Req::Find(query));
             }
             Intent::ConfirmArm => {
                 // Echo the choice INTO the DJ chat immediately so the keypress is
@@ -362,15 +375,19 @@ fn show_screen(tx: &Sender<Req>, state: &mut TuiState, screen: Screen) {
     match screen {
         // The DJ pane shows the queue alongside; keep it live-refreshed like Queue.
         Screen::Queue | Screen::Dj => request_refresh(tx, state),
+        // Find sends NOTHING on entry: a query surface with no query has nothing to
+        // ask, so opening the tab is instant and never touches a socket.
+        Screen::Find => {}
         Screen::Albums => {
             if !state.albums.loaded {
-                // Seed Albums from the `newest` smart list (no flat A-Z album index
-                // exists server-side yet - see task rglhxv1 server gaps).
+                // The flat A-Z index, not the newest-100 smart list: an artist whose
+                // albums never entered that window was otherwise unreachable by
+                // browsing. The smart lists are the first row of it.
                 let _ = tx.send(Req::Browse {
                     target: Screen::Albums,
-                    command: "lsinfo list/newest".into(),
-                    path: "list/newest".into(),
-                    title: "Albums (newest)".into(),
+                    command: "lsinfo albums/all".into(),
+                    path: "albums/all".into(),
+                    title: "Albums".into(),
                     restore_sel: None,
                 });
             }
@@ -395,6 +412,30 @@ fn show_screen(tx: &Sender<Req>, state: &mut TuiState, screen: Screen) {
 /// Browse response, applied to the target screen's list.
 fn browse_into(tx: &Sender<Req>, state: &mut TuiState, path: String) {
     let target = state.screen;
+    // ENTERING a Find drill from a hit row. The drill is a SEPARATE Browse layered
+    // over the frozen hits, started at depth 0 with an EMPTY stack and pushing
+    // nothing: at depth 0 the "parent path" would be "", and browse_back would
+    // re-fetch that as `lsinfo ""` - the whole artist root - instead of returning to
+    // the hits. The hits are never overwritten, so backing out is free.
+    if state.screen == Screen::Find && !state.find.drilling {
+        state.find.drilling = true;
+        state.find.drill_loading = true;
+        state.find.drill.rows.clear();
+        state.find.drill.stack.clear();
+        state.find.drill.selected = 0;
+        state.find.drill.offset.set(0);
+        state.find.drill.path = path.clone();
+        state.find.drill.title = browse_title(&path);
+        let title = state.find.drill.title.clone();
+        let _ = tx.send(Req::Browse {
+            target,
+            command: format!("lsinfo {}", quote_arg(&path)),
+            path,
+            title,
+            restore_sel: None,
+        });
+        return;
+    }
     let (cur_path, cur_sel) = match state.active_browse() {
         Some(b) => (b.path.clone(), b.selected),
         None => return,
@@ -496,6 +537,35 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
 /// Apply a (non-stale) command-worker response to TuiState.
 fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
     match kind {
+        // THE STALENESS GATE: fold only when the echoed query is the one still in
+        // flight. There is no request cancellation anywhere in this codebase, so
+        // submitting three queries in a row lands three responses - and only the
+        // last one may be allowed to paint. Same guarantee as a generation counter,
+        // no new plumbing, and the degenerate case (the same query twice) is
+        // harmless because the two answers are identical.
+        RespKind::Find { query, result } => {
+            let awaited = matches!(&state.find.phase, crate::find::Phase::Loading(q) if *q == query);
+            if !awaited {
+                return;
+            }
+            match result {
+                Ok(hits) => {
+                    state.find.hits = hits;
+                    state.find.selected = 0;
+                    state.find.offset.set(0);
+                    state.find.phase = crate::find::Phase::Done;
+                    // Land the cursor on the results so the next keystroke acts on a
+                    // hit rather than appending to the query that produced it.
+                    if !state.find.hits.rows.is_empty() {
+                        state.find.focus = crate::find::Focus::Results;
+                    }
+                }
+                // The previous hits stay visible underneath a failure: they are a
+                // truthful answer to a question the user asked, and re-running is
+                // one Enter away.
+                Err(reason) => state.find.phase = crate::find::Phase::Failed(reason),
+            }
+        }
         RespKind::Snapshot { now, queue, version } => {
             match queue {
                 Some(q) => {
@@ -540,6 +610,15 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             }
         }
         RespKind::Browse { target, rows, path, title, restore_sel } => {
+            // browse_for(Find) returns the drill ONLY while `drilling`, which is the
+            // staleness gate: a drill response that lands after the user already
+            // backed out is dropped here rather than left as stale rows waiting to
+            // flash under the NEXT drill's title. Req::Browse carries no request
+            // identity and Browse::apply latches `loaded`, so without this gate the
+            // late response would silently win.
+            if target == Screen::Find {
+                state.find.drill_loading = false;
+            }
             if let Some(b) = state.browse_for(target) {
                 b.apply(rows, path, title);
                 if let Some(sel) = restore_sel {
@@ -688,6 +767,7 @@ mod tests {
     fn dj_confirm_arm_echoes_choice_and_arms() {
         let (tx, rx) = mpsc::channel::<Req>();
         let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
+        let (find_tx, _find_rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Dj;
         state.enter_confirm(Pending {
@@ -697,7 +777,7 @@ mod tests {
             note: None,
             trust: None,
         });
-        dispatch(&tx, &cc_tx, &mut state, vec![Intent::ConfirmArm]);
+        dispatch(&tx, &cc_tx, &find_tx, &mut state, vec![Intent::ConfirmArm]);
         assert!(state.dj_log.iter().any(|l| l == "> y"), "choice echoed to chat");
         assert_eq!(state.mode, Mode::Normal, "confirm dismissed");
         assert!(state.pending.is_none(), "pending consumed");
@@ -802,13 +882,14 @@ mod tests {
     fn dj_confirm_cancel_echoes_cancelled() {
         let (tx, rx) = mpsc::channel::<Req>();
         let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
+        let (find_tx, _find_rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Dj;
         state.enter_confirm(Pending {
             token: Some("nl-1".into()),
             ..Default::default()
         });
-        dispatch(&tx, &cc_tx, &mut state, vec![Intent::ConfirmCancel]);
+        dispatch(&tx, &cc_tx, &find_tx, &mut state, vec![Intent::ConfirmCancel]);
         assert!(state.dj_log.iter().any(|l| l == "cancelled"), "cancellation echoed");
         assert_eq!(state.mode, Mode::Normal);
         assert!(state.pending.is_none());

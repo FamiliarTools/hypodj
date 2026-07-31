@@ -116,26 +116,64 @@ pub fn load(path: &Path) -> Option<ResumeState> {
     }
 }
 
-/// Atomically write resume state to `path`: serialize, write a sibling
-/// `resume.toml.tmp`, fsync it, then rename over `path` (same directory => the
-/// rename is atomic). A partially written file is never observed. Returns the
-/// io error to the caller (which logs it warn, never fatal).
-pub fn store_atomic(path: &Path, s: &ResumeState) -> std::io::Result<()> {
-    let body = to_toml(s);
+/// Atomically write `bytes` to `path`: a sibling unique temp file, `write_all`,
+/// `sync_all`, then `rename` over `path`. A partially written file is NEVER
+/// observed at `path` - a reader sees either the previous contents or the whole
+/// new ones, and a crash at any point leaves at worst a stray temp.
+///
+/// This is the ONE place that discipline lives, shared by the two writers that
+/// depend on it: the resume checkpoint ([`store_atomic`]) and the offline store's
+/// per-song sidecar ([`crate::store`]), where the sidecar rename IS the commit
+/// point for a cached song. A second copy of these five lines is exactly how one
+/// of them would eventually drift into a valid-looking partial file, so both go
+/// through here.
+///
+/// Requirements on `path`: it must have a file name and a parent that already
+/// exists, because the temp is a SIBLING - a cross-directory rename is not atomic,
+/// so the temp can never live in `/tmp` while the target lives elsewhere.
+pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // Sibling temp in the SAME dir so the final rename is atomic (cross-dir
     // renames are not). The temp name is UNIQUE per write (pid + a process-wide
-    // counter) so two concurrent checkpoints (periodic vs edge-triggered) cannot
-    // clobber each other's half-written temp before their renames.
+    // counter) so two concurrent writers (the periodic vs edge-triggered resume
+    // checkpoint; a sidecar rewrite racing a checkpoint) cannot clobber each
+    // other's half-written temp before their renames.
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic write target has no file name: {}", path.display()),
+        )
+    })?;
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("toml.tmp.{}.{}", std::process::id(), seq));
+    let tmp = path.with_file_name(format!(
+        "{}.tmp.{}.{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        seq
+    ));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
+        // On ANY failure after create, remove the temp before returning so a
+        // failed write does not accumulate litter in the state dir.
+        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
+}
+
+/// Atomically write resume state to `path`: serialize, then commit through the
+/// shared [`atomic_write_bytes`] (sibling temp, fsync, rename). A partially
+/// written file is never observed. Returns the io error to the caller (which logs
+/// it warn, never fatal).
+pub fn store_atomic(path: &Path, s: &ResumeState) -> std::io::Result<()> {
+    let body = to_toml(s);
+    atomic_write_bytes(path, body.as_bytes())
 }
 
 /// A built shutdown fade: the validated [`FadeSpec`] plus the REAL wall-clock
@@ -268,18 +306,112 @@ mod tests {
         assert!(load(&std::env::temp_dir()).is_none());
     }
 
+    /// A fresh, uniquely named temp dir for one test. No `tempfile` dependency
+    /// (the project keeps zero new deps here); uniqueness comes from pid + a
+    /// process-wide counter so tests running in parallel cannot collide.
+    fn test_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "hypodj-resume-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// Every file name in `dir`, sorted - so a test can assert that NOTHING but
+    /// the committed file survives (the temp-litter bar).
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn store_atomic_then_load_round_trip_no_leftover_tmp() {
-        let dir = std::env::temp_dir().join(format!("hypodj-resume-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = test_dir("store-atomic");
         let path = dir.join("resume.toml");
         let s = sample_state();
         store_atomic(&path, &s).expect("write");
         let back = load(&path).expect("read back");
         assert_eq!(s, back);
-        // No leftover .tmp after the rename.
-        let tmp = path.with_extension("toml.tmp");
-        assert!(!tmp.exists(), "temp file must be renamed away");
+        // The committed file is the ONLY thing left: no `resume.toml.tmp.<pid>.<n>`
+        // survives the rename.
+        assert_eq!(dir_names(&dir), vec!["resume.toml".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_bytes_round_trips_bytes_exactly_and_leaves_no_temp() {
+        let dir = test_dir("awb-roundtrip");
+        // A NON-UTF8 payload: the helper is byte-oriented (the store commits a
+        // TOML sidecar through it, but nothing about it may assume text).
+        let path = dir.join("song-1.toml");
+        let payload: Vec<u8> = vec![0x00, 0xff, 0xfe, b'h', b'i', 0x80];
+        atomic_write_bytes(&path, &payload).expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), payload);
+        assert_eq!(dir_names(&dir), vec!["song-1.toml".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_bytes_overwrite_is_whole_or_nothing_and_never_appends() {
+        let dir = test_dir("awb-overwrite");
+        let path = dir.join("sidecar.toml");
+        atomic_write_bytes(&path, b"first-and-longer").expect("write 1");
+        // A SHORTER second write must fully replace, not truncate-in-place leaving
+        // a tail of the first (which is precisely the valid-looking partial the
+        // rename discipline exists to prevent).
+        atomic_write_bytes(&path, b"second").expect("write 2");
+        assert_eq!(std::fs::read(&path).expect("read"), b"second");
+        assert_eq!(dir_names(&dir), vec!["sidecar.toml".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_bytes_concurrent_writers_leave_one_whole_file_no_temps() {
+        // The unique-temp discipline under real contention: N threads write
+        // DIFFERENT whole payloads to the SAME path. The survivor must be one
+        // complete payload (never a blend), and no temp may be orphaned.
+        let dir = test_dir("awb-concurrent");
+        let path = dir.join("resume.toml");
+        let payloads: Vec<Vec<u8>> = (0..8u8).map(|i| vec![b'a' + i; 512 + i as usize]).collect();
+        let mut handles = Vec::new();
+        for p in payloads.clone() {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                atomic_write_bytes(&path, &p).expect("concurrent write");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        let got = std::fs::read(&path).expect("read");
+        assert!(
+            payloads.contains(&got),
+            "the survivor must be exactly one whole payload, got {} bytes",
+            got.len()
+        );
+        assert_eq!(dir_names(&dir), vec!["resume.toml".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_bytes_bad_target_is_err_never_panic_and_leaves_nothing() {
+        // No file name (the filesystem root) => a clean InvalidInput error.
+        let err = atomic_write_bytes(Path::new("/"), b"x").expect_err("root has no file name");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // A parent that does not exist => the temp create fails; the caller logs
+        // warn, and nothing is left behind (there is nowhere to leave it).
+        let dir = test_dir("awb-badparent");
+        let missing = dir.join("nope").join("sidecar.toml");
+        assert!(atomic_write_bytes(&missing, b"x").is_err(), "missing parent is an error");
+        assert_eq!(dir_names(&dir), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

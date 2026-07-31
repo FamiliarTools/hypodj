@@ -209,7 +209,13 @@ let
     Unit = {
       Description = "hypodj MPD-to-OpenSubsonic daemon";
       # No network-online.target: it is not reliably satisfiable in the user
-      # manager and can wedge the unit. Restart=on-failure covers a cold network.
+      # manager and can wedge the unit. A cold network no longer needs covering
+      # here either: the daemon's startup greet WARNS instead of exiting, so it
+      # binds MPD and restores its queue with the music server unreachable.
+      # Restart=on-failure below therefore covers real crashes only - it is no
+      # longer doubling as a network wait (it never was a good one: the old
+      # `ping().await?` exit meant a sleeping server crash-looped the unit every
+      # RestartSec without ever serving a client).
     };
     Service = {
       # Type=simple (default): foreground process, no sd_notify.

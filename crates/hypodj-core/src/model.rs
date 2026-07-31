@@ -92,43 +92,95 @@ pub struct Album {
     pub song_count: u32,
 }
 
-#[derive(Debug, Clone)]
+/// A library track.
+///
+/// `Serialize`/`Deserialize` (plus `PartialEq`) so the offline audio store
+/// ([`crate::store`]) can embed a WHOLE song in its per-song sidecar: that
+/// embedded copy is what makes an offline restore and an offline `add song/<id>`
+/// carry real metadata instead of a bare id.
+///
+/// EVERY optional field carries `#[serde(default)]`, which is load-bearing rather
+/// than decorative: the TOML serializer OMITS a `None` field entirely, so without
+/// the defaults a plain round-trip of a song with (say) no comment would fail to
+/// deserialize its own output. `id` and `title` stay REQUIRED - a sidecar missing
+/// either is genuinely corrupt and must fail the parse (the
+/// [`crate::resume::from_toml`] corruption bar), never silently load as an empty
+/// id that would then mis-key the store.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Song {
     pub id: SongId,
     pub title: String,
+    #[serde(default)]
     pub album: Option<String>,
+    #[serde(default)]
     pub album_id: Option<AlbumId>,
+    #[serde(default)]
     pub artist: Option<String>,
+    #[serde(default)]
     pub track: Option<u32>,
+    #[serde(default)]
     pub duration_secs: Option<u32>,
     /// Cover-art id (NOT the song id). Used to resolve `albumart`/`readpicture`.
     /// When absent, the handler falls back to the song id itself (Navidrome and
     /// most servers accept the media id directly for getCoverArt).
+    #[serde(default)]
     pub cover_art: Option<String>,
+    #[serde(default)]
     pub starred: bool,
     // ── richer metadata (feature 7) - all Option so absent server data is clean.
     /// MusicBrainz recording/track id (wire `Child.music_brainz_id`).
+    #[serde(default)]
     pub musicbrainz_id: Option<String>,
     /// Disc number (wire `Child.disc_number`).
+    #[serde(default)]
     pub disc: Option<u32>,
     /// Release year (wire `Child.year`). Emitted as MPD `Date`.
+    #[serde(default)]
     pub year: Option<u32>,
     /// Genre name (wire `Child.genre`).
+    #[serde(default)]
     pub genre: Option<String>,
     /// Bitrate in kbps (wire `Child.bit_rate`).
+    #[serde(default)]
     pub bitrate: Option<u32>,
     /// Free-form comment (wire `Child.comment`).
+    #[serde(default)]
     pub comment: Option<String>,
     /// The current user's 0..=5 rating (wire `Child.user_rating`).
+    #[serde(default)]
     pub user_rating: Option<u8>,
     /// Composer display string (OpenSubsonic). Prefer wire `Child.display_composer`;
     /// fall back to the `Child.contributors` entries whose role is "composer".
     /// Plain-Subsonic servers omit this - `None` then matches nothing (honest).
+    #[serde(default)]
     pub composer: Option<String>,
     /// Performer display string (OpenSubsonic). There is no `display_performer`
     /// wire field; derived from `Child.contributors` entries whose role is
     /// "performer". Plain-Subsonic servers omit contributors - `None` then.
+    #[serde(default)]
     pub performer: Option<String>,
+    // ── store identity fingerprint (offline audio store) - the four fields the
+    // sidecar's `fingerprint` is built from, all straight off the wire `Child`.
+    // They are metadata about the ORIGINAL file, so they describe exactly what
+    // `/rest/download` returns and are unaffected by server-side transcoding.
+    /// Byte size of the ORIGINAL file (wire `Child.size`). The store's commit
+    /// check: a download is only committed when its length equals this exactly,
+    /// and [`crate::store::AudioStore::lookup`] re-confirms it with one stat.
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// File suffix of the original, e.g. `flac` / `mp3` (wire `Child.suffix`).
+    /// Names the store's audio file; sanitized before it ever reaches a path.
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// MIME type of the original (wire `Child.content_type`). Recorded in the
+    /// sidecar for provenance; never used to build a path.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// Server-side creation timestamp, ISO-8601 / RFC 3339 (wire `Child.created`).
+    /// The third leg of the store fingerprint: a re-import bumps it, which is how
+    /// a background pass notices the server's bytes changed under a stable id.
+    #[serde(default)]
+    pub created: Option<String>,
 }
 
 /// One thing that can sit in the play queue: either a resolved Subsonic [`Song`]

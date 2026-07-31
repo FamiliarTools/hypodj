@@ -31,6 +31,150 @@ pub struct Config {
     /// `[recognize]` section the defaults apply (auto ON, interval 300s).
     #[serde(default)]
     pub recognize: RecognizeConfig,
+    /// Offline audio store config. Optional; with no `[store]` section the store
+    /// is ON with an 8 GiB budget, because the offline path is meant to be the
+    /// EVERYDAY path (an untested branch is how offline support rots). The safety
+    /// bound is `max_bytes`, not the flag.
+    #[serde(default)]
+    pub store: StoreConfig,
+}
+
+/// `[store]` config for the OFFLINE AUDIO STORE ([`crate::store`]): the on-disk
+/// mirror that lets starred songs and the upcoming queue window play from local
+/// bytes when the server is slow, flaky, or gone.
+///
+/// Only `/rest/download` ORIGINALS are ever stored, which is why there is no
+/// format/bitrate knob here: the store mirrors exactly what the server holds, so
+/// a server-side transcoding change cannot invalidate a cached file. The
+/// metadata-client timeouts that bound "transient failure" are hardcoded consts
+/// in `subsonic.rs`, not config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoreConfig {
+    /// Master switch. Additionally disabled when no state dir resolves (neither
+    /// `store.dir` nor `restart.state_dir` nor `$STATE_DIRECTORY`) - resume's
+    /// posture: warn and run without it, never fail to start.
+    #[serde(default = "d_store_enable")]
+    pub enable: bool,
+    /// Where the store lives. `None` resolves to `<state_dir>/store`, mirroring
+    /// how `restart.state_dir` is resolved. An override MUST sit on the same
+    /// filesystem as its own temp files (they are siblings), because the atomic
+    /// rename that commits a download is not atomic across filesystems.
+    ///
+    /// THE DIRECTORY IS OWNED EXCLUSIVELY: the store converges it by DELETING
+    /// everything in it that is not a valid cached song, so it must be a dedicated
+    /// directory and never the state dir, a music library, or a home directory.
+    /// That is enforced, not merely documented - the store adopts only an EMPTY
+    /// directory (marking it) or one it already marked, and refuses any other,
+    /// running without a store rather than deleting a byte of it.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Hard byte budget for stored AUDIO (originals, so FLACs count full). When
+    /// the total exceeds it, unpinned entries evict by oldest `last_played`; pins
+    /// are NEVER silently evicted - a pinned set that alone exceeds the budget
+    /// warns per pass naming the shortfall and halts pin downloads at the cap.
+    /// Floored to [`STORE_MIN_MAX_BYTES`] at load: below that the budget cannot
+    /// hold even a couple of FLAC originals, so eviction would thrash against
+    /// every download instead of bounding anything.
+    #[serde(default = "d_store_max_bytes")]
+    pub max_bytes: u64,
+    /// How many UPCOMING queue Song entries beyond the current one join the
+    /// desired set, so an ordinary end-of-track advance is a disk open rather than
+    /// a network fetch. `0` disables queue-ahead downloads (pins still apply).
+    #[serde(default = "d_store_queue_ahead")]
+    pub queue_ahead: u32,
+    /// Cadence of the FULL reconcile pass (directory scan + one `getStarred2` +
+    /// fingerprint verdicts), seconds. Floored to
+    /// [`STORE_MIN_SYNC_INTERVAL_SECS`] so no config typo can turn the reconciler
+    /// into a busy loop against the server. Star flips kick a full pass; window
+    /// changes, suspect marks, and skip pins kick a LIGHT pass immediately, so
+    /// this cadence is not the latency of anything the user is waiting for.
+    #[serde(default = "d_store_sync_interval_secs")]
+    pub sync_interval_secs: u64,
+    /// Whether the `getStarred2` song set is the authoritative PIN set - the
+    /// hearted-songs-work-offline promise. With this false the store still mirrors
+    /// the queue window opportunistically, but nothing is protected from eviction
+    /// beyond the window itself.
+    #[serde(default = "d_store_pin_starred")]
+    pub pin_starred: bool,
+}
+
+pub const DEFAULT_STORE_ENABLE: bool = true;
+/// 8 GiB: roughly 350 to 400 FLAC originals at the live-observed ~22 MB each.
+pub const DEFAULT_STORE_MAX_BYTES: u64 = 8_589_934_592;
+pub const DEFAULT_STORE_QUEUE_AHEAD: u32 = 3;
+pub const DEFAULT_STORE_SYNC_INTERVAL_SECS: u64 = 900;
+pub const DEFAULT_STORE_PIN_STARRED: bool = true;
+
+/// Hard floor on `store.max_bytes`, 64 MiB. A budget smaller than a couple of
+/// originals makes every download immediately over-cap, so the store would
+/// download-then-evict forever instead of bounding disk use. Clamp up, never
+/// reject (the [`FadeConfig::normalize`] posture).
+pub const STORE_MIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Hard floor on `store.sync_interval_secs`, 60s. The full pass costs a directory
+/// scan plus a `getStarred2` round trip; below a minute a typo (`= 1`) would hammer
+/// the server and starve the runtime for no gain, since every latency-sensitive
+/// trigger is already a kick, not a tick.
+pub const STORE_MIN_SYNC_INTERVAL_SECS: u64 = 60;
+
+fn d_store_enable() -> bool {
+    DEFAULT_STORE_ENABLE
+}
+fn d_store_max_bytes() -> u64 {
+    DEFAULT_STORE_MAX_BYTES
+}
+fn d_store_queue_ahead() -> u32 {
+    DEFAULT_STORE_QUEUE_AHEAD
+}
+fn d_store_sync_interval_secs() -> u64 {
+    DEFAULT_STORE_SYNC_INTERVAL_SECS
+}
+fn d_store_pin_starred() -> bool {
+    DEFAULT_STORE_PIN_STARRED
+}
+
+/// MANUAL (not derived) so a MISSING `[store]` section - which the top-level
+/// `#[serde(default)]` fills from `Default` - is byte-identical to an EMPTY
+/// `[store]` section. A derived `Default` would give `enable = false`,
+/// `max_bytes = 0`, `queue_ahead = 0`: the store silently off for everyone who
+/// never wrote the section, which is the exact opposite of the intent. This is the
+/// [`ContinuationConfig`] rule; the parity test below is what keeps it true.
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            enable: DEFAULT_STORE_ENABLE,
+            dir: None,
+            max_bytes: DEFAULT_STORE_MAX_BYTES,
+            queue_ahead: DEFAULT_STORE_QUEUE_AHEAD,
+            sync_interval_secs: DEFAULT_STORE_SYNC_INTERVAL_SECS,
+            pin_starred: DEFAULT_STORE_PIN_STARRED,
+        }
+    }
+}
+
+impl StoreConfig {
+    /// Floor-clamp the two knobs whose out-of-range values are pathological rather
+    /// than merely odd, at LOAD time, logging any correction (the
+    /// [`FadeConfig::normalize`] posture: clamp up, never reject, never panic).
+    /// TOTAL - there is no input for which this can fail.
+    pub fn normalize(&mut self) {
+        if self.max_bytes < STORE_MIN_MAX_BYTES {
+            tracing::warn!(
+                configured = self.max_bytes,
+                floor = STORE_MIN_MAX_BYTES,
+                "store.max_bytes below the 64 MiB floor; clamping up"
+            );
+            self.max_bytes = STORE_MIN_MAX_BYTES;
+        }
+        if self.sync_interval_secs < STORE_MIN_SYNC_INTERVAL_SECS {
+            tracing::warn!(
+                configured = self.sync_interval_secs,
+                floor = STORE_MIN_SYNC_INTERVAL_SECS,
+                "store.sync_interval_secs below the 60s floor; clamping up"
+            );
+            self.sync_interval_secs = STORE_MIN_SYNC_INTERVAL_SECS;
+        }
+    }
 }
 
 /// `[recognize]` config for AUTO now-playing recognition of no-ICY streams (task
@@ -583,16 +727,22 @@ impl Config {
         let mut cfg: Config = toml::from_str(&raw)?;
         cfg.fade.normalize();
         cfg.recognize.normalize();
+        cfg.store.normalize();
         Ok(cfg)
     }
 
     /// Parse from a TOML string (test/embedded use). Kept as an inherent method
     /// with this name for ergonomics; it is not the `FromStr` trait.
+    ///
+    /// Normalizes the SAME sections as [`Config::load`] - a section normalized in
+    /// only one of the two is a latent bug where a test-parsed config and a
+    /// file-loaded config disagree.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(raw: &str) -> Result<Self, ConfigError> {
         let mut cfg: Config = toml::from_str(raw)?;
         cfg.fade.normalize();
         cfg.recognize.normalize();
+        cfg.store.normalize();
         Ok(cfg)
     }
 }
@@ -901,6 +1051,243 @@ mod tests {
             cfg.recognize.interval_secs, RECOGNIZE_MIN_INTERVAL_SECS,
             "interval_secs floor-clamped to 60"
         );
+    }
+
+    /// The minimal valid config: a `[server]` section and nothing else. Every
+    /// section-default test starts from this so "no section at all" is what is
+    /// actually being exercised.
+    const BARE: &str = r#"
+        [server]
+        url = "https://m"
+        username = "a"
+        password = "b"
+    "#;
+
+    #[test]
+    fn store_section_defaults_on_with_the_documented_budget() {
+        // No [store] section at all -> the store is ON by default (the offline path
+        // is meant to be the everyday path) with the documented 8 GiB budget.
+        let cfg = Config::from_str(BARE).unwrap();
+        assert!(cfg.store.enable, "the store defaults ON");
+        assert_eq!(cfg.store.dir, None, "dir defaults to <state_dir>/store");
+        assert_eq!(cfg.store.max_bytes, 8_589_934_592, "8 GiB");
+        assert_eq!(cfg.store.queue_ahead, 3);
+        assert_eq!(cfg.store.sync_interval_secs, 900);
+        assert!(cfg.store.pin_starred, "starred is the pin set by default");
+    }
+
+    #[test]
+    fn store_section_partial_overrides_only_named_keys() {
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [store]
+            dir = "/srv/hypodj-audio"
+            max_bytes = 1073741824
+            queue_ahead = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.store.dir.as_deref(), Some(Path::new("/srv/hypodj-audio")));
+        assert_eq!(cfg.store.max_bytes, 1_073_741_824);
+        assert_eq!(cfg.store.queue_ahead, 0, "0 disables queue-ahead downloads");
+        // Untouched keys still default.
+        assert!(cfg.store.enable);
+        assert_eq!(cfg.store.sync_interval_secs, DEFAULT_STORE_SYNC_INTERVAL_SECS);
+        assert!(cfg.store.pin_starred);
+
+        // The master switch and the pin set are both individually flippable.
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [store]
+            enable = false
+            pin_starred = false
+        "#,
+        )
+        .unwrap();
+        assert!(!cfg.store.enable);
+        assert!(!cfg.store.pin_starred);
+    }
+
+    #[test]
+    fn store_normalize_floors_max_bytes_and_interval() {
+        // A pathologically small budget would make every download instantly
+        // over-cap (download-evict thrash), and a 1s cadence would hammer the
+        // server. Both clamp UP at load, never reject.
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [store]
+            max_bytes = 1
+            sync_interval_secs = 1
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.store.max_bytes, STORE_MIN_MAX_BYTES, "floored to 64 MiB");
+        assert_eq!(
+            cfg.store.sync_interval_secs, STORE_MIN_SYNC_INTERVAL_SECS,
+            "floored to 60s"
+        );
+
+        // Zero is the same story (and must not underflow anything).
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [store]
+            max_bytes = 0
+            sync_interval_secs = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.store.max_bytes, STORE_MIN_MAX_BYTES);
+        assert_eq!(cfg.store.sync_interval_secs, STORE_MIN_SYNC_INTERVAL_SECS);
+
+        // An in-range value is untouched by normalize (it is a FLOOR, not a pin).
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [store]
+            max_bytes = 209715200
+            sync_interval_secs = 120
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.store.max_bytes, 209_715_200);
+        assert_eq!(cfg.store.sync_interval_secs, 120);
+    }
+
+    // The manual `impl Default for StoreConfig` MUST match the per-field serde
+    // defaults, or a config with no [store] section behaves differently from one
+    // with an empty [store] section. A derived Default would give enable = false
+    // and max_bytes = 0 - the store silently off for every existing config.
+    #[test]
+    fn store_manual_default_matches_serde_defaults() {
+        // (a) an EMPTY [store] section: every field comes from its `d_*` fn.
+        let from_serde = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [store]
+        "#,
+        )
+        .unwrap()
+        .store;
+        // (b) NO [store] section: the field's #[serde(default)] uses `Default`.
+        let from_default = Config::from_str(BARE).unwrap().store;
+
+        assert_eq!(from_default.enable, from_serde.enable);
+        assert_eq!(from_default.dir, from_serde.dir);
+        assert_eq!(from_default.max_bytes, from_serde.max_bytes);
+        assert_eq!(from_default.queue_ahead, from_serde.queue_ahead);
+        assert_eq!(from_default.sync_interval_secs, from_serde.sync_interval_secs);
+        assert_eq!(from_default.pin_starred, from_serde.pin_starred);
+
+        // And the bare `Default` impl itself (used by main.rs / tests that build a
+        // Config in code) agrees with both, field by field.
+        let d = StoreConfig::default();
+        assert_eq!(d.enable, from_serde.enable);
+        assert_eq!(d.dir, from_serde.dir);
+        assert_eq!(d.max_bytes, from_serde.max_bytes);
+        assert_eq!(d.queue_ahead, from_serde.queue_ahead);
+        assert_eq!(d.sync_interval_secs, from_serde.sync_interval_secs);
+        assert_eq!(d.pin_starred, from_serde.pin_starred);
+    }
+
+    // The same parity bar for the OTHER manually-defaulted sections, so the rule
+    // is enforced across the config surface rather than only where it was last
+    // remembered.
+    #[test]
+    fn manual_defaults_match_serde_defaults_for_every_section() {
+        let bare = Config::from_str(BARE).unwrap();
+        let empty = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [mpd]
+            [mpris]
+            [fade]
+            [restart]
+            [continuation]
+            [recognize]
+            [store]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(bare.mpd.bind, empty.mpd.bind);
+        assert_eq!(bare.mpris.enable, empty.mpris.enable);
+        assert_eq!(bare.mpris.raise_command, empty.mpris.raise_command);
+        assert_eq!(bare.restart.state_dir, empty.restart.state_dir);
+        assert_eq!(bare.restart.checkpoint_secs, empty.restart.checkpoint_secs);
+        assert_eq!(bare.continuation.station, empty.continuation.station);
+        assert_eq!(bare.continuation.mode, empty.continuation.mode);
+        assert_eq!(bare.continuation.autofill_count, empty.continuation.autofill_count);
+        assert_eq!(bare.recognize.auto, empty.recognize.auto);
+        assert_eq!(bare.recognize.interval_secs, empty.recognize.interval_secs);
+        assert_eq!(bare.store.enable, empty.store.enable);
+        assert_eq!(bare.store.max_bytes, empty.store.max_bytes);
+        assert_eq!(bare.store.queue_ahead, empty.store.queue_ahead);
+        assert_eq!(bare.store.sync_interval_secs, empty.store.sync_interval_secs);
+        assert_eq!(bare.store.pin_starred, empty.store.pin_starred);
+        // The float/int fade knobs too, since [fade] is the largest section.
+        assert_eq!(bare.fade.min_slew_ms, empty.fade.min_slew_ms);
+        assert_eq!(bare.fade.max_dur_secs, empty.fade.max_dur_secs);
+        assert_eq!(bare.fade.pause_fade_secs, empty.fade.pause_fade_secs);
+        assert_eq!(bare.fade.skip_fade_secs, empty.fade.skip_fade_secs);
+        assert_eq!(bare.fade.glide_fade_secs, empty.fade.glide_fade_secs);
+    }
+
+    // Config::load and Config::from_str must normalize the SAME sections: a
+    // section normalized in only one is a latent divergence between the daemon's
+    // real load path and every test.
+    #[test]
+    fn load_normalizes_the_same_sections_as_from_str() {
+        let raw = r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [fade]
+            min_slew_ms = 10
+            [recognize]
+            interval_secs = 2
+            [store]
+            max_bytes = 3
+            sync_interval_secs = 4
+        "#;
+        let dir = std::env::temp_dir().join(format!("hypodj-config-load-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(&path, raw).expect("write config");
+        let loaded = Config::load(&path).expect("load");
+        let parsed = Config::from_str(raw).expect("from_str");
+        assert_eq!(loaded.fade.min_slew_ms, parsed.fade.min_slew_ms);
+        assert_eq!(loaded.recognize.interval_secs, parsed.recognize.interval_secs);
+        assert_eq!(loaded.store.max_bytes, parsed.store.max_bytes);
+        assert_eq!(loaded.store.sync_interval_secs, parsed.store.sync_interval_secs);
+        // And the values really are the normalized ones, not the raw TOML.
+        assert_eq!(loaded.store.max_bytes, STORE_MIN_MAX_BYTES);
+        assert_eq!(loaded.store.sync_interval_secs, STORE_MIN_SYNC_INTERVAL_SECS);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

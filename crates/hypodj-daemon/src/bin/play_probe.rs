@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     println!("[2/7] ping OK (authenticated)");
 
     let artists = client.artists().await?;
-    let albums = client.album_list(AlbumListType::Newest, Some(20)).await?;
+    let albums = client.album_list(AlbumListType::Newest, Some(20), None).await?;
     println!(
         "[3/7] browse OK: {} artists, {} albums (newest)",
         artists.len(),
@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         MpvPlayer::spawn(AudioOut::File(std::path::PathBuf::from(&out_path)));
 
     player
-        .play_url(Some(SongId(song.id.0.clone())), None, url.as_str())
+        .play_url(Some(SongId(song.id.0.clone())), None, url.as_str(), false)
         .await?;
     println!("[6/7] play_url issued; mpv state = {:?}", player.state());
 

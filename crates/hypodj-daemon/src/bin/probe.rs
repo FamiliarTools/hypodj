@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     println!("[2/4] ping OK (authenticated)");
 
     let artists = client.artists().await?;
-    let albums = client.album_list(AlbumListType::Newest, Some(20)).await?;
+    let albums = client.album_list(AlbumListType::Newest, Some(20), None).await?;
     println!(
         "[3/4] browse OK: {} artists, {} albums (newest)",
         artists.len(),

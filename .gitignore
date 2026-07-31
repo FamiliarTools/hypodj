@@ -6,3 +6,4 @@
 /subsonity.validate.toml
 .direnv/
 .envrc
+.claude/

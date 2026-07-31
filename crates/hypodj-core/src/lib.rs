@@ -31,6 +31,7 @@ pub mod recognize;
 pub mod resume;
 pub mod scrobble;
 pub mod station_identity;
+pub mod store;
 pub mod subsonic;
 pub mod timer;
 pub mod viz;
