@@ -69,6 +69,7 @@ use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
     RESUME_SCHEMA_VERSION,
 };
+use crate::store::AudioStore;
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
 use crate::timer::{TimerGuard, TimerHandle};
 
@@ -762,6 +763,31 @@ impl FadeSlot {
 /// What happens AFTER a fade's ramp completes. Lives in the wrapper task, not in
 /// the pure driver. Skipped on abort (a superseded/cancelled fade) and on a sink
 /// error, so a manual action that cancelled the fade is never undone.
+/// The whole [`PlayerEvent::Eof`](crate::player::PlayerEvent::Eof) payload, as
+/// [`HypodjHandler::advance_on_eof`] receives it from the director spine.
+///
+/// A struct rather than four positional bools because the four facts are read by
+/// different halves of the advance: `continuation_landed` selects the drain-edge
+/// mechanism, while `song` + `errored` + `was_local` are the offline store's suspect
+/// signal. `Default` is an ORDINARY natural EOF of a remote track - the shape almost
+/// every caller (and every fake-clock test that just wants an advance) wants.
+///
+/// The song id is carried BY VALUE off the event on purpose: `st.current` is repointed
+/// after the `play_url` await, so a re-read at processing time would misattribute the
+/// mark to whatever an interleaved play just loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EofSignal {
+    /// The finishing entry's library song id, or `None` for a raw stream.
+    pub song: Option<SongId>,
+    /// The end was an ERROR (an `EndFile(Error)` or a top-level open failure), not a
+    /// natural end.
+    pub errored: bool,
+    /// The finishing entry was playing LOCAL offline-store bytes.
+    pub was_local: bool,
+    /// A warmed continuation station AUTO-ADVANCED at this EOF (slice 2).
+    pub continuation_landed: bool,
+}
+
 /// A target's play arguments, pre-resolved SYNCHRONOUSLY (the Subsonic
 /// `stream_url` is sync) so the skip dip terminal only needs a SINK-level
 /// `play_url`, never a `&self` handler call under the fade slot lock.
@@ -770,6 +796,14 @@ struct ResolvedPlay {
     song_id: Option<SongId>,
     qid: QueueId,
     url: String,
+    /// Whether `url` is a LOCAL path out of the offline store rather than a network
+    /// URL. Carried (not re-derived downstream) because resolution happens ONCE per
+    /// gesture: the skip dip pre-resolves and hands the same value to both the warm
+    /// prefetch and the trough terminal, so local/remote can never flip inside a
+    /// gesture. Feeds the store's bulk-work deferral (do not saturate a thin link
+    /// while playback itself is coming off the network) and, later, the suspect
+    /// attribution that rides the Eof event.
+    local: bool,
 }
 
 // NOTE: no `Copy` - the `SkipLoad` arm carries owned, non-Copy fields
@@ -1219,7 +1253,13 @@ fn fade_task(
                     // trough gap collapses toward ~0); if the warm never completed it
                     // falls back to a plain loadfile-replace - today's behavior, so a
                     // prefetch miss/failure is never worse than before.
-                    let _ = sink.switch_warmed(play.song_id, Some(play.qid), &play.url).await;
+                    // `play.local` is the value resolved ONCE for this gesture (the same
+                    // one the warm used), so the actor latches the right local/remote
+                    // fact for the target's own later Eof - resolution cannot flip
+                    // inside a gesture.
+                    let _ = sink
+                        .switch_warmed(play.song_id, Some(play.qid), &play.url, play.local)
+                        .await;
                     // Commit the target as the real current, clear the reported-target
                     // override, pin the live gain to the dip floor (where the deck and
                     // the ResumeIn's from_db agree) and keep `fading` true - the
@@ -1486,6 +1526,45 @@ pub struct HypodjHandler {
     /// floor-clamped to `RECOGNIZE_MIN_INTERVAL_SECS`). Read locklessly at rearm time so
     /// a live config reload could retune it without touching an armed slot.
     recognize_interval_secs: AtomicU64,
+    /// The OFFLINE AUDIO STORE ([`crate::store`]), plumbed once at daemon startup via
+    /// [`Self::set_audio_store`] when a store directory resolves. `None` in a raw
+    /// handler and whenever the store is disabled or failed to open, in which case
+    /// EVERY store seam here is a no-op and playback is byte-identical to a
+    /// store-less build. `Mutex<Option<..>>` (not `OnceLock`) mirrors
+    /// [`Self::state_path`]: an unset store is a valid, permanent state. Read under
+    /// a SHORT scope that clones the `Arc` out - the store's own methods are then
+    /// called with NO handler lock held.
+    audio_store: Mutex<Option<Arc<AudioStore>>>,
+    /// The song id currently protected from eviction as the PENDING-SKIP TARGET, so
+    /// the protection is a SINGLE SLOT rather than an ever-growing set: installing a
+    /// new skip target releases the previous one, and any track becoming current
+    /// releases it entirely. Without the slot a superseded skip would leak its
+    /// target's protection forever and eviction would slowly lose the budget.
+    /// Guarded by its own Mutex, only ever taken for the length of a swap.
+    store_skip_pin: Mutex<Option<SongId>>,
+    /// Song ids an OFFLINE restore installed as ID-ONLY PLACEHOLDERS (see
+    /// [`Self::restore`]): real queue entries carrying nothing but the id, awaiting
+    /// the server's metadata. Drained by [`Self::refresh_restore_placeholders`] on the
+    /// store's server-back edge. Purely COSMETIC state - persistence stores ids, so a
+    /// placeholder that is never refreshed costs a title, never a lost entry.
+    restore_placeholders: Mutex<Vec<SongId>>,
+    /// How many CONSECUTIVE errored EOFs the auto-advance has taken with NO audio
+    /// flowing in between. The fuse behind [`MAX_CONSECUTIVE_EOF_FAILURES`]: reset by
+    /// any evidence that a track actually PLAYED - a live playback position
+    /// ([`Self::note_playback_progress`], the director's identity-matched `TimePos`), a
+    /// natural (non-errored) EOF, or a fresh-play GESTURE ([`Self::play_index`]) - so it
+    /// only ever counts an unbroken run of loads that never produced sound.
+    ///
+    /// The position tick is the LOAD-BEARING reset, because neither of the other two
+    /// covers the ordinary online failures: a track that plays for minutes and THEN
+    /// drops ends errored (mpv reason `Error` is a post-load failure), and a user skip
+    /// off a healthy track ends as reason `Stop`, which emits no `Eof` at all. Without
+    /// it, three unrelated hiccups spread across a whole session would accumulate into a
+    /// halt on a healthy queue.
+    ///
+    /// Lockless like [`Self::last_elapsed_ms`] - it is read and written on the player
+    /// event spine, never together with State.
+    consecutive_eof_failures: AtomicU32,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -1553,6 +1632,27 @@ const AUTOFILL_SEEN_CAP: usize = 200;
 /// server. A healthy batch is tens of minutes of playback, so the fuse never trips in
 /// normal use; the hard ceiling is <= 1 fetch per this interval in ANY execution.
 const AUTOFILL_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The EOF auto-advance FUSE: a run of this many CONSECUTIVE errored EOFs WITH NO AUDIO
+/// IN BETWEEN stops the walk instead of grinding the queue down to no current entry
+/// (see [`HypodjHandler::advance_on_eof`]).
+///
+/// mpv's loadfile Ok is premature, so a load that cannot open comes back as an errored
+/// Eof - which re-enters the advance and loads the NEXT entry. With no server (the
+/// everyday offline case, where only some of the queue is mirrored) that is a walk
+/// through the whole queue in seconds, ending at `current: None`, which the checkpoint
+/// loop then persists over the saved position. Three is chosen so the ordinary online
+/// case is untouched: one dead track (or two) is still skipped past exactly as before,
+/// while a systemic failure - which is what three in a row means - stops at the entry
+/// that failed, with the queue and the position intact.
+///
+/// "In a row" is measured against PLAYBACK, not against EOFs: any live position tick
+/// re-arms the fuse (see [`HypodjHandler::note_playback_progress`]). An errored EOF is NOT by
+/// itself a failed load - `EndReason::Error` also covers a track that played to 90% and
+/// then lost its source - so counting errored EOFs alone would turn three flaky drops
+/// spread over an evening into a dead deck. Only a run of loads that never produced a
+/// single frame of sound is systemic.
+const MAX_CONSECUTIVE_EOF_FAILURES: u32 = 3;
 
 /// The ICY GRACE window (task bspk8v5): after a raw [`QueueEntry::Stream`] becomes the
 /// current entry, wait this long for ICY metadata (`icy-name`/`icy-title`) to arrive
@@ -1811,6 +1911,12 @@ impl HypodjHandler {
             recognize_interval_secs: AtomicU64::new(
                 crate::config::DEFAULT_RECOGNIZE_INTERVAL_SECS,
             ),
+            // No store until the daemon plumbs one: a raw handler resolves every
+            // play to a stream URL exactly as before.
+            audio_store: Mutex::new(None),
+            store_skip_pin: Mutex::new(None),
+            restore_placeholders: Mutex::new(Vec::new()),
+            consecutive_eof_failures: AtomicU32::new(0),
         }
     }
 
@@ -3074,6 +3180,8 @@ impl HypodjHandler {
             // The playing entry itself was removed: stop rather than leave the player
             // running a track no longer in the queue.
             let _ = self.player.stop().await;
+            // And the deck is empty, so bulk store work stops deferring.
+            self.set_store_playback_remote(false);
         }
         if removed > 0 {
             self.notify_change();
@@ -3955,6 +4063,12 @@ impl HypodjHandler {
         if let Some(tx) = self.snapshot_tx.get() {
             let _ = tx.send(self.queue_snapshot());
         }
+        // Republish the offline store's QUEUE WINDOW off the same edge. This is the
+        // ONE choke point every queue mutation, fresh play, and EOF advance already
+        // funnels through, which is what makes "the window follows the queue" a
+        // structural property instead of a per-command convention nobody can forget.
+        // A no-op without a store, and a kick only when the window truly moved.
+        self.update_store_window();
         self.changed.notify_waiters();
     }
 
@@ -4377,7 +4491,22 @@ impl HypodjHandler {
             (true, PlayState::Playing) => self.pause_with_fade().await,
             // Paused (or pending-pause) -> resume (unpause from silence, then fade
             // in). This also aborts an in-flight pause-out fade (F5).
-            (false, PlayState::Paused) => self.resume_with_fade().await,
+            //
+            // UNLESS the player holds NOTHING: the PAUSED-WITH-NOTHING-LOADED terminal
+            // ([`Self::halt_failed_advance`], and an offline [`Self::restore`] of a
+            // saved Playing state) reports Paused off `pending_pause` alone over a
+            // player whose last act was an honest STOP, so there is no paused track to
+            // unpause. A raw Stopped under a reported Paused can ONLY be that terminal:
+            // a settled pause is raw Paused, a mid-fade pause is raw Playing, and
+            // without `pending_pause` a raw Stopped already reports Stopped. Resuming
+            // there means LOADING the held entry - see the helper.
+            (false, PlayState::Paused) => {
+                if matches!(self.player.state(), PlayState::Stopped) {
+                    self.resume_by_loading_current().await
+                } else {
+                    self.resume_with_fade().await
+                }
+            }
             // Stopped and asked to play: nothing loaded to fade; mirror the prior
             // direct-resume behavior and notify so a listener still refreshes.
             (false, PlayState::Stopped) => {
@@ -4632,6 +4761,51 @@ impl HypodjHandler {
         r
     }
 
+    /// Resume out of the PAUSED-WITH-NOTHING-LOADED terminal (see the `set_pause`
+    /// arm) by LOADING the held entry, because there is nothing to unpause.
+    ///
+    /// Without this, a resume gesture from that terminal - MPD `pause 0`, an MPRIS
+    /// Play/PlayPause, a knob-up, all of which funnel through `set_pause` - reached
+    /// [`Self::resume_with_fade`], whose cancel closure sees a raw Stopped player,
+    /// takes the NOT-settled branch (no `resume()`, no load) and merely clears
+    /// `pending_pause`: the deck silently fell to Stopped, and the NEXT toggle then
+    /// unpaused an idle mpv into a PHANTOM Playing over silence. So the terminal's own
+    /// promise - a state a play gesture or an MPRIS widget can pick up from - only
+    /// held for `play`, the one gesture that loads.
+    ///
+    /// The load starts at the entry's beginning, exactly as `play` on a restored deck
+    /// always has: the held entry never played a frame (the fuse halt) or was never
+    /// loaded at all (an offline restore), so there is no live position to resume into
+    /// and seeking to the elapsed atomic would risk dropping the playhead into the
+    /// PREVIOUS entry's position. A load that fails - the server is still away - keeps
+    /// the deck REPORTING Paused at this exact entry rather than letting it fall to
+    /// Stopped, so the position survives for the next attempt and the checkpoint keeps
+    /// saving the session rather than a stopped deck.
+    async fn resume_by_loading_current(&self) -> Result<(), PlayerError> {
+        // Brief lock, dropped BEFORE the load await (never hold State across `.await`).
+        let held = self.state.lock().unwrap().current;
+        let Some(idx) = held else {
+            // The entry went away between the state read and here: nothing to load,
+            // and the deck already reports Stopped without a current.
+            return Ok(());
+        };
+        match self.play_index(idx).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                {
+                    let mut st = self.state.lock().unwrap();
+                    // Only while an entry is actually held: `pending_pause` over an
+                    // empty queue would report Paused with nothing to resume.
+                    if st.current.and_then(|i| st.queue.get(i)).is_some() {
+                        st.pending_pause = true;
+                    }
+                }
+                self.notify_change();
+                Err(PlayerError::Backend(e))
+            }
+        }
+    }
+
     /// Stop playback the startle-safe way the MPD `stop` path does: atomically cancel
     /// any in-flight fade and settle the baseline, then stop mpv and re-assert the
     /// baseline gain, then notify. Shared by the MPD `stop` command and MPRIS Stop
@@ -4648,6 +4822,9 @@ impl HypodjHandler {
             })
             .await;
         let _ = self.player.stop().await;
+        // A stopped deck carries no bytes at all, so the store's bulk backfill must
+        // stop deferring: an idle daemon is exactly when the mirror should fill.
+        self.set_store_playback_remote(false);
         // Disarm any pending continuation warm (slice 2): a stop kills the deck, so a
         // parked station warm must die (its timer cancelled, any prefetch dropped) rather
         // than surprise the user by auto-advancing behind a stopped track.
@@ -4700,6 +4877,305 @@ impl HypodjHandler {
             interval_secs.max(crate::config::RECOGNIZE_MIN_INTERVAL_SECS),
             Ordering::Relaxed,
         );
+    }
+
+    // ── the offline audio store ─────────────────────────────────────────────
+
+    /// Register the opened [`AudioStore`], plumbed once at daemon startup like
+    /// [`Self::set_continuation_station`] - and BEFORE `resume::load`/`restore`, so
+    /// a restored queue can already resolve to local bytes.
+    ///
+    /// Absent (a raw handler, a disabled store, a store that failed to open) every
+    /// seam below no-ops and playback is byte-identical to a store-less build.
+    pub fn set_audio_store(&self, store: Arc<AudioStore>) {
+        *self.audio_store.lock().unwrap() = Some(store);
+    }
+
+    /// The store handle, CLONED OUT under a short lock so no store call ever runs
+    /// with a handler lock held.
+    pub(crate) fn audio_store(&self) -> Option<Arc<AudioStore>> {
+        self.audio_store.lock().unwrap().clone()
+    }
+
+    /// Publish the CURRENT queue window (the playing entry plus the next
+    /// `queue_ahead` upcoming library songs, in play order) to the store and kick a
+    /// LIGHT reconcile pass when it actually moved.
+    ///
+    /// Light, not full: a track boundary must not cost a directory scan plus a
+    /// `getStarred2`. The light pass replans against cached state only and executes
+    /// exactly the downloads the user is about to hear.
+    ///
+    /// Called from [`Self::notify_change`], which is the ONE choke point every queue
+    /// mutation, fresh play, and EOF advance already funnels through - so no
+    /// queue-mutating command can forget it. Sync and cheap: one short state lock, a
+    /// small `Vec<SongId>`, and a kick only on a real change.
+    pub(crate) fn update_store_window(&self) {
+        let Some(store) = self.audio_store() else { return };
+        let ahead = store.config().queue_ahead as usize;
+        let ids = {
+            let st = self.state.lock().unwrap();
+            // The reported current is the right anchor: during a skip dip the target
+            // is what is about to be audible, so the window must already lead from it.
+            let from = st.reported_current().unwrap_or(0);
+            st.queue
+                .iter()
+                .skip(from)
+                .take(ahead.saturating_add(1))
+                .filter_map(|item| match &item.entry {
+                    QueueEntry::Song(s) => Some(s.id.clone()),
+                    // A raw stream has no id and nothing to mirror.
+                    QueueEntry::Stream { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        if store.set_window(ids) {
+            store.kick_light();
+        }
+    }
+
+    /// Refresh the ID-ONLY PLACEHOLDERS an offline [`Self::restore`] installed, now
+    /// that the server has answered again. Returns how many entries were filled in.
+    ///
+    /// Driven by the store's server-back edge (the reconciler fires it after a pass
+    /// whose `getStarred2` succeeded), so no new timer and no polling exists for it.
+    /// Cheap and idempotent: with nothing pending it returns at once, which is the
+    /// case on every pass but the one after an offline start.
+    ///
+    /// Purely COSMETIC, and deliberately conservative about failure:
+    ///
+    /// - a resolved id patches EVERY queue entry carrying it (a song can legitimately
+    ///   sit in the queue twice) and leaves the entry's queue id / position untouched,
+    ///   so nothing a client is watching moves;
+    /// - a `NotFound` id is DROPPED FROM THE PENDING SET but its entry STAYS - the
+    ///   queue never shrinks behind the user's back, and the id-titled row is honest
+    ///   about what it is;
+    /// - the FIRST transient failure stops the batch and keeps the rest pending: the
+    ///   server is evidently not back after all, and hammering it with one bounded
+    ///   request per placeholder would buy nothing.
+    pub async fn refresh_restore_placeholders(&self) -> usize {
+        let pending: Vec<SongId> = self.restore_placeholders.lock().unwrap().clone();
+        if pending.is_empty() {
+            return 0;
+        }
+        let mut remaining: Vec<SongId> = Vec::new();
+        let mut filled = 0usize;
+        let mut iter = pending.into_iter();
+        for id in iter.by_ref() {
+            match self.client.song(&id).await {
+                Ok(song) => {
+                    // One SHORT lock per resolved id: never held across the await
+                    // above, and never long enough to stall a status render.
+                    let mut st = self.state.lock().unwrap();
+                    let mut patched = false;
+                    for item in st.queue.iter_mut() {
+                        if let QueueEntry::Song(existing) = &mut item.entry {
+                            if existing.id == song.id {
+                                *existing = song.clone();
+                                patched = true;
+                            }
+                        }
+                    }
+                    if patched {
+                        filled += 1;
+                    }
+                }
+                Err(SubsonicError::NotFound(e)) => {
+                    tracing::info!(id = %id.0, error = %e, "resume: placeholder is gone from the library; leaving the entry as-is");
+                }
+                Err(e) => {
+                    tracing::info!(id = %id.0, error = %e, "resume: placeholder refresh deferred (server still unreachable)");
+                    remaining.push(id);
+                    break;
+                }
+            }
+        }
+        // Whatever the aborted batch never reached stays pending for the next edge.
+        remaining.extend(iter);
+        *self.restore_placeholders.lock().unwrap() = remaining;
+        if filled > 0 {
+            tracing::info!(filled, "resume: placeholder metadata refreshed");
+            self.notify_change();
+        }
+        filled
+    }
+
+    /// THE SUSPECT HOOK: a locally resolved track that ended in an ERROR marks its
+    /// store entry suspect and kicks a LIGHT pass, which schedules the replacement
+    /// download ahead of everything else.
+    ///
+    /// Keyed on the EVENT's own song id (see [`EofSignal`]) - never a re-read of
+    /// `st.current`, which the advance below is about to repoint. Runs before the
+    /// pending-skip early return, because "these local bytes failed" is true regardless
+    /// of who owns the next load.
+    ///
+    /// De-offers only: [`AudioStore::mark_suspect`] deletes nothing, and the bytes go
+    /// only when a verified replacement is renamed over them. So an ao/pipewire hiccup
+    /// on suspend costs at worst a stream fallback until the server returns.
+    ///
+    /// THE HONEST GAP this does NOT close: a cached file with a valid header and a
+    /// rotted TAIL most plausibly ends with reason EOF, not Error, so it never reaches
+    /// here and re-confirms valid forever. The repair verb is manual - `rm
+    /// <store>/<song-id>.*`, and the next reconcile pass re-downloads it (see the
+    /// [`crate::store`] module docs). Deliberately no early-EOF heuristic: comparing the
+    /// observed position against `duration_secs` produces false suspects on VBR duration
+    /// disagreement, each costing a full original re-download.
+    fn note_eof_playability(&self, ev: &EofSignal) {
+        if !(ev.errored && ev.was_local) {
+            return;
+        }
+        let Some(id) = ev.song.as_ref() else { return };
+        let Some(store) = self.audio_store() else { return };
+        if store.mark_suspect(id) {
+            // Only on a real state change: a repeat failure must not kick a pass that
+            // is already scheduled to replace these exact bytes.
+            store.kick_light();
+        }
+    }
+
+    /// Fold this EOF into the consecutive-failure run and return the run's new length.
+    /// A natural (non-errored) EOF is a track that PLAYED, so it clears the run
+    /// outright - which is what keeps one dead track in a healthy queue costing exactly
+    /// one skip-past, as it always did.
+    ///
+    /// An ERRORED EOF only extends the run; it does not by itself mean the load failed
+    /// (`EndReason::Error` covers a track that played and then lost its source), which
+    /// is why [`Self::note_playback_progress`] - not this - is what proves a track
+    /// played and re-arms the fuse.
+    fn note_eof_load_outcome(&self, errored: bool) -> u32 {
+        if !errored {
+            self.consecutive_eof_failures.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        self.consecutive_eof_failures.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// AUDIO IS FLOWING: re-arm the consecutive-failure fuse (see
+    /// [`MAX_CONSECUTIVE_EOF_FAILURES`]). Called from the director's `TimePos` arm for
+    /// every live position sample that matches the latched entry, so the fuse measures
+    /// failures against PLAYBACK rather than against EOF events.
+    ///
+    /// This is the reset that makes the fuse honest, because the EOF stream alone
+    /// cannot see either of the two ordinary healthy cases:
+    ///
+    /// - a track that plays for minutes and then drops ends errored, so a run of
+    ///   played-then-dropped tracks would look identical to a run of dead loads;
+    /// - a user skip off a healthy track ends with mpv reason `Stop`, which emits no
+    ///   `Eof` at all, so in a skip-heavy session the run would be monotone for the
+    ///   whole process lifetime.
+    ///
+    /// A load that never opens produces no position sample, so the systemic case the
+    /// fuse exists for (an unreachable server, a queue of unplayable entries) is
+    /// untouched. Level-triggered and lockless: a dropped `TimePos` costs nothing but
+    /// the next sample, and the store is skipped when the run is already clear.
+    pub fn note_playback_progress(&self) {
+        if self.consecutive_eof_failures.load(Ordering::Relaxed) != 0 {
+            self.consecutive_eof_failures.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear the consecutive-failure run: a fresh-play GESTURE is the user saying try
+    /// again, so the fuse re-arms with its full budget. A latched fuse - the alternative
+    /// - would let one bad run stop the queue for the rest of the process. Only
+    /// [`Self::play_index`] resets here; every other gesture that leads to real audio
+    /// re-arms through [`Self::note_playback_progress`] once the position starts moving.
+    fn reset_eof_failures(&self) {
+        self.consecutive_eof_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// The auto-advance FUSE terminal: stay on the entry that just failed rather than
+    /// walking the rest of the queue into `current: None`.
+    ///
+    /// `current` is deliberately NOT moved and the queue is NOT touched, so the saved
+    /// position is exactly what a checkpoint persists. `pending_pause` makes the deck
+    /// report Paused (the player is already stopped - the failed load published its own
+    /// honest stop), which is the state a `play` gesture, an MPRIS widget, or a returning
+    /// server can all pick up from. The run counter is left standing: while the cause
+    /// persists, the next failure stops immediately instead of walking two more entries;
+    /// a fresh-play gesture re-arms it, and so does the first position tick of the first
+    /// entry that plays again once the cause clears.
+    fn halt_failed_advance(&self) {
+        let held = {
+            let mut st = self.state.lock().unwrap();
+            let held = st.current.and_then(|i| st.queue.get(i)).is_some();
+            if held {
+                st.pending_pause = true;
+            }
+            held
+        };
+        tracing::warn!(
+            failures = MAX_CONSECUTIVE_EOF_FAILURES,
+            held,
+            "eof advance stopped after consecutive failed loads; holding the queue position (server unreachable?)"
+        );
+        // Nothing is loaded any more, so the store's bulk backfill must stop deferring -
+        // the same reasoning as the end-of-queue honest stop.
+        self.set_store_playback_remote(false);
+        self.notify_change();
+    }
+
+    /// Protect the pending-skip TARGET from eviction (it is about to be current but
+    /// is not in the window yet), releasing whatever the previous skip protected.
+    /// `None` clears the slot outright - what every track-becomes-current path does,
+    /// since a current entry is protected by the window from then on.
+    ///
+    /// Single-slot on purpose: a superseded skip's terminal never runs, so a
+    /// grow-only protected set would leak one id per superseded skip and slowly
+    /// starve eviction of victims.
+    ///
+    /// ONE lock acquisition covers the slot swap AND the protected-set edit. Splitting
+    /// them (swap under the lock, protect/unprotect after releasing it) reopens exactly
+    /// the leak the single slot exists to close: two concurrent skips - or the gap
+    /// between this pin and `pending_skip` being written - can interleave so that A's
+    /// `protect(X)` lands AFTER B's `unprotect(X)`, stranding X in the protected set
+    /// forever with no slot left holding it. Both store calls are SYNC (a short internal
+    /// set lock, no await), so nothing is held across an `.await`; only the kick, which
+    /// needs no ordering, happens after the lock is released.
+    fn set_store_skip_pin(&self, id: Option<SongId>) {
+        let Some(store) = self.audio_store() else { return };
+        let installed = {
+            let mut slot = self.store_skip_pin.lock().unwrap();
+            let previous = std::mem::replace(&mut *slot, id.clone());
+            if previous == id {
+                false
+            } else {
+                if let Some(old) = previous {
+                    store.unprotect(&old);
+                }
+                match id {
+                    Some(new) => {
+                        store.protect(new);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        };
+        if installed {
+            // The target may have nothing cached: a light pass fetches it while the
+            // dip is still ramping down.
+            store.kick_light();
+        }
+    }
+
+    /// Tell the store whether the DECK is carrying network bytes, so bulk backfill
+    /// defers while a thin link is already busy with playback.
+    ///
+    /// It is a property of the deck, not of the last load, so it has TWO kinds of
+    /// call site and both are mandatory: `true`/`!play.local` wherever a track is
+    /// loaded, and `false` wherever playback ENDS (the MPD/MPRIS stop, a clear, the
+    /// current entry deleted out from under playback, the end-of-queue honest stop).
+    /// Setting it only on load would latch it true after the last stream ended and
+    /// suspend starred backfill and stale replacement for the rest of the process -
+    /// silently, and precisely during the idle hours the mirror is meant to use.
+    ///
+    /// A PAUSE deliberately does NOT clear it: the remote track is still the current
+    /// track, mpv keeps its demuxer cache alive across the pause, and the resume must
+    /// be instant - which is the design's "while the current track is a remote
+    /// stream" read literally.
+    pub(crate) fn set_store_playback_remote(&self, remote: bool) {
+        if let Some(store) = self.audio_store() {
+            store.set_playback_remote(remote);
+        }
     }
 
     /// The end-of-queue continuation status as X- extension pairs for `status`,
@@ -4873,17 +5349,37 @@ impl HypodjHandler {
     ///   transport error) ABORTS the WHOLE restore with Err WITHOUT mutating
     ///   State, leaving resume.toml intact so the next start retries once the
     ///   backend is up. A transient outage must never drop entries and let the
-    ///   checkpoint loop clobber the saved session with an empty queue.
+    ///   checkpoint loop clobber the saved session with an empty queue. (With an
+    ///   offline store registered this becomes the OFFLINE ARM below, which keeps
+    ///   every id instead of aborting - a strictly better answer to the same fact.)
     /// - A PERMANENT NotFound ([`SubsonicError::NotFound`], Subsonic API code 70
     ///   - the song was authoritatively deleted from the library) SKIPS just that
     ///   one entry and keeps rebuilding the rest. All-or-nothing here would let a
     ///   single deleted song abort every restart forever, self-perpetuating (the
     ///   empty-stopped checkpoint guard refuses to rewrite resume.toml, so the
     ///   dead id is never pruned), permanently losing the whole saved session.
+    ///
+    /// THE OFFLINE ARM (only when an [`AudioStore`] is registered): the first
+    /// transient failure flips the rest of the restore OFFLINE instead of aborting.
+    /// Each remaining id then resolves store-first, from the sidecar-embedded `Song`;
+    /// an id with NO cached entry becomes a MINIMAL ID-ONLY PLACEHOLDER rather than
+    /// being dropped, so the installed queue has exactly the saved queue's length and
+    /// the checkpoint loop cannot persist a shrunken session - the never-shrink
+    /// guarantee is preserved, not traded away. A placeholder is still attempt-playable
+    /// (a stream URL needs only the id) and its title falls back to the id until
+    /// [`Self::refresh_restore_placeholders`] fills it in on the server-back edge.
+    /// With no store the transient abort stands exactly as before - there is nothing
+    /// local to degrade to, and the saved file must survive for the next start.
     pub async fn restore(&self, s: &ResumeState) -> Result<(), String> {
         // 1. Rebuild the queue entries. A raw Stream is verbatim; a Song is
         //    re-resolved from Subsonic (we persisted only its id). Track how the
         //    saved current index maps onto the rebuilt (skip-compacted) queue.
+        let store = self.audio_store();
+        // Flipped by the FIRST transient failure and never back: one dead server means
+        // every remaining id would pay the same timeout for the same answer.
+        let mut offline = false;
+        // Ids that resolved to an id-only placeholder, for the later refresh.
+        let mut placeholders: Vec<SongId> = Vec::new();
         let mut entries: Vec<QueueEntry> = Vec::with_capacity(s.queue.len());
         let mut new_current: Option<usize> = None;
         let mut current_is_song = false;
@@ -4894,7 +5390,22 @@ impl HypodjHandler {
                     title: title.clone(),
                 },
                 ResumeItem::Song { id } => {
-                    match self.client.song(&SongId(id.clone())).await {
+                    let song_id = SongId(id.clone());
+                    // Already degraded: no server call at all for the rest of the
+                    // queue. Store-first, else a placeholder.
+                    if let (true, Some(store)) = (offline, store.as_ref()) {
+                        entries.push(QueueEntry::Song(offline_restore_song(
+                            store,
+                            &song_id,
+                            &mut placeholders,
+                        )));
+                        if Some(i) == s.current {
+                            new_current = Some(entries.len() - 1);
+                            current_is_song = true;
+                        }
+                        continue;
+                    }
+                    match self.client.song(&song_id).await {
                         Ok(song) => QueueEntry::Song(song),
                         Err(SubsonicError::NotFound(e)) => {
                             // The song was authoritatively deleted from the
@@ -4913,7 +5424,19 @@ impl HypodjHandler {
                             }
                             continue;
                         }
-                        Err(e) => {
+                        Err(e) => match store.as_ref() {
+                            // OFFLINE DEGRADE: keep every id, resolve what is cached,
+                            // placeholder the rest. Nothing is dropped, so a transient
+                            // outage can never shrink the saved queue.
+                            Some(store) => {
+                                tracing::warn!(id, error = %e, "resume: server unreachable; restoring the rest of the queue from the offline store");
+                                offline = true;
+                                QueueEntry::Song(offline_restore_song(
+                                    store,
+                                    &song_id,
+                                    &mut placeholders,
+                                ))
+                            }
                             // A TRANSIENT re-resolution failure (backend not yet
                             // reachable when the daemon restarts before Navidrome
                             // is up, a transport error) MUST NOT drop the song:
@@ -4922,9 +5445,11 @@ impl HypodjHandler {
                             // resume.toml. Abort the WHOLE restore without mutating
                             // State so the on-disk file survives for the next start
                             // (a retry once the backend is up).
-                            tracing::warn!(id, error = %e, "resume: song not resolvable (transient); aborting restore to preserve saved queue");
-                            return Err(format!("resume: song {id} unresolvable: {e}"));
-                        }
+                            None => {
+                                tracing::warn!(id, error = %e, "resume: song not resolvable (transient); aborting restore to preserve saved queue");
+                                return Err(format!("resume: song {id} unresolvable: {e}"));
+                            }
+                        },
                     }
                 }
             };
@@ -4945,8 +5470,44 @@ impl HypodjHandler {
             }
         }
 
+        // Restoring OFFLINE with an uncached current entry must NOT wake into
+        // playback: every load would fail, cascade through the queue, and burn the
+        // saved position. Restore Paused instead and let the user (or the server
+        // coming back) resume from exactly where they left off. "Uncached" is the
+        // PLAY-TIME probe, not the metadata one: a placeholder, a sidecar-only entry
+        // whose bytes went missing, and a raw stream are all equally unplayable with no
+        // server.
+        let current_uncached = offline
+            && !new_current
+                .and_then(|c| entries.get(c))
+                .zip(store.as_ref())
+                .map(|(entry, store)| match entry {
+                    QueueEntry::Song(song) => store.lookup(&song.id).is_some(),
+                    QueueEntry::Stream { .. } => false,
+                })
+                .unwrap_or(false);
         let synth_floor = self.fade_cfg.synth_floor_db;
-        let playing = s.play_state == ResumePlayState::Playing && new_current.is_some();
+        let playing =
+            s.play_state == ResumePlayState::Playing && new_current.is_some() && !current_uncached;
+        // The DEGRADED restore, reported honestly as PAUSED (not Stopped) at the saved
+        // elapsed. This is what makes the "the saved position survives" claim true: the
+        // reported state is the ONE source the checkpoint persists, so a Stopped deck
+        // with a zeroed elapsed would have the very next checkpoint overwrite the saved
+        // position with `0` - the outage would eat the playhead exactly like the queue
+        // loss the offline arm above exists to prevent. A saved STOPPED deck is left
+        // stopped: an explicit stop survives the rebuild, offline or not.
+        let offline_paused = current_uncached
+            && new_current.is_some()
+            && s.play_state != ResumePlayState::Stopped;
+        if offline_paused {
+            tracing::info!(
+                elapsed_secs = s.elapsed_secs,
+                "resume: offline with an uncached current entry; restoring PAUSED at the saved position"
+            );
+        }
+        // Remember what needs a metadata refresh once the server answers again. Set
+        // (not appended) - a fresh restore replaces whatever a previous one left.
+        *self.restore_placeholders.lock().unwrap() = placeholders;
 
         // 2. Install the rebuilt queue + baseline under one short state-lock scope.
         {
@@ -5018,6 +5579,19 @@ impl HypodjHandler {
             let v = s.volume.min(100);
             self.state.lock().unwrap().set_manual_volume(v);
             let _ = self.player.set_volume(v).await;
+            if offline_paused {
+                // Asserted HERE, after the baseline commit: `set_manual_volume` clears
+                // `pending_pause` on principle (a concrete baseline must never leave the
+                // reported state stuck at Paused), so setting it with the queue install
+                // above would be silently undone. Seeding the live-elapsed atomic with
+                // the saved position completes the pair the checkpoint reads - Paused
+                // plus a real elapsed - so the playhead survives an offline start the
+                // way it survives a pause. Notify so a client watching `idle` sees the
+                // Paused edge rather than the momentary Stopped published above.
+                self.state.lock().unwrap().pending_pause = true;
+                self.note_elapsed_ms((s.elapsed_secs.max(0.0) * 1000.0) as u64);
+                self.notify_change();
+            }
         }
         Ok(())
     }
@@ -5268,11 +5842,18 @@ impl HypodjHandler {
     /// Called by the daemon when the player reports a natural EOF: advance to the
     /// next queue entry (honoring random/repeat/single/consume via
     /// [`Self::plan_next`]), or leave the state stopped at the end of the queue.
-    /// `continuation_landed` is the actor's signal that a WARMED continuation station
+    /// `ev.continuation_landed` is the actor's signal that a WARMED continuation station
     /// AUTO-ADVANCED at this EOF (slice 2): the None-branch then ATTRIBUTES the
     /// already-playing station instead of cold-starting. False on every ordinary EOF and
     /// honest stop (the slice-1 cold-start / honest stop, byte-identical).
-    pub async fn advance_on_eof(&self, continuation_landed: bool) {
+    ///
+    /// `ev.song` / `ev.errored` / `ev.was_local` carry the offline store's SUSPECT
+    /// signal (see [`EofSignal`]); it is applied FIRST, before any early return, because
+    /// the fact that local bytes failed is true whether or not this particular EOF also
+    /// advances the queue.
+    pub async fn advance_on_eof(&self, ev: EofSignal) {
+        let continuation_landed = ev.continuation_landed;
+        self.note_eof_playability(&ev);
         // A skip dip in flight (pending_skip Some) OWNS the next load: the OLD
         // track keeps playing audibly through the dip and may reach its natural
         // EOF inside that window. Advancing here would load an unrelated track and
@@ -5317,6 +5898,21 @@ impl HypodjHandler {
                     == st.continuation_active;
             (finishing_is_continuation, st.is_true_drain())
         };
+        // THE FUSE, checked BEFORE plan_next (which mutates the queue under `consume`):
+        // count the unbroken run of errored ends WITH NO AUDIO IN BETWEEN (any live
+        // position tick re-arms it through note_playback_progress, so a track that
+        // played and then dropped costs exactly one skip-past) and refuse to keep walking
+        // once it reaches MAX_CONSECUTIVE_EOF_FAILURES. See that const for why the walk
+        // is the problem; the terminal state is the point here. Stopping means `current: None`,
+        // which the checkpoint loop persists over the saved position - so instead we
+        // stay PUT: `current` keeps pointing at the entry that just failed, the queue is
+        // untouched, and the deck reports Paused. That is a state the user can resume
+        // from and that a returning server makes playable again, and it is what the
+        // checkpoint then saves.
+        if self.note_eof_load_outcome(ev.errored) >= MAX_CONSECUTIVE_EOF_FAILURES {
+            self.halt_failed_advance();
+            return;
+        }
         // The continuation MODE (radio | autofill), read once under a short scope (a
         // SEPARATE Mutex): it selects which mechanism the drain-edge dispatch fires and
         // gates the slice-2 landed-commit + warm predicate off in autofill mode.
@@ -5369,6 +5965,10 @@ impl HypodjHandler {
                         }
                     };
                     if committed {
+                        // The station mpv auto-advanced into is a NETWORK stream, and
+                        // this arm never passes through play_index_inner - so the deck's
+                        // remoteness is published here or not at all.
+                        self.set_store_playback_remote(true);
                         self.notify_change();
                         return;
                     }
@@ -5421,6 +6021,10 @@ impl HypodjHandler {
                 // No continuation stream is live once the deck stops honestly.
                 st.continuation_active = None;
                 drop(st);
+                // The queue drained: nothing is loaded, so the store's bulk backfill
+                // stops deferring. This is the transition into the long idle window
+                // the mirror is meant to use.
+                self.set_store_playback_remote(false);
                 self.notify_change();
             }
         }
@@ -5867,20 +6471,44 @@ impl HypodjHandler {
     /// is sync), so a caller can hand a sink-level [`ResolvedPlay`] to a fade
     /// terminal that runs under the slot lock (no `&self` handler call there).
     /// Shared by [`Self::play_index_inner`] and [`Self::skip_with_fade`].
+    ///
+    /// OFFLINE STORE: a library song PREFERS local bytes. The probe is
+    /// [`AudioStore::lookup`] - one short index lock plus one stat, no parsing, no
+    /// network - so this stays the sync, never-blocking contract the fade terminal
+    /// depends on, and the local branch is the EVERYDAY path rather than an
+    /// untested fallback. A miss (no store, no entry, a suspect entry, a
+    /// wrong-length file) falls through to today's stream URL, which is the same
+    /// audible outcome as having no store at all.
     fn resolve_play(&self, item: &QueueItem) -> Result<ResolvedPlay, String> {
         match &item.entry {
             QueueEntry::Song(song) => {
+                if let Some(store) = self.audio_store() {
+                    if let Some(path) = store.lookup(&song.id) {
+                        // Real LRU: without this bump eviction would degenerate into
+                        // FIFO-by-download-date. In memory only - the reconciler is
+                        // the one disk writer and flushes it on a full pass.
+                        store.note_played(&song.id, crate::store::now_unix());
+                        return Ok(ResolvedPlay {
+                            song_id: Some(song.id.clone()),
+                            qid: QueueId(item.id),
+                            url: path.to_string_lossy().into_owned(),
+                            local: true,
+                        });
+                    }
+                }
                 let url = self.client.stream_url(&song.id).map_err(|e| e.to_string())?;
                 Ok(ResolvedPlay {
                     song_id: Some(song.id.clone()),
                     qid: QueueId(item.id),
                     url: url.to_string(),
+                    local: false,
                 })
             }
             QueueEntry::Stream { url, .. } => Ok(ResolvedPlay {
                 song_id: None,
                 qid: QueueId(item.id),
                 url: url.clone(),
+                local: false,
             }),
         }
     }
@@ -5991,6 +6619,15 @@ impl HypodjHandler {
             Ok(p) => p,
             Err(_) => return self.play_index(idx).await,
         };
+        // The target is about to be current but is not in the window yet, so pin it
+        // against eviction for the length of the dip and kick a light pass in case
+        // its bytes are not cached. Cleared by whichever path makes a track current
+        // (play_index_inner) or by the degrade paths below.
+        if let Some(id) = play.song_id.clone() {
+            self.set_store_skip_pin(Some(id));
+        }
+        // What the trough is about to load: local bytes or the network.
+        self.set_store_playback_remote(!play.local);
 
         // (b) Baseline + the resume target dB.
         let baseline = self.state.lock().unwrap().target_volume;
@@ -6125,6 +6762,11 @@ impl HypodjHandler {
     /// advance) resyncs mpv's gain to the baseline first - see
     /// [`Self::play_index_inner`].
     async fn play_index(&self, idx: usize) -> Result<(), String> {
+        // A deliberate gesture re-arms the EOF failure fuse (see
+        // [`MAX_CONSECUTIVE_EOF_FAILURES`]): the EOF advance itself goes through
+        // `play_index_inner` and must NOT reset it, because mpv's premature loadfile Ok
+        // makes every failed load look like a successful play from here.
+        self.reset_eof_failures();
         self.play_index_inner(idx, true).await
     }
 
@@ -6186,8 +6828,14 @@ impl HypodjHandler {
         // Resolve the play args (sync stream_url) then load - the SAME resolution
         // the skip dip pre-computes, factored into one place.
         let play = self.resolve_play(&item)?;
+        // A track is becoming current, so no skip target is pending any more: release
+        // the single-slot eviction pin (the new current is protected by the window).
+        self.set_store_skip_pin(None);
+        // Tell the store whether what is now audible comes off the network, so bulk
+        // backfill defers while a thin link is already carrying playback.
+        self.set_store_playback_remote(!play.local);
         self.player
-            .play_url(play.song_id, Some(play.qid), &play.url)
+            .play_url(play.song_id, Some(play.qid), &play.url, play.local)
             .await
             .map_err(|e| e.to_string())?;
         {
@@ -6283,11 +6931,23 @@ impl HypodjHandler {
             let song_id = uri
                 .strip_prefix("song/")
                 .ok_or_else(|| format!("unsupported uri: {uri}"))?;
-            let song = self
-                .client
-                .song(&SongId(song_id.to_string()))
-                .await
-                .map_err(|e| e.to_string())?;
+            let song_id = SongId(song_id.to_string());
+            let song = match self.client.song(&song_id).await {
+                Ok(song) => song,
+                // AUTHORITATIVE: the library says this song is gone, and local bytes do
+                // not override the server on existence. ACK the error as before.
+                Err(e @ SubsonicError::NotFound(_)) => return Err(e.to_string()),
+                // TRANSIENT: the store's sidecar carries the whole Song, so a hearted
+                // song stays addable while the server is away - and it will resolve to
+                // its local bytes at play time.
+                Err(e) => match self.audio_store().and_then(|st| st.cached_song(&song_id)) {
+                    Some(cached) => {
+                        tracing::info!(id = %song_id.0, error = %e, "add: server unreachable; using the offline store's cached metadata");
+                        cached
+                    }
+                    None => return Err(e.to_string()),
+                },
+            };
             QueueEntry::Song(song)
         };
         let mut st = self.state.lock().unwrap();
@@ -6333,6 +6993,58 @@ impl HypodjHandler {
         // has a warm to drop). A `PlayNow` re-arms cleanly via its follow-on play_index.
         self.disarm_continuation_warm().await;
         id
+    }
+}
+
+/// Resolve ONE saved song id with no server: the offline restore arm's per-entry
+/// decision. The sidecar-embedded [`Song`] is real metadata (title, artist, duration,
+/// everything the mirror recorded); with no cached entry the id becomes a
+/// PLACEHOLDER, recorded in `placeholders` for the later refresh.
+///
+/// Dropping the id instead is what this exists to prevent: a shrunken queue is what
+/// the checkpoint loop would then persist over the good resume.toml.
+fn offline_restore_song(
+    store: &AudioStore,
+    id: &SongId,
+    placeholders: &mut Vec<SongId>,
+) -> Song {
+    match store.cached_song(id) {
+        Some(song) => song,
+        None => {
+            placeholders.push(id.clone());
+            placeholder_song(id)
+        }
+    }
+}
+
+/// A MINIMAL id-only [`Song`]: everything the queue structurally needs and nothing
+/// invented. The title falls back to the id (honest - we genuinely do not know it yet)
+/// until [`HypodjHandler::refresh_restore_placeholders`] replaces it with the server's
+/// answer. A `stream_url` needs only the id, so a placeholder stays attempt-playable.
+fn placeholder_song(id: &SongId) -> Song {
+    Song {
+        id: id.clone(),
+        title: id.0.clone(),
+        album: None,
+        album_id: None,
+        artist: None,
+        track: None,
+        duration_secs: None,
+        cover_art: None,
+        starred: false,
+        musicbrainz_id: None,
+        disc: None,
+        year: None,
+        genre: None,
+        bitrate: None,
+        comment: None,
+        user_rating: None,
+        composer: None,
+        performer: None,
+        size: None,
+        suffix: None,
+        content_type: None,
+        created: None,
     }
 }
 
@@ -7028,6 +7740,8 @@ impl MpdHandler for HypodjHandler {
                     .await;
                 let v = self.state.lock().unwrap().target_volume;
                 let _ = self.player.stop().await;
+                // Nothing is loaded any more: the store stops deferring bulk work.
+                self.set_store_playback_remote(false);
                 // A clear empties the queue: disarm any pending continuation warm so a
                 // parked station cannot auto-advance behind the stopped deck. Slice 2.
                 self.disarm_continuation_warm().await;
@@ -8378,10 +9092,19 @@ impl HypodjHandler {
     }
 
     /// Invalidate cached listings whose starred flag could change after a star.
+    ///
+    /// Also kicks a FULL store pass: the star set IS the offline pin set, so a star
+    /// should start mirroring the song within seconds rather than at the next
+    /// interval tick, and an unstar should DEMOTE it (bytes kept, evictable) rather
+    /// than wait too. Full and not light because only a full pass talks to
+    /// `getStarred2`, which is where the pin set comes from.
     fn bust_star_caches(&self) {
         self.dir_cache.invalidate_prefix("album/");
         self.dir_cache.invalidate(&"artists".to_string());
         self.listings.invalidate_prefix("album/");
+        if let Some(store) = self.audio_store() {
+            store.kick_full();
+        }
     }
 
     /// Flip the in-memory `starred` flag on every queued entry whose song id
@@ -8653,6 +9376,8 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::path::Path;
     use crate::config::ServerConfig;
     use crate::model::StationId;
     use crate::player::{NullPlayer, PlayState, PlayerEvent, SYNTH_FLOOR_DB};
@@ -8730,6 +9455,10 @@ mod tests {
             user_rating: None,
             composer: None,
             performer: None,
+            size: None,
+            suffix: None,
+            content_type: None,
+            created: None,
         }
     }
 
@@ -8779,7 +9508,7 @@ mod tests {
         }
         // The track reaches its natural EOF: end of queue -> current becomes None,
         // and the finishing track is latched as the recency seed.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.current, None, "end of queue stops the deck");
@@ -8852,7 +9581,7 @@ mod tests {
             st.current = Some(0);
             st.last_finished = Some(playlist_test_song("real"));
         }
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(
             h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
             Some(&SongId("real".into())),
@@ -8876,7 +9605,7 @@ mod tests {
         h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 2, "the continuation stream is appended after the drained song");
@@ -8905,7 +9634,7 @@ mod tests {
         h.set_continuation_station(Some(NTS.to_string()));
         assert!(!h.state.lock().unwrap().continuation, "continuation defaults OFF");
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "disarmed => the deck ends stopped as today");
@@ -8923,7 +9652,7 @@ mod tests {
         // No station set (None). Also an empty/whitespace station must be inert.
         h.set_continuation_station(None);
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "no station => inert, deck ends stopped");
@@ -8943,7 +9672,7 @@ mod tests {
         // the never-called client, so resolution yields None.
         h.set_continuation_station(Some("No Such Station".to_string()));
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "unresolvable station => inert, deck ends stopped");
@@ -8961,7 +9690,7 @@ mod tests {
         h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
 
-        h.advance_on_eof(false).await; // drains -> continuation stream now current+playing
+        h.advance_on_eof(EofSignal::default()).await; // drains -> continuation stream now current+playing
 
         // The continuation stream carries no library id, so the id sources that back
         // scrobbling / similar-seeding see ONLY the real song, never the stream.
@@ -8977,7 +9706,7 @@ mod tests {
         );
         // A SECOND drain (the stream 'ends') must still not latch the id-less stream -
         // and, still ARMED, the one-shot guard must stop it honestly WITHOUT re-firing.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(
             h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
             Some(&SongId("seed".into())),
@@ -9024,7 +9753,7 @@ mod tests {
         h.set_continuation_station(Some(NTS.to_string()));
 
         // Drain -> continuation cold-starts: the stream is appended + becomes current.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 2, "the continuation stream is appended once");
@@ -9039,7 +9768,7 @@ mod tests {
         // spine (on real mpv this Eof is synthesized by the actor from the top-level
         // load-failure error; NullPlayer cannot raise that, so we drive the re-entry
         // directly). STILL ARMED, the guard must stop honestly, NOT re-fire.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "a dead continuation stream ends the deck STOPPED (honest)");
         assert_eq!(
@@ -9068,7 +9797,7 @@ mod tests {
         h.state.lock().unwrap().single = true;
         h.set_continuation_station(Some(NTS.to_string()));
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "single stops the deck after the current track (its semantics)");
@@ -9108,7 +9837,7 @@ mod tests {
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![autofill_song("a1"), autofill_song("a2"), autofill_song("a3")]));
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 4, "the three similar library songs are appended after the drained seed");
@@ -9145,14 +9874,14 @@ mod tests {
         h.push_autofill_batch(Ok(vec![autofill_song("a2")]));
 
         // Drain 1: seed drains -> a1 appended + playing; the fetch seeded from the seed.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_last_seed(), Some(SongId("seed".into())), "drain 1 seeds from the finished seed");
         assert_eq!(h.state.lock().unwrap().current, Some(1), "a1 is now current+playing");
 
         // Drain 2: a1 drains -> a2 appended; the fetch seeded from a1 (fresh seed walk),
         // NOT the original seed. Advance past the fuse window first.
         tokio::time::advance(Duration::from_secs(31)).await;
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_last_seed(), Some(SongId("a1".into())), "drain 2 seeds from the LAST appended track");
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 3, "a2 is appended (seed, a1, a2)");
@@ -9172,11 +9901,11 @@ mod tests {
         h.push_autofill_batch(Ok(vec![autofill_song("X"), autofill_song("Y")])); // drain 2: X seen, Y new
         h.push_autofill_batch(Ok(vec![autofill_song("X"), autofill_song("Y")])); // drain 3: all seen
 
-        h.advance_on_eof(false).await; // drain 1 -> X appended
+        h.advance_on_eof(EofSignal::default()).await; // drain 1 -> X appended
         assert_eq!(h.state.lock().unwrap().current, Some(1));
 
         tokio::time::advance(Duration::from_secs(31)).await;
-        h.advance_on_eof(false).await; // drain 2 -> X filtered (seen), Y appended
+        h.advance_on_eof(EofSignal::default()).await; // drain 2 -> X filtered (seen), Y appended
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 3, "only the new Y is appended; the overlapping X is filtered");
@@ -9188,7 +9917,7 @@ mod tests {
 
         let calls_before = h.autofill_fetch_calls();
         tokio::time::advance(Duration::from_secs(31)).await;
-        h.advance_on_eof(false).await; // drain 3 -> X seen, Y is the seed: all dropped -> honest stop
+        h.advance_on_eof(EofSignal::default()).await; // drain 3 -> X seen, Y is the seed: all dropped -> honest stop
         assert_eq!(h.state.lock().unwrap().current, None, "all-already-seen => honest stop, deck stopped");
         assert_eq!(h.state.lock().unwrap().queue.len(), 3, "nothing appended on the all-seen drain");
         assert_eq!(
@@ -9208,7 +9937,7 @@ mod tests {
         h.state.lock().unwrap().current = Some(0);
         arm_autofill(&h);
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         assert_eq!(h.state.lock().unwrap().current, None, "no seed => honest stop");
         assert_eq!(h.autofill_fetch_calls(), 0, "no fetch attempted without a seed (never seed from a stream)");
@@ -9225,7 +9954,7 @@ mod tests {
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![])); // backend returns nothing
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         assert_eq!(h.state.lock().unwrap().current, None, "empty backend => honest stop");
         assert_eq!(h.state.lock().unwrap().queue.len(), 1, "nothing appended on an empty fetch");
@@ -9242,7 +9971,7 @@ mod tests {
         arm_autofill(&h);
         h.push_autofill_batch(Err(())); // transport error
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         assert_eq!(h.state.lock().unwrap().current, None, "fetch error => honest stop");
         assert_eq!(h.autofill_fetch_calls(), 1, "one fetch, no retry on error");
@@ -9261,13 +9990,13 @@ mod tests {
         h.push_autofill_batch(Ok(vec![autofill_song("a2")]));
 
         // Drain 1 (t=0): a1 appended, current -> a1, the fetch time is stamped.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_fetch_calls(), 1, "drain 1 fetched once");
         assert_eq!(h.state.lock().unwrap().current, Some(1));
 
         // Drain 2 (t=0, no advance): the fuse trips BEFORE any fetch -> honest stop, and
         // the scripted a2 batch is NOT consumed (the fetch never ran).
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_fetch_calls(), 1, "the fuse stops BEFORE the fetch - still one fetch total");
         assert_eq!(h.state.lock().unwrap().current, None, "fuse => honest stop");
 
@@ -9275,7 +10004,7 @@ mod tests {
         // last entry). Now a drain refires and consumes a2.
         tokio::time::advance(Duration::from_secs(31)).await;
         h.state.lock().unwrap().current = Some(1); // a1 is the last entry again
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_fetch_calls(), 2, "past the fuse window, a fresh drain fetches again");
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 3, "a2 is appended after the fuse cleared");
@@ -9294,7 +10023,7 @@ mod tests {
         h.state.lock().unwrap().single = true;
         h.push_autofill_batch(Ok(vec![autofill_song("x")])); // must NOT be consumed
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "single stops after the current track (its own semantics)");
@@ -9321,7 +10050,7 @@ mod tests {
 
         // Drain 1: consume evicts the seed; the seed survives in last_finished and seeds
         // the fetch; a1 is appended into the emptied queue.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_last_seed(), Some(SongId("seed".into())), "drain 1 seeds from the consumed seed");
         {
             let st = h.state.lock().unwrap();
@@ -9331,7 +10060,7 @@ mod tests {
 
         // Drain 2: a1 is consumed and becomes the fresh seed; a2 is appended.
         tokio::time::advance(Duration::from_secs(31)).await;
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_last_seed(), Some(SongId("a1".into())), "drain 2 walks to the a1 seed");
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 1, "consume emptied again, then a2 was appended");
@@ -10068,7 +10797,7 @@ mod tests {
         install_warmed_slot(&h, 777, NTS);
         let ver_before = h.state.lock().unwrap().playlist_version;
 
-        h.advance_on_eof(true).await;
+        h.advance_on_eof(EofSignal { continuation_landed: true, ..EofSignal::default() }).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 2, "the warmed station is appended as the tail Stream");
@@ -10099,7 +10828,7 @@ mod tests {
         }
         h.set_continuation_station(Some(NTS.to_string()));
 
-        h.advance_on_eof(true).await;
+        h.advance_on_eof(EofSignal { continuation_landed: true, ..EofSignal::default() }).await;
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 1, "a landed=true with a disarmed slot appends nothing");
@@ -10121,7 +10850,7 @@ mod tests {
         h.set_continuation_station(Some(NTS.to_string()));
         install_warmed_slot(&h, 888, NTS);
 
-        h.advance_on_eof(true).await;
+        h.advance_on_eof(EofSignal { continuation_landed: true, ..EofSignal::default() }).await;
 
         assert_eq!(
             h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
@@ -10150,11 +10879,11 @@ mod tests {
         h.set_continuation_station(Some(NTS.to_string()));
         install_warmed_slot(&h, 999, NTS);
         // First EOF: the warmed station lands (attributed).
-        h.advance_on_eof(true).await;
+        h.advance_on_eof(EofSignal { continuation_landed: true, ..EofSignal::default() }).await;
         assert_eq!(h.state.lock().unwrap().continuation_active, Some(999), "the station is latched active");
         // The station dies: on real mpv the actor synthesizes an honest-stop Eof
         // (landed=false). The one-shot guard must stop honestly, NOT re-fire.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, None, "a dead landed station ends the deck STOPPED (honest)");
         assert_eq!(st.queue.len(), 2, "no SECOND continuation appended - the queue does not grow");
@@ -10210,7 +10939,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("finished")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof(false).await; // natural end-of-queue EOF, nothing playing after
+        h.advance_on_eof(EofSignal::default()).await; // natural end-of-queue EOF, nothing playing after
         let status = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&status, "X-hypodj-hint-kind"), Some("just-finished"));
         assert_eq!(pair(&status, "X-hypodj-hint-title"), Some("Song finished"));
@@ -10268,7 +10997,7 @@ mod tests {
         // consume OFF: A LINGERS at pos0 (state stop, current None, last_finished A).
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 1, "A lingers at the queue head (consume off)");
@@ -10469,7 +11198,7 @@ mod tests {
         // A single real song plays, then reaches natural EOF: consume off, so A LINGERS.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 1, "A lingers (consume off)");
@@ -10522,7 +11251,7 @@ mod tests {
             assert!(st.fresh_enqueue_anchor.is_none(), "play cleared the anchor");
         }
         // A finishes single: deck stops, current None, both lingering, last_finished A.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.current, None, "single stops after A");
@@ -10571,7 +11300,7 @@ mod tests {
         // A lingering at pos0 after a real EOF.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         // Fresh idle enqueue D arms the anchor at D (pos1).
         h.enqueue_songs(vec![playlist_test_song("D")]).await;
         assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "sanity: G-state seeds D");
@@ -10642,7 +11371,7 @@ mod tests {
         // A lingering at pos0 after a real EOF.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.state.lock().unwrap().current = Some(0);
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         // Simulate the append-only action: snapshot the first-appended qid, append the
         // tail, then arm on append. The tail lands at pos1, behind lingering A.
         let first = h.enqueue_song_for_test(playlist_test_song("tail")).await;
@@ -11456,6 +12185,10 @@ mod tests {
             user_rating: None,
             composer: Some("Kalabrese".into()),
             performer: Some("Itzhak Perlman, Yo-Yo Ma".into()),
+            size: None,
+            suffix: None,
+            content_type: None,
+            created: None,
         }
     }
 
@@ -13860,7 +14593,7 @@ mod tests {
 
         // Natural EOF advance to the next track: the fade must survive, not be wiped
         // and the gain re-asserted to the baseline.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.state.lock().unwrap().current, Some(1), "advanced to next track");
         assert!(h.fade_active().await, "winddown must survive the track boundary");
         assert!(
@@ -14032,6 +14765,10 @@ mod tests {
             user_rating: None,
             composer: None,
             performer: None,
+            size: None,
+            suffix: None,
+            content_type: None,
+            created: None,
         }
     }
 
@@ -14802,7 +15539,7 @@ mod tests {
         h.handle(MpdCommand::Add(NTS.to_string())).await;
         h.handle(MpdCommand::Play(Some(0))).await;
 
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.state.lock().unwrap().current, Some(1));
         assert!(!h.fade_active().await, "eof advance never dips");
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
@@ -14873,7 +15610,7 @@ mod tests {
 
         // The OLD track (idx0) reaches its natural EOF mid-dip: must be a no-op, NOT
         // an advance to idx2 (current+1). current + pending_skip stay put.
-        h.advance_on_eof(false).await;
+        h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.state.lock().unwrap().current, Some(0), "eof did not advance mid-skip");
         assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "skip intent intact");
 
@@ -15310,7 +16047,7 @@ mod tests {
         let seed = seed.into_iter().next().expect("a real track in the library");
         h.enqueue_song_for_test(seed.clone()).await;
         h.handle(MpdCommand::Play(Some(0))).await;
-        h.advance_on_eof(false).await; // natural end-of-queue EOF
+        h.advance_on_eof(EofSignal::default()).await; // natural end-of-queue EOF
         assert_eq!(h.state.lock().unwrap().current, None, "deck stopped after EOF");
         assert_eq!(
             h.similar_seed_id(),
@@ -15472,5 +16209,869 @@ mod tests {
         let cur = h.state.lock().unwrap().current;
         h.plan_enqueue(&Selector::Radio, 1).await.expect("enqueue");
         assert_eq!(h.state.lock().unwrap().current, cur, "append-only never jumps");
+    }
+
+    // ── the offline audio store: the READ path ──────────────────────────────
+    //
+    // Filesystem-only, no network, no clock. The store is opened over a temp dir and
+    // handed to the handler exactly as the daemon does.
+
+    /// A fresh temp dir for one store test. No `tempfile` dependency; uniqueness
+    /// comes from pid + a process-wide counter so parallel tests cannot collide.
+    fn store_tmpdir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("hypodj-handler-store-{tag}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// A song carrying the store fingerprint `map_song` would fill in.
+    fn store_song(id: &str, size: u64) -> Song {
+        let mut s = playlist_test_song(id);
+        s.size = Some(size);
+        s.suffix = Some("flac".into());
+        s.content_type = Some("audio/flac".into());
+        s.created = Some("2024-05-01T12:00:00Z".into());
+        s
+    }
+
+    /// Commit `song` into `store` through the REAL write protocol (a verified temp
+    /// renamed into place, then the sidecar), so what the read path sees is what the
+    /// reconciler actually produces.
+    fn commit_into(store: &crate::store::AudioStore, song: &Song) -> PathBuf {
+        let tmp = store.tmp_path();
+        std::fs::write(&tmp, vec![b'x'; song.size.expect("fixture size") as usize])
+            .expect("write temp");
+        store.commit(song, &tmp, true, 1_000).expect("commit")
+    }
+
+    fn open_store(dir: &Path) -> Arc<crate::store::AudioStore> {
+        Arc::new(
+            crate::store::AudioStore::open(dir.to_path_buf(), crate::config::StoreConfig::default())
+                .expect("open store"),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolve_play_prefers_local_bytes_and_bumps_recency() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("resolve");
+        let store = open_store(&dir);
+        let cached = store_song("s-cached", 16);
+        let audio = commit_into(&store, &cached);
+        h.set_audio_store(store.clone());
+
+        // A cached song resolves to the LOCAL PATH, not a stream URL.
+        h.enqueue_song_for_test(cached.clone()).await;
+        let item = h.state.lock().unwrap().queue[0].clone();
+        let play = h.resolve_play(&item).expect("resolve cached");
+        assert!(play.local, "a cached song resolves local");
+        assert_eq!(play.url, audio.to_string_lossy(), "mpv gets the file path verbatim");
+        assert_eq!(play.song_id, Some(cached.id.clone()), "the id is unchanged - scrobbling still keys on it");
+
+        // The resolve-time recency bump is what makes eviction real LRU rather than
+        // FIFO-by-download-date. In memory only: the reconciler owns the disk.
+        let e = store.entries().into_iter().next().expect("entry");
+        assert!(e.recency_dirty, "resolving bumped recency");
+        assert!(e.last_played_unix >= 1_000);
+        assert_eq!(
+            store.read_sidecar(&cached.id).expect("sidecar").last_played_unix,
+            1_000,
+            "the bump did NOT touch the disk - one writer, the reconciler"
+        );
+
+        // An UNCACHED song falls through to today's stream URL: a miss is exactly a
+        // store-less build.
+        let remote = store_song("s-remote", 16);
+        h.enqueue_song_for_test(remote).await;
+        let item = h.state.lock().unwrap().queue[1].clone();
+        let play = h.resolve_play(&item).expect("resolve uncached");
+        assert!(!play.local, "an uncached song stays remote");
+        assert!(play.url.starts_with("http"), "and gets a stream URL: {}", play.url);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_play_declines_a_suspect_or_wrong_length_entry() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("resolve-bad");
+        let store = open_store(&dir);
+        let cached = store_song("s-bad", 16);
+        let audio = commit_into(&store, &cached);
+        h.set_audio_store(store.clone());
+        h.enqueue_song_for_test(cached.clone()).await;
+        let item = h.state.lock().unwrap().queue[0].clone();
+        assert!(h.resolve_play(&item).expect("resolve").local, "cached to begin with");
+
+        // A truncated file: the one stat rejects it, and playback falls back.
+        std::fs::write(&audio, vec![b'x'; 15]).expect("truncate");
+        assert!(!h.resolve_play(&item).expect("resolve").local, "a wrong length is never offered");
+
+        // A suspect entry is de-offered outright - replaying known-bad bytes just
+        // loops corrupt audio.
+        std::fs::write(&audio, vec![b'x'; 16]).expect("restore");
+        assert!(h.resolve_play(&item).expect("resolve").local, "restored");
+        assert!(store.mark_suspect(&cached.id));
+        assert!(!h.resolve_play(&item).expect("resolve").local, "a suspect entry is de-offered");
+        // But its BYTES are still there: only a verified replacement retires them.
+        assert!(audio.exists(), "de-offered, never deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_handler_without_a_store_resolves_exactly_as_before() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(store_song("s-1", 16)).await;
+        let item = h.state.lock().unwrap().queue[0].clone();
+        let play = h.resolve_play(&item).expect("resolve");
+        assert!(!play.local);
+        assert!(play.url.starts_with("http"));
+        // And every store seam is a silent no-op rather than a panic.
+        h.update_store_window();
+        h.set_store_skip_pin(Some(SongId("s-1".into())));
+        h.bust_star_caches();
+    }
+
+    #[tokio::test]
+    async fn queue_changes_publish_the_store_window_and_kick() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("window");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        assert_eq!(store.config().queue_ahead, 3, "the default the window is sized from");
+
+        // Every enqueue funnels through notify_change, which is the ONE choke point
+        // the window follows - no queue command has to remember to do it.
+        for i in 0..6 {
+            h.enqueue_song_for_test(store_song(&format!("w{i}"), 16)).await;
+        }
+        assert_eq!(
+            store.window().into_iter().map(|i| i.0).collect::<Vec<_>>(),
+            vec!["w0", "w1", "w2", "w3"],
+            "current plus queue_ahead upcoming, in play order"
+        );
+
+        // A raw stream carries no id and is simply skipped, never a hole.
+        h.enqueue_stream_for_test(NTS).await;
+        assert_eq!(store.window().len(), 4, "a stream cannot be mirrored");
+
+        // The window leads from the CURRENT entry, so an advance moves it along.
+        h.state.lock().unwrap().current = Some(2);
+        h.update_store_window();
+        assert_eq!(
+            store.window().into_iter().map(|i| i.0).collect::<Vec<_>>(),
+            vec!["w2", "w3", "w4", "w5"],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_skip_target_pin_is_a_single_slot_and_never_leaks() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("skip-pin");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        let a = SongId("a".into());
+        let b = SongId("b".into());
+        h.set_store_skip_pin(Some(a.clone()));
+        assert_eq!(store.protected_ids(), HashSet::from([a.clone()]));
+
+        // A SUPERSEDING skip releases the previous target. Without the single slot
+        // every superseded skip would leak one protected id forever and eviction
+        // would slowly run out of victims.
+        h.set_store_skip_pin(Some(b.clone()));
+        assert_eq!(store.protected_ids(), HashSet::from([b.clone()]));
+
+        // A track becoming current clears it: from then on the window protects it.
+        h.set_store_skip_pin(None);
+        assert!(store.protected_ids().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_deck_stops_deferring_bulk_store_work() {
+        // THE LATCH TRACKS THE DECK, NOT THE LAST LOAD. Set only on load, it would
+        // stay true forever after the last remote track ended, and every full pass
+        // would skip starred backfill and stale replacement for the rest of the
+        // process - so a song starred while a radio stream played would NEVER mirror,
+        // and the idle overnight window (the whole point) would do no bulk work at
+        // all. Every path that empties the deck must clear it.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("defer-clear");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        h.enqueue_song_for_test(store_song("s-1", 16)).await;
+
+        // `true` is what a remote load publishes (`!play.local` in play_index_inner
+        // and in the skip dip); each leg below starts from a deck carrying a stream.
+        store.set_playback_remote(true);
+        h.stop_playback().await;
+        assert!(!store.playback_remote(), "the MPD / MPRIS stop empties the deck");
+
+        // The currently-playing entry removed out from under playback.
+        h.state.lock().unwrap().current = Some(0);
+        store.set_playback_remote(true);
+        assert_eq!(h.remove_indices(&[0]).await, 1);
+        assert!(!store.playback_remote(), "removing the playing entry stops the deck");
+
+        // A clear.
+        h.enqueue_song_for_test(store_song("s-2", 16)).await;
+        store.set_playback_remote(true);
+        h.handle(MpdCommand::Clear).await;
+        assert!(!store.playback_remote(), "a clear empties the deck");
+
+        // The end-of-queue HONEST STOP - the transition into the long idle window the
+        // mirror is meant to use, and the leg that made the mirror rot.
+        store.set_playback_remote(true);
+        h.advance_on_eof(EofSignal::default()).await;
+        assert_eq!(h.state.lock().unwrap().current, None, "the queue drained");
+        assert!(!store.playback_remote(), "a drained queue defers nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_landed_continuation_station_publishes_a_remote_deck() {
+        // The landed handoff never passes through play_index_inner (mpv already
+        // advanced into the warmed station), so the deck's remoteness is published in
+        // that arm or nowhere - and a radio stream is exactly the thin-link case bulk
+        // backfill is supposed to stay out of.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("defer-landed");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        h.enqueue_song_for_test(store_song("s-local", 16)).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 777, NTS);
+        // The finishing track played off local bytes, so nothing was deferring.
+        store.set_playback_remote(false);
+
+        h.advance_on_eof(EofSignal { continuation_landed: true, ..EofSignal::default() }).await;
+
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "the station is current");
+        assert!(store.playback_remote(), "and the deck is on the network again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the offline audio store: the SUSPECT path (step 8) ──────────────────
+
+    #[tokio::test]
+    async fn an_errored_local_eof_marks_the_entry_suspect_and_kicks_light() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("suspect");
+        let store = open_store(&dir);
+        let cached = store_song("s-sus", 16);
+        let audio = commit_into(&store, &cached);
+        h.set_audio_store(store.clone());
+        h.enqueue_song_for_test(cached.clone()).await;
+        // Clear the kick the enqueue's window update fired.
+        let _ = store.take_full_request_for_test();
+        let item = h.state.lock().unwrap().queue[0].clone();
+        assert!(h.resolve_play(&item).expect("resolve").local, "offerable to begin with");
+
+        // The event says: THESE LOCAL BYTES FAILED.
+        h.advance_on_eof(EofSignal {
+            song: Some(cached.id.clone()),
+            errored: true,
+            was_local: true,
+            continuation_landed: false,
+        })
+        .await;
+
+        assert_eq!(store.lookup(&cached.id), None, "the entry is de-offered at once");
+        assert!(!h.resolve_play(&item).expect("resolve").local, "and playback falls back to streaming");
+        assert!(audio.exists(), "but the bytes STAY - only a verified replacement retires them");
+        assert!(
+            !store.take_full_request_for_test(),
+            "a suspect mark kicks LIGHT: the replacement needs no getStarred2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn only_an_errored_local_end_is_suspicious() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("suspect-negatives");
+        let store = open_store(&dir);
+        let cached = store_song("s-ok", 16);
+        commit_into(&store, &cached);
+        h.set_audio_store(store.clone());
+
+        // A NATURAL end of local bytes: healthy, and the commonest event there is.
+        h.advance_on_eof(EofSignal {
+            song: Some(cached.id.clone()),
+            errored: false,
+            was_local: true,
+            continuation_landed: false,
+        })
+        .await;
+        assert!(store.lookup(&cached.id).is_some(), "a natural local end is never suspect");
+
+        // An ERRORED end of a REMOTE track (expired token, dropped stream): says
+        // nothing about any local file.
+        h.advance_on_eof(EofSignal {
+            song: Some(cached.id.clone()),
+            errored: true,
+            was_local: false,
+            continuation_landed: false,
+        })
+        .await;
+        assert!(store.lookup(&cached.id).is_some(), "a remote failure never de-offers stored bytes");
+
+        // A raw stream carries no song id: nothing to key on, and no panic.
+        h.advance_on_eof(EofSignal {
+            song: None,
+            errored: true,
+            was_local: true,
+            continuation_landed: false,
+        })
+        .await;
+        assert!(store.lookup(&cached.id).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // THE RACE THE DESIGN CLOSED: the mark keys off the EVENT's song id, never a
+    // re-read of `st.current` - which is repointed after the play_url await, so an
+    // interleaved play would otherwise de-offer a perfectly good, different file.
+    #[tokio::test]
+    async fn the_suspect_mark_follows_the_event_not_the_current_entry() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("suspect-race");
+        let store = open_store(&dir);
+        let finished = store_song("s-finished", 16);
+        let now_playing = store_song("s-now", 16);
+        commit_into(&store, &finished);
+        commit_into(&store, &now_playing);
+        h.set_audio_store(store.clone());
+        h.enqueue_song_for_test(finished.clone()).await;
+        h.enqueue_song_for_test(now_playing.clone()).await;
+        // An interleaved play already repointed current onto the OTHER song.
+        h.state.lock().unwrap().current = Some(1);
+
+        h.advance_on_eof(EofSignal {
+            song: Some(finished.id.clone()),
+            errored: true,
+            was_local: true,
+            continuation_landed: false,
+        })
+        .await;
+
+        assert_eq!(store.lookup(&finished.id), None, "the failing entry is the one marked");
+        assert!(store.lookup(&now_playing.id).is_some(), "the entry current points at is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A skip dip owns the next load, so advance_on_eof early-returns - but the FACT
+    // that local bytes failed is true either way, so the mark must already have been
+    // applied before that return.
+    #[tokio::test]
+    async fn a_pending_skip_does_not_swallow_the_suspect_mark() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("suspect-skip");
+        let store = open_store(&dir);
+        let cached = store_song("s-dip", 16);
+        commit_into(&store, &cached);
+        h.set_audio_store(store.clone());
+        h.enqueue_song_for_test(cached.clone()).await;
+        h.state.lock().unwrap().pending_skip = Some(0);
+
+        h.advance_on_eof(EofSignal {
+            song: Some(cached.id.clone()),
+            errored: true,
+            was_local: true,
+            continuation_landed: false,
+        })
+        .await;
+        assert_eq!(store.lookup(&cached.id), None, "marked despite the early return");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the offline audio store: the OFFLINE SEAMS (step 9) ─────────────────
+    //
+    // The test client points at 127.0.0.1:1, so EVERY `client.song` is an instant
+    // transient failure - which is exactly "the server is gone" for these paths.
+
+    /// A saved session of library songs, current at `current`, saved Playing.
+    fn offline_resume_state(ids: &[&str], current: Option<usize>) -> ResumeState {
+        ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
+            queue: ids
+                .iter()
+                .map(|id| ResumeItem::Song { id: (*id).to_string() })
+                .collect(),
+            current,
+            elapsed_secs: 0.0,
+            volume: 50,
+            play_state: ResumePlayState::Playing,
+            playlist_version: 3,
+            saved_at_unix: 1,
+            continuation: false,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_offline_restore_keeps_every_id_cached_or_not() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("restore-offline");
+        let store = open_store(&dir);
+        let cached = store_song("r-cached", 16);
+        commit_into(&store, &cached);
+        h.set_audio_store(store.clone());
+
+        // Saved: one cached song plus two the store has never seen. Current is the
+        // cached one, so playback can genuinely wake.
+        let s = offline_resume_state(&["r-cached", "r-gone-1", "r-gone-2"], Some(0));
+        h.restore(&s).await.expect("an offline restore SUCCEEDS instead of aborting");
+
+        let q = h.state.lock().unwrap().queue.clone();
+        assert_eq!(q.len(), 3, "THE GUARANTEE: the queue never shrinks on a transient");
+        match &q[0].entry {
+            QueueEntry::Song(song) => {
+                assert_eq!(song.title, cached.title, "the cached entry carries REAL sidecar metadata");
+                assert_eq!(song.duration_secs, cached.duration_secs);
+            }
+            _ => panic!("entry 0 is a song"),
+        }
+        for (i, id) in [(1usize, "r-gone-1"), (2, "r-gone-2")] {
+            match &q[i].entry {
+                QueueEntry::Song(song) => {
+                    assert_eq!(song.id.0, id, "the id is what persistence keeps, and it survived");
+                    assert_eq!(song.title, id, "an unknown title falls back to the id, honestly");
+                    assert_eq!(song.duration_secs, None, "and nothing is invented");
+                }
+                _ => panic!("entry {i} is a placeholder song"),
+            }
+        }
+        // The current entry IS playable from local bytes, so the saved Playing state
+        // is honored (this is the everyday offline start).
+        assert_eq!(h.state.lock().unwrap().current, Some(0));
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "a cached current wakes normally");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_offline_restore_with_an_uncached_current_stays_paused() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("restore-paused");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        // Nothing is cached, so waking would cascade failed loads through the whole
+        // queue and burn the saved position.
+        let mut s = offline_resume_state(&["u-1", "u-2"], Some(1));
+        s.elapsed_secs = 42.5;
+        h.restore(&s).await.expect("restore succeeds");
+
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "still no shrinking");
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "and the saved position survives");
+        // PAUSED specifically, not merely "not Playing": Stopped would be a lie about a
+        // deck that still holds a position, and it is what the checkpoint persists.
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Paused,
+            "an uncached current restores PAUSED, never a failing-load cascade"
+        );
+        assert_eq!(h.last_elapsed_secs(), 42.5, "and the playhead is carried, not zeroed");
+        // THE POINT: the very next checkpoint round-trips the whole saved position
+        // instead of overwriting it with a stopped deck at 0.
+        let snap = h.resume_snapshot(h.last_elapsed_secs());
+        assert_eq!(snap.play_state, ResumePlayState::Paused);
+        assert_eq!(snap.current, Some(1));
+        assert_eq!(snap.elapsed_secs, 42.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_offline_restore_of_a_stopped_deck_stays_stopped() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("restore-stopped");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        // An EXPLICIT stop survives the rebuild, offline or not: the degraded arm must
+        // not promote a deliberately stopped deck to Paused.
+        let mut s = offline_resume_state(&["u-1"], Some(0));
+        s.play_state = ResumePlayState::Stopped;
+        h.restore(&s).await.expect("restore succeeds");
+        assert_eq!(h.reported_play_state(), PlayState::Stopped, "a saved stop stays a stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn placeholders_stay_pending_while_the_server_is_still_away() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("restore-refresh");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        h.restore(&offline_resume_state(&["p-1", "p-2"], Some(0)))
+            .await
+            .expect("restore succeeds");
+        assert_eq!(h.restore_placeholders.lock().unwrap().len(), 2, "both ids await metadata");
+
+        // The server is STILL unreachable: the batch stops at the first transient
+        // failure and keeps every id pending rather than dropping them.
+        assert_eq!(h.refresh_restore_placeholders().await, 0, "nothing could be filled in");
+        assert_eq!(
+            h.restore_placeholders.lock().unwrap().len(),
+            2,
+            "a failed refresh forgets nothing - the next server-back edge retries"
+        );
+        // And the queue is untouched by the attempt.
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_store_less_transient_restore_still_aborts() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        // No store: there is nothing local to degrade to, so the hard-won abort (which
+        // preserves resume.toml for the next start) must stand exactly as before.
+        assert!(
+            h.restore(&offline_resume_state(&["x-1"], Some(0))).await.is_err(),
+            "without a store a transient failure still aborts the whole restore"
+        );
+        assert_eq!(h.state.lock().unwrap().queue.len(), 0, "and installs nothing");
+    }
+
+    /// THE FUSE (the sting the offline restore's paused-if-uncached arm only covers for
+    /// the FIRST track). mpv's loadfile Ok is premature, so a load that cannot open comes
+    /// back as an errored Eof - which re-enters the advance and loads the NEXT entry. With
+    /// a cached current followed by uncached ones and no server, that walks the whole
+    /// queue down to `current: None` in seconds, and the checkpoint loop then persists
+    /// THAT over the saved position: permanently gone. The walk must stop at the failing
+    /// entry, with the queue and the position intact - without regressing the ordinary
+    /// online case, where one dead track is still skipped past.
+    #[tokio::test]
+    async fn a_run_of_failed_loads_stops_the_eof_walk_and_keeps_the_position() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..8 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("f-{i}"))).await;
+        }
+        h.state.lock().unwrap().current = Some(0);
+        let failed = || EofSignal { errored: true, ..EofSignal::default() };
+
+        // One dead track is still skipped past, and so is a second: the fuse only ever
+        // fires on a RUN, so the everyday online case is untouched.
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "a single failed load still advances");
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(2), "and so does a second");
+        // A track that PLAYED clears the run, so the budget starts over.
+        h.advance_on_eof(EofSignal::default()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(3), "a natural EOF advances normally");
+        h.advance_on_eof(failed()).await;
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(5), "the natural EOF reset the run");
+
+        // The THIRD consecutive failure stops the walk dead.
+        h.advance_on_eof(failed()).await;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.current, Some(5), "held AT the entry that failed, never walked past it");
+            assert_eq!(st.queue.len(), 8, "and the queue is untouched");
+        }
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Paused,
+            "the deck reports Paused - a state the user and a returning server can resume from"
+        );
+        // And it stays put: more failures cannot restart the grind.
+        h.advance_on_eof(failed()).await;
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(5), "still held, never ground to None");
+
+        // THE POINT: what the checkpoint loop would now write still carries the session.
+        let snap = h.resume_snapshot(12.5);
+        assert_eq!(snap.current, Some(5), "resume.toml keeps the position");
+        assert_eq!(snap.play_state, ResumePlayState::Paused);
+        assert_eq!(snap.queue.len(), 8, "and the whole queue");
+
+        // A fresh-play GESTURE is the user saying try again: the fuse re-arms in full.
+        h.play_index(0).await.expect("play");
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "the gesture re-armed the walk");
+    }
+
+    /// THE ORDINARY ONLINE FAILURE, which is NOT a failed load: mpv's `EndReason::Error`
+    /// also covers a track that played for minutes and THEN lost its source (expired
+    /// token, dropped link, server hiccup). Counting errored EOFs alone would turn three
+    /// such drops - spread across a whole listening session, each with a healthy track
+    /// in between - into a dead deck, where before the fuse existed the walk simply
+    /// carried on. The same shape covers the user-skip path: a skip off a HEALTHY track
+    /// ends with mpv reason `Stop` and emits no `Eof` at all, so no natural EOF ever
+    /// arrives to clear the run either.
+    ///
+    /// So the run is measured against PLAYBACK: one position tick between failures is
+    /// enough to re-arm the fuse in full, and the queue keeps walking forever.
+    #[tokio::test]
+    async fn played_then_dropped_tracks_never_trip_the_eof_fuse() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..12 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("d-{i}"))).await;
+        }
+        h.state.lock().unwrap().current = Some(0);
+        let failed = || EofSignal { errored: true, ..EofSignal::default() };
+
+        // Six errored ends, each on a track that actually PLAYED first (the director
+        // feeds note_playback_progress from every identity-matched TimePos). Well past
+        // MAX_CONSECUTIVE_EOF_FAILURES, and the walk never stops.
+        for expected in 1..=6usize {
+            h.note_playback_progress();
+            h.advance_on_eof(failed()).await;
+            assert_eq!(
+                h.state.lock().unwrap().current,
+                Some(expected),
+                "a track that played and then dropped costs exactly one skip-past"
+            );
+        }
+        assert!(
+            !h.state.lock().unwrap().pending_pause,
+            "and the deck was never halted behind the user's back"
+        );
+
+        // The fuse is NOT disarmed by any of that: from here, three loads that produce
+        // no sound at all still stop the walk - that is the systemic case it exists for.
+        h.note_playback_progress();
+        h.advance_on_eof(failed()).await;
+        h.advance_on_eof(failed()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(8), "two silent failures still walk");
+        h.advance_on_eof(failed()).await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, Some(8), "the third silent failure holds the position");
+        assert!(st.pending_pause, "and the deck reports Paused");
+    }
+
+    /// THE HALT TERMINAL MUST BE RESUMABLE BY EVERY RESUME GESTURE, not just `play`.
+    /// [`HypodjHandler::halt_failed_advance`] - and an offline restore of a saved
+    /// Playing state - reports Paused off `pending_pause` alone while the PLAYER holds
+    /// nothing: the failed load already published its honest stop. Every resume gesture
+    /// (MPD `pause 0`, MPRIS Play/PlayPause, a knob-up) funnels through `set_pause`,
+    /// whose Paused arm UNPAUSES - which against a raw Stopped player is a no-op that
+    /// merely clears the intent, so the deck silently fell to Stopped with nothing
+    /// loaded, and the next toggle then unpaused an idle mpv into a PHANTOM Playing
+    /// over silence. The terminal's whole promise is that a play gesture or an MPRIS
+    /// widget can pick it up, so a resume from here must LOAD the held entry.
+    #[tokio::test]
+    async fn a_resume_gesture_reloads_the_held_entry_after_the_eof_halt() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..6 {
+            h.enqueue_song_for_test(playlist_test_song(&format!("r-{i}"))).await;
+        }
+        h.state.lock().unwrap().current = Some(0);
+        let failed = || EofSignal { errored: true, ..EofSignal::default() };
+        for _ in 0..3 {
+            h.advance_on_eof(failed()).await;
+        }
+        // The REAL halt shape: the load that failed published its own honest stop, so
+        // the player holds NOTHING. (A NullPlayer is left Playing by the walk because
+        // ITS loads all succeed, so the stop is asserted here explicitly.)
+        let _ = h.player.stop().await;
+        h.state.lock().unwrap().pending_pause = true;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "the halt reports Paused");
+        assert_eq!(h.state.lock().unwrap().current, Some(2), "holding the failed entry");
+
+        // ONE resume gesture.
+        h.set_pause(Some(false)).await.expect("resume");
+        assert_eq!(
+            h.reported_play_state(),
+            PlayState::Playing,
+            "the held entry was LOADED - not merely un-intended into a silent Stopped"
+        );
+        assert_eq!(h.state.lock().unwrap().current, Some(2), "and it is the SAME entry");
+
+        // And the deck behaves like an ordinary loaded one from there: a pause reports
+        // Paused over a track that is really loaded, never the phantom toggle pair.
+        h.set_pause(Some(true)).await.expect("pause");
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+    }
+
+    /// The skip-pin SLOT must be leak-proof under CONCURRENCY - two connections issuing
+    /// `next`, or the window between the pin and `pending_skip` being written. With the
+    /// slot swap and the protected-set edit taken under SEPARATE lock acquisitions, one
+    /// caller's `protect(X)` can land after another's `unprotect(X)` and strand X in the
+    /// protected set forever, starving eviction of victims - the exact leak the single
+    /// slot was introduced to prevent. Ids are distinct per iteration so any strand is
+    /// permanent and therefore visible at the end.
+    #[tokio::test]
+    async fn concurrent_skip_pins_never_strand_a_protected_id() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("skip-pin-race");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        let h = Arc::new(h);
+
+        let workers: Vec<_> = (0..4u32)
+            .map(|t| {
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    for i in 0..4000u32 {
+                        h.set_store_skip_pin(Some(SongId(format!("p-{t}-{i}"))));
+                        h.set_store_skip_pin(None);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().expect("worker");
+        }
+
+        // Every pin was released, so the slot holds nothing and neither may the set.
+        assert!(h.store_skip_pin.lock().unwrap().is_none(), "the slot ends empty");
+        let stranded = store.protected_ids().len();
+        assert_eq!(
+            stranded, 0,
+            "stranded skip pins starve eviction forever (leaked ids: {stranded})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn add_song_falls_back_to_the_cached_metadata_when_the_server_is_away() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("add-offline");
+        let store = open_store(&dir);
+        let cached = store_song("a-cached", 16);
+        commit_into(&store, &cached);
+        h.set_audio_store(store.clone());
+
+        // A hearted song stays addable offline: the sidecar carries the whole Song.
+        let id = h.enqueue_uri("song/a-cached").await.expect("add resolves from the store");
+        let q = h.state.lock().unwrap().queue.clone();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].id, id);
+        match &q[0].entry {
+            QueueEntry::Song(song) => assert_eq!(song.title, cached.title, "real metadata, not a bare id"),
+            _ => panic!("a song entry"),
+        }
+        // And it resolves to LOCAL BYTES at play time, which is the whole point.
+        let item = h.state.lock().unwrap().queue[0].clone();
+        assert!(h.resolve_play(&item).expect("resolve").local);
+
+        // An id the store has never seen still ACKs the error - we do not invent
+        // entries for songs nobody can produce.
+        assert!(h.enqueue_uri("song/a-unknown").await.is_err());
+        assert_eq!(h.state.lock().unwrap().queue.len(), 1, "and nothing was queued");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // LIVE end-to-end suspect proof over the REAL mpv actor (what no
+    // handler_with_null_player test can reach): a committed store entry whose bytes
+    // are replaced by SAME-LENGTH garbage still passes the length gate and is offered
+    // to playback; mpv then fails to open it; the resulting errored+local Eof reaches
+    // advance_on_eof and de-offers the entry - WITHOUT deleting the bytes. Ignored by
+    // default (needs a real libmpv runtime, absent in the Nix build sandbox):
+    //   cargo test -p hypodj-core -- --ignored live_corrupt_store_bytes_become_suspect
+    #[tokio::test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the end-to-end suspect path"]
+    async fn live_corrupt_store_bytes_become_suspect() {
+        use crate::player::{AudioOut, MpvPlayer};
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1/never-called".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            client_name: "test".to_string(),
+        };
+        let Ok(Ok(client)) = std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) else {
+            return;
+        };
+        // ao=null: this proof is SILENT, it never touches the real device.
+        let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+        let h = HypodjHandler::new(Arc::new(client), player);
+
+        let dir = store_tmpdir("live-suspect");
+        let store = open_store(&dir);
+        // Commit real, playable bytes through the real write protocol.
+        let mut wav: Vec<u8> = Vec::new();
+        {
+            let sr = 44100u32;
+            let n = sr as usize; // one second
+            let mut pcm: Vec<u8> = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let t = i as f64 / sr as f64;
+                let s = (2.0 * std::f64::consts::PI * 330.0 * t).sin() * 0.5;
+                pcm.extend_from_slice(&((s * i16::MAX as f64) as i16).to_le_bytes());
+            }
+            let data_len = pcm.len() as u32;
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVE");
+            wav.extend_from_slice(b"fmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&sr.to_le_bytes());
+            wav.extend_from_slice(&(sr * 2).to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            wav.extend_from_slice(&pcm);
+        }
+        let mut song = playlist_test_song("live-sus");
+        song.size = Some(wav.len() as u64);
+        song.suffix = Some("wav".into());
+        let tmp = store.tmp_path();
+        std::fs::write(&tmp, &wav).expect("write temp");
+        let audio = store.commit(&song, &tmp, true, 1_000).expect("commit");
+        h.set_audio_store(store.clone());
+        h.enqueue_song_for_test(song.clone()).await;
+
+        // SAME-LENGTH garbage: the stat still passes, so only playback can catch it.
+        std::fs::write(&audio, vec![0xA5u8; wav.len()]).expect("rot the bytes");
+        let item = h.state.lock().unwrap().queue[0].clone();
+        assert!(
+            h.resolve_play(&item).expect("resolve").local,
+            "the length gate cannot see tail/whole-file rot - the path is still offered"
+        );
+
+        // Play it for real. loadfile's Ok is premature; the failure arrives as an event.
+        h.play_index(0).await.expect("play_index returns Ok (loadfile is premature)");
+        let mut signal: Option<EofSignal> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline && signal.is_none() {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await {
+                Ok(Some(PlayerEvent::Eof { song, errored, was_local, continuation_landed, .. })) => {
+                    signal = Some(EofSignal { song, errored, was_local, continuation_landed });
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        let ev = signal.expect("the corrupt local file surfaced an Eof");
+        assert!(ev.errored && ev.was_local, "carrying the suspect signal: {ev:?}");
+        // The director's exact call.
+        h.advance_on_eof(ev).await;
+
+        assert_eq!(store.lookup(&song.id), None, "the entry is de-offered");
+        assert!(audio.exists(), "and its bytes survive for the reconciler to replace");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_star_flip_kicks_a_full_pass_and_the_window_kicks_light() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("kicks");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        // A star flip may have changed the PIN SET itself, and only a full pass talks
+        // to getStarred2 - so the kick must be a full one.
+        h.bust_star_caches();
+        assert!(store.take_full_request_for_test(), "bust_star_caches kicks FULL");
+
+        // A queue change is a light kick: a track boundary must not cost a directory
+        // scan plus a getStarred2.
+        h.enqueue_song_for_test(store_song("k1", 16)).await;
+        assert!(!store.take_full_request_for_test(), "a window change kicks LIGHT");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

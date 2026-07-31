@@ -1,7 +1,11 @@
 //! hypodj daemon entrypoint.
 //!
-//! FOUNDATION wiring: load config, connect + ping the Subsonic server, then
-//! (TODO next-phase) start the MPD server bound to config.mpd.bind.
+//! FOUNDATION wiring: load config, build the Subsonic client and greet the server,
+//! then start the MPD server bound to config.mpd.bind.
+//!
+//! OFFLINE-TOLERANT STARTUP: the server greet is a WARN, never fatal (see
+//! [`greet_server`]) - hypodj's own MPD surface does not depend on the music
+//! server being awake.
 //!
 //! HARD CONSTRAINT honored: default bind is 127.0.0.1:6601, NOT 6600 - the
 //! running mopidy service owns 6600 and must not be disturbed.
@@ -72,12 +76,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("hypodj.toml"));
     let cfg = Config::load(&cfg_path)?;
 
+    // `connect` is pure construction (URL + auth + a bounded HTTP client) and never
+    // touches the network, so it fails only on genuinely broken config.
     let mut client = SubsonicClient::connect(&cfg.server)?;
-    client.ping().await?;
-    // Negotiate OpenSubsonic extensions ONCE, while we still hold &mut, before
-    // the client is shared into the handler + scrobbler (feature 9).
-    client.probe_extensions().await;
-    tracing::info!("connected to {}", cfg.server.url);
+    let server_online = greet_server(&mut client, &cfg.server.url).await;
     let client = std::sync::Arc::new(client);
 
     // Spawn the real mpv-backed player actor behind the same PlayerHandle.
@@ -222,6 +224,66 @@ async fn main() -> anyhow::Result<()> {
             })
         });
     let resume_enabled = state_dir.is_some();
+
+    // OFFLINE AUDIO STORE. Root: an explicit [store].dir wins, else
+    // <state_dir>/store; with neither, the store is disabled with a warn (resume's
+    // posture - never fatal). Opened and REGISTERED BEFORE resume::load/restore
+    // below, so a restored queue can already resolve to local bytes, and the
+    // reconciler is spawned next to the checkpoint loop.
+    if cfg.store.enable {
+        let store_root = cfg
+            .store
+            .dir
+            .clone()
+            .or_else(|| state_dir.as_ref().map(|d| d.join("store")));
+        match store_root {
+            None => tracing::warn!(
+                "offline store enabled but no directory resolves (set [store].dir or [restart].state_dir); running without it"
+            ),
+            Some(root) => {
+                match hypodj_core::store::AudioStore::open(root.clone(), cfg.store.clone()) {
+                    Ok(store) => {
+                        let store = Arc::new(store);
+                        handler.set_audio_store(store.clone());
+                        // THE SERVER-BACK EDGE: the reconciler fires this after any pass
+                        // whose getStarred2 succeeded, which is exactly when the id-only
+                        // placeholders an OFFLINE restore installed can finally be filled
+                        // in. A Weak so the hook can never keep the handler alive, and a
+                        // spawn so the (cosmetic, network-bound) refresh never sits inside
+                        // the reconciler's pass.
+                        let weak = Arc::downgrade(&handler);
+                        store.set_server_back_hook(Arc::new(move || {
+                            if let Some(h) = weak.upgrade() {
+                                tokio::spawn(async move {
+                                    h.refresh_restore_placeholders().await;
+                                });
+                            }
+                        }));
+                        // The ONE owner of every store mutation, for the daemon's
+                        // lifetime: interval full passes plus light passes on the
+                        // handler's kicks (window changes, skip pins, star flips).
+                        let source = Arc::new(hypodj_core::store::SubsonicPinSource::new(
+                            client.clone(),
+                            cfg.store.pin_starred,
+                        ));
+                        tokio::spawn(hypodj_core::store::run(
+                            store,
+                            source,
+                            hypodj_core::clock::TokioClock,
+                        ));
+                    }
+                    Err(e) => tracing::warn!(
+                        root = %root.display(),
+                        error = %e,
+                        "offline store unavailable; running without it"
+                    ),
+                }
+            }
+        }
+    } else {
+        tracing::info!("offline store disabled by config");
+    }
+
     if let Some(dir) = &state_dir {
         let path = dir.join("resume.toml");
         handler.set_state_path(path.clone());
@@ -264,7 +326,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let server = MpdServer::new(bind);
-    tracing::info!(%bind, "starting MPD server");
+    // `server_online = false` is a normal startup, not a degraded one: the socket
+    // binds, the restored queue is installed, and clients connect. It is logged here
+    // so one line says whether the music server answered while MPD came up.
+    tracing::info!(%bind, server_online, "starting MPD server");
     // The internal shutdown-fade budget tracks the configured shutdown_fade_secs
     // plus a small headroom for the up-front persist, so raising the fade knob
     // does not silently make the budget reject the fade (immediate exit). The
@@ -288,6 +353,42 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => graceful_shutdown(handler.clone(), resume_enabled, shutdown_budget).await,
     }
     Ok(())
+}
+
+/// Greet the metadata server once at startup WITHOUT making its reachability a
+/// precondition for the daemon existing. Returns whether the server answered.
+///
+/// This used to be `client.ping().await?`, and that `?` exited the process before
+/// the MPD bind and before the resume restore: a music server that was merely
+/// asleep took hypodj's own MPD surface down with it, and the unit's
+/// `Restart=on-failure` / `RestartSec=5` turned that into a crash-loop which could
+/// never serve a client. Now a failed greet only WARNS - the daemon binds MPD,
+/// restores its saved queue, and serves; the first metadata call that succeeds
+/// afterwards is the "server is back" edge, with no restart needed.
+///
+/// The extension probe runs only when the greet SUCCEEDED. It swallows its own
+/// errors and an empty extension set already degrades conservatively (every shipped
+/// feature is core Subsonic; a `supports()` miss only sends `similar` down its
+/// documented `getSimilarSongs2` fallback), so a second round trip into a dead
+/// address would buy nothing but startup latency. It has to happen here regardless,
+/// while we still hold `&mut`, before the client is shared into the handler +
+/// scrobbler (feature 9).
+async fn greet_server(client: &mut SubsonicClient, url: &str) -> bool {
+    match client.ping().await {
+        Ok(()) => {
+            client.probe_extensions().await;
+            tracing::info!(%url, "connected");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                %url,
+                "subsonic server did not answer; starting anyway (MPD serves; server calls retry as they are made)"
+            );
+            false
+        }
+    }
 }
 
 /// The graceful shutdown path on SIGTERM/SIGINT. ORDERING: PERSIST FIRST (the
@@ -380,5 +481,40 @@ async fn checkpoint_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hypodj_core::config::ServerConfig;
+
+    /// The headline of offline-tolerant startup: an unreachable server makes the
+    /// greet report offline, NOT exit the process. Points at loopback port 1 (no
+    /// normal process can bind it) so the failure is an instant local
+    /// ECONNREFUSED - no network and no wall-clock wait.
+    ///
+    /// `connect()` builds a real reqwest client, which needs system CA certs; a
+    /// network-isolated build sandbox has none and the builder fails, so skip there
+    /// (the same guard hypodj-core's tests use).
+    #[tokio::test]
+    async fn greet_server_reports_offline_instead_of_aborting_startup() {
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            client_name: "hypodj-test".to_string(),
+        };
+        let mut client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return;
+            }
+        };
+        assert!(
+            !greet_server(&mut client, &cfg.url).await,
+            "an unreachable server must report offline and let startup continue"
+        );
     }
 }

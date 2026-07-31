@@ -19,6 +19,7 @@
 //! existence and NOT a get()/raw fallback or a fork.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::config::ServerConfig;
 use crate::model::{
@@ -36,6 +37,42 @@ use url::Url;
 /// [`SubsonicClient::similar`] falls through to `getSimilarSongs2` on any error or
 /// empty result.
 const SONIC_SIMILARITY_EXT: &str = "sonicSimilarity";
+
+/// Connect timeout for the METADATA HTTP client (see
+/// [`build_metadata_http_client`]). Bounds the one failure the kernel otherwise
+/// stretches to minutes: a BLACKHOLED server address (a suspended box, a captive
+/// portal, a dead VPN) answers neither SYN nor RST, and the default SYN retry
+/// ladder runs ~127s PER CALL. Five seconds is generous for a LAN/Tailscale
+/// Navidrome and still turns "server is gone" into a second-scale verdict.
+const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Total per-request timeout for the METADATA HTTP client, covering the whole
+/// request including the body read. Only JSON endpoints plus small cover-art
+/// fetches flow through this client, so 15s is far above any healthy response and
+/// far below a hang worth calling transient. AUDIO never flows through it -
+/// playback is mpv's own HTTP - so this cannot truncate a long stream.
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Build the bounded HTTP client injected into the upstream
+/// `opensubsonic::Client`, which otherwise constructs a bare
+/// `reqwest::Client::new()` with NO timeout of any kind (opensubsonic 0.3.0
+/// client.rs:54). That default is what made "flip to offline on the first
+/// transient failure" unbounded in practice: every metadata call - the startup
+/// greet, a resume restore, `enqueue_uri` - could sit in kernel SYN retries for
+/// minutes against a blackholed address.
+///
+/// HARD-FAILS at construction instead of degrading to an unbounded fallback, the
+/// same posture as `build_cover_http_client` in handler.rs: the bound IS the
+/// feature here, so a silent fallback would reintroduce the very hang it exists to
+/// prevent. The error surfaces as [`SubsonicError::Init`] out of
+/// [`SubsonicClient::connect`], which is already a fallible sync constructor.
+fn build_metadata_http_client() -> Result<reqwest::Client, SubsonicError> {
+    reqwest::Client::builder()
+        .connect_timeout(METADATA_CONNECT_TIMEOUT)
+        .timeout(METADATA_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| SubsonicError::Init(format!("bounded metadata http client: {e}")))
+}
 
 /// Errors surfaced from the Subsonic layer. We flatten the upstream error into
 /// a message so callers don't depend on the upstream error enum.
@@ -89,14 +126,28 @@ impl SubsonicClient {
     /// daemon calls once immediately after connect, before the client is moved
     /// into the handler. (Critique mustChange #1: the "cached at connect" claim
     /// is not implementable in a sync connect; this `&mut self` probe is.)
+    ///
+    /// Pure construction: it builds a URL, an auth token, and an HTTP client, and
+    /// never touches the network - so an unreachable server does NOT fail here.
+    /// The first network contact is the daemon's startup greet, which warns and
+    /// continues (offline-tolerant startup).
     pub fn connect(cfg: &ServerConfig) -> Result<Self, SubsonicError> {
         let auth = opensubsonic::Auth::token(&cfg.username, &cfg.password);
+        // Build the bounded client BEFORE handing off to the upstream constructor:
+        // `Client::new` internally unwraps this same reqwest builder, so building
+        // ours first turns a TLS-backend init failure (the certless build sandbox)
+        // into an honest Init error rather than an upstream panic.
+        let http = build_metadata_http_client()?;
         // Send the configured client_name as the OpenSubsonic `c` param, rather
         // than the crate's default. This is the `server.client_name` config field
         // (and the module's `clientName` option) actually taking effect.
+        //
+        // `with_http_client` replaces the upstream's UNBOUNDED default client with
+        // the timeout-bounded one above; every metadata call in the daemon rides it.
         let inner = opensubsonic::Client::new(&cfg.url, auth)
             .map_err(|e| SubsonicError::Init(e.to_string()))?
-            .with_client_name(&cfg.client_name);
+            .with_client_name(&cfg.client_name)
+            .with_http_client(http);
         Ok(Self {
             inner,
             supported_exts: HashSet::new(),
@@ -139,6 +190,10 @@ impl SubsonicClient {
     }
 
     /// Liveness + credential check. Vertical-slice step 2.
+    ///
+    /// NOT a startup precondition: the daemon's greet treats a failure as a WARN
+    /// and serves MPD anyway (offline-tolerant startup). Bounded by the injected
+    /// metadata client, so an unreachable server answers in seconds.
     pub async fn ping(&self) -> Result<(), SubsonicError> {
         self.inner
             .ping()
@@ -252,6 +307,44 @@ impl SubsonicClient {
         self.inner
             .stream_url(&id.0, None, None)
             .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    /// The `/rest/download` URL for a song: the ORIGINAL file, byte for byte, with
+    /// no transcoding applied. This is the ONLY endpoint the offline store ever
+    /// fetches, which deletes the entire transcoding-settings validity class by
+    /// construction - server-side transcoding changes what `stream` returns, never
+    /// what `download` returns.
+    ///
+    /// DERIVED from [`stream_url`](Self::stream_url) by swapping the last path
+    /// segment, rather than built independently: the two endpoints take the same
+    /// single `id` parameter and the same auth query, so deriving means the auth
+    /// scheme, the base path (`https://host/music/rest/...` included), the api
+    /// version, and the client name can never drift between what plays and what is
+    /// stored. Sync, like `stream_url` - it only builds a URL.
+    ///
+    /// NOT the crate's own `download()`: that buffers the WHOLE file into memory
+    /// before returning it, which for a 60 MB original is a 60 MB spike per
+    /// download. The store streams this URL through a bounded chunk loop instead.
+    pub fn download_url(&self, id: &SongId) -> Result<Url, SubsonicError> {
+        let mut url = self.stream_url(id)?;
+        // Refuse to guess if the shape is not the one we derived from: better an
+        // honest error the reconciler backs off on than a silently wrong URL that
+        // would store transcoded bytes as originals.
+        let last = url
+            .path_segments()
+            .and_then(|mut s| s.next_back())
+            .map(str::to_owned);
+        if last.as_deref() != Some("stream") {
+            return Err(SubsonicError::Request(format!(
+                "unexpected stream url shape ({}); cannot derive a download url",
+                url.path()
+            )));
+        }
+        url.path_segments_mut()
+            .map_err(|()| SubsonicError::Request("stream url cannot be a base".to_string()))?
+            .pop()
+            .push("download");
+        Ok(url)
     }
 
     // ── scrobbling (feature 1) ─────────────────────────────────────────────
@@ -801,6 +894,21 @@ fn map_song(c: data::Child) -> Song {
         // Performer: no display field exists; derive from the "performer"-role
         // contributors joined by artist name (OpenSubsonic only).
         performer: contributors_by_role(&c.contributors, "performer"),
+        // Store identity fingerprint. These describe the ORIGINAL file, so they
+        // are exactly the identity of what `/rest/download` returns - the whole
+        // reason the store only ever mirrors originals. Deliberately NOT the
+        // `transcoded_*` twins: mixing provenances is what the sidecar's
+        // `endpoint = "download"` marker exists to make impossible.
+        //
+        // `size` is `i64` on the wire; a negative value is nonsense, so clamp it
+        // to 0 rather than wrapping into a huge u64 (a huge fingerprint would
+        // make every commit check fail forever instead of once).
+        size: c.size.map(|s| s.max(0) as u64),
+        // Kept verbatim here; the store sanitizes it to `[a-z0-9]{1,8}` (else
+        // `bin`) before it can ever become a path component.
+        suffix: c.suffix,
+        content_type: c.content_type,
+        created: c.created,
     }
 }
 
@@ -991,6 +1099,50 @@ mod tests {
     }
 
     #[test]
+    fn map_song_carries_the_store_fingerprint_fields() {
+        // The offline store's identity fingerprint (size, suffix, created) plus
+        // content_type must round-trip through the real camelCase Child wire
+        // shape. `size` is the commit check for a download, so a drift in the
+        // wire field name here must fail at THIS boundary, not silently produce
+        // `None` and a store that can never commit anything.
+        let wire: data::Child = serde_json::from_str(
+            r#"{ "id": "so-11", "title": "Sonderbar", "isDir": false,
+                 "size": 22548990, "suffix": "flac",
+                 "contentType": "audio/flac",
+                 "created": "2024-05-01T12:34:56.000Z",
+                 "transcodedSuffix": "mp3",
+                 "transcodedContentType": "audio/mpeg" }"#,
+        )
+        .unwrap();
+        let s = map_song(wire);
+        assert_eq!(s.size, Some(22_548_990));
+        assert_eq!(s.suffix.as_deref(), Some("flac"));
+        assert_eq!(s.content_type.as_deref(), Some("audio/flac"));
+        assert_eq!(s.created.as_deref(), Some("2024-05-01T12:34:56.000Z"));
+    }
+
+    #[test]
+    fn map_song_store_fingerprint_absent_is_none_and_negative_size_clamps() {
+        // A plain-Subsonic / minimal Child omits all four: honest None, never a
+        // fabricated zero-size fingerprint that would let a 0-byte file commit.
+        let bare: data::Child =
+            serde_json::from_str(r#"{ "id": "so-12", "title": "X", "isDir": false }"#).unwrap();
+        let s = map_song(bare);
+        assert_eq!(s.size, None);
+        assert_eq!(s.suffix, None);
+        assert_eq!(s.content_type, None);
+        assert_eq!(s.created, None);
+
+        // A negative wire size (nonsense) clamps to 0 rather than wrapping into
+        // ~1.8e19, which would make the commit length check unsatisfiable.
+        let negative: data::Child = serde_json::from_str(
+            r#"{ "id": "so-13", "title": "Y", "isDir": false, "size": -1 }"#,
+        )
+        .unwrap();
+        assert_eq!(map_song(negative).size, Some(0));
+    }
+
+    #[test]
     fn map_song_derives_composer_and_performer_from_opensubsonic_fields() {
         // Composer comes from the ready-made displayComposer; performer is
         // derived from the contributors whose role is "performer" (joined by
@@ -1102,6 +1254,168 @@ mod tests {
             .query_pairs()
             .any(|(k, v)| k == "c" && v == "hypodj-custom");
         assert!(has_c, "c= param must carry configured client_name; got {url}");
+    }
+
+    #[test]
+    fn download_url_swaps_only_the_endpoint_segment_and_keeps_the_auth_query() {
+        // The offline store stores ORIGINALS ONLY, so `download` must be derived
+        // from the very URL that plays: same base path, same auth, same id, one
+        // segment different. A base URL with a PATH PREFIX is the case that would
+        // break a naively rebuilt URL (`/music/rest/stream` must become
+        // `/music/rest/download`, not `/rest/download`).
+        let cfg = ServerConfig {
+            url: "https://music.example.com/music".into(),
+            username: "alice".into(),
+            password: "s3cr3t".into(),
+            client_name: "hypodj".into(),
+        };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return;
+            }
+        };
+        let id = SongId("so-1".into());
+        let stream = client.stream_url(&id).expect("stream url");
+        let download = client.download_url(&id).expect("download url");
+        assert_eq!(stream.path(), "/music/rest/stream");
+        assert_eq!(download.path(), "/music/rest/download");
+        assert_eq!(stream.host_str(), download.host_str());
+        // The whole point of deriving: everything but the per-call auth salt is
+        // identical between the URL that plays and the URL that is stored. The
+        // token+salt pair IS expected to differ - it is re-minted on every call,
+        // which is exactly why a URL is never a store key.
+        let q = |u: &Url| {
+            let mut v: Vec<(String, String)> = u
+                .query_pairs()
+                .filter(|(k, _)| k != "s" && k != "t")
+                .map(|(k, val)| (k.into_owned(), val.into_owned()))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(q(&stream), q(&download), "id, version, and client carry over");
+        assert!(
+            q(&download).iter().any(|(k, v)| k == "id" && v == "so-1"),
+            "the id must survive the swap"
+        );
+        for key in ["s", "t"] {
+            assert!(
+                download.query_pairs().any(|(k, v)| k == key && !v.is_empty()),
+                "the derived URL is fully authenticated ({key} present)"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_http_bounds_are_ordered_and_far_under_the_kernel_syn_wait() {
+        // The reason the injected client exists: an unreachable server must be a
+        // second-scale verdict, not the ~127s of kernel SYN retries the upstream's
+        // timeout-less `reqwest::Client::new()` inherits. A connect bound at or
+        // above the total bound would be dead code, so pin the ordering too.
+        assert!(
+            METADATA_CONNECT_TIMEOUT < METADATA_REQUEST_TIMEOUT,
+            "a connect bound at/above the total bound can never fire"
+        );
+        assert!(
+            METADATA_REQUEST_TIMEOUT <= Duration::from_secs(30),
+            "the total bound must stay well under a blackhole SYN ladder"
+        );
+    }
+
+    /// The BOUND ITSELF, exercised end to end - the one thing the constant-ordering
+    /// assertions above cannot prove. Drop `.with_http_client(http)` from `connect`
+    /// and this test is what fails: the upstream's timeout-less default client would
+    /// sit on a server that never answers until the kernel gives up, which is the
+    /// ~127s-per-call hang the injection exists to delete.
+    ///
+    /// Needs NO outbound network: plain http to a loopback listener this test binds
+    /// itself, ACCEPTED and then answered with nothing - the blackhole shape without
+    /// the blackhole, so only the client's own timeout can end the request.
+    ///
+    /// It DOES need a constructible HTTP client, which the certless nix build
+    /// sandbox cannot give: reqwest's rustls platform verifier has no roots to load
+    /// there, so `Client::builder().build()` fails and `connect` returns Init before
+    /// any URL is touched (verified: the sandbox reports `builder error`). That is
+    /// the same environmental bar `handler_with_null_player` skips on, so this test
+    /// skips on exactly that ONE condition - a client that BUILDS and is not bounded
+    /// still fails. The devshell `cargo test --workspace` gate is where it bites.
+    ///
+    /// The clock is PAUSED, so the 15s bound is observed in virtual time (tokio
+    /// auto-advances while the runtime is idle) and the test costs milliseconds. The
+    /// outer guard turns a regression into a FAILURE rather than a hung harness.
+    #[tokio::test(start_paused = true)]
+    async fn ping_is_bounded_when_the_server_accepts_and_then_answers_nothing() {
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1".into(),
+            username: "u".into(),
+            password: "p".into(),
+            client_name: "hypodj-test".into(),
+        };
+        if let Err(e) = SubsonicClient::connect(&cfg) {
+            eprintln!("skipping: no HTTP client is constructible here ({e})");
+            return;
+        }
+
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        // Accept and HOLD every connection: an open socket that never replies. If
+        // the streams were dropped the peer would see EOF and fail early, proving
+        // nothing about the timeout.
+        let sink = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let client = SubsonicClient::connect(&ServerConfig { url: format!("http://{addr}"), ..cfg })
+            .expect("connect builds the bounded client");
+        let guard = METADATA_REQUEST_TIMEOUT * 4;
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(guard, client.ping()).await;
+        let waited = started.elapsed();
+        sink.abort();
+
+        match outcome {
+            Ok(Err(_)) => {}
+            Ok(Ok(())) => panic!("a server that never answers cannot ping successfully"),
+            Err(_) => panic!(
+                "ping() outlasted {guard:?} against a socket that accepts and never answers: the metadata client is NOT bounded (is `with_http_client` still wired into connect?)"
+            ),
+        }
+        assert!(
+            waited <= METADATA_REQUEST_TIMEOUT,
+            "the failure must land ON the configured bound, not somewhere past it (waited {waited:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn ping_surfaces_a_refused_connection_as_a_transient_error() {
+        // Wiring proof for the injected client: a request through it still reports
+        // failures as ordinary transient errors (what the daemon's greet warns on
+        // and continues past), rather than panicking or reporting NotFound. Port 1
+        // on loopback is unbindable by any normal process, so this is an instant
+        // local ECONNREFUSED - no network and no wall-clock wait.
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1".into(),
+            username: "u".into(),
+            password: "p".into(),
+            client_name: "hypodj-test".into(),
+        };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return;
+            }
+        };
+        match client.ping().await {
+            Err(SubsonicError::Request(_)) => {}
+            other => panic!("a refused port must be a transient Request error, got {other:?}"),
+        }
     }
 
     #[test]

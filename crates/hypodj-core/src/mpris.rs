@@ -498,6 +498,10 @@ mod tests {
             user_rating: None,
             composer: None,
             performer: None,
+            size: None,
+            suffix: None,
+            content_type: None,
+            created: None,
         }
     }
 
