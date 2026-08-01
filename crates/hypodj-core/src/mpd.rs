@@ -257,6 +257,15 @@ pub enum MpdCommand {
     /// extension. See [`ContinuationCmd`] and [`parse_continuation`].
     Continuation(ContinuationCmd),
 
+    /// `radio [this|random|song/<id>|album/<id>|artist/<id>]` / `radio on|off|status` -
+    /// START an ENDLESS radio from a thing. The bare form ACTS (it is a TRANSPORT verb,
+    /// like `identify`, not a state verb like `continuation`): it puts the pointed-at
+    /// thing on the deck, plays it, and hands the drain edge to the SAME autofill walk
+    /// `continuation mode = autofill` already runs - so there is one engine, entered by
+    /// a gesture instead of only by running out of music. NOT a standard MPD command; a
+    /// hypodj extension. See [`RadioCmd`], [`RadioSeed`] and [`parse_radio`].
+    Radio(RadioCmd),
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
@@ -271,6 +280,36 @@ pub enum ContinuationCmd {
     Off,
     /// `continuation` / `continuation status` - report the live toggle + station.
     Status,
+}
+
+/// A parsed `radio` subcommand (the seeded endless-radio gesture).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RadioCmd {
+    /// `radio` / `radio this|random|<uri>` - START the walk from a thing.
+    Start(RadioSeed),
+    /// `radio on` / `radio 1` - ARM the walk only: no fetch, no queue change ("keep
+    /// going from what I already queued").
+    On,
+    /// `radio off` / `radio 0` - disarm, and restore the CONFIGURED continuation mode.
+    Off,
+    /// `radio status` - report the live arm + mode + the seed the walk would use.
+    Status,
+}
+
+/// What a `radio` start seeds FROM. Deliberately tiny: one seed per gesture, mirroring
+/// [`parse_continuation`]'s arity discipline (at most one argument, anything else a loud
+/// [`MpdCommand::Unsupported`] rather than a silently wrong start).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RadioSeed {
+    /// `radio` / `radio this` - what is playing, or what just finished (the handler's
+    /// existing recency seed ladder). A track already playing is NEVER restarted.
+    Current,
+    /// `radio random` - one random library track, the cold-start door for an empty deck.
+    Random,
+    /// `radio song/<id>` / `radio album/<id>` / `radio artist/<id>` - an explicit thing.
+    /// The prefix set is whitelisted at PARSE time so a typo is a loud ACK, never a
+    /// resolve attempt against a uri shape the verb does not serve.
+    Uri(String),
 }
 
 /// A parsed `field` subcommand (the latent-field first-slice surface).
@@ -306,6 +345,39 @@ fn parse_continuation(args: &[String], line: &str) -> MpdCommand {
         Some("off") | Some("0") => MpdCommand::Continuation(ContinuationCmd::Off),
         _ => MpdCommand::Unsupported(line.to_string()),
     }
+}
+
+/// Parse a `radio` request - the seeded endless-radio gesture. At most ONE argument
+/// (the same arity discipline as [`parse_continuation`]): `radio` alone ACTS, starting
+/// from what is playing / just finished, because this is a TRANSPORT verb whose bare
+/// form must mean the right thing on a daily-use CLI (`dj radio`); `this` is its
+/// explicit synonym. `on`/`off` arm and disarm, `status` reports, and a `song/`,
+/// `album/` or `artist/` uri names the thing explicitly. Every other keyword, every
+/// other uri shape, and any second argument is a loud (no-op-safe)
+/// [`MpdCommand::Unsupported`] ACK rather than a silently wrong start.
+fn parse_radio(args: &[String], line: &str) -> MpdCommand {
+    if args.len() > 1 {
+        return MpdCommand::Unsupported(line.to_string());
+    }
+    match args.first().map(|s| s.as_str()) {
+        None | Some("this") => MpdCommand::Radio(RadioCmd::Start(RadioSeed::Current)),
+        Some("random") => MpdCommand::Radio(RadioCmd::Start(RadioSeed::Random)),
+        Some("on") | Some("1") => MpdCommand::Radio(RadioCmd::On),
+        Some("off") | Some("0") => MpdCommand::Radio(RadioCmd::Off),
+        Some("status") => MpdCommand::Radio(RadioCmd::Status),
+        Some(u) if is_radio_seed_uri(u) => {
+            MpdCommand::Radio(RadioCmd::Start(RadioSeed::Uri(u.to_string())))
+        }
+        _ => MpdCommand::Unsupported(line.to_string()),
+    }
+}
+
+/// The uri shapes `radio <uri>` seeds from. Whitelisted (not a catch-all) so a typo
+/// (`radio wat`) and a shape the verb cannot serve (`radio list/newest`, a raw stream
+/// URL) both ACK loudly at parse time instead of reaching a resolver that would only
+/// discover the problem after a network round trip.
+fn is_radio_seed_uri(s: &str) -> bool {
+    s.starts_with("song/") || s.starts_with("album/") || s.starts_with("artist/")
 }
 
 /// Parse a `field` request. `field` alone reads the field; the reserved keywords
@@ -1162,6 +1234,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "field" => parse_field(&args, line),
         "identify" => MpdCommand::Identify,
         "continuation" => parse_continuation(&args, line),
+        "radio" => parse_radio(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -1246,6 +1319,43 @@ mod parse_tests {
         assert!(matches!(parse("continuation 0"), MpdCommand::Continuation(ContinuationCmd::Off)));
         // A garbage arg is an Unsupported ACK, never a silent wrong toggle.
         assert!(matches!(parse("continuation maybe"), MpdCommand::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_radio_seeds_toggle_and_status() {
+        // The bare form ACTS (transport verb): it starts from what is playing / just
+        // finished, and `this` is its explicit synonym.
+        assert!(matches!(parse("radio"), MpdCommand::Radio(RadioCmd::Start(RadioSeed::Current))));
+        assert!(matches!(parse("radio this"), MpdCommand::Radio(RadioCmd::Start(RadioSeed::Current))));
+        assert!(matches!(parse("radio random"), MpdCommand::Radio(RadioCmd::Start(RadioSeed::Random))));
+        // The three explicit seed shapes keep their uri verbatim.
+        assert!(matches!(
+            parse("radio song/s1"),
+            MpdCommand::Radio(RadioCmd::Start(RadioSeed::Uri(u))) if u == "song/s1"
+        ));
+        assert!(matches!(
+            parse("radio album/a1"),
+            MpdCommand::Radio(RadioCmd::Start(RadioSeed::Uri(u))) if u == "album/a1"
+        ));
+        assert!(matches!(
+            parse("radio artist/ar1"),
+            MpdCommand::Radio(RadioCmd::Start(RadioSeed::Uri(u))) if u == "artist/ar1"
+        ));
+        // Arm / disarm / report.
+        assert!(matches!(parse("radio on"), MpdCommand::Radio(RadioCmd::On)));
+        assert!(matches!(parse("radio 1"), MpdCommand::Radio(RadioCmd::On)));
+        assert!(matches!(parse("radio off"), MpdCommand::Radio(RadioCmd::Off)));
+        assert!(matches!(parse("radio 0"), MpdCommand::Radio(RadioCmd::Off)));
+        assert!(matches!(parse("radio status"), MpdCommand::Radio(RadioCmd::Status)));
+        // A typo, a uri shape the verb cannot serve, and a raw stream URL are all loud
+        // Unsupported ACKs, never a silently wrong start.
+        assert!(matches!(parse("radio wat"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("radio list/newest"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("radio http://example.org/s"), MpdCommand::Unsupported(_)));
+        // ARITY: at most one argument (the parse_continuation discipline).
+        assert!(matches!(parse("radio song/s1 song/s2"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("radio on off"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("radio something jazzy please"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

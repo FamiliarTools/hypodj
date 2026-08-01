@@ -164,6 +164,12 @@ fn route_one(verb: &str, args: &[String]) -> Action {
         // Favoriting is a first-class server feature (Subsonic Starred); expose the
         // natural bare verbs. Resolved against the current track by the CLI.
         "fav" | "favorite" | "favourite" | "star" => Action::FavoriteCurrent,
+        // Endless radio from what is playing. A TRANSPORT verb whose bare form ACTS
+        // (like `identify`, unlike the state verbs), and the DAEMON resolves the seed
+        // from what is playing / just finished - so the client needs no `currentsong`
+        // round trip and `radio` means the same thing here, on the TUI `:` line, and
+        // in raw ncmpcpp.
+        "radio" => Action::Command("radio".into()),
         "clear" => Action::ClearConfirm,
         "help" => Action::Help,
         // vol/volume alone (no scalar) is under-specified -> NL.
@@ -198,6 +204,15 @@ fn route_two(verb: &str, arg: &str, args: &[String]) -> Action {
         "fav" | "favorite" | "favourite" | "star" if is_filler_noun(arg) => {
             Action::FavoriteCurrent
         }
+        // The radio keywords the daemon's parser accepts, passed through verbatim.
+        // A seed URI is deliberately NOT routed here: `radio song/<id>` is a machine
+        // gesture the TUI emits as a raw command line, not something typed at the CLI.
+        "radio" if matches!(arg, "on" | "off" | "random" | "status") => {
+            Action::Command(format!("radio {arg}"))
+        }
+        // "radio this", "radio it", "radio current" - the natural phrasings of the
+        // bare gesture, which the daemon spells `radio this`.
+        "radio" if is_filler_noun(arg) => Action::Command("radio this".into()),
         // Any other two-token phrase (including "play something") is NL.
         _ => Action::Nl(args.join(" ")),
     }
@@ -361,6 +376,32 @@ mod tests {
         // A real target is NOT an identify phrase -> stays NL.
         assert_eq!(r("what is this jazz"), Action::Nl("what is this jazz".into()));
         assert_eq!(r("identify miles davis"), Action::Nl("identify miles davis".into()));
+    }
+
+    #[test]
+    fn route_radio_bare_acts_and_keywords_pass_through() {
+        // The bare verb ACTS: the daemon resolves the seed from what is playing / just
+        // finished, so the CLI needs no currentsong round trip and no new Action.
+        assert_eq!(r("radio"), Action::Command("radio".into()));
+        // The keywords the daemon's parser accepts.
+        assert_eq!(r("radio random"), Action::Command("radio random".into()));
+        assert_eq!(r("radio on"), Action::Command("radio on".into()));
+        assert_eq!(r("radio off"), Action::Command("radio off".into()));
+        assert_eq!(r("radio status"), Action::Command("radio status".into()));
+        // The natural phrasings of the bare gesture collapse to `radio this`.
+        assert_eq!(r("radio this"), Action::Command("radio this".into()));
+        assert_eq!(r("radio it"), Action::Command("radio this".into()));
+        assert_eq!(r("radio current"), Action::Command("radio this".into()));
+        assert_eq!(r("radio song"), Action::Command("radio this".into()));
+        // A real target is NOT the bare gesture - it stays NL rather than silently
+        // starting a radio from the wrong thing (the play-something-calmer trap).
+        assert_eq!(r("radio jazz"), Action::Nl("radio jazz".into()));
+        assert_eq!(
+            r("radio something jazzy"),
+            Action::Nl("radio something jazzy".into())
+        );
+        // Nothing else regressed into the radio arm.
+        assert_eq!(r("next"), Action::Command("next".into()));
     }
 
     #[test]

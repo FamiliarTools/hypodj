@@ -959,6 +959,10 @@ mod tests {
         // derived from keymap::grouped (so the overlay can never drift).
         assert!(out.contains("View"), "group header rendered:\n{out}");
         assert!(out.contains("play / pause"), "a keymap help line rendered:\n{out}");
+        assert!(
+            out.contains("endless radio from this row"),
+            "the radio gesture is discoverable in the overlay:\n{out}"
+        );
         assert!(out.contains("quit"), "quit binding rendered:\n{out}");
         assert!(out.contains("Help - keys"), "overlay titled:\n{out}");
     }
@@ -1434,6 +1438,55 @@ mod tests {
         s.now.continuation = None;
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(!out.contains("then:"), "no tail hint when continuation is disarmed:\n{out}");
+    }
+
+    #[test]
+    fn pressing_r_draws_its_own_confirmation_at_60x24() {
+        // A successful `Req::Command` produces no banner (worker.rs banners only
+        // ACKs), so the gesture's ONLY immediate feedback is the status line it sets
+        // itself. Prove it actually lands on the smallest supported surface.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Queue;
+        s.queue = vec![hypodj_client::model::QueueItem {
+            pos: 0,
+            title: "Roygbiv".into(),
+            artist: None,
+            uri: Some("song/9".into()),
+            album_uri: None,
+        }];
+        let intent = s.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(
+            intent,
+            Some(crate::state::Intent::Command("radio song/9".into())),
+        );
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("radio from Roygbiv"), "the gesture says what it did:\n{out}");
+        // An unseedable row draws its REASON on the same line, never nothing.
+        s.queue[0].uri = Some("http://stream.example/live".into());
+        assert_eq!(s.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)), None);
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("can't start a radio"), "the reason is visible:\n{out}");
+    }
+
+    #[test]
+    fn an_armed_walk_renders_its_seed_as_the_tail_hint_at_60x24() {
+        // The STANDING confirmation (the status line is gone on the next keypress):
+        // an armed autofill walk emits `X-hypodj-continuation-station: more like
+        // <seed>` with no station configured, which the existing tail hint renders
+        // with zero client change. Pinned at the smallest supported surface.
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Queue;
+        s.queue = vec![hypodj_client::model::QueueItem {
+            pos: 0,
+            title: "Roygbiv".into(),
+            artist: None,
+            uri: Some("song/9".into()),
+            album_uri: None,
+        }];
+        s.now.continuation = Some("more like Roygbiv".into());
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("then: more like"), "the walk is visible in the queue:\n{out}");
     }
 
     #[test]

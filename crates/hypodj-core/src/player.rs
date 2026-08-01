@@ -519,7 +519,19 @@ impl NullPlayer {
         Self::spawn_inner(
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            false,
         )
+    }
+
+    /// TEST-ONLY: spawn an actor whose LOADS always fail, so a handler test can drive
+    /// the by-stable-id batch ROLLBACK legs (`radio <thing>` and the autofill refill both
+    /// promise the user's queue is never collateral damage when the first appended song
+    /// will not load). The ordinary [`Self::spawn`] can never fail a load, which is
+    /// exactly why those legs would otherwise be untestable.
+    #[cfg(test)]
+    pub(crate) fn spawn_failing() -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
+        Self::spawn_inner(None, true)
     }
 
     /// TEST-ONLY: spawn with a shared [`WarmProbe`] so a handler test can observe
@@ -528,12 +540,13 @@ impl NullPlayer {
     pub(crate) fn spawn_with_probe(
     ) -> (PlayerHandle, mpsc::Receiver<PlayerEvent>, std::sync::Arc<WarmProbe>) {
         let probe = std::sync::Arc::new(WarmProbe::default());
-        let (h, rx) = Self::spawn_inner(Some(probe.clone()));
+        let (h, rx) = Self::spawn_inner(Some(probe.clone()), false);
         (h, rx, probe)
     }
 
     fn spawn_inner(
         #[cfg(test)] probe: Option<std::sync::Arc<WarmProbe>>,
+        #[cfg(test)] fail_loads: bool,
     ) -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<PlayerCommand>(32);
         let (state_tx, state_rx) = watch::channel(PlayState::Stopped);
@@ -551,6 +564,16 @@ impl NullPlayer {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     PlayerCommand::PlayUrl { song, queue_id, url: _, local, reply } => {
+                        // A scripted load failure: nothing becomes current, no state
+                        // change, no event - exactly what a dead file / 404 looks like
+                        // to the handler, which is what the rollback legs react to.
+                        #[cfg(test)]
+                        if fail_loads {
+                            let _ = reply.send(Err(PlayerError::Backend(
+                                "test player: load always fails".into(),
+                            )));
+                            continue;
+                        }
                         current = song.clone();
                         current_qid = queue_id;
                         current_local = local;

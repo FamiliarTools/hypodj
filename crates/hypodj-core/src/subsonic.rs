@@ -708,7 +708,7 @@ impl SubsonicClient {
     // The CORE Subsonic Internet Radio endpoints (getInternetRadioStations /
     // createInternetRadioStation / updateInternetRadioStation /
     // deleteInternetRadioStation), NOT the synthetic algorithmic `Radio` browse
-    // dir the handler keeps for random/similar/top. `SubsonicClient` stays the one
+    // dir the handler keeps for random. `SubsonicClient` stays the one
     // file that touches the opensubsonic wire types; each wire
     // `data::InternetRadioStation` is decomposed to our `Station` at this boundary.
 

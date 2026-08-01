@@ -42,6 +42,8 @@ daemon's idle-push socket with worker-thread IO so the UI never blocks on networ
   natural-language Claude Code DJ pane beside the queue (shown above)
 - Vim-like navigation: `j`/`k`, `g`/`G`, scrolloff; `Shift`+`P` jumps the Queue
   cursor to the currently-playing song
+- `r` starts an endless radio from the row under the cursor - a song, an album, an
+  artist, anywhere including the search hits - and the queue keeps refilling itself
 - `/` incremental search with `n`/`N` match cycling and matched-substring highlight
 - `:` command line - verbs plus natural language with echo-before-arm confirm
 - Physical-potentiometer volume knob: perceptual dB detents, off-click pause
@@ -51,7 +53,9 @@ daemon's idle-push socket with worker-thread IO so the UI never blocks on networ
 
 Pure MPD/TCP, no libmpv. Bare `dj` prints a now-playing card; `dj next`,
 `dj pause`, `dj vol 40` are quick verbs; anything else is natural language with
-the same echo-before-arm confirm: `dj "play something calmer"`.
+the same echo-before-arm confirm: `dj "play something calmer"`. `dj radio` starts
+the endless radio from whatever is playing (`dj radio random` from cold, `dj radio
+off` to stop).
 
 Any stock MPD client (ncmpcpp, mpc) also works unchanged against the daemon.
 
@@ -60,8 +64,9 @@ Any stock MPD client (ncmpcpp, mpc) also works unchanged against the daemon.
 | Area | What |
 | --- | --- |
 | MPD server | Hand-rolled TCP server: full ncmpcpp command surface, `idle` push, binary `albumart`/`readpicture`, `sticker` ratings, `find`/`search`, playlists |
-| Library | OpenSubsonic browse/search3, smart album lists, genres, radio/similar, first-class favorites (songs / albums / artists), scrobbling, TTL+LRU listing cache |
+| Library | OpenSubsonic browse/search3, smart album lists, genres, first-class favorites (songs / albums / artists), scrobbling, TTL+LRU listing cache |
 | Playback | libmpv actor; startle-safe fades on pause/resume/skip; graduated + humanized absolute volume; sleep / wind-down / wake; smooth restart |
+| Endless radio | `radio` starts a never-ending radio from a thing (`radio`, `radio random`, `radio song/<id>`, `radio album/<id>`, `radio artist/<id>`): it plays what you pointed at - bare `radio` picks the deck up where it stands (resumes a paused one, starts a stopped one, never restarts what is already playing) - prefetches one batch of similar library tracks behind it, and hands the end-of-queue edge to the continuation walk, which re-seeds from what just played and so keeps moving through your own library. `radio on` arms the walk without touching the queue; `radio off` disarms and restores the configured continuation mode |
 | Intent | Deterministic capability core + typed Plan IR; the NL front-end (rules-first, optional local model) only ever emits a validated plan |
 | Desktop | MPRIS, so GNOME media controls work |
 

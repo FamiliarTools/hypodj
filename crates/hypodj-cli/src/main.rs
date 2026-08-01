@@ -22,6 +22,8 @@ USAGE:
   dj play | pause | stop  playback control
   dj next | prev          skip / go back (also \"next song\", \"skip this\")
   dj fav | favorite       favorite the current track (also \"fav current\")
+  dj radio                endless radio from what is playing; it keeps going
+                           (\"radio random\" to start cold, \"radio off\" to stop)
   dj vol <0-100>          set volume
   dj clear                clear the queue (asks first)
   dj <anything else>      natural language: e.g. \"fade out\", \"stop after this

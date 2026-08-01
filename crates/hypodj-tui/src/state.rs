@@ -349,10 +349,12 @@ fn seekcur_delta(line: &str) -> Option<i32> {
 
 /// Coalesce a frame's drained intents so a burst of held-key autorepeat collapses
 /// into ONE real action instead of a backlog. Consecutive relative scrubs
-/// (`seekcur +/-N`) SUM into a single seek; everything else passes through in
-/// order. This is what makes holding a key track the finger and stop the instant
-/// it is released - the loop then applies the REAL summed effect (no faked UI
-/// preview, no queued backlog draining after release). Pure and testable.
+/// (`seekcur +/-N`) SUM into a single seek; a run of IDENTICAL `radio` lines
+/// collapses to one (holding `r` is one gesture, not forty - and unlike `>`/next,
+/// repeating it says nothing new); everything else passes through in order. This is
+/// what makes holding a key track the finger and stop the instant it is released -
+/// the loop then applies the REAL summed effect (no faked UI preview, no queued
+/// backlog draining after release). Pure and testable.
 pub fn coalesce_intents(intents: Vec<Intent>) -> Vec<Intent> {
     let mut out: Vec<Intent> = Vec::new();
     let mut scrub: i32 = 0;
@@ -360,6 +362,10 @@ pub fn coalesce_intents(intents: Vec<Intent>) -> Vec<Intent> {
         if let Intent::Command(line) = &it {
             if let Some(d) = seekcur_delta(line) {
                 scrub = scrub.saturating_add(d);
+                continue;
+            }
+            // A repeat of the SAME radio gesture in one frame is the same press.
+            if line.starts_with("radio") && out.last() == Some(&it) {
                 continue;
             }
         }
@@ -813,6 +819,10 @@ impl TuiState {
             // Scrub the current track (relative seekcur).
             Act::ScrubFwd => Some(Intent::Command(format!("seekcur +{SCRUB_STEP}"))),
             Act::ScrubBack => Some(Intent::Command(format!("seekcur -{SCRUB_STEP}"))),
+            // `r` starts an ENDLESS radio from the selected row (the daemon resolves a
+            // bare `radio` from what is playing, so an unseedable screen still has a
+            // meaning - but never a silent one; see `radio_selected`).
+            Act::Radio => self.radio_selected(),
             // `s` stars the SELECTED row; C-s stars the CURRENT playing track.
             Act::FavSelected => self.favorite_selected(),
             Act::FavCurrent => self.favorite_current(),
@@ -1011,6 +1021,82 @@ impl TuiState {
             }
             None => None,
         }
+    }
+
+    /// `r`: start an ENDLESS radio from the SELECTED row - the thing under the cursor
+    /// plays, and the daemon's continuation walk owns the end of the queue from then
+    /// on. Mirrors `favorite_selected` in acting on the cursor rather than on the
+    /// current track, so a radio can be started from anything the eye is on.
+    ///
+    /// Every screen answers: a seedable row emits `radio <uri>`, an unseedable one
+    /// (a playlist name, a smart-list dir, a stream) says WHY in the status line, and
+    /// an empty list says there is nothing here - the key is never silently dead.
+    fn radio_selected(&mut self) -> Option<Intent> {
+        // The Find HIT list is not a `Browse`, so it must be claimed BEFORE any
+        // `active_browse()` consultation (which returns None off-drill and would fall
+        // through to the QUEUE row while the visible list sat still). All three hit
+        // kinds are valid seeds - this is also the artist row's first working action,
+        // since `enqueue_uri` rejects `artist/<id>` outright.
+        if self.screen == Screen::Find && !self.find.drilling {
+            let Some(row) = self.find.current_row() else {
+                self.status_msg = Some("nothing here to start a radio from".into());
+                return None;
+            };
+            let (uri, label) = (row.uri.clone(), row.label.clone());
+            return self.radio_from_uri(&uri, &label);
+        }
+        match self.screen {
+            // The DJ ask line owns every printable key, so `r` is text there and never
+            // reaches dispatch; unreachable rather than meaningful.
+            Screen::Dj => None,
+            // A Playlists row is a NAME, not a uri (see `BrowseRow::uri`), so there is
+            // no id to seed a radio from.
+            Screen::Playlists => {
+                self.status_msg = Some("can't start a radio from a playlist".into());
+                None
+            }
+            // Albums, and a Find drill, are real browse lists keyed by uri.
+            Screen::Albums | Screen::Find => {
+                let Some(b) = self.active_browse() else { return None };
+                let Some(row) = b.rows.get(b.selected) else {
+                    self.status_msg = Some("nothing here to start a radio from".into());
+                    return None;
+                };
+                let (uri, label) = (row.uri.clone(), row.label.clone());
+                self.radio_from_uri(&uri, &label)
+            }
+            Screen::Queue => {
+                let Some(it) = self.queue.get(self.selected) else {
+                    self.status_msg = Some("nothing here to start a radio from".into());
+                    return None;
+                };
+                let (uri, label) = (it.uri.clone(), it.title.clone());
+                match uri {
+                    Some(uri) => self.radio_from_uri(&uri, &label),
+                    None => None,
+                }
+            }
+        }
+    }
+
+    /// The ONE uri gate behind `r`: the daemon's `radio` verb seeds from `song/`,
+    /// `album/` and `artist/` and parse-ACKs everything else, so the client whitelists
+    /// the same three shapes and turns every other row into a reason rather than an
+    /// ACK banner. The status line is the instant feedback; the standing confirmation
+    /// is the `then: more like <seed>` queue-tail hint the armed walk emits.
+    fn radio_from_uri(&mut self, uri: &str, label: &str) -> Option<Intent> {
+        if uri.starts_with("song/") || uri.starts_with("album/") || uri.starts_with("artist/") {
+            self.status_msg = Some(format!("radio from {label}"));
+            return Some(Intent::Command(format!("radio {uri}")));
+        }
+        self.status_msg = Some(if uri.starts_with("list/") {
+            "can't start a radio from a list".into()
+        } else if uri.contains("://") {
+            "that row is a stream, can't start a radio".into()
+        } else {
+            "can't start a radio from that row".into()
+        });
+        None
     }
 
     /// Space: enqueue the selected browse row (no play) and advance the cursor one
@@ -1553,6 +1639,25 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_collapses_a_held_radio_burst_to_one_gesture() {
+        // `r` is a GLOBAL auto-repeating binding: resting a finger on it delivers a
+        // Repeat stream, and every one of those would otherwise be a separate seed
+        // resolve on the daemon. Holding it is ONE press.
+        let batch = (0..8).map(|_| cmd("radio song/abc")).collect();
+        assert_eq!(coalesce_intents(batch), vec![cmd("radio song/abc")]);
+        // Two DIFFERENT radio gestures are two gestures, and a repeat that resumes
+        // after another action is a new press, not a duplicate to swallow.
+        let batch = vec![cmd("radio song/a"), cmd("radio song/b"), cmd("next"), cmd("radio song/b")];
+        assert_eq!(
+            coalesce_intents(batch),
+            vec![cmd("radio song/a"), cmd("radio song/b"), cmd("next"), cmd("radio song/b")],
+        );
+        // And a held `>` still means N skips - only radio is idempotent.
+        let batch = vec![cmd("next"), cmd("next")];
+        assert_eq!(coalesce_intents(batch), vec![cmd("next"), cmd("next")]);
+    }
+
+    #[test]
     fn wake_gate_collapses_a_storm_to_one_refresh() {
         // First wake with nothing in flight -> start a refresh.
         assert!(wake_wants_refresh(false));
@@ -1685,6 +1790,136 @@ mod tests {
 
 
 
+
+    #[test]
+    fn radio_starts_from_every_row_kind_that_has_an_id() {
+        use crate::find::{FindKind, FindRow, Focus};
+        let hit = |kind: FindKind, label: &str, uri: &str| FindRow {
+            kind,
+            label: label.into(),
+            uri: uri.into(),
+            trailer: String::new(),
+            song_count: None,
+            album_uri: None,
+        };
+        // The Find HIT list: all three kinds seed. The ARTIST row's first working
+        // action - Enter emits an Enqueue the daemon rejects outright.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![
+            hit(FindKind::Artist, "El Waili", "artist/a1"),
+            hit(FindKind::Album, "Volume Alpha", "album/b1"),
+            hit(FindKind::Song, "Sweden", "song/s1"),
+        ];
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio artist/a1")));
+        assert_eq!(s.status_msg.as_deref(), Some("radio from El Waili"));
+        s.find.selected = 1;
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio album/b1")));
+        s.find.selected = 2;
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio song/s1")));
+
+        // A Find DRILL row is an ordinary browse row and seeds the same way.
+        s.find.drilling = true;
+        s.find.drill.rows = vec![brow("Sweden", "song/s9", false)];
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio song/s9")));
+
+        // Albums: an album dir row and a song row both seed.
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        s.albums.rows = vec![brow("Volume Alpha", "album/b1", true), brow("Sweden", "song/s1", false)];
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio album/b1")));
+        s.albums.selected = 1;
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio song/s1")));
+
+        // Queue: the row under the cursor, never the playing track.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1)]);
+        s.selected = 1;
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio song/1")));
+    }
+
+    #[test]
+    fn radio_on_an_unseedable_row_says_why_instead_of_acting() {
+        // A row with no library id must never emit a command the daemon would ACK, and
+        // must never be a dead key either: each case states its own reason.
+        let mut s = TuiState::new();
+        // Albums: a smart-list dir row has no id to seed from.
+        s.screen = Screen::Albums;
+        s.albums.rows = vec![brow("newest", "list/newest", true)];
+        assert_eq!(s.handle_key(ch('r')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("can't start a radio from a list"));
+        // Queue: a stream row.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0)]);
+        s.queue[0].uri = Some("http://stream.example/live".into());
+        assert_eq!(s.handle_key(ch('r')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("that row is a stream, can't start a radio"));
+        // Playlists: the row is a NAME, not a uri.
+        let mut s = TuiState::new();
+        s.screen = Screen::Playlists;
+        s.playlists.rows = vec![brow("Starred", "Starred", false)];
+        assert_eq!(s.handle_key(ch('r')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("can't start a radio from a playlist"));
+        // An empty list still answers rather than feeling dead.
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ch('r')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("nothing here to start a radio from"));
+    }
+
+    #[test]
+    fn radio_over_the_find_hits_never_moves_the_queue_cursor() {
+        // THE per-screen-helper trap: the hit list is not a `Browse`, so a resolver
+        // that consulted active_browse() first would fall through to the QUEUE row and
+        // start a radio from something the user is not even looking at.
+        use crate::find::{FindKind, FindRow, Focus};
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1)]);
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![FindRow {
+            kind: FindKind::Song,
+            label: "Sweden".into(),
+            uri: "song/s1".into(),
+            trailer: String::new(),
+            song_count: None,
+            album_uri: None,
+        }];
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio song/s1")), "the HIT row, not song/0");
+        assert_eq!(s.selected, 0, "and the queue cursor never moved");
+    }
+
+    #[test]
+    fn r_is_a_letter_on_an_input_line_never_a_gesture() {
+        // On the Find query line and the DJ ask line `r` is text a user is typing; the
+        // route to the verb from there is the `:`/ask line itself.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        assert_eq!(s.handle_key(ch('r')), None);
+        assert_eq!(s.find.query, "r");
+        let mut s = TuiState::new();
+        s.screen = Screen::Dj;
+        assert_eq!(s.handle_key(ch('r')), None);
+        assert_eq!(s.dj_input, "r");
+        // And a confirm popup still only answers y/N (never a radio behind the modal).
+        let mut s = TuiState::new();
+        s.enter_confirm(Pending { command: Some("clear".into()), ..Default::default() });
+        assert_eq!(s.handle_key(ch('r')), None);
+        assert_eq!(s.mode, Mode::Confirm);
+    }
+
+    #[test]
+    fn the_colon_line_routes_radio_through_the_shared_router() {
+        // One routing source with the CLI: `:radio` is the bare gesture, and the
+        // keywords pass through verbatim.
+        let mut s = TuiState::new();
+        s.mode = Mode::Command;
+        s.input = "radio".into();
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(cmd("radio")));
+        s.mode = Mode::Command;
+        s.input = "radio off".into();
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(cmd("radio off")));
+    }
 
     #[test]
     fn a_lost_connection_stops_the_find_spinner_but_keeps_the_hits() {

@@ -53,6 +53,15 @@ pub struct ResumeState {
     /// on upgrade, and startle-safe (default false = today's silent-stop behavior).
     #[serde(default)]
     pub continuation: bool,
+    /// Whether the armed continuation is the library WALK (`continuation.mode =
+    /// autofill`, or a `radio <thing>` gesture that forced it at runtime) rather than
+    /// the station handoff. Persisted for the same reason the toggle beside it is: an
+    /// armed walk that came back as an armed RADIO with no station configured would be
+    /// armed into silence. `#[serde(default)]` so a pre-radio resume.toml (which lacks
+    /// the key) loads cleanly with the walk off - no schema bump, no cold start on
+    /// upgrade, and the configured mode then stands unchanged.
+    #[serde(default)]
+    pub continuation_walk: bool,
 }
 
 /// One persisted queue entry. Internally tagged (`kind = "song" | "stream"`) so
@@ -253,6 +262,7 @@ mod tests {
             playlist_version: 9,
             saved_at_unix: 1_700_000_000,
             continuation: true,
+            continuation_walk: false,
         }
     }
 
@@ -294,6 +304,23 @@ mod tests {
         let raw = "schema_version = 1\nelapsed_secs = 0.0\nvolume = 50\nplaylist_version = 0\nsaved_at_unix = 0\nplay_state = \"stopped\"\ncurrent = 0\nqueue = []\n";
         let s = from_toml(raw).expect("pre-continuation file still parses");
         assert!(!s.continuation, "the missing toggle defaults OFF");
+    }
+
+    #[test]
+    fn continuation_walk_round_trips_and_defaults_off_on_upgrade() {
+        // The persisted MODE round-trips, so an armed WALK comes back a walk instead of
+        // an armed station handoff with no station (armed into silence).
+        let mut s = sample_state();
+        s.continuation_walk = true;
+        let back = from_toml(&to_toml(&s)).expect("round-trips");
+        assert_eq!(s, back);
+        assert!(back.continuation_walk, "the walk survives the restart");
+        // A resume.toml written BEFORE this key existed still loads - no schema bump,
+        // no cold start on upgrade - with the walk off, so the configured mode stands.
+        let raw = "schema_version = 1\nelapsed_secs = 0.0\nvolume = 50\nplaylist_version = 0\nsaved_at_unix = 0\nplay_state = \"stopped\"\ncurrent = 0\ncontinuation = true\nqueue = []\n";
+        let old = from_toml(raw).expect("pre-radio file still parses");
+        assert!(old.continuation, "the toggle it DID carry is read");
+        assert!(!old.continuation_walk, "the missing mode defaults to the station handoff");
     }
 
     #[test]

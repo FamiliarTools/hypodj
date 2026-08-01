@@ -47,6 +47,7 @@ pub enum Act {
     Prev,
     ScrubFwd,
     ScrubBack,
+    Radio,
     FavSelected,
     FavCurrent,
     PlaySel,
@@ -165,6 +166,7 @@ pub const KEYMAP: &[Binding] = &[
     Binding { matchers: &[Char('<')], keys: "<", group: Playback, scope: Scope::Global, act: Prev, help: "previous track" },
     Binding { matchers: &[Ctrl('f')], keys: "C-f", group: Playback, scope: Scope::Global, act: ScrubFwd, help: "scrub forward 5s" },
     Binding { matchers: &[Ctrl('b')], keys: "C-b", group: Playback, scope: Scope::Global, act: ScrubBack, help: "scrub back 5s" },
+    Binding { matchers: &[Char('r')], keys: "r", group: Playback, scope: Scope::Global, act: Radio, help: "endless radio from this row" },
     // Volume.
     Binding { matchers: &[Char('0'), Char('+'), Char('=')], keys: "0 / + / =", group: Volume, scope: Scope::Global, act: VolumeUp, help: "turn the knob up" },
     Binding { matchers: &[Char('9'), Char('-'), Char('_')], keys: "9 / - / _", group: Volume, scope: Scope::Global, act: VolumeDown, help: "turn the knob down" },
@@ -260,6 +262,23 @@ mod tests {
     }
 
     #[test]
+    fn no_two_rows_claim_the_same_matcher() {
+        // match_key returns the FIRST matching row, so a duplicated matcher would make
+        // one binding permanently unreachable - silently, since the round-trip test
+        // only checks that each matcher resolves to SOME row's Act. Adding a row for an
+        // already-taken key (the `r` question) is caught here.
+        let mut seen: Vec<(KeyMatch, Act)> = Vec::new();
+        for b in KEYMAP {
+            for m in b.matchers {
+                if let Some((_, other)) = seen.iter().find(|(k, _)| k == m) {
+                    panic!("matcher {m:?} is claimed by both {other:?} and {:?}", b.act);
+                }
+                seen.push((*m, b.act));
+            }
+        }
+    }
+
+    #[test]
     fn grouped_is_stable_and_non_empty() {
         let g = grouped();
         // Every group present is non-empty and appears in GROUP_ORDER order.
@@ -281,7 +300,7 @@ mod tests {
     #[test]
     fn documented_bindings_all_present() {
         // The set the task calls out must each have a row.
-        let want_chars = ['j', 'k', 'g', 'G', 'P', '/', 'n', 'N', ':', 'p', '<', '>', 's', 'o', 'h', 'q', '?', '0', '9', ' '];
+        let want_chars = ['j', 'k', 'g', 'G', 'P', '/', 'n', 'N', ':', 'p', '<', '>', 'r', 's', 'o', 'h', 'q', '?', '0', '9', ' '];
         for c in want_chars {
             assert!(
                 KEYMAP.iter().any(|b| b.matchers.iter().any(|m| matches!(m, KeyMatch::Char(k) if *k == c))),

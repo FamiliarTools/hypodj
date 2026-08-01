@@ -246,7 +246,7 @@ pub struct StationId(pub String);
 
 /// A saved internet radio station (Subsonic getInternetRadioStations row): a raw
 /// stream URL played verbatim, plus its display name and an optional homepage.
-/// Distinct from the synthetic algorithmic `Radio` browse dir (random/similar/top);
+/// Distinct from the synthetic algorithmic `Radio` browse dir (random);
 /// this is a persisted station the user can save, browse, and play by URL or name.
 #[derive(Debug, Clone)]
 pub struct Station {

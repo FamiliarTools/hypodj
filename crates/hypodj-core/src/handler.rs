@@ -45,7 +45,9 @@ use crate::intelligence::{
     lexicon_pull, pull_reweight, FeatureStore, MetadataStore, Pull, PullField, TrackFeatures,
     LEXICON_PULL_STRENGTH,
 };
-use crate::model::{AlbumId, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId, Station};
+use crate::model::{
+    Album, AlbumId, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId, Station,
+};
 use crate::plan::{
     clamp_raw, validate, Action, ArmedPlan, FadeIntentIr, PlanBounds, PlanError, PlanId, RawPlan,
     RawTrigger, Resolved, Selector, ORIGIN_SLEEP, ORIGIN_WAKE, ORIGIN_WINDDOWN,
@@ -55,7 +57,8 @@ use crate::echo::describe_batch;
 use crate::nl::{NlContext, NlError, NlSource, Translator};
 use crate::mpd::{
     ContinuationCmd, FadeArgs, FadeKind, FieldCmd, FieldNudge, KnobDir, MpdCommand, MpdHandler,
-    MpdResponse, NlCmd, PlanCmd, SleepCmd, StickerCmd, WakeCmd, WakeWhen, WinddownCmd,
+    MpdResponse, NlCmd, PlanCmd, RadioCmd, RadioSeed, SleepCmd, StickerCmd, WakeCmd, WakeWhen,
+    WinddownCmd,
 };
 use crate::player::{
     db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerError, PlayerHandle,
@@ -404,6 +407,102 @@ struct SeedSource {
     kind: SeedKind,
     id: SongId,
     title: String,
+}
+
+/// What a refill batch must do to the TRANSPORT once its tracks land.
+///
+/// The three callers are genuinely different gestures and the difference is audible, so
+/// it is spelled out rather than carried as a bool: a prefetch behind music must not
+/// touch the deck, the walk's own handoff must NOT resync gain (an in-flight
+/// winddown/sleep ramp has to survive it), and a deliberate press starting a silent deck
+/// must take the full fresh-play gesture path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutofillStart {
+    /// Leave the deck exactly as it is: the batch is a PREFETCH sitting behind music
+    /// that is already audible (or behind a deck the caller started itself).
+    Behind,
+    /// Continue the WALK onto the batch at the drain edge - the non-gesture inner play,
+    /// no volume resync.
+    Walk,
+    /// A deliberate GESTURE is starting the deck ON this batch (a `radio` over a deck
+    /// with nothing to pick up): fade supersede, baseline re-assert, pending-pause
+    /// retirement, EOF fuse - everything `play <pos>` does.
+    Gesture,
+}
+
+/// Where the `radio` gesture finds the deck when it has nothing of its own to place.
+/// Derived from the PLAY STATE, never from `current.is_none()` - see
+/// [`HypodjHandler::radio_pickup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadioPickup {
+    /// Music is already audible. Touch NOTHING - the startle case that matters most.
+    Audible,
+    /// The deck holds a frozen entry (a settled pause, or the long-lived
+    /// nothing-loaded terminal): pick THAT up, never a different track.
+    Resume,
+    /// Nothing is running: start the queue at this position.
+    Start(usize),
+    /// The deck holds nothing at all - the prefetch owns the start.
+    Empty,
+}
+
+/// A resolved `radio <thing>` start: what to place on the deck, what to call it, which
+/// shape it came from (the `radio_from` pair), and the id the first prefetch seeds from.
+///
+/// `tracks` is EMPTY whenever the seed names the deck itself - the reflex bare `radio`,
+/// and `radio song/<id>` on the song already current - because there is nothing to place,
+/// only a walk to arm behind it. Whether that deck then needs STARTING is a separate
+/// question, answered from the play state ([`HypodjHandler::radio_pickup`]). `tracks_len`
+/// is captured up front and survives the append moving `tracks` out.
+#[derive(Debug, Clone, PartialEq)]
+struct RadioStart {
+    tracks: Vec<Song>,
+    tracks_len: usize,
+    label: String,
+    from: &'static str,
+    seed_id: Option<SongId>,
+}
+
+impl RadioStart {
+    fn new(tracks: Vec<Song>, label: String, from: &'static str, seed_id: Option<SongId>) -> Self {
+        Self { tracks_len: tracks.len(), tracks, label, from, seed_id }
+    }
+}
+
+/// Why a `radio <thing>` seed could not be resolved, carrying the ACK code the client
+/// deserves: "that thing is not there" is a NO_EXIST, "the server could not be reached"
+/// is an UNKNOWN. Either way NOTHING was mutated when it is returned.
+#[derive(Debug, Clone, PartialEq)]
+enum RadioResolveError {
+    NotFound(String),
+    Backend(String),
+}
+
+/// Which wire call a radio seed resolve step needs. Exists so the whole resolve funnels
+/// through ONE mockable seam ([`HypodjHandler::radio_fetch_songs`]) instead of four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadioWire {
+    /// `getSong` - one track by id.
+    Song,
+    /// `getAlbum` songs - the album in order.
+    Album,
+    /// `getTopSongs` by artist NAME (the wire takes a name, never an id).
+    ArtistTop(i32),
+    /// `getRandomSongs` - one track.
+    Random,
+}
+
+impl RadioWire {
+    /// The call's name for the test-hook call log.
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self {
+            RadioWire::Song => "song",
+            RadioWire::Album => "album",
+            RadioWire::ArtistTop(_) => "top",
+            RadioWire::Random => "random",
+        }
+    }
 }
 
 /// One splitmix64 step: advance `state` and return a well-mixed u64. The shared
@@ -1455,7 +1554,7 @@ pub struct HypodjHandler {
     /// Per-user fade tunables (startle bounds, tick, durations).
     fade_cfg: FadeConfig,
     /// Bounded LRU+TTL cache for STABLE listings (artists, albums, genres, smart
-    /// lists, similar/top). NEVER holds its lock across an `.await` (see cache
+    /// lists). NEVER holds its lock across an `.await` (see cache
     /// docs): get -> await refill -> put, two separate lock scopes.
     listings: TtlLru<String, Vec<Song>>,
     /// Cache for stable album/artist directory listings (name-bearing rows).
@@ -1567,6 +1666,15 @@ pub struct HypodjHandler {
     /// prefetch ever arms in autofill mode). Defaults `Radio` in a raw handler, so the
     /// existing radio path is byte-identical until the daemon plumbs a real config.
     continuation_mode: Mutex<ContinuationMode>,
+    /// The CONFIGURED continuation mode - what `[continuation].mode` said at daemon
+    /// startup, kept apart from the LIVE [`Self::continuation_mode`] so a runtime
+    /// override can be undone. `radio <thing>` forces the live mode to `Autofill` (the
+    /// verb IS the mode switch, so a user never has to edit a config to use it); `radio
+    /// off` / `continuation off` put THIS value back. Without the capture one radio
+    /// gesture would silently kill a configured station for the whole process lifetime.
+    /// Written only by [`Self::set_continuation_mode`] (the config plumb), never by the
+    /// runtime override.
+    configured_continuation_mode: Mutex<ContinuationMode>,
     /// The AUTOFILL refill count (`[continuation].autofill_count`, default 20): how many
     /// similar library tracks each true-drain refill targets after dedup shrinkage.
     /// Read locklessly at the drain edge; floor-clamped to 1 on set so a misconfig can
@@ -1580,6 +1688,13 @@ pub struct HypodjHandler {
     /// test can assert "exactly one fetch per drain" and records the last seed used.
     #[cfg(test)]
     autofill_test: Mutex<AutofillTestHook>,
+    /// TEST-ONLY radio-seed resolve hook (see [`Self::radio_fetch_songs`] /
+    /// [`Self::radio_fetch_albums`]). Mirrors [`Self::autofill_test`]: it scripts ONLY
+    /// the wire, so every shape decision the verb makes (label, `radio_from`, the
+    /// artist top-songs-then-album fallback, the empty-result ACK) stays REAL code under
+    /// test. Not compiled into a production build.
+    #[cfg(test)]
+    radio_test: Mutex<RadioTestHook>,
     /// Auto-identify master toggle (task bspk8v5), plumbed from `[recognize].auto` at
     /// daemon startup via [`Self::set_recognize_config`]. Default `false` in a raw
     /// handler (feature inert until the daemon plumbs the real config, which defaults
@@ -1961,6 +2076,23 @@ struct AutofillTestHook {
     last_seed: Option<SongId>,
 }
 
+/// TEST-ONLY scripted wire hook for the `radio` seed resolve (see
+/// [`HypodjHandler::radio_test`]). Only the two network seams are scripted, so the
+/// shape logic around them is the real thing under test. Not compiled into a
+/// production build.
+#[cfg(test)]
+#[derive(Default)]
+struct RadioTestHook {
+    /// Scripted per-call song results, front popped by [`HypodjHandler::radio_fetch_songs`].
+    /// `Ok(vec)` models a wire success (possibly empty); `Err(())` models a transport error.
+    songs: VecDeque<Result<Vec<Song>, ()>>,
+    /// Scripted per-call album results, front popped by [`HypodjHandler::radio_fetch_albums`].
+    albums: VecDeque<Result<Vec<Album>, ()>>,
+    /// Every wire call the resolve made, in order, as `<kind>:<arg>` - so a test can
+    /// assert the artist top-songs-then-album fallback ORDER, not just its result.
+    calls: Vec<String>,
+}
+
 impl HypodjHandler {
     /// Construct with the default `[fade]` tunables (research-backed constants).
     pub fn new(client: Arc<SubsonicClient>, player: PlayerHandle) -> Self {
@@ -2029,9 +2161,12 @@ impl HypodjHandler {
             // Continuation mode defaults RADIO (back-compat); the daemon plumbs the real
             // config via set_continuation_mode. Autofill count seeds at the default.
             continuation_mode: Mutex::new(ContinuationMode::Radio),
+            configured_continuation_mode: Mutex::new(ContinuationMode::Radio),
             autofill_count: AtomicU32::new(crate::config::DEFAULT_AUTOFILL_COUNT),
             #[cfg(test)]
             autofill_test: Mutex::new(AutofillTestHook::default()),
+            #[cfg(test)]
+            radio_test: Mutex::new(RadioTestHook::default()),
             // Auto-identify starts INERT in a raw handler; the daemon plumbs the real
             // (default-ON) config via set_recognize_config, so tests without a config
             // never arm a capture. The interval seeds at the default (>= the floor).
@@ -5049,9 +5184,25 @@ impl HypodjHandler {
     /// on|off` toggle fires; it does NOT arm anything on its own. The count is floor-
     /// clamped to 1 (a zero-count refill would fetch then honest-stop for nothing). Radio
     /// stays the default, so an un-plumbed handler behaves exactly as before.
+    /// Records the mode TWICE: into the live [`Self::continuation_mode`] and into
+    /// [`Self::configured_continuation_mode`], which is what `radio off` restores after
+    /// a `radio <thing>` gesture forced the live mode to autofill. Two separate short
+    /// locks, never nested.
     pub fn set_continuation_mode(&self, mode: ContinuationMode, autofill_count: u32) {
         *self.continuation_mode.lock().unwrap() = mode;
+        *self.configured_continuation_mode.lock().unwrap() = mode;
         self.autofill_count.store(autofill_count.max(1), Ordering::Relaxed);
+    }
+
+    /// Force the LIVE continuation mode without touching the configured value - the
+    /// runtime override behind `radio <thing>` (which is itself the mode switch, so the
+    /// verb works on a daemon whose config never mentions `[continuation]`) and behind
+    /// the rehydrate of a persisted walk. `radio off` / `continuation off` put
+    /// [`Self::configured_continuation_mode`] back through this same seam. Arms
+    /// NOTHING on its own: the mode only selects which mechanism the one arm toggle
+    /// fires.
+    fn set_continuation_mode_runtime(&self, mode: ContinuationMode) {
+        *self.continuation_mode.lock().unwrap() = mode;
     }
 
     /// Register the `[recognize]` auto-identify config (task bspk8v5), plumbed once at
@@ -5425,15 +5576,37 @@ impl HypodjHandler {
     }
 
     /// The end-of-queue continuation status as X- extension pairs for `status`,
-    /// present ONLY when the feature is ARMED (the runtime toggle is ON AND a
-    /// non-empty station is configured) so a disarmed/unconfigured deck stays lean -
+    /// present ONLY when the feature is ARMED so a disarmed deck stays lean -
     /// mirroring the armed-feature / ambient-hint HUD discipline. `X-hypodj-
-    /// continuation` is `on` and `X-hypodj-continuation-station` names the configured
-    /// station, so a client renders the standing "then: <station>" queue-tail hint
-    /// BEFORE the handoff (the future is visible before it happens - anti-surprise).
+    /// continuation` is `on` and `X-hypodj-continuation-station` names what comes next,
+    /// so a client renders the standing "then: <station>" queue-tail hint BEFORE the
+    /// handoff (the future is visible before it happens - anti-surprise).
+    ///
+    /// In RADIO mode "what comes next" is the configured station, and an armed toggle
+    /// with no station configured emits nothing (there is genuinely no handoff). In
+    /// AUTOFILL mode there is no station at all, yet the handoff is the most certain
+    /// one there is - so the label is the SEED the walk would use ("more like
+    /// <title>"), which is what makes an armed walk visible to every client instead of
+    /// silently invisible. `seed_source` locks `State` itself and `std::sync::Mutex` is
+    /// not reentrant, so the arm read below is a whole statement whose temporary guard
+    /// is dropped before that call.
     fn continuation_status_pairs(&self) -> Vec<(&'static str, String)> {
-        if !self.state.lock().unwrap().continuation {
+        let armed = self.state.lock().unwrap().continuation;
+        if !armed {
             return Vec::new();
+        }
+        let mode = *self.continuation_mode.lock().unwrap();
+        if mode == ContinuationMode::Autofill {
+            let label = match self.seed_source() {
+                Some(s) => format!("more like {}", s.title),
+                // Armed but nothing has played yet: honest about the walk, honest that
+                // it cannot yet name a seed.
+                None => "similar".to_string(),
+            };
+            return vec![
+                ("X-hypodj-continuation", "on".to_string()),
+                ("X-hypodj-continuation-station", label),
+            ];
         }
         match self.continuation_station.lock().unwrap().clone() {
             Some(station) if !station.trim().is_empty() => vec![
@@ -5444,39 +5617,552 @@ impl HypodjHandler {
         }
     }
 
+    /// Flip the ONE end-of-queue continuation arm bit, persist it, and re-evaluate the
+    /// station warm. Shared verbatim by `continuation on|off` and `radio on|off` so
+    /// there is provably one arm bit and one off path - `radio` is a second spelling of
+    /// the gesture, never a second mechanism.
+    ///
+    /// The flip is PERSISTED immediately (a resume checkpoint right after) so the arming
+    /// survives a restart. Best-effort: a missing state path is a silent no-op and a
+    /// write error is logged, never fatal. An empty-stopped deck is skipped by the
+    /// checkpoint guard, but there is nothing to continue from there anyway - it
+    /// persists on the next real checkpoint once a queue exists.
+    async fn arm_continuation(&self, on: bool) {
+        self.state.lock().unwrap().continuation = on;
+        self.notify_change();
+        self.checkpoint(self.last_elapsed_secs()).await;
+        // Re-evaluate the continuation warm: `off` disarms a pending warm (no more
+        // handoff), `on` arms one behind a finite current that will drain. Slice 2.
+        // In autofill mode this can only ever DISARM (station_ok folds mode == Radio).
+        self.reschedule_continuation_warm().await;
+    }
+
     /// The `continuation on|off` runtime toggle + `continuation [status]` report - the
     /// startle-safe opt-in for end-of-queue continuation radio. Default OFF and NEVER
     /// default-on: a configured station does nothing until this is armed. The flip is
     /// PERSISTED (a resume checkpoint right after) so the arming survives a restart;
-    /// `status` reports the live toggle + configured station honestly.
+    /// `status` reports the live toggle + mode + configured station honestly.
     async fn handle_continuation(&self, cmd: ContinuationCmd) -> MpdResponse {
         match cmd {
             ContinuationCmd::On | ContinuationCmd::Off => {
                 let on = matches!(cmd, ContinuationCmd::On);
-                self.state.lock().unwrap().continuation = on;
-                self.notify_change();
-                // Persist the flip immediately so the arming survives a restart (the
-                // resume checkpoint carries the toggle). Best-effort: a missing state
-                // path is a silent no-op and a write error is logged, never fatal. An
-                // empty-stopped deck is skipped by the checkpoint guard, but there is
-                // nothing to continue from there anyway - it persists on the next real
-                // checkpoint once a queue exists.
-                self.checkpoint(self.last_elapsed_secs()).await;
-                // Re-evaluate the continuation warm: `off` disarms a pending warm (no more
-                // handoff), `on` arms one behind a finite current that will drain. Slice 2.
-                self.reschedule_continuation_warm().await;
+                // `off` also puts the CONFIGURED mode back, so a `radio <thing>` runtime
+                // override never outlives the arming it came with - one arm bit, one off.
+                if !on {
+                    let configured = *self.configured_continuation_mode.lock().unwrap();
+                    self.set_continuation_mode_runtime(configured);
+                }
+                self.arm_continuation(on).await;
                 MpdResponse::ok()
             }
             ContinuationCmd::Status => {
                 let on = self.state.lock().unwrap().continuation;
+                let mode = *self.continuation_mode.lock().unwrap();
                 let station = self.continuation_station.lock().unwrap().clone();
+                // The MODE is reported too: without it a client cannot tell an armed
+                // station handoff from an armed library walk, which is the whole
+                // difference between "then: <station>" and "then: more like <seed>".
                 let mut b = MpdResponse::pairs()
-                    .pair("continuation", if on { "on" } else { "off" });
+                    .pair("continuation", if on { "on" } else { "off" })
+                    .pair("continuation_mode", continuation_mode_name(mode));
                 if let Some(s) = station {
                     b = b.pair("continuation_station", s);
                 }
                 b.build()
             }
+        }
+    }
+
+    // ── `radio <thing>` - the seeded entry into the endless walk (task 8pns0hi) ──
+
+    /// The `radio` verb: START an ENDLESS radio from a thing, or arm / disarm / report
+    /// one. This is Enter plus one promise - the thing you pointed at plays FIRST, one
+    /// batch of the EXISTING autofill walk is prefetched behind it, and the walk owns
+    /// the drain edge from then on. There is no second engine here: the append is the
+    /// same tail push `add` does, the play is the same [`Self::play_index`] gesture
+    /// `play <pos>` does, and the refill is [`Self::autofill_once`] - literally the body
+    /// the drain edge calls, handed an explicit seed.
+    ///
+    /// Never a bare OK: every non-error form returns pairs, because a silent success is
+    /// invisible to a client that only surfaces ACKs. And the verb ACKs exactly when it
+    /// put ZERO tracks on the deck AND armed nothing, so a gesture that visibly did
+    /// nothing always says why.
+    async fn handle_radio(&self, cmd: RadioCmd) -> MpdResponse {
+        match cmd {
+            RadioCmd::Start(seed) => self.start_radio(seed).await,
+            RadioCmd::On => {
+                // ARM ONLY: no resolve, no fetch, no queue change - "keep going from
+                // what I already queued". The mode force is what makes the verb work on
+                // a daemon whose config never mentions [continuation]; the fuse reset is
+                // the same explicit-gesture exemption `start_radio` takes (see there).
+                self.set_continuation_mode_runtime(ContinuationMode::Autofill);
+                self.state.lock().unwrap().last_autofill_at = None;
+                self.arm_continuation(true).await;
+                MpdResponse::pairs()
+                    .pair("radio", "on")
+                    .pair("radio_from", "armed")
+                    .pair("radio_queued", "0")
+                    .build()
+            }
+            RadioCmd::Off => {
+                // Restore the CONFIGURED mode before disarming, so a station config a
+                // radio gesture overrode comes back intact for the next arm.
+                let configured = *self.configured_continuation_mode.lock().unwrap();
+                self.set_continuation_mode_runtime(configured);
+                self.arm_continuation(false).await;
+                MpdResponse::pairs().pair("radio", "off").build()
+            }
+            RadioCmd::Status => {
+                let (on, blocked_by) = {
+                    let st = self.state.lock().unwrap();
+                    // `is_true_drain` returns false whenever repeat or random is set
+                    // over a non-empty queue, so the walk can NEVER fire while either
+                    // is on. Reporting a bare `radio: on` there is the exact lie this
+                    // verb must not tell: the whole promise is "press this and it keeps
+                    // going". Name the flag instead of pretending.
+                    let blocked = if st.repeat {
+                        Some("repeat")
+                    } else if st.random {
+                        Some("random")
+                    } else {
+                        None
+                    };
+                    (st.continuation, blocked)
+                };
+                let mode = *self.continuation_mode.lock().unwrap();
+                let mut b = MpdResponse::pairs()
+                    .pair("radio", if on { "on" } else { "off" })
+                    .pair("radio_mode", radio_mode_name(mode));
+                if on {
+                    if let Some(flag) = blocked_by {
+                        b = b.pair("radio_blocked_by", flag);
+                    }
+                }
+                // Name the seed the walk WOULD use, so "is this thing actually going to
+                // keep going, and from what" is answerable without draining the queue.
+                if let Some(s) = self.seed_source() {
+                    b = b.pair("radio_seed", s.title);
+                }
+                b.build()
+            }
+        }
+    }
+
+    /// Start the endless walk from `seed`. Six steps, in this order for a reason:
+    /// resolve BEFORE mutating (a seed that cannot be resolved leaves the queue exactly
+    /// as it was), arm, place-and-play, pick the deck up if nothing was placed, prefetch
+    /// one batch, persist.
+    async fn start_radio(&self, seed: RadioSeed) -> MpdResponse {
+        // 1. Resolve the thing with NO lock held and BEFORE anything is mutated.
+        let start = match self.resolve_radio_start(&seed).await {
+            Ok(s) => s,
+            Err(RadioResolveError::NotFound(msg)) => {
+                return ack(ACK_ERROR_NO_EXIST, "radio", &msg)
+            }
+            Err(RadioResolveError::Backend(msg)) => {
+                return ack(ACK_ERROR_UNKNOWN, "radio", &msg)
+            }
+        };
+        // 2. Arm. Two short unnested locks. The prior values are captured so a load
+        //    failure below can put the arming back: the verb must arm nothing on a
+        //    gesture that ACKs.
+        let prior_mode = *self.continuation_mode.lock().unwrap();
+        self.set_continuation_mode_runtime(ContinuationMode::Autofill);
+        let prior_arm = {
+            let mut st = self.state.lock().unwrap();
+            let prior = (st.continuation, st.last_autofill_at);
+            st.continuation = true;
+            // Reset the degenerate-input FUSE, and ONLY for an explicit gesture:
+            // AUTOFILL_MIN_INTERVAL guards against an instant-EOF spiral, and a
+            // deliberate human gesture is not degenerate input. Without this a radio
+            // pressed within 30s of a previous refill would silently eat its OWN
+            // prefetch. Every subsequent automatic refill still honors the fuse.
+            st.last_autofill_at = None;
+            prior
+        };
+        // 3. Place the thing at the TAIL and play it. Appending (never clearing) is what
+        //    keeps the user's queue recoverable AND is what makes the walk fire with no
+        //    special casing: the appended music IS the tail, so `is_true_drain` holds the
+        //    moment it plays out.
+        let mut queued = 0usize;
+        if !start.tracks.is_empty() {
+            let (first_qid, appended_ids) = {
+                let mut st = self.state.lock().unwrap();
+                let mut appended_ids = Vec::with_capacity(start.tracks.len());
+                for song in start.tracks {
+                    let id = st.next_id;
+                    st.next_id += 1;
+                    // Feed the dedup ring here too, not only from the autofill path.
+                    // Without this the gesture's OWN tracks are invisible to the walk,
+                    // so a later refill can re-serve the very song you seeded from -
+                    // observed live: refill 4 appended back the track the gesture had
+                    // placed at pos 0. For an album seed the exposure is the whole
+                    // album.
+                    st.push_autofill_seen(song.id.clone());
+                    st.queue.push(QueueItem { id, entry: QueueEntry::Song(song) });
+                    appended_ids.push(id);
+                }
+                st.playlist_version += 1;
+                (appended_ids[0], appended_ids)
+            };
+            queued = appended_ids.len();
+            self.notify_change();
+            // Re-resolve the STABLE id to a position rather than trusting an index
+            // captured across the lock release: consume mode can shift indices, and the
+            // id is the identity the rest of the handler already trusts.
+            let idx = self
+                .state
+                .lock()
+                .unwrap()
+                .queue
+                .iter()
+                .position(|it| it.id == first_qid);
+            // The plain deliberate-gesture play path (NOT play_index_inner): a radio
+            // press IS a fresh play and must behave exactly like `play <pos>` - it arms
+            // the EOF failure fuse and latches the walk origin, it supersedes an
+            // in-flight PauseOut fade atomically under one slot lock and re-asserts
+            // baseline gain before loading, and it retires a pending pause as a
+            // TRANSPORT event. Taking the no-resync path here would leave a superseded
+            // pause fade free to drag the fresh track to silence.
+            let played = match idx {
+                Some(i) => self.play_index(i).await,
+                None => Err("the queue moved under the radio start".to_string()),
+            };
+            if let Err(e) = played {
+                // Remove the just-appended rows by STABLE id (a concurrent queue edit
+                // cannot make us drop the wrong rows) and put the arming back: the
+                // user's queue is never collateral damage, and an ACK means nothing was
+                // armed. Mirrors the autofill batch rollback.
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.queue.retain(|it| !appended_ids.contains(&it.id));
+                    st.playlist_version += 1;
+                    st.continuation = prior_arm.0;
+                    st.last_autofill_at = prior_arm.1;
+                }
+                self.set_continuation_mode_runtime(prior_mode);
+                self.notify_change();
+                return ack(ACK_ERROR_UNKNOWN, "radio", &e);
+            }
+        }
+        // 4. Make sure something is AUDIBLE. A gesture that placed its own music already
+        //    started it above; otherwise the deck is picked up WHERE IT STANDS - resumed
+        //    if it is merely frozen, started at the position `play` would pick if it holds
+        //    nothing. This is the whole promise of the verb: press it and it keeps going.
+        //    The one thing it never does is restart music that is already playing.
+        let mut audible = true;
+        if start.tracks_len == 0 {
+            let picked_up = match self.radio_pickup() {
+                RadioPickup::Audible => Ok(()),
+                // `set_pause` already tells a settled mid-track pause from the
+                // nothing-loaded terminal and resumes each correctly (fade back in vs
+                // load the held entry), so the resume shapes stay in ONE place.
+                RadioPickup::Resume => self.set_pause(Some(false)).await.map_err(|e| e.to_string()),
+                RadioPickup::Start(idx) => self.play_index(idx).await,
+                RadioPickup::Empty => {
+                    // Nothing on the deck to pick up (an empty queue, or a drained one):
+                    // the prefetch below owns the start.
+                    audible = false;
+                    Ok(())
+                }
+            };
+            if let Err(e) = picked_up {
+                // NOTHING has been appended on this leg, so putting the arming back leaves
+                // the deck exactly as the gesture found it - the same ACK contract as the
+                // load-failure rollback above.
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.continuation = prior_arm.0;
+                    st.last_autofill_at = prior_arm.1;
+                }
+                self.set_continuation_mode_runtime(prior_mode);
+                return ack(ACK_ERROR_UNKNOWN, "radio", &e);
+            }
+        }
+        // 5. Leave a BATCH of music ahead of the deck. Measured as what is actually ahead
+        //    of the play position, not as what this gesture placed: a single seed track
+        //    (song / random / this) reaches its first handoff in three minutes, so its
+        //    batch is prefetched HERE, at gesture time, where the latency is expected and
+        //    covered by the reply; an album or an artist's top tracks is already a body of
+        //    music whose first handoff is far out, and the walk's own drain-edge fetch
+        //    covers that. Reading the DECK rather than the gesture is also what makes the
+        //    verb idempotent: a second press over a deck that already has a batch waiting
+        //    costs no fetch and appends nothing, so a held `r` cannot grow the queue or
+        //    hammer the server. Same body as the drain edge, handed the explicit seed.
+        let ahead = {
+            let st = self.state.lock().unwrap();
+            match st.current {
+                // The rows AFTER the play position are the music still to come.
+                Some(i) => st.queue.len().saturating_sub(i + 1),
+                // Step 4 found nothing to pick up, so whatever rows are left are spent:
+                // there is nothing ahead of this deck by definition.
+                None => 0,
+            }
+        };
+        if ahead == 0 {
+            if let Some(seed_id) = start.seed_id.clone() {
+                let mode = if audible { AutofillStart::Behind } else { AutofillStart::Gesture };
+                queued += self.autofill_once(Some(seed_id), mode).await;
+            }
+        }
+        // A gesture that ends with NOTHING audible and NOTHING queued did not start a
+        // radio, whatever it armed: the deck was empty and the library had no similar
+        // songs to walk to (or the first one would not load). Arming a walk over a
+        // stopped deck that will never reach another drain edge is inert, so put it back
+        // and say so - `radio: on` over silence is exactly the lie this verb must not
+        // tell. (`radio on`, the arm-only verb, is the deliberate way to arm ahead.)
+        if !audible && queued == 0 {
+            {
+                let mut st = self.state.lock().unwrap();
+                st.continuation = prior_arm.0;
+                st.last_autofill_at = prior_arm.1;
+            }
+            self.set_continuation_mode_runtime(prior_mode);
+            return ack(
+                ACK_ERROR_NO_EXIST,
+                "radio",
+                "nothing to play: no similar songs came back for that seed",
+            );
+        }
+        // 6. Wake the watchers on the arm edge (the reflex bare `radio` over a playing
+        //    track changes NO queue and NO transport, so this is the only edge a client
+        //    could see the standing "then: more like <seed>" hint appear on), persist the
+        //    arming, then re-evaluate the warm - which in autofill mode can only DISARM,
+        //    and must: a station warm can never be live while the walk owns the drain edge.
+        self.notify_change();
+        self.checkpoint(self.last_elapsed_secs()).await;
+        self.reschedule_continuation_warm().await;
+        MpdResponse::pairs()
+            .pair("radio", "on")
+            .pair("radio_seed", start.label)
+            .pair("radio_from", start.from)
+            .pair("radio_queued", queued.to_string())
+            .build()
+    }
+
+    /// Where the `radio` gesture finds the deck when it placed nothing of its own.
+    ///
+    /// Read off the PLAY STATE, never off `current.is_none()`: MPD `stop` and the
+    /// nothing-loaded terminal ([`Self::halt_failed_advance`], an offline
+    /// [`Self::restore`]) both leave `current` SET over a deck carrying no sound, so an
+    /// is-there-a-current test reads a silent deck as busy - and the one gesture whose
+    /// entire promise is "press this and it keeps going" would report `radio: on`, queue
+    /// a batch, and play nothing. Three shapes, one decision:
+    ///   - Playing -> [`RadioPickup::Audible`]: never restart what is already sounding;
+    ///   - Paused (a settled pause OR the pending-pause terminal) ->
+    ///     [`RadioPickup::Resume`]: pick that entry up where it stands;
+    ///   - Stopped -> the SAME pertinence ladder [`Self::seed_source`] walks, so what
+    ///     starts and what the walk seeds from can never point at different music:
+    ///     where the deck was left, else the music the NEWEST idle enqueue put up (the
+    ///     `fresh_enqueue_anchor`, so the gesture starts the rows the person just queued
+    ///     and not a lingering played head), else - once anything has FINISHED this
+    ///     session - [`RadioPickup::Empty`], because the rows still sitting in a drained
+    ///     queue are spent and "keep going" means the fresh batch, never a replay of
+    ///     what just ended, else the queue head (nothing has ever played: the cold
+    ///     start with an album queued and Enter never pressed).
+    /// A deck with nothing to start is [`RadioPickup::Empty`] and the prefetch owns the
+    /// start from there.
+    fn radio_pickup(&self) -> RadioPickup {
+        match self.reported_play_state() {
+            PlayState::Playing => RadioPickup::Audible,
+            PlayState::Paused => RadioPickup::Resume,
+            PlayState::Stopped => {
+                let st = self.state.lock().unwrap();
+                if let Some(i) = st.current.filter(|i| *i < st.queue.len()) {
+                    return RadioPickup::Start(i);
+                }
+                if let Some(pos) = st
+                    .fresh_enqueue_anchor
+                    .and_then(|qid| st.queue.iter().position(|it| it.id == qid))
+                {
+                    return RadioPickup::Start(pos);
+                }
+                if st.last_finished.is_some() || st.queue.is_empty() {
+                    return RadioPickup::Empty;
+                }
+                RadioPickup::Start(0)
+            }
+        }
+    }
+
+    /// Resolve a [`RadioSeed`] into the tracks to place on the deck, a human label, the
+    /// shape name for `radio_from`, and the id the prefetch seeds from. NO lock is held
+    /// across any of it (every branch is network work), and NOTHING is mutated - a
+    /// failure here leaves the deck exactly as it was.
+    ///
+    /// `Current` names the DECK, so it resolves to ZERO tracks in every shape: `radio`
+    /// fired by reflex over a playing track must arm and prefetch BEHIND it, never
+    /// restart it (the startle case that matters most), and over a stopped or frozen deck
+    /// there is still nothing to PLACE - only a deck to pick up, which
+    /// [`Self::radio_pickup`] decides from the play state.
+    async fn resolve_radio_start(&self, seed: &RadioSeed) -> Result<RadioStart, RadioResolveError> {
+        match seed {
+            RadioSeed::Current => {
+                let Some(src) = self.seed_source() else {
+                    return Err(RadioResolveError::NotFound(
+                        "nothing playing to start a radio from".to_string(),
+                    ));
+                };
+                Ok(RadioStart::new(Vec::new(), src.title, "current", Some(src.id)))
+            }
+            RadioSeed::Random => {
+                // ONE track, not fifty: the gesture is "surprise me and keep going", and
+                // the walk supplies the rest.
+                let songs = self.radio_fetch_songs(RadioWire::Random, "").await?;
+                let Some(song) = songs.into_iter().next() else {
+                    return Err(RadioResolveError::NotFound(
+                        "the library returned no random song".to_string(),
+                    ));
+                };
+                let label = song.title.clone();
+                let id = song.id.clone();
+                Ok(RadioStart::new(vec![song], label, "random", Some(id)))
+            }
+            RadioSeed::Uri(uri) => self.resolve_radio_uri(uri).await,
+        }
+    }
+
+    /// The `song/` | `album/` | `artist/` half of [`Self::resolve_radio_start`].
+    async fn resolve_radio_uri(&self, uri: &str) -> Result<RadioStart, RadioResolveError> {
+        if let Some(id) = uri.strip_prefix("song/") {
+            // The song ALREADY ON THE DECK is never placed a second time. `r` on the row
+            // that is playing is the commonest press there is (and the ONLY form the TUI
+            // ever sends - it always spells the gesture `radio song/<id>`), so it has to
+            // mean what bare `radio` means: arm and prefetch BEHIND it, never append a
+            // duplicate and hard-cut the track back to 0:00. Answered from the queue entry
+            // itself, so the reflex press also costs ZERO wire calls.
+            let current = {
+                let st = self.state.lock().unwrap();
+                st.current
+                    .and_then(|i| st.queue.get(i))
+                    .and_then(|it| match &it.entry {
+                        QueueEntry::Song(s) => Some(s.clone()),
+                        QueueEntry::Stream { .. } => None,
+                    })
+            };
+            if let Some(song) = current.filter(|s| s.id.0 == id) {
+                return Ok(RadioStart::new(Vec::new(), song.title, "song", Some(song.id)));
+            }
+            let songs = self.radio_fetch_songs(RadioWire::Song, id).await?;
+            let Some(song) = songs.into_iter().next() else {
+                return Err(RadioResolveError::NotFound(format!("no such song: {uri}")));
+            };
+            let label = song.title.clone();
+            let seed = song.id.clone();
+            return Ok(RadioStart::new(vec![song], label, "song", Some(seed)));
+        }
+        if let Some(id) = uri.strip_prefix("album/") {
+            // Pressing radio on an album means HEARING the album, then drifting.
+            let songs = self.radio_fetch_songs(RadioWire::Album, id).await?;
+            if songs.is_empty() {
+                return Err(RadioResolveError::NotFound(format!("no such album: {uri}")));
+            }
+            let label = songs[0]
+                .album
+                .clone()
+                .unwrap_or_else(|| songs[0].title.clone());
+            let seed = songs[0].id.clone();
+            return Ok(RadioStart::new(songs, label, "album", Some(seed)));
+        }
+        if let Some(id) = uri.strip_prefix("artist/") {
+            return self.resolve_radio_artist(&ArtistId(id.to_string()), uri).await;
+        }
+        Err(RadioResolveError::NotFound(format!("unsupported uri: {uri}")))
+    }
+
+    /// `radio artist/<id>` - what a person means by artist radio: start with the hits,
+    /// then wander. This relation used to be a `radio/top/<artist>` browse listing
+    /// nothing advertised; it is now a gesture you can press.
+    ///
+    /// `getTopSongs` takes an artist NAME, not an id, so the album list is fetched first
+    /// to recover the name - and it is then already in hand for the fallback. Top songs
+    /// come back EMPTY often (Navidrome's are last.fm-backed and a local-only rip has
+    /// none), so an empty result falls back ONCE to the artist's first album. That is
+    /// NOT a degrade ladder: it is still exactly the artist the user pointed at, just a
+    /// different ordering source. There is still no genre/random degrade anywhere.
+    async fn resolve_radio_artist(
+        &self,
+        id: &ArtistId,
+        uri: &str,
+    ) -> Result<RadioStart, RadioResolveError> {
+        let albums = self.radio_fetch_albums(id).await?;
+        let Some(first_album) = albums.first() else {
+            return Err(RadioResolveError::NotFound(format!("no such artist: {uri}")));
+        };
+        let name = first_album.artist.clone();
+        let album_id = first_album.id.clone();
+        let want = self.autofill_count.load(Ordering::Relaxed).max(1);
+        let top = self
+            .radio_fetch_songs(RadioWire::ArtistTop(want as i32), &name)
+            .await?;
+        let songs = if top.is_empty() {
+            self.radio_fetch_songs(RadioWire::Album, &album_id.0).await?
+        } else {
+            top
+        };
+        if songs.is_empty() {
+            return Err(RadioResolveError::NotFound(format!(
+                "no playable tracks for artist: {uri}"
+            )));
+        }
+        let seed = songs[0].id.clone();
+        Ok(RadioStart::new(songs, name, "artist", Some(seed)))
+    }
+
+    /// The ONE song-returning wire seam of the radio seed resolve, so it is mockable in
+    /// tests exactly like [`Self::autofill_fetch`]: a `#[cfg(test)]` build pops a
+    /// scripted result (the sandbox has no live server) and records the call, leaving
+    /// every shape decision around it real code under test.
+    async fn radio_fetch_songs(
+        &self,
+        wire: RadioWire,
+        arg: &str,
+    ) -> Result<Vec<Song>, RadioResolveError> {
+        #[cfg(test)]
+        {
+            let mut t = self.radio_test.lock().unwrap();
+            t.calls.push(format!("{}:{arg}", wire.name()));
+            if let Some(scripted) = t.songs.pop_front() {
+                return scripted
+                    .map_err(|_| RadioResolveError::Backend("test radio fetch error".into()));
+            }
+        }
+        let res = match wire {
+            RadioWire::Song => self
+                .client
+                .song(&SongId(arg.to_string()))
+                .await
+                .map(|s| vec![s]),
+            RadioWire::Album => self.client.album_songs(&AlbumId(arg.to_string())).await,
+            RadioWire::ArtistTop(count) => self.client.top_songs(arg, Some(count)).await,
+            RadioWire::Random => self.client.random_songs(Some(1)).await,
+        };
+        match res {
+            Ok(songs) => Ok(songs),
+            // The library saying "gone" is a NO_EXIST, a transport failure is an
+            // UNKNOWN: the ACK a client sees distinguishes "that thing is not there"
+            // from "the server could not be reached".
+            Err(e @ SubsonicError::NotFound(_)) => Err(RadioResolveError::NotFound(e.to_string())),
+            Err(e) => Err(RadioResolveError::Backend(e.to_string())),
+        }
+    }
+
+    /// The album-returning wire seam of the artist resolve (see
+    /// [`Self::radio_fetch_songs`] for why the seam exists).
+    async fn radio_fetch_albums(&self, id: &ArtistId) -> Result<Vec<Album>, RadioResolveError> {
+        #[cfg(test)]
+        {
+            let mut t = self.radio_test.lock().unwrap();
+            t.calls.push(format!("artist_albums:{}", id.0));
+            if let Some(scripted) = t.albums.pop_front() {
+                return scripted
+                    .map_err(|_| RadioResolveError::Backend("test radio fetch error".into()));
+            }
+        }
+        match self.client.artist_albums(id).await {
+            Ok(albums) => Ok(albums),
+            Err(e @ SubsonicError::NotFound(_)) => Err(RadioResolveError::NotFound(e.to_string())),
+            Err(e) => Err(RadioResolveError::Backend(e.to_string())),
         }
     }
 
@@ -5510,6 +6196,10 @@ impl HypodjHandler {
             PlayState::Paused => ResumePlayState::Paused,
             PlayState::Stopped => ResumePlayState::Stopped,
         };
+        // The live continuation MODE, read BEFORE `State` is locked (its own separate
+        // Mutex, never nested with this one): an armed WALK must come back a walk, not
+        // an armed station handoff with no station.
+        let walk = *self.continuation_mode.lock().unwrap() == ContinuationMode::Autofill;
         let st = self.state.lock().unwrap();
         let queue = st
             .queue
@@ -5531,6 +6221,7 @@ impl HypodjHandler {
             play_state,
             playlist_version: st.playlist_version,
             continuation: st.continuation,
+            continuation_walk: walk,
             saved_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -5780,6 +6471,12 @@ impl HypodjHandler {
                 st.fading = false;
             }
         }
+        // Rehydrate the persisted MODE too, and only in the forcing direction: a saved
+        // WALK comes back a walk (else it would be armed into silence with no station),
+        // while a saved station handoff leaves the configured mode exactly as loaded.
+        if s.continuation_walk {
+            self.set_continuation_mode_runtime(ContinuationMode::Autofill);
+        }
         self.notify_change();
 
         if playing {
@@ -5940,6 +6637,25 @@ impl HypodjHandler {
     #[cfg(test)]
     pub(crate) fn autofill_last_seed(&self) -> Option<SongId> {
         self.autofill_test.lock().unwrap().last_seed.clone()
+    }
+
+    /// TEST-ONLY: script the NEXT song-returning radio seed resolve (FIFO).
+    #[cfg(test)]
+    pub(crate) fn push_radio_songs(&self, songs: Result<Vec<Song>, ()>) {
+        self.radio_test.lock().unwrap().songs.push_back(songs);
+    }
+
+    /// TEST-ONLY: script the NEXT album-returning radio seed resolve (FIFO).
+    #[cfg(test)]
+    pub(crate) fn push_radio_albums(&self, albums: Result<Vec<Album>, ()>) {
+        self.radio_test.lock().unwrap().albums.push_back(albums);
+    }
+
+    /// TEST-ONLY: every wire call the radio seed resolve made, in order, as
+    /// `<kind>:<arg>` - so a test asserts the artist fallback ORDER, not just its result.
+    #[cfg(test)]
+    pub(crate) fn radio_calls(&self) -> Vec<String> {
+        self.radio_test.lock().unwrap().calls.clone()
     }
 
     /// TEST-ONLY: queue a raw stream uri (no network), for director tests.
@@ -6257,7 +6973,10 @@ impl HypodjHandler {
                     tracing::warn!(
                         "continuation stream ended (dropped / finite / unreachable); stopping honestly - one-shot, no re-fire"
                     );
-                } else if true_drain && mode == ContinuationMode::Autofill && self.try_autofill().await {
+                } else if true_drain
+                    && mode == ContinuationMode::Autofill
+                    && self.autofill_once(None, AutofillStart::Walk).await > 0
+                {
                     // AUTOFILL appended similar library Songs and started playing the first;
                     // they are ordinary tracks on the normal player path, so no landed
                     // orphan / continuation latch is involved. Re-autofills each true-drain.
@@ -6405,12 +7124,20 @@ impl HypodjHandler {
 
     // ── end-of-queue CONTINUATION autofill (mode = autofill, task t83os4h) ────
 
-    /// End-of-queue AUTOFILL refill. Fired ONLY from the [`Self::advance_on_eof`]
-    /// None-branch at a genuine true-drain when the runtime toggle is ARMED and
-    /// `continuation.mode == Autofill`. It appends N real LIBRARY tracks similar to the
-    /// recency seed and continues playback, so the music keeps going from the user's own
-    /// library. Returns `true` when it appended-and-started a refill, `false` in EVERY
-    /// inert / failure case so the caller performs the SAME honest stop as today.
+    /// ONE autofill refill - the whole walk body, shared by its two entry points.
+    ///
+    /// Entry 1 is the [`Self::advance_on_eof`] None-branch at a genuine true-drain when
+    /// the runtime toggle is ARMED and `continuation.mode == Autofill`: `seed_override`
+    /// is `None` (the seed comes from recency) and `start` is [`AutofillStart::Walk`].
+    /// Entry 2 is the `radio <thing>` gesture ([`Self::start_radio`]), which hands an
+    /// EXPLICIT seed and either prefetches BEHIND audible music or - on a deck with
+    /// nothing to pick up - starts on the batch as a GESTURE. So a hand-started radio and
+    /// a drained-into one are the same engine, indistinguishable after the first batch.
+    ///
+    /// It appends N real LIBRARY tracks similar to the seed and (when asked) continues
+    /// playback, so the music keeps going from the user's own library. Returns how many
+    /// tracks it appended - `0` in EVERY inert / failure case, so the drain-edge caller
+    /// performs the SAME honest stop as today.
     ///
     /// CONTINUOUS, not one-shot: unlike [`Self::try_continuation`] (whose one-shot
     /// `continuation_active` latch stops a DEAD radio stream from re-firing forever),
@@ -6428,14 +7155,14 @@ impl HypodjHandler {
     /// Lock discipline mirrors [`Self::try_continuation`]: the std `Mutex<State>` is
     /// released BEFORE the `similar` await; the seed resolve, the fetch, and the filter
     /// all run lock-free; the append is one pure mutation under a single short lock scope.
-    async fn try_autofill(&self) -> bool {
+    async fn autofill_once(&self, seed_override: Option<SongId>, start: AutofillStart) -> usize {
         // 1. One short lock: armed? fuse? snapshot the dedup ring; stamp the fetch time.
         let (n, seen) = {
             let mut st = self.state.lock().unwrap();
             // Armed? The runtime toggle must be ON (default OFF - never a surprise). Same
             // toggle as radio: ONE arm switch, `mode` selects the behavior.
             if !st.continuation {
-                return false;
+                return 0;
             }
             // Degenerate-input FUSE: a true-drain within AUTOFILL_MIN_INTERVAL of the
             // previous fetch is a pathological instant-EOF spiral (corrupt library). Stop
@@ -6447,7 +7174,7 @@ impl HypodjHandler {
                     tracing::warn!(
                         "autofill re-drained within the min interval; stopping honestly (instant-EOF fuse)"
                     );
-                    return false;
+                    return 0;
                 }
             }
             st.last_autofill_at = Some(now);
@@ -6455,11 +7182,13 @@ impl HypodjHandler {
                 st.autofill_seen.iter().cloned().collect();
             (self.autofill_count.load(Ordering::Relaxed).max(1), seen)
         };
-        // The recency seed (its own short lock inside seed_source). No seed - nothing
-        // ever played / empty deck / streams-only session - is the genuine empty case.
-        let Some(seed) = self.similar_seed_id() else {
+        // The seed: the caller's EXPLICIT one (a `radio <thing>` gesture) if it supplied
+        // one, else the recency seed (its own short lock inside seed_source). No seed -
+        // nothing ever played / empty deck / streams-only session - is the genuine empty
+        // case.
+        let Some(seed) = seed_override.or_else(|| self.similar_seed_id()) else {
             tracing::info!("autofill: no seed (nothing played / empty deck); ending stopped");
-            return false;
+            return 0;
         };
         // 2. Fetch similar library tracks with NO std lock held. 2x over-fetch so dedup
         //    shrinkage still leaves a full batch. ONE call per drain, NO genre/random
@@ -6469,11 +7198,11 @@ impl HypodjHandler {
             Ok(v) if !v.is_empty() => v,
             Ok(_) => {
                 tracing::info!(seed = %seed.0, "autofill: backend returned no similar songs; ending stopped");
-                return false;
+                return 0;
             }
             Err(e) => {
                 tracing::info!(seed = %seed.0, error = %e, "autofill: similar fetch failed; ending stopped");
-                return false;
+                return 0;
             }
         };
         // 3. Filter lock-free: drop the seed itself, drop anything in the dedup ring,
@@ -6491,7 +7220,7 @@ impl HypodjHandler {
         }
         if picked.is_empty() {
             tracing::info!(seed = %seed.0, "autofill: all similar songs already recently seen; ending stopped");
-            return false;
+            return 0;
         }
         // 4. Append the picked Songs as ordinary library entries in ONE short lock scope
         //    (never across an await). Each id is recorded in the dedup ring so the NEXT
@@ -6512,24 +7241,42 @@ impl HypodjHandler {
             (first_idx, appended_ids)
         };
         self.notify_change();
-        // 5. Continue playback from the first appended entry. No volume resync (like the
-        //    natural advance and try_continuation step 5), so an in-flight winddown/sleep
-        //    ramp survives the handoff. NEVER set continuation_active: these are ordinary
-        //    library Songs on the normal player path - they scrobble, seek, become
+        let appended = appended_ids.len();
+        // A gesture-time PREFETCH loads nothing: the thing the user pointed at is already
+        // playing (or the deck is deliberately left as it was), and this batch sits behind
+        // it waiting for the drain edge. Nothing was loaded, so there is nothing to roll
+        // back either - the appended rows stay, which is the whole point of prefetching.
+        if start == AutofillStart::Behind {
+            return appended;
+        }
+        // 5. Continue playback from the first appended entry.
+        //
+        //    The WALK takes the no-resync inner path (like the natural advance and
+        //    try_continuation step 5), so an in-flight winddown/sleep ramp survives the
+        //    handoff. A GESTURE takes the full fresh-play path: a deliberate `radio` press
+        //    starting a silent deck must supersede an in-flight pause/winddown fade under
+        //    one slot lock, re-assert baseline gain before loading, retire a standing
+        //    pending-pause as the TRANSPORT event it is, and arm the EOF fuse - exactly
+        //    what `play <pos>` does. Either way NEVER set continuation_active: these are
+        //    ordinary library Songs on the normal player path - they scrobble, seek, become
         //    last_finished, and ride the existing song-to-song warm-skip for gapless.
-        if self.play_index_inner(first_idx, false).await.is_ok() {
-            return true;
+        let played = match start {
+            AutofillStart::Gesture => self.play_index(first_idx).await,
+            _ => self.play_index_inner(first_idx, false).await,
+        };
+        if played.is_ok() {
+            return appended;
         }
         // The first appended song failed to load: remove the ENTIRE just-appended batch by
         // stable id (a concurrent queue edit cannot make us drop the wrong rows) and return
-        // false -> the caller's single honest stop. Never a per-row load-retry walk.
+        // 0 -> the caller's single honest stop. Never a per-row load-retry walk.
         tracing::warn!("autofill: first appended song failed to load; removing the batch, ending stopped");
         {
             let mut st = self.state.lock().unwrap();
             st.queue.retain(|it| !appended_ids.contains(&it.id));
             st.playlist_version += 1;
         }
-        false
+        0
     }
 
     /// Fetch library Songs similar to `seed` for an autofill refill (2x over-fetched
@@ -7671,6 +8418,26 @@ fn identify_hit_response(
     b.build()
 }
 
+/// The `continuation status` spelling of a [`ContinuationMode`] - the same words the
+/// config file uses, so what a client reads back matches what a user would write.
+fn continuation_mode_name(mode: ContinuationMode) -> &'static str {
+    match mode {
+        ContinuationMode::Radio => "radio",
+        ContinuationMode::Autofill => "autofill",
+    }
+}
+
+/// The `radio status` spelling of a [`ContinuationMode`]. Deliberately NOT the config
+/// words: inside the `radio` verb "radio" would name the whole feature rather than the
+/// mechanism, so the two mechanisms are reported as what they DO - a library `walk` or a
+/// `station` handoff.
+fn radio_mode_name(mode: ContinuationMode) -> &'static str {
+    match mode {
+        ContinuationMode::Radio => "station",
+        ContinuationMode::Autofill => "walk",
+    }
+}
+
 fn ack(code: u32, command: &str, message: &str) -> MpdResponse {
     MpdResponse::Ack {
         code,
@@ -8060,6 +8827,7 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::Continuation(cmd) => self.handle_continuation(cmd).await,
+            MpdCommand::Radio(cmd) => self.handle_radio(cmd).await,
 
             // ── queue ─────────────────────────────────────────────────────
             MpdCommand::Add(uri) => match self.enqueue_uri(&uri).await {
@@ -8943,9 +9711,12 @@ impl HypodjHandler {
 
             // ── Radio: random / similar / top (feature 4) ───────────────────
             Some("Radio") => {
-                // random is always reachable; similar/top are seeded per song or
-                // artist from a browse path (radio/similar/<songId>,
-                // radio/top/<artist>). We advertise the random entry plus a hint.
+                // `radio/random` is the ONLY entry here, and this listing is the
+                // only thing that advertises it - which is why the old
+                // `radio/similar/<songId>` and `radio/top/<artist>` arms were
+                // removed: nothing listed them, no client could reach them without
+                // typing a literal path, and `enqueue_uri` refused them as
+                // directories anyway. The `radio` VERB is how you seed from a thing.
                 MpdResponse::pairs()
                     .pair("directory", "radio/random")
                     .build()
@@ -8954,34 +9725,6 @@ impl HypodjHandler {
                 // NEVER cached: randomness is the whole point.
                 match self.client.random_songs(Some(50)).await {
                     Ok(songs) => song_rows(&songs),
-                    Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
-                }
-            }
-            Some(p) if p.starts_with("radio/similar/") => {
-                let id = p.trim_start_matches("radio/similar/").to_string();
-                let key = format!("similar/{id}");
-                if let Some(songs) = self.listings.get(&key) {
-                    return song_rows(&songs);
-                }
-                match self.client.similar_songs(&SongId(id), Some(50)).await {
-                    Ok(songs) => {
-                        self.listings.put(key, songs.clone());
-                        song_rows(&songs)
-                    }
-                    Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
-                }
-            }
-            Some(p) if p.starts_with("radio/top/") => {
-                let artist = p.trim_start_matches("radio/top/").to_string();
-                let key = format!("top/{artist}");
-                if let Some(songs) = self.listings.get(&key) {
-                    return song_rows(&songs);
-                }
-                match self.client.top_songs(&artist, Some(50)).await {
-                    Ok(songs) => {
-                        self.listings.put(key, songs.clone());
-                        song_rows(&songs)
-                    }
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
                 }
             }
@@ -9946,6 +10689,28 @@ mod tests {
         Some((HypodjHandler::new(client, player), events))
     }
 
+    /// Like [`handler_with_null_player`] but wires a NullPlayer whose LOADS always
+    /// fail, so a test can drive the by-stable-id batch rollback legs. Same sandbox
+    /// `None` guard.
+    fn handler_with_failing_player(
+    ) -> Option<(HypodjHandler, tokio::sync::mpsc::Receiver<PlayerEvent>)> {
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1/never-called".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            client_name: "test".to_string(),
+        };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => Arc::new(c),
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return None;
+            }
+        };
+        let (player, events) = NullPlayer::spawn_failing();
+        Some((HypodjHandler::new(client, player), events))
+    }
+
     /// Like [`handler_with_null_player`] but wires a probing NullPlayer so a test
     /// can observe the warm-skip commands the handler issues (prefetch / drop).
     /// Same sandbox `None` guard.
@@ -10747,6 +11512,728 @@ mod tests {
         assert!(
             h.state.lock().unwrap().pending_continuation_warm.is_none(),
             "no station warm arms in autofill mode (mode == Radio folded into station_ok)"
+        );
+    }
+
+    // THE SEAM the gesture and the drain edge share. An EXPLICIT seed wins over recency,
+    // so what the walk fetches is the thing the user pointed at even if another
+    // connection repointed `current` in between (the handler is Arc-shared across
+    // connections); and `play_now = false` appends WITHOUT loading, which is what makes
+    // a prefetch behind a playing track possible at all.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_once_prefers_an_explicit_seed_and_can_skip_playback() {
+        let Some((mut events, h)) = handler_with_null_player().map(|(h, e)| (e, h)) else {
+            return;
+        };
+        h.enqueue_song_for_test(autofill_song("recency")).await;
+        h.play_for_test(0).await;
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![autofill_song("x1")]));
+        while events.try_recv().is_ok() {}
+
+        let appended = h
+            .autofill_once(Some(SongId("EXPLICIT".into())), AutofillStart::Behind)
+            .await;
+
+        assert_eq!(appended, 1, "the count of appended tracks is what comes back");
+        assert_eq!(
+            h.autofill_last_seed(),
+            Some(SongId("EXPLICIT".into())),
+            "the explicit seed wins over the recency seed (`recency`)"
+        );
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 2, "the batch is appended");
+        assert_eq!(st.current, Some(0), "and nothing was loaded - the deck is untouched");
+        drop(st);
+        assert!(events.try_recv().is_err(), "no load reached the player");
+    }
+
+    // ── `radio <thing>` - the seeded entry into the endless walk (task 8pns0hi) ──
+
+    // A minimal album for the artist resolve (getTopSongs takes a NAME, so the album
+    // list is what recovers it).
+    fn radio_test_album(id: &str, artist: &str) -> Album {
+        Album {
+            id: AlbumId(id.to_string()),
+            name: format!("Album {id}"),
+            artist: artist.to_string(),
+            artist_id: None,
+            year: None,
+            genre: None,
+            cover_art: None,
+            song_count: 3,
+        }
+    }
+
+    fn radio(seed: RadioSeed) -> MpdCommand {
+        MpdCommand::Radio(RadioCmd::Start(seed))
+    }
+
+    fn radio_uri(uri: &str) -> MpdCommand {
+        radio(RadioSeed::Uri(uri.to_string()))
+    }
+
+    fn is_ack(resp: &MpdResponse) -> bool {
+        matches!(resp, MpdResponse::Ack { .. })
+    }
+
+    // `radio song/<id>` APPENDS at the tail (the user's existing rows survive, one play
+    // away), plays the seed, arms the walk, and forces the runtime mode to autofill even
+    // though the config said radio - the verb IS the mode switch, so it works on a daemon
+    // whose config never mentions [continuation].
+    #[tokio::test(start_paused = true)]
+    async fn radio_seed_appends_at_the_tail_and_plays() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for id in ["q0", "q1", "q2"] {
+            h.enqueue_song_for_test(autofill_song(id)).await;
+        }
+        h.set_continuation_mode(ContinuationMode::Radio, 3);
+        let version_before = h.state.lock().unwrap().playlist_version;
+        h.push_radio_songs(Ok(vec![autofill_song("S1")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("p1"), autofill_song("p2")]));
+
+        let resp = h.handle(radio_uri("song/S1")).await;
+
+        assert_eq!(pair(&resp, "radio"), Some("on"));
+        assert_eq!(pair(&resp, "radio_from"), Some("song"));
+        assert_eq!(pair(&resp, "radio_seed"), Some("Song S1"));
+        assert_eq!(pair(&resp, "radio_queued"), Some("3"), "1 seed + a 2-track prefetch");
+        let st = h.state.lock().unwrap();
+        assert_eq!(
+            st.queue.iter().take(3).map(|it| it.id).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the three pre-existing rows are untouched (never cleared)"
+        );
+        assert_eq!(st.current, Some(3), "the pointed-at song is what plays, at the tail");
+        assert!(st.playlist_version > version_before, "the queue change is observable");
+        assert!(st.continuation, "the walk is armed");
+        drop(st);
+        assert_eq!(
+            h.queue_song_ids(),
+            ["q0", "q1", "q2", "S1", "p1", "p2"].map(|s| SongId(s.into())).to_vec(),
+            "the prefetched batch sits BEHIND the seed, in the queue the user can see"
+        );
+        assert_eq!(
+            *h.continuation_mode.lock().unwrap(),
+            ContinuationMode::Autofill,
+            "the gesture forces the runtime mode; no config edit is ever required"
+        );
+    }
+
+    // THE STARTLE CASE: bare `radio` over a track already playing must NEVER restart it.
+    // The resolved track list is empty, the append/play step is skipped entirely, and the
+    // gesture only arms + prefetches BEHIND the playing track.
+    #[tokio::test(start_paused = true)]
+    async fn radio_bare_over_a_playing_track_never_restarts_it() {
+        let Some((mut events, h)) = handler_with_null_player().map(|(h, e)| (e, h)) else {
+            return;
+        };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        h.push_autofill_batch(Ok(vec![autofill_song("p1"), autofill_song("p2")]));
+        // Drain the load event the deliberate play just produced, so anything left in
+        // the channel afterwards can only be a SECOND load.
+        while events.try_recv().is_ok() {}
+
+        let resp = h.handle(radio(RadioSeed::Current)).await;
+
+        assert_eq!(pair(&resp, "radio_from"), Some("current"));
+        assert_eq!(pair(&resp, "radio_seed"), Some("Song now"));
+        assert_eq!(pair(&resp, "radio_queued"), Some("2"), "only the prefetch was queued");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, Some(0), "the playing track stays current - no restart");
+        assert_eq!(st.queue.len(), 3, "the batch is appended behind it");
+        assert!(st.continuation);
+        drop(st);
+        assert!(
+            events.try_recv().is_err(),
+            "the player never saw a second load of the track already playing"
+        );
+        assert!(h.radio_calls().is_empty(), "the current seed costs ZERO wire calls");
+    }
+
+    // THE SAME STARTLE, through the form the TUI actually sends: `r` on the row that is
+    // playing spells `radio song/<that id>`, and it must mean what the bare gesture means
+    // - arm and prefetch BEHIND it. Never a duplicate row, never a hard cut back to 0:00,
+    // and (answered off the queue entry) never a wire call either.
+    #[tokio::test(start_paused = true)]
+    async fn radio_song_uri_on_the_track_already_playing_never_restarts_it() {
+        let Some((mut events, h)) = handler_with_null_player().map(|(h, e)| (e, h)) else {
+            return;
+        };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        // Scripted so the wire COULD answer: what proves the guard is that it never has to.
+        h.push_radio_songs(Ok(vec![autofill_song("now")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("p1")]));
+        while events.try_recv().is_ok() {}
+
+        let resp = h.handle(radio_uri("song/now")).await;
+
+        assert_eq!(pair(&resp, "radio_queued"), Some("1"), "only the prefetch was queued");
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "no restart");
+        assert_eq!(
+            h.queue_song_ids(),
+            ["now", "p1"].map(|s| SongId(s.into())).to_vec(),
+            "the playing song is never placed a SECOND time"
+        );
+        assert!(events.try_recv().is_err(), "the player never saw a second load");
+        assert!(h.radio_calls().is_empty(), "the song already on the deck costs ZERO wire calls");
+    }
+
+    // A STOPPED deck still holds its `current` (MPD `stop` never clears it), so a
+    // gesture that reads "is anything playing" off `current.is_none()` sees a silent deck
+    // as busy: it would arm, queue a batch, and start NOTHING. The one gesture whose whole
+    // promise is "press this and it keeps going" must pick the deck back up.
+    #[tokio::test(start_paused = true)]
+    async fn radio_over_a_stopped_deck_picks_the_music_back_up() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        h.handle(MpdCommand::Stop).await;
+        assert_eq!(
+            h.state.lock().unwrap().current,
+            Some(0),
+            "the premise: MPD stop KEEPS the current"
+        );
+        h.push_autofill_batch(Ok(vec![autofill_song("p1")]));
+
+        let resp = h.handle(radio(RadioSeed::Current)).await;
+
+        assert_eq!(pair(&resp, "radio"), Some("on"));
+        assert_eq!(h.player.state(), PlayState::Playing, "the deck is AUDIBLE again");
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "state"), Some("play"), "and it reports what it is doing");
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "on the song it was left on");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "with a batch behind it");
+    }
+
+    // A deck that was ENQUEUED but never played (`current` is None, nothing has finished):
+    // bare `radio` means "play what I queued and keep going". Starting on the appended
+    // batch instead would strand every row the person chose, unheard, above music they
+    // never picked.
+    #[tokio::test(start_paused = true)]
+    async fn radio_over_an_unplayed_queue_starts_the_queue_not_the_batch() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for id in ["q0", "q1", "q2"] {
+            h.enqueue_song_for_test(autofill_song(id)).await;
+        }
+        assert!(h.state.lock().unwrap().current.is_none(), "the premise: nothing ever played");
+        h.push_autofill_batch(Ok(vec![autofill_song("far1"), autofill_song("far2")]));
+
+        h.handle(radio(RadioSeed::Current)).await;
+
+        assert_eq!(
+            h.state.lock().unwrap().current,
+            Some(0),
+            "the user's OWN first row is what plays"
+        );
+        assert_eq!(
+            h.queue_song_ids(),
+            ["q0", "q1", "q2"].map(|s| SongId(s.into())).to_vec(),
+            "and their queue is untouched - two rows ahead is already a body of music, so \
+             the walk's own drain edge covers the handoff"
+        );
+        assert_eq!(h.autofill_fetch_calls(), 0, "nothing to prefetch behind a stocked deck");
+        assert!(h.state.lock().unwrap().continuation, "the walk is armed all the same");
+    }
+
+    // A DRAINED deck (everything played, `current` cleared, a pending-pause terminal
+    // possibly standing) starts on the fresh batch - through the full fresh-play GESTURE
+    // path, not the walk's inner one. That path is what supersedes an in-flight
+    // winddown/pause fade and retires the pending-pause intent, so the freshly started
+    // radio cannot be dragged to silence or report Paused while it is audibly playing.
+    #[tokio::test(start_paused = true)]
+    async fn radio_on_a_drained_deck_starts_the_batch_as_a_gesture() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        {
+            let mut st = h.state.lock().unwrap();
+            st.last_finished = Some(autofill_song("gone"));
+            // The long-lived nothing-loaded terminal a night of offline retries leaves.
+            st.pending_pause = true;
+        }
+        h.push_autofill_batch(Ok(vec![autofill_song("p1"), autofill_song("p2")]));
+
+        let resp = h.handle(radio(RadioSeed::Current)).await;
+
+        assert_eq!(pair(&resp, "radio_queued"), Some("2"));
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "the batch starts playing");
+        assert!(
+            !h.state.lock().unwrap().pending_pause,
+            "the gesture path RETIRED the standing pause intent"
+        );
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(
+            pair(&status, "state"),
+            Some("play"),
+            "so the deck never reports Paused while it is audibly playing"
+        );
+    }
+
+    // A drained queue is SPENT: its rows already played, so "keep going" is the fresh
+    // batch, never a replay of what just ended.
+    #[tokio::test(start_paused = true)]
+    async fn radio_on_a_drained_queue_does_not_replay_the_spent_rows() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("done")).await;
+        h.play_for_test(0).await;
+        // The honest end-of-queue stop: last_finished latched, current cleared, the row
+        // still sitting in the queue (consume off).
+        h.advance_on_eof(EofSignal::default()).await;
+        assert!(h.state.lock().unwrap().current.is_none(), "the premise: drained");
+        h.push_autofill_batch(Ok(vec![autofill_song("p1")]));
+
+        h.handle(radio(RadioSeed::Current)).await;
+
+        assert_eq!(
+            h.state.lock().unwrap().current,
+            Some(1),
+            "the FRESH row plays, not the spent one at the head"
+        );
+    }
+
+    // An empty deck whose seed has NO similar songs left in the library: nothing plays,
+    // nothing is queued, so the gesture says so instead of reporting `radio: on` over
+    // silence. The arming goes back too - a walk armed over a stopped deck that will
+    // never reach another drain edge is inert.
+    #[tokio::test(start_paused = true)]
+    async fn radio_that_could_start_nothing_acks_and_arms_nothing() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().last_finished = Some(autofill_song("gone"));
+        h.push_autofill_batch(Ok(Vec::new())); // the library has nothing similar left
+
+        let resp = h.handle(radio(RadioSeed::Current)).await;
+
+        assert!(is_ack(&resp), "silence is never reported as a radio that started");
+        let st = h.state.lock().unwrap();
+        assert!(!st.continuation, "the inert arming was put back");
+        assert!(st.queue.is_empty(), "and the deck is exactly as it was");
+    }
+
+    // The gesture is IDEMPOTENT over a deck that already has music ahead of it: a held
+    // `r` (a global auto-repeating binding) must not turn into a fetch-and-append storm.
+    // The at-least-a-batch-ahead rule reads the DECK, so the second press costs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn radio_pressed_again_over_a_stocked_deck_appends_nothing() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        h.push_autofill_batch(Ok(vec![autofill_song("p1"), autofill_song("p2")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("p3"), autofill_song("p4")]));
+
+        h.handle(radio(RadioSeed::Current)).await;
+        let after_one = h.state.lock().unwrap().queue.len();
+        let resp = h.handle(radio(RadioSeed::Current)).await;
+
+        assert_eq!(h.autofill_fetch_calls(), 1, "the second press fetches NOTHING");
+        assert_eq!(pair(&resp, "radio_queued"), Some("0"), "and queues nothing");
+        assert_eq!(h.state.lock().unwrap().queue.len(), after_one, "the queue stops growing");
+    }
+
+    // A single seed track leaves one BATCH of music ahead of the deck, prefetched at
+    // gesture time from the EXPLICIT seed (not from recency).
+    #[tokio::test(start_paused = true)]
+    async fn radio_single_seed_prefetches_one_batch() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_continuation_mode(ContinuationMode::Radio, 3);
+        h.push_radio_songs(Ok(vec![autofill_song("S1")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("p1"), autofill_song("p2"), autofill_song("p3")]));
+
+        h.handle(radio_uri("song/S1")).await;
+
+        assert_eq!(h.autofill_fetch_calls(), 1, "exactly one similar fetch");
+        assert_eq!(
+            h.autofill_last_seed(),
+            Some(SongId("S1".into())),
+            "the prefetch seeds from the EXPLICIT thing the user pointed at"
+        );
+        assert_eq!(h.state.lock().unwrap().queue.len(), 4, "seed + a full batch");
+    }
+
+    // An album is ALREADY a body of music: the at-least-one-batch-ahead invariant is
+    // satisfied, so the gesture fires ZERO similar fetches and the walk's own drain-edge
+    // fetch covers the handoff forty minutes out.
+    #[tokio::test(start_paused = true)]
+    async fn radio_album_seed_does_not_prefetch() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let mut tracks = Vec::new();
+        for id in ["t1", "t2", "t3", "t4", "t5"] {
+            let mut s = autofill_song(id);
+            s.album = Some("Blue Album".to_string());
+            tracks.push(s);
+        }
+        h.push_radio_songs(Ok(tracks));
+
+        let resp = h.handle(radio_uri("album/AL1")).await;
+
+        assert_eq!(pair(&resp, "radio_from"), Some("album"));
+        assert_eq!(pair(&resp, "radio_seed"), Some("Blue Album"));
+        assert_eq!(pair(&resp, "radio_queued"), Some("5"));
+        assert_eq!(h.autofill_fetch_calls(), 0, "a body of music needs no gesture-time prefetch");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 5, "the album is the whole of what was queued");
+        assert_eq!(st.current, Some(0), "the album's first track plays");
+        assert!(st.continuation, "the walk is armed behind it all the same");
+    }
+
+    // `radio artist/<id>` resolves the NAME through the album list (getTopSongs takes a
+    // name, not an id), then starts on the artist's top tracks.
+    #[tokio::test(start_paused = true)]
+    async fn radio_artist_seed_starts_on_top_songs() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.push_radio_albums(Ok(vec![radio_test_album("AL1", "Broadcast")]));
+        h.push_radio_songs(Ok(vec![autofill_song("hit1"), autofill_song("hit2")]));
+
+        let resp = h.handle(radio_uri("artist/AR1")).await;
+
+        assert_eq!(pair(&resp, "radio_from"), Some("artist"));
+        assert_eq!(pair(&resp, "radio_seed"), Some("Broadcast"));
+        assert_eq!(pair(&resp, "radio_queued"), Some("2"));
+        assert_eq!(
+            h.radio_calls(),
+            vec!["artist_albums:AR1".to_string(), "top:Broadcast".to_string()],
+            "the name is recovered from the album list, then top songs are asked BY NAME"
+        );
+    }
+
+    // Navidrome's top songs are last.fm-backed, so a local-only artist often has NONE.
+    // Fall back ONCE to the artist's first album, using the album list already in hand -
+    // still exactly the artist that was pointed at, never a genre/random degrade.
+    #[tokio::test(start_paused = true)]
+    async fn radio_artist_falls_back_to_an_album_when_top_songs_is_empty() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.push_radio_albums(Ok(vec![radio_test_album("AL1", "Local Only")]));
+        h.push_radio_songs(Ok(Vec::new())); // top songs: empty
+        h.push_radio_songs(Ok(vec![autofill_song("a1"), autofill_song("a2")]));
+
+        let resp = h.handle(radio_uri("artist/AR9")).await;
+
+        assert_eq!(pair(&resp, "radio_from"), Some("artist"));
+        assert_eq!(pair(&resp, "radio_queued"), Some("2"), "the album carried the start");
+        assert_eq!(
+            h.radio_calls(),
+            vec![
+                "artist_albums:AR9".to_string(),
+                "top:Local Only".to_string(),
+                "album:AL1".to_string(),
+            ],
+            "exactly one fallback, to the album list already in hand"
+        );
+        assert!(h.state.lock().unwrap().continuation, "the walk is armed");
+    }
+
+    // THE FEATURE: a HAND-STARTED radio rejoins the existing walk. The refill after the
+    // gesture's batch seeds from that batch's LAST track, not from the original thing -
+    // it MOVES through the similarity graph rather than orbiting.
+    #[tokio::test(start_paused = true)]
+    async fn radio_hand_start_then_drain_walks_a_fresh_seed() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_continuation_mode(ContinuationMode::Radio, 1);
+        h.push_radio_songs(Ok(vec![autofill_song("S1")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("p1")])); // the gesture's prefetch
+        h.push_autofill_batch(Ok(vec![autofill_song("p2")])); // the drain-edge refill
+
+        h.handle(radio_uri("song/S1")).await;
+        assert_eq!(h.autofill_last_seed(), Some(SongId("S1".into())), "fetch 1 seeds from the thing");
+
+        // S1 ends -> the ordinary advance loads p1. p1 ends -> a true drain fires the walk.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        h.advance_on_eof(EofSignal::default()).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "the prefetched p1 plays next");
+        tokio::time::advance(Duration::from_secs(31)).await;
+        h.advance_on_eof(EofSignal::default()).await;
+
+        assert_eq!(
+            h.autofill_last_seed(),
+            Some(SongId("p1".into())),
+            "fetch 2 seeds from the batch's LAST track - the walk moves, it does not orbit"
+        );
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 3, "the refill appended p2");
+        assert_eq!(st.current, Some(2), "and the music keeps going");
+    }
+
+    // The 30s fuse is a degenerate-INPUT guard, so an explicit gesture resets it (else a
+    // radio pressed within 30s of a refill would silently eat its OWN prefetch). Every
+    // SUBSEQUENT automatic refill still honors it, so the unattended ceiling is intact.
+    #[tokio::test(start_paused = true)]
+    async fn radio_gesture_resets_the_fuse_but_the_walk_still_honors_it() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_continuation_mode(ContinuationMode::Radio, 1);
+        // A refill just happened (the fuse would eat anything for the next 30s).
+        h.state.lock().unwrap().last_autofill_at = Some(Instant::now());
+        h.push_radio_songs(Ok(vec![autofill_song("S1")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("p1")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("p2")]));
+
+        h.handle(radio_uri("song/S1")).await;
+        assert_eq!(h.autofill_fetch_calls(), 1, "the gesture's own prefetch is NOT eaten by the fuse");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "seed + prefetch");
+
+        // Two automatic drains INSIDE the fuse window yield exactly ONE more fetch.
+        h.advance_on_eof(EofSignal::default()).await; // advances onto p1, no refill
+        h.advance_on_eof(EofSignal::default()).await; // true drain, but fused
+        assert_eq!(
+            h.autofill_fetch_calls(),
+            1,
+            "the automatic refill still honors the <= 1 fetch / 30s ceiling"
+        );
+    }
+
+    // `radio on` is ARM ONLY: keep going from what I already queued. No resolve, no
+    // fetch, no queue change, no transport.
+    #[tokio::test(start_paused = true)]
+    async fn radio_on_arms_without_touching_the_queue() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("q0")).await;
+        h.play_for_test(0).await;
+
+        let resp = h.handle(MpdCommand::Radio(RadioCmd::On)).await;
+
+        assert_eq!(pair(&resp, "radio"), Some("on"));
+        assert_eq!(pair(&resp, "radio_from"), Some("armed"));
+        assert_eq!(pair(&resp, "radio_queued"), Some("0"));
+        assert_eq!(h.autofill_fetch_calls(), 0, "arming fetches nothing");
+        assert!(h.radio_calls().is_empty(), "arming resolves nothing");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 1, "the queue is untouched");
+        assert_eq!(st.current, Some(0));
+        assert!(st.continuation);
+        drop(st);
+        assert_eq!(*h.continuation_mode.lock().unwrap(), ContinuationMode::Autofill);
+    }
+
+    // ONE arm bit and ONE off path: `radio off` AND `continuation off` both disarm AND
+    // put the CONFIGURED mode back, so one radio press can never silently kill a
+    // configured station for the rest of the process.
+    #[tokio::test(start_paused = true)]
+    async fn radio_off_restores_the_configured_mode() {
+        for use_continuation_verb in [false, true] {
+            let Some((h, _events)) = handler_with_null_player() else { return };
+            h.set_continuation_mode(ContinuationMode::Radio, 1);
+            h.set_continuation_station(Some("NTS 1".to_string()));
+            h.push_radio_songs(Ok(vec![autofill_song("S1")]));
+            h.push_autofill_batch(Ok(vec![autofill_song("p1")]));
+            h.handle(radio_uri("song/S1")).await;
+            assert_eq!(*h.continuation_mode.lock().unwrap(), ContinuationMode::Autofill);
+
+            let resp = if use_continuation_verb {
+                h.handle(MpdCommand::Continuation(ContinuationCmd::Off)).await
+            } else {
+                h.handle(MpdCommand::Radio(RadioCmd::Off)).await
+            };
+
+            if !use_continuation_verb {
+                assert_eq!(pair(&resp, "radio"), Some("off"));
+            }
+            assert!(!h.state.lock().unwrap().continuation, "the one arm bit is off");
+            assert_eq!(
+                *h.continuation_mode.lock().unwrap(),
+                ContinuationMode::Radio,
+                "the CONFIGURED mode is back (use_continuation_verb = {use_continuation_verb})"
+            );
+        }
+    }
+
+    // Nothing ever played, empty deck: the gesture ACKs and arms NOTHING. Zero fetches,
+    // zero state change - the route out is `radio random`, which is why that keyword
+    // earns its place.
+    #[tokio::test(start_paused = true)]
+    async fn radio_no_seed_arms_nothing() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+
+        let resp = h.handle(radio(RadioSeed::Current)).await;
+
+        assert!(is_ack(&resp), "an honest ACK, never a silent no-op");
+        let st = h.state.lock().unwrap();
+        assert!(!st.continuation, "nothing was armed");
+        assert!(st.queue.is_empty(), "the queue is untouched");
+        drop(st);
+        assert_eq!(h.autofill_fetch_calls(), 0);
+        assert_eq!(*h.continuation_mode.lock().unwrap(), ContinuationMode::Radio, "the mode is untouched");
+    }
+
+    // A uri shape the verb cannot serve ACKs and arms nothing (the parser whitelists the
+    // three prefixes, and the handler refuses anything else in depth).
+    #[tokio::test(start_paused = true)]
+    async fn radio_bad_uri_arms_nothing() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for uri in ["list/newest", "station/NTS", "http://example.org/s"] {
+            let resp = h.handle(radio_uri(uri)).await;
+            assert!(is_ack(&resp), "{uri} ACKs");
+            assert!(!h.state.lock().unwrap().continuation, "{uri} armed nothing");
+            assert!(h.state.lock().unwrap().queue.is_empty(), "{uri} queued nothing");
+        }
+        assert!(h.radio_calls().is_empty(), "an unservable shape never reaches the wire");
+    }
+
+    // A backend failure resolving the seed ACKs and arms nothing - the deck is exactly as
+    // it was.
+    #[tokio::test(start_paused = true)]
+    async fn radio_resolve_failure_arms_nothing() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.push_radio_songs(Err(()));
+
+        let resp = h.handle(radio_uri("song/S1")).await;
+
+        assert!(is_ack(&resp));
+        assert!(!h.state.lock().unwrap().continuation);
+        assert!(h.state.lock().unwrap().queue.is_empty());
+        assert_eq!(h.autofill_fetch_calls(), 0, "a failed resolve never reaches the walk");
+    }
+
+    // The seed resolved but would not LOAD: the just-appended rows go by STABLE id, the
+    // pre-existing rows survive, the arming is put back, and the reply is an ACK. The
+    // verb ACKs exactly when it put zero tracks on the deck AND armed nothing.
+    #[tokio::test(start_paused = true)]
+    async fn radio_seed_load_failure_rolls_back_by_id() {
+        // A player whose loads always fail: the dead-file / 404 case.
+        let Some((h, _events)) = handler_with_failing_player() else { return };
+        h.enqueue_song_for_test(autofill_song("q0")).await;
+        h.push_radio_songs(Ok(vec![autofill_song("dead")]));
+
+        let resp = h.handle(radio_uri("song/dead")).await;
+
+        assert!(is_ack(&resp), "a start that never played is an ACK");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 1, "only the pre-existing row is left");
+        assert_eq!(st.queue[0].id, 0, "and it is untouched");
+        assert!(!st.continuation, "the arming was put back");
+        drop(st);
+        assert_eq!(
+            *h.continuation_mode.lock().unwrap(),
+            ContinuationMode::Radio,
+            "the mode override was put back too"
+        );
+    }
+
+    // `is_true_drain` returns false whenever repeat or random is set over a non-empty
+    // queue, so the walk can NEVER fire while either is on. A bare `radio: on` there is
+    // the exact lie this verb must not tell.
+    #[tokio::test(start_paused = true)]
+    async fn radio_status_names_the_flag_that_is_blocking_the_walk() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        h.push_autofill_batch(Ok(Vec::new()));
+        h.handle(radio(RadioSeed::Current)).await;
+
+        // Armed and unobstructed: no blocked_by pair at all.
+        let rep = h.handle(MpdCommand::Radio(RadioCmd::Status)).await;
+        assert_eq!(pair(&rep, "radio"), Some("on"));
+        assert_eq!(pair(&rep, "radio_blocked_by"), None);
+
+        // repeat on: the walk cannot fire, and status must say so rather than
+        // reporting a bare on that promises music which will never come.
+        h.state.lock().unwrap().repeat = true;
+        let rep = h.handle(MpdCommand::Radio(RadioCmd::Status)).await;
+        assert_eq!(pair(&rep, "radio"), Some("on"));
+        assert_eq!(pair(&rep, "radio_blocked_by"), Some("repeat"));
+
+        h.state.lock().unwrap().repeat = false;
+        h.state.lock().unwrap().random = true;
+        let rep = h.handle(MpdCommand::Radio(RadioCmd::Status)).await;
+        assert_eq!(pair(&rep, "radio_blocked_by"), Some("random"));
+
+        // Disarmed: no blocked_by, because there is no promise to qualify.
+        h.state.lock().unwrap().random = true;
+        h.handle(MpdCommand::Radio(RadioCmd::Off)).await;
+        let rep = h.handle(MpdCommand::Radio(RadioCmd::Status)).await;
+        assert_eq!(pair(&rep, "radio"), Some("off"));
+        assert_eq!(pair(&rep, "radio_blocked_by"), None);
+    }
+
+    // The gesture's OWN tracks must feed the dedup ring. Without this a later refill
+    // can re-serve the very song you seeded from - observed live, refill 4 appended
+    // back the track the gesture had placed at pos 0. Seeded from a SONG, not
+    // `Current`: a Current seed places nothing (RadioStart::new(Vec::new(), ..)), so it
+    // never reaches the append loop this pins.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_gesture_feeds_its_appended_tracks_to_the_dedup_ring() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // The scripted seam returns the tracks the gesture will APPEND itself.
+        h.push_radio_songs(Ok(vec![autofill_song("placed-a"), autofill_song("placed-b")]));
+        h.push_autofill_batch(Ok(Vec::new())); // the follow-on prefetch is not what we pin
+        h.handle(radio(RadioSeed::Uri("song/placed-a".into()))).await;
+
+        let st = h.state.lock().unwrap();
+        assert!(
+            st.queue.iter().any(|q| matches!(&q.entry, QueueEntry::Song(s) if s.id.0 == "placed-a")),
+            "precondition: the gesture actually appended its tracks; queue = {:?}",
+            st.queue.len()
+        );
+        // Assert over what the gesture ACTUALLY appended rather than what was
+        // scripted: a song seed places the seed track, not the whole scripted list.
+        let appended: Vec<String> = st
+            .queue
+            .iter()
+            .filter_map(|q| match &q.entry {
+                QueueEntry::Song(song) => Some(song.id.0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!appended.is_empty(), "precondition: the gesture appended something");
+        for want in &appended {
+            assert!(
+                st.autofill_seen.iter().any(|id| &id.0 == want),
+                "the gesture's own track {want:?} must be visible to the walk, else a \
+                 later refill re-serves it; ring = {:?}",
+                st.autofill_seen
+            );
+        }
+    }
+
+    // An ARMED WALK is visible to every client with NO station configured: the standing
+    // queue-tail hint pairs name the SEED. Without this an armed autofill is invisible.
+    #[tokio::test(start_paused = true)]
+    async fn armed_walk_emits_the_continuation_status_pairs() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        h.push_autofill_batch(Ok(Vec::new())); // an empty prefetch does not matter here
+
+        h.handle(radio(RadioSeed::Current)).await;
+
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "X-hypodj-continuation"), Some("on"));
+        assert_eq!(
+            pair(&status, "X-hypodj-continuation-station"),
+            Some("more like Song now"),
+            "the walk names its seed where a station would name itself"
+        );
+        // And the mode is reportable, so a client can tell a walk from a station handoff.
+        let rep = h.handle(MpdCommand::Continuation(ContinuationCmd::Status)).await;
+        assert_eq!(pair(&rep, "continuation_mode"), Some("autofill"));
+        let rep = h.handle(MpdCommand::Radio(RadioCmd::Status)).await;
+        assert_eq!(pair(&rep, "radio"), Some("on"));
+        assert_eq!(pair(&rep, "radio_mode"), Some("walk"));
+        assert_eq!(pair(&rep, "radio_seed"), Some("Song now"));
+    }
+
+    // A restart of an ARMED WALK must come back a walk. The snapshot carries the mode
+    // and the rehydrate forces it - without that the daemon would come back armed into
+    // RADIO with no station configured, i.e. armed into silence.
+    #[tokio::test(start_paused = true)]
+    async fn an_armed_walk_survives_a_restart_as_a_walk() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_continuation_mode(ContinuationMode::Radio, 1);
+        h.handle(MpdCommand::Radio(RadioCmd::On)).await;
+
+        // An empty saved queue keeps the restore purely about the arming (a song entry
+        // would need a live server to re-resolve).
+        let snap = h.resume_snapshot(0.0);
+        assert!(snap.continuation, "the arm bit persists");
+        assert!(snap.continuation_walk, "and so does the WALK mode");
+
+        // A fresh handler (configured radio, as the daemon would plumb it) restores it.
+        let Some((h2, _events2)) = handler_with_null_player() else { return };
+        h2.set_continuation_mode(ContinuationMode::Radio, 1);
+        h2.restore(&snap).await.expect("an empty saved queue restores");
+        assert!(h2.state.lock().unwrap().continuation, "armed again");
+        assert_eq!(
+            *h2.continuation_mode.lock().unwrap(),
+            ContinuationMode::Autofill,
+            "and armed into the WALK, not into a station that is not configured"
         );
     }
 
@@ -15605,6 +17092,7 @@ mod tests {
             playlist_version: 7,
             saved_at_unix: 1,
             continuation: false,
+            continuation_walk: false,
         };
         h.restore(&s).await.unwrap();
         assert_eq!(h.player.state(), PlayState::Playing);
@@ -15631,6 +17119,7 @@ mod tests {
             playlist_version: 3,
             saved_at_unix: 1,
             continuation: false,
+            continuation_walk: false,
         };
         h.restore(&s).await.unwrap();
         assert_eq!(h.player.state(), PlayState::Stopped, "no autoplay on a paused resume");
@@ -15698,6 +17187,7 @@ mod tests {
             playlist_version: 9,
             saved_at_unix: 1,
             continuation: false,
+            continuation_walk: false,
         };
         // (a) restore aborts and leaves State untouched (no drain to empty, no
         // partial install).
@@ -15727,6 +17217,7 @@ mod tests {
             playlist_version: 9,
             saved_at_unix: 1,
             continuation: false,
+            continuation_walk: false,
         };
         crate::resume::store_atomic(&path, &good).expect("seed the good file");
         h.set_state_path(path.clone());
@@ -17243,6 +18734,7 @@ mod tests {
             playlist_version: 3,
             saved_at_unix: 1,
             continuation: false,
+            continuation_walk: false,
         }
     }
 
