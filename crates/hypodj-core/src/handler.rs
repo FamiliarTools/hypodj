@@ -1775,6 +1775,13 @@ const QUERY_KEYWORD_SONG_CAP: usize = 50;
 
 /// One page of the flat A-Z album index. Matches the page size the artist-albums
 /// path already uses, so the two share one idiom rather than inventing a second.
+/// The fixed per-kind caps `subsonic::search3` passes. Mirrored here so the
+/// `X-Hits` preamble can state each kind's ceiling, letting a client distinguish
+/// "this is everything" from "this is as much as the server would give".
+const SEARCH3_ARTIST_CAP: usize = 20;
+const SEARCH3_ALBUM_CAP: usize = 50;
+const SEARCH3_SONG_CAP: usize = 200;
+
 const ALBUM_INDEX_PAGE: i32 = 500;
 /// Hard ceiling on the flat index. Paging a whole library into `dir_cache` is
 /// unbounded, and an unbounded cache entry is the kind of thing that is fine until
@@ -7685,6 +7692,10 @@ fn startle_bounds(cfg: &FadeConfig, sub_jnd: bool) -> StartleBounds {
 }
 
 // ACK error codes (subset of MPD's ack.h).
+/// MPD `ACK_ERROR_ARG` (2): a well-formed command with bad arguments, as distinct
+/// from an unknown one. Using ACK_ERROR_UNKNOWN for an arity error would tell the
+/// client the command does not exist, which is a lie it may act on.
+const ACK_ERROR_ARG: u32 = 2;
 const ACK_ERROR_NO_EXIST: u32 = 50;
 const ACK_ERROR_UNKNOWN: u32 = 5;
 const ACK_ERROR_EXIST: u32 = 56;
@@ -8391,6 +8402,7 @@ impl MpdHandler for HypodjHandler {
 
             MpdCommand::Find(filters) => self.search_filtered(filters, true).await,
             MpdCommand::Search(filters) => self.search_filtered(filters, false).await,
+            MpdCommand::SearchAll(args) => self.search_all(args).await,
             MpdCommand::FindAdd(filters) => self.find_add(filters, true).await,
             MpdCommand::SearchAdd(filters) => self.find_add(filters, false).await,
             MpdCommand::Count(filters) => self.count(filters).await,
@@ -9235,6 +9247,72 @@ impl HypodjHandler {
     /// Full search3 with client-side MPD-tag post-filtering (feature 7). `exact`
     /// (find) matches equality on tags; otherwise (search) case-insensitive
     /// substring. search3 is full-text only, so this filter recovers precision.
+    /// `searchall <query>`: ONE search3, returning ARTISTS, ALBUMS and SONGS.
+    ///
+    /// Deliberately NOT `collect_matches_capped`: that loop is up to 25 sequential
+    /// Subsonic round trips before a single byte comes back, which is the wrong
+    /// shape for an interactive query surface. One call, fixed server caps.
+    ///
+    /// The song set is post-filtered by the SAME `tag_matches` rule
+    /// `collect_matches_capped` applies, with an `any` filter. Without that clause
+    /// `searchall q` and `search any q` would return materially different song sets
+    /// (the `any` arm spans exactly the modeled fields; Navidrome's full-text index
+    /// is broader), so a client upgrading from one to the other would silently get a
+    /// different answer. With it, `searchall q` is a bounded prefix of `search any q`
+    /// and the upgrade is purely additive.
+    ///
+    /// Results are query-specific and ephemeral: NEVER cached.
+    async fn search_all(&self, args: Vec<String>) -> MpdResponse {
+        if args.len() > 1 {
+            return ack(
+                ACK_ERROR_ARG,
+                "searchall",
+                "searchall takes exactly one query argument",
+            );
+        }
+        let query = args.into_iter().next().unwrap_or_default();
+        if query.trim().is_empty() {
+            return MpdResponse::ok();
+        }
+        let hits = match self.client.search3(&query).await {
+            Ok(h) => h,
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, "searchall", &e.to_string()),
+        };
+        let songs: Vec<_> = hits
+            .songs
+            .into_iter()
+            .filter(|s| tag_matches(s, "any", &query, false))
+            .collect();
+
+        let mut pairs = Vec::new();
+        // The count preamble is load-bearing: the protocol otherwise makes an empty
+        // RESULT and an empty FILTER byte-identical (both a bare OK), so this is the
+        // only way a zero-hit kind can be stated explicitly rather than inferred.
+        // `returned == cap` is rendered by the client as "server cap", never "200+":
+        // search3 is called with a fixed song cap and no over-request, so a full page
+        // is not evidence that more exist.
+        pairs.push(("X-Hits".to_string(), format!("artist {} {}", hits.artists.len(), SEARCH3_ARTIST_CAP)));
+        pairs.push(("X-Hits".to_string(), format!("album {} {}", hits.albums.len(), SEARCH3_ALBUM_CAP)));
+        pairs.push(("X-Hits".to_string(), format!("song {} {}", songs.len(), SEARCH3_SONG_CAP)));
+        // Artist and album blocks are byte-identical in shape to what lsinfo already
+        // emits, so the client parses them with machinery it already has.
+        for a in &hits.artists {
+            pairs.push(("directory".to_string(), format!("artist/{}", a.id.0)));
+            pairs.push(("Artist".to_string(), a.name.clone()));
+            pairs.push(("X-AlbumCount".to_string(), a.album_count.to_string()));
+        }
+        for al in &hits.albums {
+            pairs.push(("directory".to_string(), format!("album/{}", al.id.0)));
+            pairs.push(("Album".to_string(), al.name.clone()));
+            pairs.push(("Artist".to_string(), al.artist.clone()));
+            pairs.push(("X-SongCount".to_string(), al.song_count.to_string()));
+        }
+        for s in &songs {
+            pairs.extend(browse_song_pairs(s));
+        }
+        MpdResponse::Pairs(pairs)
+    }
+
     async fn search_filtered(&self, filters: Vec<(String, String)>, exact: bool) -> MpdResponse {
         if filters.is_empty() {
             return MpdResponse::ok();

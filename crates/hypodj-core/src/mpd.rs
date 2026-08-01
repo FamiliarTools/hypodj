@@ -151,6 +151,18 @@ pub enum MpdCommand {
     /// precisely; search3 itself is full-text only.
     Find(Vec<(String, String)>),
     Search(Vec<(String, String)>),
+    /// `searchall <query>` -> ONE Subsonic search3, returning ARTISTS, ALBUMS and
+    /// SONGS rather than the song-only answer `search`/`find` give.
+    ///
+    /// Non-standard, in the same house style as `knob` / `nl` / `identify`, and
+    /// deliberately NOT a change to `search`/`find`, which must stay song-only so
+    /// ncmpcpp keeps working. Exactly ONE positional argument, quoted if it has
+    /// spaces: more is an ACK, never a silent join, so a future
+    /// `searchall "q" window 0:50` cannot be mistaken for query text and a newer
+    /// client can never silently search for its own arguments.
+    /// Carries ALL positional args so dispatch can ACK an arity error truthfully;
+    /// the parser stays dumb and never silently joins them into a query.
+    SearchAll(Vec<String>),
     /// `findadd <filter...>` (exact) / `searchadd <filter...>`
     /// (case-insensitive substring) -> the same Subsonic search3 + client-side
     /// tag post-filter as [`MpdCommand::Find`]/[`MpdCommand::Search`], but every
@@ -1122,6 +1134,11 @@ pub fn parse(line: &str) -> MpdCommand {
         // dispatch can post-filter search3 (full-text) with MPD-tag precision.
         "find" => MpdCommand::Find(parse_filter(&args)),
         "search" => MpdCommand::Search(parse_filter(&args)),
+        // Exactly one positional argument. `args.join(" ")` would permanently
+        // foreclose a positional window/offset later, which matters because
+        // search3 already accepts artist_offset/album_offset that subsonic.rs
+        // declines to pass.
+        "searchall" => MpdCommand::SearchAll(args.clone()),
         "findadd" => MpdCommand::FindAdd(parse_filter(&args)),
         "searchadd" => MpdCommand::SearchAdd(parse_filter(&args)),
         // count takes the same `TAG VALUE ...` filters as find, optionally
@@ -1162,6 +1179,37 @@ pub fn parse(line: &str) -> MpdCommand {
 #[cfg(test)]
 mod parse_tests {
     use super::*;
+
+    #[test]
+    fn searchall_takes_exactly_one_quoted_query() {
+        assert!(matches!(
+            parse("searchall c418"),
+            MpdCommand::SearchAll(ref a) if a == &vec!["c418".to_string()]
+        ));
+        assert!(matches!(
+            parse("searchall \"volume alpha\""),
+            MpdCommand::SearchAll(ref a) if a == &vec!["volume alpha".to_string()]
+        ));
+    }
+
+    #[test]
+    fn searchall_carries_extra_args_verbatim_so_dispatch_can_ack_them() {
+        // The parser must NOT join them into a query: `args.join(" ")` would
+        // permanently foreclose a positional window/offset later, and a newer
+        // client could then silently search for its own arguments.
+        assert!(matches!(
+            parse("searchall volume alpha"),
+            MpdCommand::SearchAll(ref a) if a.len() == 2
+        ));
+    }
+
+    #[test]
+    fn searchall_with_no_argument_is_an_empty_arg_list() {
+        assert!(matches!(
+            parse("searchall"),
+            MpdCommand::SearchAll(ref a) if a.is_empty()
+        ));
+    }
 
     #[test]
     fn tokenizes_quoted_args() {
