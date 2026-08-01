@@ -802,8 +802,15 @@ fn find_worker(rx: Receiver<Req>, tx: Sender<Inbound>, host: &str, port: u16) {
 fn run_find(host: &str, port: u16, query: &str) -> Result<FindHits, String> {
     let mut conn = MpdConn::connect(host, port)
         .map_err(|_| "search unavailable - could not reach the daemon".to_string())?;
-    match conn.command(&format!("search any {}", quote_arg(query))) {
-        Ok(pairs) => Ok(crate::find::parse_song_hits(&pairs)),
+    // `searchall` (not `search any`): it returns ARTISTS and ALBUMS as well as
+    // songs, and albums that match on their TITLE rather than only through a
+    // matching song. There is deliberately no fallback to `search any` for an older
+    // daemon: client and daemon come from the same flake input and the same
+    // nixos-rebuild switch, so a client that has this cannot run against a daemon
+    // that does not - which removes the entire degraded-mode branch, the
+    // unknown-command retry, and the "quietly less than it claims" failure mode.
+    match conn.command(&format!("searchall {}", quote_arg(query))) {
+        Ok(pairs) => Ok(crate::find::parse_searchall_hits(&pairs)),
         Err(MpdError::Ack(m)) => Err(map_ack_reason(&m)),
         // A read timeout here is a SLOW QUERY, not a dropped player: say so, and say
         // what to do about it, instead of bouncing a connection the user still has.
