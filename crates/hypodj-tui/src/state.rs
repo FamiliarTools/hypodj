@@ -1383,10 +1383,18 @@ impl TuiState {
             Some(uri) if uri.starts_with("song/") => {
                 Some(Intent::Command(format!("playlistadd Starred {uri}")))
             }
-            Some(_) => {
-                self.status_msg = Some("the current track is a stream, can't favorite".into());
-                None
-            }
+            // A raw stream has no star surface of its own, but a RECOGNIZED track that
+            // matched the library does: star the copy the user actually owns (task
+            // g96g064). Only reachable when songrec named the track AND the matcher was
+            // confident, so it can never star a guess.
+            Some(_) => match self.now.match_uri.as_deref() {
+                Some(uri) => Some(Intent::Command(format!("playlistadd Starred {uri}"))),
+                None => {
+                    self.status_msg =
+                        Some("the current track is a stream, can't favorite".into());
+                    None
+                }
+            },
             None => {
                 self.status_msg = Some("nothing is playing to favorite".into());
                 None
@@ -1618,6 +1626,38 @@ mod tests {
 
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn favorite_current_stars_the_library_match_for_a_stream() {
+        // Phase 2 (task g96g064): starring what the radio is playing. A stream has no
+        // star surface of its own, but a confidently matched library counterpart does.
+        let mut s = TuiState::default();
+        s.now.file = Some("https://stream.example/live".into());
+        s.now.match_uri = Some("song/s7".into());
+        assert_eq!(
+            s.favorite_current(),
+            Some(Intent::Command("playlistadd Starred song/s7".into())),
+            "the library copy is starred, not the stream"
+        );
+
+        // Without a match the refusal is unchanged - never star a guess.
+        let mut s = TuiState::default();
+        s.now.file = Some("https://stream.example/live".into());
+        assert_eq!(s.favorite_current(), None);
+        assert_eq!(
+            s.status_msg.as_deref(),
+            Some("the current track is a stream, can't favorite")
+        );
+
+        // A library song still stars itself, ignoring any match uri.
+        let mut s = TuiState::default();
+        s.now.file = Some("song/lib1".into());
+        s.now.match_uri = Some("song/other".into());
+        assert_eq!(
+            s.favorite_current(),
+            Some(Intent::Command("playlistadd Starred song/lib1".into()))
+        );
     }
 
     fn item(pos: usize) -> QueueItem {
