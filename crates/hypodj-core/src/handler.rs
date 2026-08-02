@@ -229,6 +229,15 @@ struct State {
     /// type. EPHEMERAL: never persisted to resume.toml; cleared on every play edge
     /// alongside `stream_meta` so a stale cover can never leak onto a new track.
     recognized_cover: Option<(QueueId, String)>,
+    /// The confident LIBRARY counterpart of the currently recognized track (task
+    /// g96g064), keyed by the LATCHED [`QueueId`], or `None` when nothing matched. A
+    /// FOURTH qid-gated stream overlay beside [`Self::stream_meta`] (ICY),
+    /// [`Self::recognized_cover`] (Shazam) and [`Self::station_identity`]; merged at
+    /// READ time, never written into a shared field, so there is no write race. Routes
+    /// the art pane to LOCAL library bytes and fills album/date/genre that Shazam left
+    /// blank. EPHEMERAL: never persisted; cleared on every play edge alongside
+    /// `stream_meta` so a stale match can never leak onto a new track.
+    library_match: Option<(QueueId, crate::library_match::LibraryMatch)>,
     /// End-of-queue CONTINUATION-radio arming toggle (`continuation on|off`). When
     /// ON and a station is configured, the [`Self::advance_on_eof`] drain edge flows
     /// into the continuation station instead of stopping silent. Default OFF and
@@ -482,6 +491,8 @@ impl Default for State {
             stream_meta: None,
             // No recognized cover until an on-demand `identify` matches.
             recognized_cover: None,
+            // No library counterpart until a recognition resolves one.
+            library_match: None,
             // Continuation radio starts DISARMED - never a surprise on first run.
             continuation: false,
             // No continuation stream is live until one is cold-started.
@@ -1480,6 +1491,12 @@ pub struct HypodjHandler {
     /// [`NTS_CATALOGUE_CACHE_KEY`] so repeated stream track-starts re-match against the
     /// cached document instead of re-fetching. A miss is a natural refetch.
     nts_catalogue_cache: TtlLru<String, String>,
+    /// Recognized (artist, title) -> the confident library counterpart, or `None` for a
+    /// cached NEGATIVE. Caching the misses is what bounds the unattended cost: the auto
+    /// cadence re-identifying an unmatchable long mix searches once an hour, not once
+    /// per interval. Accepted trade: a track newly added to the library is not matched
+    /// for up to the TTL on a stream that keeps re-identifying it.
+    library_match_cache: TtlLru<String, Option<crate::library_match::LibraryMatch>>,
 
     // ── P2 plan registry ───────────────────────────────────────────────────
     /// The armed-plan registry, SHARED with the [`crate::executor::Executor`]
@@ -2005,6 +2022,7 @@ impl HypodjHandler {
             // The NTS mixtapes catalogue is static; cache it for an hour so repeated
             // stream track-starts re-match without re-fetching.
             nts_catalogue_cache: TtlLru::new(4, Duration::from_secs(3600)),
+            library_match_cache: TtlLru::new(64, Duration::from_secs(3600)),
             plan_pending: Arc::new(Mutex::new(Vec::new())),
             next_plan_id: AtomicU64::new(0),
             plan_timers: OnceLock::new(),
@@ -3676,6 +3694,83 @@ impl HypodjHandler {
         self.notify_change();
     }
 
+    /// Publish the FULL recognized overlay for `queue_id` under ONE lock scope: the
+    /// stream tags, an optional recognized cover URL, and the resolved library match
+    /// (task g96g064). One write and one `notify_change`, so a client can never observe
+    /// a fresh cover beside stale tags.
+    ///
+    /// `cover_url = None` LEAVES any existing recognized cover (today's
+    /// [`Self::set_recognized_cover`] semantics, unchanged). `library` is written
+    /// UNCONDITIONALLY, including `None`: a new recognition on the same stream must
+    /// RETIRE the previous track's match rather than keep serving its album art beside
+    /// the new track's tags. Same lock discipline as its siblings - the std lock is held
+    /// only for the field writes and dropped BEFORE `notify_change`, never across an
+    /// await; mutated through `&self` interior mutability.
+    pub(crate) fn set_stream_surface(
+        &self,
+        queue_id: QueueId,
+        meta: StreamMeta,
+        cover_url: Option<String>,
+        library: Option<crate::library_match::LibraryMatch>,
+    ) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.stream_meta = Some((queue_id, meta));
+            if let Some(url) = cover_url {
+                st.recognized_cover = Some((queue_id, url));
+            }
+            st.library_match = library.map(|m| (queue_id, m));
+        }
+        self.notify_change();
+    }
+
+    /// Resolve the confident LIBRARY counterpart of a recognized track, or `None`
+    /// (task g96g064). Cache-first (negatives included), then ONE bounded `search3`
+    /// plus the pure matcher in [`crate::library_match`].
+    ///
+    /// NEVER errors out of `identify`: a search failure, a timeout, an empty result and
+    /// a deliberate abstention are ALL just "no match", which degrades to exactly the
+    /// Shazam-only behaviour that shipped before this. Critically, none of them may
+    /// reach the `NoMatch`/`Error` arms of the caller, because those feed the
+    /// exponential auto-identify backoff - a Navidrome outage must not decay the
+    /// recognition cadence.
+    ///
+    /// LOCK DISCIPLINE: the `TtlLru` `get` and `put` are separate scopes with the await
+    /// strictly between them, so no std lock is held across the await.
+    async fn lookup_library_match(
+        &self,
+        track: &crate::recognize::RecognizedTrack,
+    ) -> Option<crate::library_match::LibraryMatch> {
+        // A one-sided Shazam hit has nothing to verify a candidate against, so it never
+        // touches the network.
+        let artist = track.artist.as_deref().filter(|a| !a.trim().is_empty())?;
+        let title = track.title.as_deref().filter(|t| !t.trim().is_empty())?;
+
+        let key = crate::library_match::match_key(artist, title);
+        if let Some(cached) = self.library_match_cache.get(&key) {
+            return cached;
+        }
+        let query = crate::library_match::search_query(title)?;
+
+        let found = match tokio::time::timeout(
+            LIBRARY_MATCH_BUDGET,
+            self.client.search3(&query),
+        )
+        .await
+        {
+            Ok(Ok(hits)) => crate::library_match::best_library_match(
+                &hits.songs,
+                artist,
+                title,
+                track.album.as_deref(),
+            ),
+            // A timeout or a server error is a miss, never an error out of identify.
+            Ok(Err(_)) | Err(_) => None,
+        };
+        self.library_match_cache.put(key, found.clone());
+        found
+    }
+
     /// Store the recognized Shazam cover-art URL for the raw stream identified by
     /// `queue_id` (task f7vnd3i), then wake idling clients so the dj-gui art pane can
     /// re-read the `X-CoverArt` currentsong field. Keyed by the latched identity so
@@ -3805,6 +3900,14 @@ impl HypodjHandler {
                 st.station_identity = None;
             }
         }
+        // Drop the library match on the same edge (task g96g064) so a prior stream's
+        // local art / album can never linger onto the next entry - a sibling of the
+        // stream_meta / recognized_cover / station_identity drops above.
+        if let Some((qid, _)) = &st.library_match {
+            if keep != Some(*qid) {
+                st.library_match = None;
+            }
+        }
     }
 
     /// ON-DEMAND now-playing RECOGNITION for the current raw stream (task f7vnd3i).
@@ -3832,8 +3935,8 @@ impl HypodjHandler {
         // The MANUAL verb: run the shared body (no auto timer), map the outcome to the
         // exact ACK/pairs surface the verb always emitted.
         match self.identify_inner(None).await {
-            IdentifyOutcome::Hit { track, now_playing } => {
-                identify_hit_response(&track, now_playing.as_deref())
+            IdentifyOutcome::Hit { track, now_playing, library } => {
+                identify_hit_response(&track, now_playing.as_deref(), library.as_ref())
             }
             IdentifyOutcome::NoMatch => MpdResponse::pairs().pair("identify", "no match").build(),
             IdentifyOutcome::Error(e) => ack(ACK_ERROR_UNKNOWN, "identify", &e),
@@ -3936,6 +4039,14 @@ impl HypodjHandler {
 
         let now_playing = crate::recognize::now_playing_title(&track);
 
+        // Resolve the LIBRARY counterpart BEFORE the state re-check below (task g96g064),
+        // so the existing qid gate and the ICY-landed window (title_at_capture, snapshotted
+        // at capture start) automatically extend over the lookup too. No std lock is held
+        // here. The `recognizing` guard serializes this whole body, so two lookups can
+        // never be in flight and no generation counter is needed (unlike the SPAWNED
+        // station-identity resolver, whose generation is bumped per track-start).
+        let library = self.lookup_library_match(&track).await;
+
         // Re-check the qid + ICY provenance + preserve any existing ICY station Name under
         // ONE lock, so neither a track that advanced NOR a real ICY title that landed during
         // the capture is clobbered by the recognized result. The decision is factored into
@@ -3949,7 +4060,7 @@ impl HypodjHandler {
                 // The stream advanced away from what we captured: report the hit but do
                 // NOT decorate the now-different entry, and do NOT rearm (the slot for
                 // this qid was already disarmed by the track change).
-                return IdentifyOutcome::Hit { track, now_playing };
+                return IdentifyOutcome::Hit { track, now_playing, library };
             }
             IdentifySurface::IcyLanded => {
                 // A real ICY title landed during the capture: ICY wins. Do NOT overwrite it
@@ -3957,39 +4068,55 @@ impl HypodjHandler {
                 // the fire gate's ICY-wins Disarm, just detected at the surfacing step). The
                 // recognized hit is still reported honestly to the caller.
                 self.disarm_auto_identify_for_qid(qid);
-                return IdentifyOutcome::Hit { track, now_playing };
+                return IdentifyOutcome::Hit { track, now_playing, library };
             }
             IdentifySurface::Decorate(name) => name,
         };
 
-        // Surface the recognized cover toward the dj-gui pane (qid-gated slot).
-        if let Some(url) = &track.cover_url {
-            self.set_recognized_cover(qid, url.clone());
-        }
         // Surface the hit into the same Name/Title path as ICY, PLUS the split
         // Artist/Album/Date/Genre/Label tags the recognition carries (task 5578wi6) so
         // clients get a real artist instead of "Unknown artist" beside a crammed
         // "Artist - Title" line. Preserve the station Name if one was already latched;
         // the recognized now-playing still rides Title (the ICY convention every
-        // existing client already reads). Wakes idling clients (notify_change).
-        self.set_stream_meta_full(
+        // existing client already reads). The cover and the library match ride the SAME
+        // write, so the whole overlay lands atomically (one notify_change).
+        //
+        // The library contributes FILL-ONLY: it supplies album/date/genre ONLY where
+        // Shazam left the field blank, and NEVER touches title/artist/track_title.
+        // Rewriting `title` would be actively dangerous - it is the provenance value
+        // `rearm_auto_identify_after_attempt` records below and the auto gate compares
+        // against, so a canonical respelling would make the next fire misread our own
+        // write as a fresh ICY title and silently disarm the cadence forever.
+        self.set_stream_surface(
             qid,
             StreamMeta {
                 name: existing_name,
                 title: now_playing.clone(),
                 artist: track.artist.clone(),
                 track_title: track.title.clone(),
-                album: track.album.clone(),
-                date: track.released.clone(),
-                genre: track.genre.clone(),
+                album: track
+                    .album
+                    .clone()
+                    .or_else(|| library.as_ref().and_then(|m| m.album.clone())),
+                date: track
+                    .released
+                    .clone()
+                    .or_else(|| library.as_ref().and_then(|m| m.year.map(|y| y.to_string()))),
+                genre: track
+                    .genre
+                    .clone()
+                    .or_else(|| library.as_ref().and_then(|m| m.genre.clone())),
+                // No library counterpart exists for a record label.
                 label: track.label.clone(),
             },
+            track.cover_url.clone(),
+            library.clone(),
         );
         // Rearm the cadence at the interval and record own-hit provenance (so the next
         // fire does not mistake the title WE wrote for a fresh ICY title and disarm).
         self.rearm_auto_identify_after_attempt(qid, true, now_playing.clone());
 
-        IdentifyOutcome::Hit { track, now_playing }
+        IdentifyOutcome::Hit { track, now_playing, library }
     }
 
     /// AUTO-IDENTIFY trigger (task bspk8v5): (re)arm the ICY-GRACE timer when a raw
@@ -7462,14 +7589,66 @@ fn prune_expired_nl(map: &mut HashMap<String, PendingNl>) {
     map.retain(|_, p| now.duration_since(p.created) < NL_TOKEN_TTL);
 }
 
+/// The wall-clock budget for one LIBRARY match lookup (task g96g064). A bare `search3`
+/// is bounded only by the shared 15s metadata request timeout, which is too much to add
+/// to an `identify` a client is awaiting; the recognition itself already spends up to
+/// ~40s on the capture. On elapse the lookup degrades to "no match", never to an error.
+const LIBRARY_MATCH_BUDGET: Duration = Duration::from_secs(6);
+
+/// Where the current raw stream's cover comes from, resolved ONCE so the currentsong
+/// `X-CoverArt` pair, the bytes `albumart` serves and MPRIS `mpris:artUrl` can never name
+/// different images. Priority, all qid-gated: the resolved station image (task lq54isr)
+/// OUTRANKS a LIBRARY cover (task g96g064), which OUTRANKS a recognized remote Shazam
+/// cover (task f7vnd3i).
+///
+/// Station-first is deliberate and has a real consequence: on an NTS mixtape a station
+/// image is always present, so the pane keeps the stable curated show image rather than
+/// blinking to a different album cover on every recognized track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamCoverSource {
+    /// A remote image URL, fetched through the bounded `fetch_remote_cover` path.
+    Remote(String),
+    /// A LIBRARY cover id, fetched through the first-party `client.cover_art` path and
+    /// cached under the SAME `cover/{id}` key the library `albumart` path uses, so a
+    /// cover already fetched for a library browse costs nothing here.
+    Library { song_id: SongId, cover_id: String },
+}
+
+/// Resolve the cover source for the stream latched to `qid`, or `None` when no qid-gated
+/// slot names one. The single authority for the priority chain above - factored out
+/// because the same ranking was previously written three times (currentsong, current_item
+/// and stream_cover), which is exactly how such copies drift apart.
+fn stream_cover_source(st: &State, qid: QueueId) -> Option<StreamCoverSource> {
+    st.station_identity
+        .as_ref()
+        .and_then(|(q, i)| (*q == qid).then(|| i.image_url.clone()).flatten())
+        .map(StreamCoverSource::Remote)
+        .or_else(|| {
+            st.library_match.as_ref().and_then(|(q, m)| {
+                (*q == qid).then(|| StreamCoverSource::Library {
+                    song_id: m.song_id.clone(),
+                    cover_id: m.cover_id.clone(),
+                })
+            })
+        })
+        .or_else(|| {
+            st.recognized_cover
+                .as_ref()
+                .and_then(|(q, u)| (*q == qid).then(|| StreamCoverSource::Remote(u.clone())))
+        })
+}
+
 /// The outcome of one shared [`HypodjHandler::identify_inner`] recognition, so BOTH the
 /// manual verb (mapping it to an ACK/pairs surface) and the auto cadence (which ignores
 /// the value - its rearm happens inside the body) funnel through one function.
 enum IdentifyOutcome {
-    /// A Shazam hit: the recognized track + its now-playing "Artist - Track" line.
+    /// A Shazam hit: the recognized track + its now-playing "Artist - Track" line, plus
+    /// the confident LIBRARY counterpart when one resolved (task g96g064). The verb
+    /// reports the match even on the paths that deliberately do NOT decorate the entry.
     Hit {
         track: crate::recognize::RecognizedTrack,
         now_playing: Option<String>,
+        library: Option<crate::library_match::LibraryMatch>,
     },
     /// A clean no-match (songrec exit 0, empty stdout).
     NoMatch,
@@ -7632,6 +7811,7 @@ impl Drop for RecognizingGuard<'_> {
 fn identify_hit_response(
     track: &crate::recognize::RecognizedTrack,
     now_playing: Option<&str>,
+    library: Option<&crate::library_match::LibraryMatch>,
 ) -> MpdResponse {
     let mut b = MpdResponse::pairs();
     if let Some(np) = now_playing {
@@ -7660,6 +7840,13 @@ fn identify_hit_response(
     }
     if let Some(c) = &track.cover_url {
         b = b.pair("identify_cover", c.as_str());
+    }
+    // The LIBRARY counterpart (task g96g064), when one cleared the confidence bar. Both
+    // first-party clients discard this response, so these two pairs exist to make the
+    // matcher's behaviour inspectable from raw `mpc` against a real library.
+    if let Some(m) = library {
+        b = b.pair("identify_match", &format!("song/{}", m.song_id.0));
+        b = b.pair("identify_match_basis", m.basis.as_str());
     }
     b.build()
 }
@@ -7849,15 +8036,18 @@ impl MpdHandler for HypodjHandler {
                             // this exact entry: the resolved station image (task lq54isr)
                             // OUTRANKS a recognized Shazam cover (task f7vnd3i), two slots
                             // read newest-provider-first so a last-writer race is impossible.
-                            let cover = st
-                                .station_identity
-                                .as_ref()
-                                .and_then(|(q, i)| (*q == cur_qid).then(|| i.image_url.clone()).flatten())
-                                .or_else(|| {
-                                    st.recognized_cover
-                                        .as_ref()
-                                        .and_then(|(q, u)| (*q == cur_qid).then(|| u.clone()))
-                                });
+                            // A LIBRARY match publishes the opaque `song/<id>` token, NOT
+                            // an auth-baked cover URL: this pair goes out over the
+                            // plaintext MPD socket, and the token+salt in a Subsonic
+                            // cover URL would be a replayable credential on it. The TUI
+                            // uses this value only as an art cache key and fetches the
+                            // bytes back over `albumart`, so a token is all it needs.
+                            let cover = stream_cover_source(&st, cur_qid).map(|src| match src {
+                                StreamCoverSource::Remote(u) => u,
+                                StreamCoverSource::Library { song_id, .. } => {
+                                    format!("song/{}", song_id.0)
+                                }
+                            });
                             if let Some(url) = cover {
                                 pairs.push(("X-CoverArt".to_string(), url));
                             }
@@ -8620,15 +8810,19 @@ impl HypodjHandler {
                 }
             }
         }
+        // MPRIS needs a REALLY FETCHABLE url for `mpris:artUrl`, so unlike the
+        // currentsong pair above, a LIBRARY match resolves to the auth-baked getCoverArt
+        // url here - the identical call `mpris::song_metadata` already makes for a
+        // library song. D-Bus is a private session surface, not the plaintext MPD socket,
+        // so the baked credential does not leak the way it would in an `X-CoverArt` pair.
+        // `cover_art_url` is sync, so this is not a lock-across-await.
         let cover_url = if is_stream {
-            ident
-                .as_ref()
-                .and_then(|i| i.image_url.clone())
-                .or_else(|| {
-                    st.recognized_cover
-                        .as_ref()
-                        .and_then(|(q, u)| (*q == qid).then(|| u.clone()))
-                })
+            stream_cover_source(&st, qid).and_then(|src| match src {
+                StreamCoverSource::Remote(u) => Some(u),
+                StreamCoverSource::Library { cover_id, .. } => {
+                    self.client.cover_art_url(&cover_id).ok().map(|u| u.to_string())
+                }
+            })
         } else {
             None
         };
@@ -9154,7 +9348,7 @@ impl HypodjHandler {
     /// the library path uses, then frames identically via [`Self::binary_tail`].
     async fn stream_cover(&self, uri: &str, offset: usize) -> MpdResponse {
         // ONE short std lock, dropped before any await (the fade-slot discipline).
-        let cover_url = {
+        let source = {
             let st = self.state.lock().unwrap();
             let matched = st
                 .reported_current()
@@ -9163,34 +9357,44 @@ impl HypodjHandler {
                     QueueEntry::Stream { url, .. } if url == uri => Some(QueueId(item.id)),
                     _ => None,
                 })
-                .and_then(|qid| {
-                    // The resolved station image (task lq54isr) OUTRANKS a recognized
-                    // Shazam cover (task f7vnd3i); both qid-gated, station-identity first.
-                    st.station_identity
-                        .as_ref()
-                        .and_then(|(q, i)| (*q == qid).then(|| i.image_url.clone()).flatten())
-                        .or_else(|| {
-                            st.recognized_cover
-                                .as_ref()
-                                .and_then(|(q, url)| (*q == qid).then(|| url.clone()))
-                        })
-                });
+                .and_then(|qid| stream_cover_source(&st, qid));
             match matched {
-                Some(u) => u,
+                Some(src) => src,
                 None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
             }
         };
-        let cache_key = format!("remote/{cover_url}");
-        let bytes = match self.cover_cache.get(&cache_key) {
-            Some(b) => b,
-            None => match self.fetch_remote_cover(&cover_url).await {
-                Some(b) => {
-                    self.cover_cache.put(cache_key, b.clone());
-                    b
+        let bytes = match source {
+            // A LIBRARY match serves FIRST-PARTY bytes through the same client and the
+            // same `cover/{id}` cache key the library `albumart` path uses, so a cover
+            // already fetched for a library browse costs nothing and the remote-fetch
+            // guards (https-only, 2 MiB cap) correctly do not apply to our own server.
+            StreamCoverSource::Library { cover_id, .. } => {
+                let cache_key = format!("cover/{cover_id}");
+                match self.cover_cache.get(&cache_key) {
+                    Some(b) => b,
+                    None => match self.client.cover_art(&cover_id).await {
+                        Ok(b) if !b.is_empty() => {
+                            self.cover_cache.put(cache_key, b.clone());
+                            b
+                        }
+                        _ => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
+                    },
                 }
-                // Fetch failed/timed out/rejected: same no-exist as the library path.
-                None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
-            },
+            }
+            StreamCoverSource::Remote(cover_url) => {
+                let cache_key = format!("remote/{cover_url}");
+                match self.cover_cache.get(&cache_key) {
+                    Some(b) => b,
+                    None => match self.fetch_remote_cover(&cover_url).await {
+                        Some(b) => {
+                            self.cover_cache.put(cache_key, b.clone());
+                            b
+                        }
+                        // Fetch failed/timed out/rejected: same no-exist as the library path.
+                        None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
+                    },
+                }
+            }
         };
         self.binary_tail(&bytes, offset)
     }
@@ -12943,6 +13147,147 @@ mod tests {
             cur.iter().any(|(k, v)| k == "Name" && v == "SomaFM Groove Salad"),
             "a real icy-name wins with no station identity: {cur:?}"
         );
+    }
+
+    // ── library match for a recognized stream track (task g96g064) ─────────
+
+    fn test_library_match(song_id: &str, cover: &str) -> crate::library_match::LibraryMatch {
+        crate::library_match::LibraryMatch {
+            song_id: SongId(song_id.to_string()),
+            cover_id: cover.to_string(),
+            album: Some("Local Album".to_string()),
+            year: Some(1998),
+            genre: Some("House".to_string()),
+            basis: crate::library_match::MatchBasis::Exact,
+        }
+    }
+
+    #[tokio::test]
+    async fn library_cover_outranks_the_recognized_shazam_url() {
+        // With no station identity, a LIBRARY match wins the cover chain over the remote
+        // Shazam url, and publishes the OPAQUE `song/<id>` token on the plaintext MPD
+        // socket rather than an auth-baked cover url.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_recognized_cover(QueueId(qid), "https://shazam.example/cover.jpg".to_string());
+        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(
+            cur.iter().any(|(k, v)| k == "X-CoverArt" && v == "song/s7"),
+            "the library match publishes the song uri token: {cur:?}"
+        );
+        assert!(
+            !cur.iter().any(|(k, v)| k == "X-CoverArt" && v.contains("shazam")),
+            "the Shazam cover must not also appear: {cur:?}"
+        );
+        // THE FENCE: a library match must never rewrite the playing entry - the row is
+        // still the stream, so playback semantics are untouched.
+        assert!(
+            cur.iter().any(|(k, v)| k == "file" && v == NTS),
+            "file: stays the stream url: {cur:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn station_identity_outranks_a_library_match() {
+        // The pinned priority: station image > library > recognized Shazam url.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+            st.station_identity = Some((QueueId(qid), nts_identity()));
+        }
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(
+            cur.iter().any(|(k, v)| k == "X-CoverArt"
+                && v == "https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
+            "the station image still outranks a library match: {cur:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_match_ignored_for_wrong_qid() {
+        // A slot keyed to a DIFFERENT entry must never decorate this one.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().library_match =
+            Some((QueueId(qid.wrapping_add(999)), test_library_match("wrong", "wrong-cover")));
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(
+            !cur.iter().any(|(k, _)| k == "X-CoverArt"),
+            "a wrong-qid library match must not surface: {cur:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_match_dropped_on_track_change() {
+        // Dropped on the same edge as its sibling overlays, so a prior stream's local art
+        // can never linger onto the next entry.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+
+        h.clear_stream_meta_except(Some(QueueId(qid)));
+        assert!(h.state.lock().unwrap().library_match.is_some(), "kept for its own qid");
+
+        h.clear_stream_meta_except(Some(QueueId(qid.wrapping_add(1))));
+        assert!(h.state.lock().unwrap().library_match.is_none(), "dropped for another qid");
+
+        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+        h.clear_stream_meta_except(None);
+        assert!(h.state.lock().unwrap().library_match.is_none(), "dropped on stop");
+    }
+
+    #[tokio::test]
+    async fn stream_cover_library_branch_serves_cached_first_party_bytes() {
+        // The library branch reads the SAME `cover/{id}` key the library albumart path
+        // uses, so a cover already fetched for a browse costs nothing and NO network is
+        // touched here (this handler has no reachable server).
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+        h.cover_cache.put("cover/al-3".to_string(), FAKE_PNG.to_vec());
+
+        match h.handle(MpdCommand::AlbumArt(NTS.to_string(), 0)).await {
+            MpdResponse::Binary { total, chunk } => {
+                assert_eq!(total, FAKE_PNG.len());
+                assert_eq!(chunk, FAKE_PNG.to_vec());
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn library_fill_only_never_replaces_a_shazam_value() {
+        // The merge rule: the library fills a field ONLY where Shazam left it blank.
+        let lib = test_library_match("s7", "al-3");
+        let shazam_album = Some("Shazam Album".to_string());
+        let merged = shazam_album.clone().or_else(|| lib.album.clone());
+        assert_eq!(merged.as_deref(), Some("Shazam Album"), "a Shazam value is never replaced");
+
+        let blank: Option<String> = None;
+        let filled = blank.or_else(|| lib.album.clone());
+        assert_eq!(filled.as_deref(), Some("Local Album"), "a blank field is filled");
+
+        let date: Option<String> = None;
+        let filled_date = date.or_else(|| lib.year.map(|y| y.to_string()));
+        assert_eq!(filled_date.as_deref(), Some("1998"));
     }
 
     // The station image OUTRANKS a recognized Shazam cover when both slots are keyed to
