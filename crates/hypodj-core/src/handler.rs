@@ -3699,8 +3699,8 @@ impl HypodjHandler {
     /// (task g96g064). One write and one `notify_change`, so a client can never observe
     /// a fresh cover beside stale tags.
     ///
-    /// `cover_url = None` LEAVES any existing recognized cover (today's
-    /// [`Self::set_recognized_cover`] semantics, unchanged). `library` is written
+    /// `cover_url = None` LEAVES any existing recognized cover (the previous
+    /// `set_recognized_cover` semantics, unchanged). `library` is written
     /// UNCONDITIONALLY, including `None`: a new recognition on the same stream must
     /// RETIRE the previous track's match rather than keep serving its album art beside
     /// the new track's tags. Same lock discipline as its siblings - the std lock is held
@@ -3777,6 +3777,11 @@ impl HypodjHandler {
     /// the slot can only ever decorate the entry it came from. The std lock is held
     /// ONLY for the field write and dropped BEFORE `notify_change` (never across an
     /// await); mutated through `&self` interior mutability, never `&mut self`.
+    /// TEST-ONLY since task g96g064: the production path now writes the cover through
+    /// [`Self::set_stream_surface`], which publishes the tags, the cover and the library
+    /// match under ONE lock. Kept because a good number of tests seed just a cover, and
+    /// `#[cfg(test)]` is how that stays honest instead of leaving a dead-code warning.
+    #[cfg(test)]
     pub(crate) fn set_recognized_cover(&self, queue_id: QueueId, url: String) {
         {
             let mut st = self.state.lock().unwrap();

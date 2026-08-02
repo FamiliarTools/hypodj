@@ -113,6 +113,21 @@ fn fold_char(c: char) -> &'static str {
 /// `&` spelled out, any `feat.`/`with` clause dropped, punctuation flattened to spaces,
 /// whitespace collapsed. The comparison currency for every tier below.
 fn norm(s: &str) -> String {
+    // Drop everything from the first credit word on. Done AFTER flattening so the marker
+    // is matched as a whole token regardless of the punctuation that introduced it.
+    norm_uncut(s)
+        .split_whitespace()
+        .take_while(|t| !FEAT_MARKERS.contains(t))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`norm`] WITHOUT the credit cut. The cut buys recall against libraries that tag a song
+/// without its featured credit, but it must never be the LAST word on identity: two
+/// different featured cuts of one song ("Loyal (feat. Lil Wayne)" and "Loyal (feat. French
+/// Montana)") both cut to "loyal", so this uncut form is what distinguishes them when the
+/// library holds both.
+fn norm_uncut(s: &str) -> String {
     let spelled = s.to_lowercase().replace('&', " and ");
     let mut out = String::with_capacity(spelled.len());
     for c in spelled.chars() {
@@ -129,12 +144,7 @@ fn norm(s: &str) -> String {
             }
         }
     }
-    // Drop everything from the first credit word on. Done AFTER flattening so the marker
-    // is matched as a whole token regardless of the punctuation that introduced it.
-    out.split_whitespace()
-        .take_while(|t| !FEAT_MARKERS.contains(t))
-        .collect::<Vec<_>>()
-        .join(" ")
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The comparison token set: normalized words, dropping single characters (an initial or
@@ -261,7 +271,7 @@ pub fn search_query(title: &str) -> Option<String> {
 /// The cache key for one recognized (artist, title) pair. Normalized so trivial spelling
 /// differences share a cache entry, and tab-joined so the two halves cannot run together.
 pub fn match_key(artist: &str, title: &str) -> String {
-    format!("{}\t{}", norm(artist), norm(title))
+    format!("{}\t{}", norm(artist), norm_uncut(title))
 }
 
 /// A candidate that survived the vetoes, carrying what the tie-break needs.
@@ -312,9 +322,11 @@ pub fn best_library_match(
         let song_tokens = tokens(song_artist);
         let basis = if norm(song_artist) == n_artist {
             MatchBasis::Exact
-        } else if rec_artist_tokens.is_subset(&song_tokens)
-            || song_tokens.is_subset(&rec_artist_tokens)
-            || jaccard(&rec_artist_tokens, &song_tokens) >= ARTIST_JACCARD_FLOOR
+        } else if !rec_artist_tokens.is_empty()
+            && !song_tokens.is_empty()
+            && (rec_artist_tokens.is_subset(&song_tokens)
+                || song_tokens.is_subset(&rec_artist_tokens)
+                || jaccard(&rec_artist_tokens, &song_tokens) >= ARTIST_JACCARD_FLOOR)
         {
             MatchBasis::Strong
         } else {
@@ -342,6 +354,10 @@ pub fn best_library_match(
     }
 
     let n_rec_album = rec_album.map(norm);
+    // Title equality above is measured on the CUT form, so two different featured cuts of
+    // one song both qualify. This uncut form breaks that tie toward the cut the radio
+    // actually played, when the library happens to hold both.
+    let uncut_title = norm_uncut(title);
     // DETERMINISTIC selection, so the same library and hit always yield the same match
     // regardless of the order Navidrome happened to return the rows in.
     let best = accepted
@@ -349,6 +365,9 @@ pub fn best_library_match(
         .min_by(|a, b| {
             let key = |c: &Candidate| {
                 (
+                    // The cut whose FULL title (featured credit included) matches, before
+                    // a sibling cut that only agrees once the credit is dropped.
+                    norm_uncut(&c.song.title) != uncut_title,
                     // Exact before Strong.
                     matches!(c.basis, MatchBasis::Strong),
                     // A starred song first.
@@ -499,6 +518,60 @@ mod tests {
     fn same_title_unrelated_artist_rejected() {
         let hits = vec![song("s1", "Blessings", Some("Some Other Band"))];
         assert_eq!(best_library_match(&hits, "Calvin Harris", "Blessings", None), None);
+    }
+
+    #[test]
+    fn token_empty_credit_never_matches_an_unrelated_artist() {
+        // THE false-match trap: "M.I.A." norms to "m i a" - non-blank, so it clears the
+        // blank guard - but every token is one character, so `tokens` yields an EMPTY set.
+        // The empty set is a subset of EVERYTHING, so without an explicit emptiness check
+        // the Strong tier passes vacuously and artist verification is skipped entirely,
+        // matching on title alone. That is exactly the stranger's-album-art outcome this
+        // module exists to prevent.
+        let hits = vec![song("s1", "Paper Planes", Some("Some Other Band"))];
+        assert_eq!(best_library_match(&hits, "M.I.A.", "Paper Planes", None), None);
+        // Mirrored on the LIBRARY side: a credit in a script `norm` does not fold has no
+        // tokens either, and the raw-blank filter does not catch it.
+        let cjk = vec![song("s2", "Gravity", Some("宇多田ヒカル"))];
+        assert_eq!(best_library_match(&cjk, "John Mayer", "Gravity", None), None);
+        // The SAME initialism credit on both sides still matches, on the Exact tier -
+        // which compares normalized strings, not token sets, so it is unaffected.
+        let same = vec![song("s3", "Paper Planes", Some("M.I.A."))];
+        let m = best_library_match(&same, "M.I.A.", "Paper Planes", None).expect("a match");
+        assert_eq!(m.basis, MatchBasis::Exact);
+    }
+
+    #[test]
+    fn a_different_featured_cut_never_wins_over_the_right_one() {
+        // Title equality is measured on the CUT form, so both featured cuts qualify. The
+        // uncut tie-break must pick the one the radio actually played rather than letting
+        // the id ordering decide.
+        let hits = vec![
+            song("l-fm", "Loyal (feat. French Montana)", Some("Chris Brown")),
+            song("l-lw", "Loyal (feat. Lil Wayne)", Some("Chris Brown")),
+        ];
+        for order in [hits.clone(), hits.iter().rev().cloned().collect()] {
+            let m = best_library_match(&order, "Chris Brown", "Loyal (feat. Lil Wayne)", None)
+                .expect("a match");
+            assert_eq!(m.song_id, SongId("l-lw".into()), "the right featured cut wins");
+        }
+        // And the cut still buys its recall: a library that tags the song WITHOUT the
+        // credit is still matched.
+        let uncredited = vec![song("l-plain", "Loyal", Some("Chris Brown"))];
+        assert!(
+            best_library_match(&uncredited, "Chris Brown", "Loyal (feat. Lil Wayne)", None)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn match_key_separates_two_featured_cuts() {
+        // The cache key must not collide the two cuts, or one hour of the wrong answer is
+        // served for the other.
+        assert_ne!(
+            match_key("Chris Brown", "Loyal (feat. Lil Wayne)"),
+            match_key("Chris Brown", "Loyal (feat. French Montana)")
+        );
     }
 
     #[test]
