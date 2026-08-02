@@ -163,11 +163,18 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
             return Ok(());
         }
     };
-    if !uri.starts_with("song/") {
-        // A stream (http(s) URL) is not a library song - no Subsonic star.
+    // A stream (http(s) URL) is not a library song, so it has no star surface of its
+    // own - but a RECOGNIZED track that matched the library does, so star the copy the
+    // user actually owns (task g96g064).
+    let uri = if uri.starts_with("song/") {
+        uri.to_string()
+    } else if let Some(matched) = np.match_uri.as_deref() {
+        matched.to_string()
+    } else {
         println!("the current track is a stream, which can't be favorited");
         return Ok(());
-    }
+    };
+    let uri = uri.as_str();
     match conn.command(&format!("playlistadd Starred {uri}")) {
         Ok(_) => {
             let label = np.title.as_deref().unwrap_or(uri);

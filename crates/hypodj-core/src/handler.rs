@@ -8917,6 +8917,18 @@ impl MpdHandler for HypodjHandler {
                             // cover URL would be a replayable credential on it. The TUI
                             // uses this value only as an art cache key and fetches the
                             // bytes back over `albumart`, so a token is all it needs.
+                            // The resolved LIBRARY counterpart of this radio track
+                            // (task g96g064 phase 2), so a client can star the copy the
+                            // user actually owns. A SEPARATE field from `file:`, which
+                            // stays the stream url - the playing entry is never rewritten.
+                            if let Some((q, m)) = &st.library_match {
+                                if *q == cur_qid {
+                                    pairs.push((
+                                        "X-MatchUri".to_string(),
+                                        format!("song/{}", m.song_id.0),
+                                    ));
+                                }
+                            }
                             let cover = stream_cover_source(&st, cur_qid).map(|src| match src {
                                 StreamCoverSource::Remote(u) => u,
                                 StreamCoverSource::Library { song_id, .. } => {
@@ -14982,6 +14994,53 @@ mod tests {
         assert!(
             cur.iter().any(|(k, v)| k == "file" && v == NTS),
             "file: stays the stream url: {cur:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn currentsong_emits_match_uri_for_a_library_matched_stream() {
+        // Phase 2 (task g96g064): the resolved library counterpart rides its OWN pair, so
+        // a client can star the copy the user owns. `file:` must stay the stream url -
+        // the playing entry is never rewritten, so playback semantics are untouched.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(
+            cur.iter().any(|(k, v)| k == "X-MatchUri" && v == "song/s7"),
+            "the match uri is surfaced: {cur:?}"
+        );
+        assert!(
+            cur.iter().any(|(k, v)| k == "file" && v == NTS),
+            "file: stays the stream url: {cur:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn match_uri_absent_without_a_match_or_for_a_wrong_qid() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(!cur.iter().any(|(k, _)| k == "X-MatchUri"), "no match, no pair: {cur:?}");
+
+        h.state.lock().unwrap().library_match =
+            Some((QueueId(qid.wrapping_add(999)), test_library_match("wrong", "c")));
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(
+            !cur.iter().any(|(k, _)| k == "X-MatchUri"),
+            "a wrong-qid match must never be starrable here: {cur:?}"
         );
     }
 

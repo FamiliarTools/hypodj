@@ -38,6 +38,13 @@ pub struct NowPlaying {
     /// art pane and a re-identify refetches, while the bytes still arrive over the
     /// plain MPD albumart protocol (the client gains no HTTP dependency).
     pub cover: Option<String>,
+    /// The library counterpart of a RECOGNIZED radio track, as a `song/<id>` uri, from
+    /// the `currentsong` `X-MatchUri` extension (task g96g064). Present only for a raw
+    /// stream whose songrec identify matched a song the user actually owns. `file:` stays
+    /// the stream url - this is a SEPARATE field precisely because the playing entry is
+    /// never rewritten - so it is the one handle a client has for starring what the radio
+    /// is playing.
+    pub match_uri: Option<String>,
     /// The armed human-features, surfaced by the daemon as X- status pairs and
     /// present ONLY when armed. Startle-safe equals trust only if the machine's
     /// hold on the night is VISIBLE - these back that render.
@@ -230,6 +237,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         file: find(current, "file").map(str::to_string),
         starred: find(current, "X-Starred").is_some(),
         cover: find(current, "X-CoverArt").map(str::to_string),
+        match_uri: find(current, "X-MatchUri").map(str::to_string),
         armed: ArmedFeatures::parse(status),
         field: FieldState::parse(status),
         hint: AmbientHint::parse(status),
@@ -405,6 +413,24 @@ mod tests {
         // Absent pair -> no cover (a library song or a coverless stream).
         let np2 = now_playing(&status, &p(&[("file", "song/7"), ("Title", "X")]));
         assert_eq!(np2.cover, None);
+    }
+
+    #[test]
+    fn nowplaying_parses_x_match_uri() {
+        // A recognized stream that matched the library surfaces its counterpart as
+        // X-MatchUri (task g96g064 phase 2), while `file` stays the stream url.
+        let status = p(&[("state", "play")]);
+        let current = p(&[
+            ("file", "https://stream.example/live"),
+            ("Title", "Some Track"),
+            ("X-MatchUri", "song/s7"),
+        ]);
+        let np = now_playing(&status, &current);
+        assert_eq!(np.match_uri.as_deref(), Some("song/s7"));
+        assert_eq!(np.file.as_deref(), Some("https://stream.example/live"));
+        // Absent pair -> no match uri (an unmatched stream or a library song).
+        let np2 = now_playing(&status, &p(&[("file", "song/7"), ("Title", "X")]));
+        assert_eq!(np2.match_uri, None);
     }
 
     #[test]
