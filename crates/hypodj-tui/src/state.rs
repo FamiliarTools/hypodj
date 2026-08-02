@@ -1100,6 +1100,12 @@ impl TuiState {
         }
         self.status_msg = Some(if uri.starts_with("list/") {
             "can't start a radio from a list".into()
+        } else if uri.starts_with("station/") {
+            // A saved station is a STREAM, not a library object, so there is no id for
+            // the continuation walk to seed from - and `radio` here would be confused
+            // with the algorithmic `radio/random` generator, which is a different thing
+            // entirely. Enter is the verb that works on this row.
+            "a saved station is a stream, not a library seed - enter plays it".into()
         } else if uri.contains("://") {
             "that row is a stream, can't start a radio".into()
         } else {
@@ -1145,6 +1151,16 @@ impl TuiState {
             return match row.kind {
                 crate::find::FindKind::Album | crate::find::FindKind::Artist => {
                     Some(Intent::BrowseInto(row.uri.clone()))
+                }
+                // A saved station is a LEAF: `lsinfo station/<name>` falls into the
+                // daemon's catch-all and returns a well-formed EMPTY listing, while
+                // `browse_into` sets `drilling` unconditionally - so drilling would
+                // paint an empty bordered box over the hits. Say why instead of going
+                // quiet, since the cursor can land here and `o` works on the rows above.
+                crate::find::FindKind::Station => {
+                    self.status_msg =
+                        Some("a station has nothing to open - enter plays it".into());
+                    None
                 }
                 crate::find::FindKind::Song => None,
             };
@@ -2020,6 +2036,78 @@ mod tests {
         assert_eq!(s.handle_key(ch('o')), Some(Intent::BrowseInto("album/9".into())));
         s.find.selected = 1;
         assert_eq!(s.handle_key(ch('o')), None, "a song row has nothing to drill into");
+    }
+
+    #[test]
+    fn every_key_answers_on_a_station_hit_row() {
+        // A row the cursor can land on with no working verb is a defect (the artist row
+        // had exactly this). So: Enter and Space ENQUEUE through the `station/<name>`
+        // uri `enqueue_uri` already resolves, and `s`, `o` and `r` each SAY why they do
+        // not apply rather than reading as a broken binding.
+        use crate::find::{FindKind, FindRow, Focus};
+        const URI: &str = "station/Moon Mission Recordings, Tokyo Deep and Electronic";
+        let station = || FindRow {
+            kind: FindKind::Station,
+            label: "Moon Mission Recordings, Tokyo Deep and Electronic".into(),
+            uri: URI.into(),
+            trailer: "uk5.internet-radio.com".into(),
+            song_count: None,
+            album_uri: None,
+        };
+        let fresh = || {
+            let mut s = TuiState::new();
+            // A populated queue is the trap: every per-screen helper that consults
+            // active_browse() first falls through to the QUEUE cursor, silently acting
+            // on a row the user is not even looking at.
+            s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1)]);
+            s.screen = Screen::Find;
+            s.find.focus = Focus::Results;
+            s.find.hits.rows = vec![station()];
+            s
+        };
+
+        // Enter: enqueue AND play.
+        let mut s = fresh();
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Enqueue { uri: URI.into(), play: true }),
+            "the name rides the uri whole, comma and spaces included"
+        );
+        assert_eq!(s.selected, 0, "the queue cursor never moved");
+
+        // Space: enqueue without playing, and advance for rapid multi-add.
+        let mut s = fresh();
+        s.find.hits.rows.push(station());
+        assert_eq!(
+            s.handle_key(ch(' ')),
+            Some(Intent::Enqueue { uri: URI.into(), play: false })
+        );
+        assert_eq!(s.find.selected, 1, "the HIT cursor advanced");
+        assert_eq!(s.selected, 0, "and the queue cursor did not");
+
+        // `s`: Subsonic has no star endpoint for internet radio at all, so this is a
+        // refusal with a reason, never a silent no-op.
+        let mut s = fresh();
+        assert_eq!(s.handle_key(ch('s')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("that row can't be favorited"));
+
+        // `o`: a station is a leaf. Drilling would paint an empty bordered box over the
+        // hits, so it says so instead.
+        let mut s = fresh();
+        assert_eq!(s.handle_key(ch('o')), None);
+        assert_eq!(
+            s.status_msg.as_deref(),
+            Some("a station has nothing to open - enter plays it")
+        );
+
+        // `r`: a stream has no library id for the continuation walk to seed from, and
+        // the message is station-specific rather than the generic fallback.
+        let mut s = fresh();
+        assert_eq!(s.handle_key(ch('r')), None);
+        assert_eq!(
+            s.status_msg.as_deref(),
+            Some("a saved station is a stream, not a library seed - enter plays it")
+        );
     }
 
     #[test]

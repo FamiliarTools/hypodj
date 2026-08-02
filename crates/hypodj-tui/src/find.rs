@@ -15,9 +15,15 @@
 //! The `/` jump can only find what is already on screen, so an artist whose albums
 //! never entered the newest-100 list is unreachable from the interface. Find asks
 //! the LIBRARY instead: type a query, press Enter, get back a single flat ranked
-//! list of matching songs and albums (and, once the daemon grows a `searchall`
-//! verb, artists) that can be enqueued, played, starred and drilled into with the
-//! keys that already work on the Albums tab.
+//! list of matching artists, albums, saved internet radio stations and songs that
+//! can be enqueued, played, starred and drilled into with the keys that already work
+//! on the Albums tab.
+//!
+//! A STATION row is the user's own saved stream, matched by name daemon-side because
+//! `search3` does not index stations at all. It is not a library object: it cannot be
+//! starred (Subsonic has no star endpoint for internet radio), cannot be drilled into
+//! and cannot seed a radio walk - so those keys say WHY rather than going quiet, while
+//! Enter and Space enqueue it through the `station/<name>` uri that already worked.
 //!
 //! ## Structure
 //!
@@ -33,7 +39,14 @@ use std::cell::Cell;
 use crate::state::Browse;
 
 /// What a hit row refers to. Ordering is the display order: artists, then albums,
-/// then songs, so a long song list can never bury the artists above it.
+/// then saved stations, then songs, so a long song list can never bury what is above
+/// it.
+///
+/// `Station` sits BETWEEN albums and songs rather than first because an ordinary
+/// library query ("coltrane") matches no station at all: the block is empty and the
+/// top of the list stays byte-identical to what it always was, while a handful of
+/// saved stations still sit safely above the 200-song flood - which is the whole
+/// reason this order exists.
 // Constructed by the wire parser in step 2; step 1 is the screen skeleton, so the
 // variants exist here (and are exercised by this module's tests) before the parser
 // that builds them lands.
@@ -42,16 +55,23 @@ use crate::state::Browse;
 pub enum FindKind {
     Artist,
     Album,
+    /// A SAVED internet radio station - a thing the user keeps and can search for.
+    /// Never the algorithmic `radio/random` browse path, which is a generator.
+    Station,
     Song,
 }
 
 impl FindKind {
     /// The gutter sigil. ASCII for the same reason `#`/`~` are: a terminal that
-    /// cannot render a glyph must not shift the column.
+    /// cannot render a glyph must not shift the column. `)` for a station: it must
+    /// clash with neither `@`/`=` here nor the `#`/`~` queue marks that share the same
+    /// three-column gutter, and `*` is avoided because it would read as "starred" right
+    /// next to the `s` favorite key.
     pub fn sigil(self) -> char {
         match self {
             FindKind::Artist => '@',
             FindKind::Album => '=',
+            FindKind::Station => ')',
             FindKind::Song => ' ',
         }
     }
@@ -61,9 +81,12 @@ impl FindKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindRow {
     pub kind: FindKind,
-    /// The primary text: an artist name, an album title, a song title.
+    /// The primary text: an artist name, an album title, a station name, a song title.
     pub label: String,
-    /// The browse/enqueue uri: `artist/<id>`, `album/<id>`, `song/<id>`.
+    /// The browse/enqueue uri: `artist/<id>`, `album/<id>`, `song/<id>`, or
+    /// `station/<name>` - a station is keyed by its NAME because that is what
+    /// `enqueue_uri` resolves it by, and the name is carried VERBATIM (spaces, commas
+    /// and all) so a row the daemon offered is a row that enqueues.
     pub uri: String,
     /// Right-aligned secondary text, precomputed at parse time so the renderer
     /// stays a dumb column fitter that truncates the label first.
@@ -282,6 +305,7 @@ impl Find {
                 let noun = match kind {
                     FindKind::Artist => "artist",
                     FindKind::Album => "album",
+                    FindKind::Station => "station",
                     FindKind::Song => "song",
                 };
                 let plural = if *n == 1 { "" } else { "s" };
@@ -317,6 +341,7 @@ pub fn parse_searchall_hits(pairs: &[(String, String)]) -> FindHits {
     let mut tallies: Vec<(FindKind, usize, Option<usize>)> = Vec::new();
     let mut artists: Vec<FindRow> = Vec::new();
     let mut albums: Vec<FindRow> = Vec::new();
+    let mut stations: Vec<FindRow> = Vec::new();
     let mut songs: Vec<FindRow> = Vec::new();
     let mut cur: Option<Block> = None;
 
@@ -328,7 +353,7 @@ pub fn parse_searchall_hits(pairs: &[(String, String)]) -> FindHits {
                 }
             }
             "directory" | "file" => {
-                flush_block(cur.take(), &mut artists, &mut albums, &mut songs);
+                flush_block(cur.take(), &mut artists, &mut albums, &mut stations, &mut songs);
                 cur = Block::start(v);
             }
             _ => {
@@ -338,24 +363,30 @@ pub fn parse_searchall_hits(pairs: &[(String, String)]) -> FindHits {
             }
         }
     }
-    flush_block(cur.take(), &mut artists, &mut albums, &mut songs);
+    flush_block(cur.take(), &mut artists, &mut albums, &mut stations, &mut songs);
 
-    // Display order is artists, then albums, then songs, so a long song list can
-    // never bury the artists above it - which is also why no per-kind display caps
-    // are needed.
+    // Display order is artists, then albums, then saved stations, then songs, so a
+    // long song list can never bury what is above it - which is also why no per-kind
+    // display caps are needed.
     let mut rows = artists;
     rows.extend(albums);
+    rows.extend(stations);
     rows.extend(songs);
     FindHits { rows, tallies }
 }
 
 /// `artist 3 20` -> (Artist, 3, Some(20)). A malformed line is DROPPED rather than
 /// guessed at: a wrong tally silently mislabels the title.
+///
+/// The cap is OPTIONAL, which is what lets `station 2` (two tokens) parse: the station
+/// match runs daemon-side over the FULL saved set, so there is no server cap to claim
+/// and [`Find::tally_title`] correctly never appends "(server cap)" for it.
 fn parse_hits_tally(v: &str) -> Option<(FindKind, usize, Option<usize>)> {
     let mut it = v.split_whitespace();
     let kind = match it.next()? {
         "artist" => FindKind::Artist,
         "album" => FindKind::Album,
+        "station" => FindKind::Station,
         "song" => FindKind::Song,
         _ => return None,
     };
@@ -373,16 +404,24 @@ struct Block {
     count: Option<u32>,
     secs: Option<u32>,
     album_uri: Option<String>,
+    host: String,
 }
 
 impl Block {
     /// Start a block from its uri, classifying by prefix. A uri whose prefix is not
     /// one we model is ignored entirely rather than rendered as an unactionable row.
+    ///
+    /// A `station/` uri keeps its remainder VERBATIM - never split further - because a
+    /// station name is a human label carrying spaces, commas and non-ASCII (his
+    /// "Moon Mission Recordings, Tokyo Deep and Electronic"), and that whole remainder
+    /// is the key `add station/<name>` resolves by.
     fn start(uri: &str) -> Option<Block> {
         let kind = if uri.starts_with("artist/") {
             FindKind::Artist
         } else if uri.starts_with("album/") {
             FindKind::Album
+        } else if uri.starts_with("station/") {
+            FindKind::Station
         } else if uri.starts_with("song/") {
             FindKind::Song
         } else {
@@ -396,6 +435,7 @@ impl Block {
             count: None,
             secs: None,
             album_uri: None,
+            host: String::new(),
         })
     }
 
@@ -410,6 +450,10 @@ impl Block {
             "Title" => self.name = v.to_string(),
             "X-AlbumCount" | "X-SongCount" => self.count = v.parse().ok(),
             "X-AlbumUri" => self.album_uri = Some(v.to_string()),
+            // The stream's host, extracted daemon-side so this stays a dumb column
+            // fitter. It is what distinguishes "NTS Infinite Mixtapes 1" from
+            // "NTS Radio Live 1" at a glance.
+            "X-StreamHost" => self.host = v.to_string(),
             "Time" => self.secs = v.parse().ok(),
             _ => {}
         }
@@ -420,6 +464,7 @@ fn flush_block(
     b: Option<Block>,
     artists: &mut Vec<FindRow>,
     albums: &mut Vec<FindRow>,
+    stations: &mut Vec<FindRow>,
     songs: &mut Vec<FindRow>,
 ) {
     let Some(b) = b else { return };
@@ -442,6 +487,10 @@ fn flush_block(
             }
             (t, albums)
         }
+        // A saved station has no artist, no track count and no duration - a stream has
+        // no end. Its host is the only thing that tells two similarly-named stations
+        // apart, so that is the trailer.
+        FindKind::Station => (b.host.clone(), stations),
         FindKind::Song => {
             let mut t = b.artist.clone();
             if let Some(secs) = b.secs {
@@ -582,6 +631,111 @@ mod tests {
         assert_eq!(hits.rows[3].label, "Manatek");
         assert!(hits.rows[3].trailer.contains("4:05"), "{:?}", hits.rows[3].trailer);
         assert_eq!(hits.rows[3].album_uri.as_deref(), Some("album/b1"));
+    }
+
+    #[test]
+    fn a_station_frame_parses_into_a_row_that_enqueues_verbatim() {
+        // The FOURTH kind, in the exact shape the daemon emits: `file: station/<name>`
+        // (a leaf), `Title:` = the label, `X-StreamHost:` = the trailer. Both halves of
+        // this feature had to land together - before it, `Block::start` dropped the
+        // unmodelled `station/` prefix and the row VANISHED with no error at all.
+        let p = pairs(&[
+            ("X-Hits", "artist 0 20"),
+            ("X-Hits", "album 0 50"),
+            ("X-Hits", "station 1"),
+            ("X-Hits", "song 0 200"),
+            ("file", "station/NTS 4 To The Floor"),
+            ("Title", "NTS 4 To The Floor"),
+            ("X-StreamHost", "stream-mixtape-geo.ntslive.net"),
+        ]);
+        let hits = parse_searchall_hits(&p);
+        assert_eq!(hits.rows.len(), 1);
+        let st = &hits.rows[0];
+        assert_eq!(st.kind, FindKind::Station);
+        assert_eq!(st.label, "NTS 4 To The Floor");
+        assert_eq!(
+            st.uri, "station/NTS 4 To The Floor",
+            "the uri `enqueue_uri` already resolves, name and spaces intact"
+        );
+        assert_eq!(st.trailer, "stream-mixtape-geo.ntslive.net");
+        assert_eq!(st.song_count, None, "a stream has no track total");
+        assert_eq!(st.album_uri, None, "and no owning album to mark");
+        assert_eq!(hits.tallies[2], (FindKind::Station, 1, None), "two tokens, no cap");
+    }
+
+    #[test]
+    fn a_station_name_with_a_comma_and_spaces_round_trips_verbatim() {
+        // His real collection carries "Moon Mission Recordings, Tokyo Deep and
+        // Electronic". The remainder after `station/` is the WHOLE name and is never
+        // split further - it is the key `add station/<name>` resolves by, so a byte
+        // lost here is a row that cannot be played.
+        const NAME: &str = "Moon Mission Recordings, Tokyo Deep and Electronic";
+        let p = pairs(&[
+            ("file", &format!("station/{NAME}")),
+            ("Title", NAME),
+            ("X-StreamHost", "uk5.internet-radio.com"),
+        ]);
+        let hits = parse_searchall_hits(&p);
+        assert_eq!(hits.rows[0].uri, format!("station/{NAME}"));
+        assert_eq!(hits.rows[0].label, NAME);
+    }
+
+    #[test]
+    fn stations_render_after_albums_and_before_songs() {
+        // The order IS the display order (nothing sorts by it - this concat is it), and
+        // it is why 22 stations can never be buried under a 200-song page while an
+        // ordinary query, which matches no station at all, leaves the top untouched.
+        let p = pairs(&[
+            ("directory", "artist/a1"), ("Artist", "NTS"),
+            ("directory", "album/b1"), ("Album", "NTS Sessions"),
+            // Emitted by the daemon between the albums and the songs; asserted here
+            // independently of that so the CLIENT order is pinned on its own.
+            ("file", "station/NTS Radio Live 1"), ("Title", "NTS Radio Live 1"),
+            ("X-StreamHost", "stream-relay-geo.ntslive.net"),
+            ("file", "song/s1"), ("Title", "Sweden"),
+        ]);
+        let hits = parse_searchall_hits(&p);
+        let kinds: Vec<FindKind> = hits.rows.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![FindKind::Artist, FindKind::Album, FindKind::Station, FindKind::Song]
+        );
+        // The derived Ord must AGREE with that display order, or the doc lies.
+        assert!(FindKind::Album < FindKind::Station && FindKind::Station < FindKind::Song);
+    }
+
+    #[test]
+    fn a_station_tally_has_no_server_cap_to_claim() {
+        // Two tokens, because the station match runs daemon-side over the FULL saved
+        // set. Claiming a cap here would invent a ceiling that does not exist.
+        let mut f = Find::default();
+        f.hits.tallies = vec![
+            (FindKind::Album, 0, Some(50)),
+            (FindKind::Station, 2, None),
+            (FindKind::Song, 200, Some(200)),
+        ];
+        assert_eq!(f.tally_title(), "no albums / 2 stations / 200 songs (server cap)");
+        // The cap suffix belongs to the SONG line; a station alone never earns it.
+        let mut f = Find::default();
+        f.hits.tallies = vec![(FindKind::Station, 2, None)];
+        assert_eq!(f.tally_title(), "2 stations");
+        let mut f = Find::default();
+        f.hits.tallies = vec![(FindKind::Station, 1, None)];
+        assert_eq!(f.tally_title(), "1 station");
+    }
+
+    #[test]
+    fn an_omitted_station_tally_makes_no_claim_at_all() {
+        // The daemon OMITS the line (never `station 0`) when the internet-radio endpoint
+        // could not be reached: absence of a claim beats a false claim. The title must
+        // then simply have no station clause, rather than inventing "no stations" about
+        // a set nobody saw.
+        let p = pairs(&[("X-Hits", "artist 0 20"), ("X-Hits", "album 1 50"), ("X-Hits", "song 3 200")]);
+        let hits = parse_searchall_hits(&p);
+        let mut f = Find::default();
+        f.hits = hits;
+        assert_eq!(f.tally_title(), "no artists / 1 album / 3 songs");
+        assert!(!f.tally_title().contains("station"));
     }
 
     #[test]
@@ -798,6 +952,22 @@ mod tests {
     fn gutter_sigils_are_ascii_and_distinct_per_kind() {
         assert_eq!(FindKind::Artist.sigil(), '@');
         assert_eq!(FindKind::Album.sigil(), '=');
+        assert_eq!(FindKind::Station.sigil(), ')');
         assert_eq!(FindKind::Song.sigil(), ' ');
+        // All four ASCII, all four distinct, and none of them a queue mark (`#`/`~`)
+        // sharing the same three-column gutter.
+        let sigils = [
+            FindKind::Artist.sigil(),
+            FindKind::Album.sigil(),
+            FindKind::Station.sigil(),
+            FindKind::Song.sigil(),
+        ];
+        assert!(sigils.iter().all(|c| c.is_ascii()), "a non-ASCII glyph would shift the column");
+        for (i, a) in sigils.iter().enumerate() {
+            for b in &sigils[i + 1..] {
+                assert_ne!(a, b, "two kinds sharing a sigil makes the gutter meaningless");
+            }
+            assert!(*a != '#' && *a != '~', "clashes with a queue mark in the same gutter");
+        }
     }
 }

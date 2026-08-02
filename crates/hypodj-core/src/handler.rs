@@ -46,7 +46,8 @@ use crate::intelligence::{
     LEXICON_PULL_STRENGTH,
 };
 use crate::model::{
-    Album, AlbumId, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId, Station,
+    Album, AlbumId, Artist, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId, Station,
+    StationId,
 };
 use crate::plan::{
     clamp_raw, validate, Action, ArmedPlan, FadeIntentIr, PlanBounds, PlanError, PlanId, RawPlan,
@@ -57,8 +58,8 @@ use crate::echo::describe_batch;
 use crate::nl::{NlContext, NlError, NlSource, Translator};
 use crate::mpd::{
     ContinuationCmd, FadeArgs, FadeKind, FieldCmd, FieldNudge, KnobDir, MpdCommand, MpdHandler,
-    MpdResponse, NlCmd, PlanCmd, RadioCmd, RadioSeed, SleepCmd, StickerCmd, WakeCmd, WakeWhen,
-    WinddownCmd,
+    MpdResponse, NlCmd, PlanCmd, RadioCmd, RadioSeed, SleepCmd, StationCmd, StickerCmd, WakeCmd,
+    WakeWhen, WinddownCmd,
 };
 use crate::player::{
     db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerError, PlayerHandle,
@@ -5807,6 +5808,124 @@ impl HypodjHandler {
         }
     }
 
+    // ── `station add|rm` - the NAMED, idempotent saved-station write surface ──
+
+    /// The `station` verb: save a stream under an EXPLICIT name (an UPSERT), or remove
+    /// one by name.
+    ///
+    /// This exists because the only pre-existing creation path,
+    /// `playlistadd Stations <url>`, always DERIVES its label (falling back to the raw
+    /// url), so it structurally cannot express the name a curated `.pls` file carries.
+    /// That path is left exactly as it was.
+    ///
+    /// IDEMPOTENCE LIVES HERE, not in the importer: one live
+    /// getInternetRadioStations, one pure [`station_upsert`] verdict, then at most one
+    /// write. So a second import writes nothing no matter which client drives it, two
+    /// overlapping runs converge, and the same holds if the user types `station add` by
+    /// hand. An `Unchanged` verdict is a SUCCESS reporting `unchanged`, never an ACK -
+    /// re-running an import is the normal case.
+    ///
+    /// Never a bare OK: every success returns pairs naming what actually happened, so a
+    /// client that only surfaces ACKs can still tell a create from a no-op.
+    async fn handle_station(&self, cmd: StationCmd) -> MpdResponse {
+        match cmd {
+            StationCmd::Add { url, name } => {
+                let url = url.trim();
+                let name = name.trim();
+                // Reject a garbage station LOUD, before any network round trip: a
+                // non-http(s) uri could never be played by the stream path anyway.
+                if !is_stream_uri(url) {
+                    return ack(ACK_ERROR_NO_EXIST, "station", "not a stream url");
+                }
+                if name.is_empty() {
+                    return ack(ACK_ERROR_ARG, "station", "station name must not be blank");
+                }
+                // The list is an `.await`, so NO std lock is held anywhere near it.
+                let stations = match self.client.get_internet_radio_stations().await {
+                    Ok(s) => s,
+                    Err(e) => return ack(ACK_ERROR_UNKNOWN, "station", &e.to_string()),
+                };
+                let verdict = station_upsert(&stations, url, name);
+                let (outcome, prev_url) = match verdict {
+                    StationUpsert::Unchanged => ("unchanged", None),
+                    StationUpsert::Conflict => {
+                        return ack(
+                            ACK_ERROR_EXIST,
+                            "station",
+                            "name already used by another station",
+                        )
+                    }
+                    StationUpsert::Create => {
+                        if let Err(e) =
+                            self.client.create_internet_radio_station(url, name, None).await
+                        {
+                            return ack(ACK_ERROR_UNKNOWN, "station", &e.to_string());
+                        }
+                        ("created", None)
+                    }
+                    StationUpsert::Update(id) => {
+                        // Echo the url the row carried BEFORE the rewrite, so a re-point
+                        // is visible in the import output rather than silent.
+                        let existing = stations.iter().find(|s| s.id == id);
+                        let prev = existing
+                            .map(|s| s.stream_url.clone())
+                            .filter(|u| u != url);
+                        // Carry the homepage FORWARD. Subsonic's update replaces the whole
+                        // row, so passing None here silently cleared a homepage the user
+                        // had set - and a re-import would do it to every station every
+                        // time. The value is already in hand two lines up; a .pls simply
+                        // has no homepage field to overwrite it with.
+                        let home = existing.and_then(|s| s.home_page_url.clone());
+                        if let Err(e) = self
+                            .client
+                            .update_internet_radio_station(&id, url, name, home.as_deref())
+                            .await
+                        {
+                            return ack(ACK_ERROR_UNKNOWN, "station", &e.to_string());
+                        }
+                        ("updated", prev)
+                    }
+                };
+                if outcome != "unchanged" {
+                    self.notify_change();
+                }
+                let mut b = MpdResponse::pairs()
+                    .pair("X-Station", outcome)
+                    .pair("Name", name)
+                    .pair("file", url);
+                if let Some(prev) = prev_url {
+                    b = b.pair("X-PrevUrl", prev);
+                }
+                b.build()
+            }
+            StationCmd::Rm { name } => {
+                let name = name.trim();
+                let stations = match self.client.get_internet_radio_stations().await {
+                    Ok(s) => s,
+                    Err(e) => return ack(ACK_ERROR_UNKNOWN, "station", &e.to_string()),
+                };
+                // Resolved by the SAME rule `add station/<name>` resolves with, so a name
+                // that plays is a name that removes.
+                let Some(station) = station_for_name(&stations, name) else {
+                    return ack(
+                        ACK_ERROR_NO_EXIST,
+                        "station",
+                        &format!("no such station: {name}"),
+                    );
+                };
+                let (id, canonical) = (station.id.clone(), station.name.clone());
+                if let Err(e) = self.client.delete_internet_radio_station(&id).await {
+                    return ack(ACK_ERROR_UNKNOWN, "station", &e.to_string());
+                }
+                self.notify_change();
+                MpdResponse::pairs()
+                    .pair("X-Station", "removed")
+                    .pair("Name", canonical)
+                    .build()
+            }
+        }
+    }
+
     // ── `radio <thing>` - the seeded entry into the endless walk (task 8pns0hi) ──
 
     /// The `radio` verb: START an ENDLESS radio from a thing, or arm / disarm / report
@@ -8397,6 +8516,60 @@ fn apply_stream_meta(pairs: &mut Vec<(String, String)>, meta: &StreamMeta) {
     }
 }
 
+/// Put the STATION'S NAME on `Title` when nothing knows what is actually playing, so a
+/// stream row never renders 50 characters of URL where a track title belongs.
+///
+/// The precedence this completes, most specific first: the BARE recognized track title
+/// (songrec), then the crammed ICY now-playing line, then - here - the station name the
+/// daemon ALREADY resolved for `Name`, and only then the raw url (kept honestly, for a
+/// bare-url add of a tagless stream nothing has named).
+///
+/// Reading `Name` back OUT of `pairs` rather than recomputing it is the point: Title
+/// precedence becomes DERIVED from Name precedence, so it cannot drift out of sync with
+/// the identity-outranks-ICY rule the caller applied just above. One ladder, not two.
+///
+/// `Title == url` is the exact, non-guessing predicate for "no real title landed":
+/// [`song_pairs`] seeds `Title` from the entry's stored title, and [`apply_stream_meta`]
+/// overwrites it only when a non-blank recognized/ICY title exists. It is the same
+/// predicate the TUI already applies client-side; moving it into the daemon is the whole
+/// point, because ncmpcpp and the `dj` now card have no such workaround.
+///
+/// KNOWN HOLE: a station saved by `playlistadd Stations <url>` can have `name == url`
+/// (that path derives its label and falls back to the raw url), so `Name` IS the url and
+/// the row still shows 50 characters of url. Honestly unfixable at render time - there is
+/// no better name to show - and it needs no guard here, since copying a url onto a Title
+/// that already holds the same url changes nothing.
+///
+/// RENDER-TIME ONLY: this mutates a LOCAL pairs vector and NEVER writes
+/// `State.stream_meta`. Writing the station name into `stream_meta.title` (the way
+/// [`HypodjHandler::current_item`] folds it into its own LOCAL MPRIS clone) would read to
+/// `auto_identify_gate` as a foreign ICY title and to `identify_surface_decision` as
+/// `IcyLanded`, silently killing songrec re-identification on exactly the no-ICY NTS
+/// mixtapes the feature exists for. After this, MPD `currentsong` and MPRIS AGREE about
+/// the title instead of disagreeing.
+fn fill_stream_title_from_name(pairs: &mut Vec<(String, String)>, url: &str) {
+    let title_is_placeholder = match pairs.iter().find(|(k, _)| k == "Title") {
+        Some((_, v)) => v.trim().is_empty() || v == url,
+        None => true,
+    };
+    if !title_is_placeholder {
+        return;
+    }
+    let Some(name) = pairs
+        .iter()
+        .find(|(k, _)| k == "Name")
+        .map(|(_, v)| v.as_str())
+        .filter(|n| !n.trim().is_empty())
+    else {
+        return;
+    };
+    let name = name.to_string();
+    match pairs.iter_mut().find(|(k, _)| k == "Title") {
+        Some(slot) => slot.1 = name,
+        None => pairs.push(("Title".to_string(), name)),
+    }
+}
+
 /// Build the join-relevant [`EntrySnapshot`] for one queue item. A raw stream
 /// has no album and no known duration (both `None`, honestly - never `0`). A
 /// duration-less song is `None` too, never `0`-as-unknown.
@@ -8897,7 +9070,7 @@ impl MpdHandler for HypodjHandler {
                         // fallback), but ONLY when the stored slot's identity matches this
                         // exact entry - so a library song never inherits a station label
                         // and a stale slot from a prior stream never leaks onto a new one.
-                        if matches!(item.entry, QueueEntry::Stream { .. }) {
+                        if let QueueEntry::Stream { url: stream_url, .. } = &item.entry {
                             let cur_qid = QueueId(item.id);
                             if let Some((qid, meta)) = &st.stream_meta {
                                 if *qid == cur_qid {
@@ -8956,6 +9129,11 @@ impl MpdHandler for HypodjHandler {
                             if let Some(url) = cover {
                                 pairs.push(("X-CoverArt".to_string(), url));
                             }
+                            // LAST, so it reads the FINAL `Name` (station identity having
+                            // already outranked ICY) and only fires when neither a
+                            // recognized nor an ICY title landed: a stream row's `Title`
+                            // is never the raw URL when a real station name is known.
+                            fill_stream_title_from_name(&mut pairs, stream_url);
                         }
                         MpdResponse::Pairs(pairs)
                     }
@@ -9145,6 +9323,7 @@ impl MpdHandler for HypodjHandler {
             }
             MpdCommand::Continuation(cmd) => self.handle_continuation(cmd).await,
             MpdCommand::Radio(cmd) => self.handle_radio(cmd).await,
+            MpdCommand::Station(cmd) => self.handle_station(cmd).await,
 
             // ── queue ─────────────────────────────────────────────────────
             MpdCommand::Add(uri) => match self.enqueue_uri(&uri).await {
@@ -10358,33 +10537,35 @@ impl HypodjHandler {
             .filter(|s| tag_matches(s, "any", &query, false))
             .collect();
 
-        let mut pairs = Vec::new();
-        // The count preamble is load-bearing: the protocol otherwise makes an empty
-        // RESULT and an empty FILTER byte-identical (both a bare OK), so this is the
-        // only way a zero-hit kind can be stated explicitly rather than inferred.
-        // `returned == cap` is rendered by the client as "server cap", never "200+":
-        // search3 is called with a fixed song cap and no over-request, so a full page
-        // is not evidence that more exist.
-        pairs.push(("X-Hits".to_string(), format!("artist {} {}", hits.artists.len(), SEARCH3_ARTIST_CAP)));
-        pairs.push(("X-Hits".to_string(), format!("album {} {}", hits.albums.len(), SEARCH3_ALBUM_CAP)));
-        pairs.push(("X-Hits".to_string(), format!("song {} {}", songs.len(), SEARCH3_SONG_CAP)));
-        // Artist and album blocks are byte-identical in shape to what lsinfo already
-        // emits, so the client parses them with machinery it already has.
-        for a in &hits.artists {
-            pairs.push(("directory".to_string(), format!("artist/{}", a.id.0)));
-            pairs.push(("Artist".to_string(), a.name.clone()));
-            pairs.push(("X-AlbumCount".to_string(), a.album_count.to_string()));
-        }
-        for al in &hits.albums {
-            pairs.push(("directory".to_string(), format!("album/{}", al.id.0)));
-            pairs.push(("Album".to_string(), al.name.clone()));
-            pairs.push(("Artist".to_string(), al.artist.clone()));
-            pairs.push(("X-SongCount".to_string(), al.song_count.to_string()));
-        }
-        for s in &songs {
-            pairs.extend(browse_song_pairs(s));
-        }
-        MpdResponse::Pairs(pairs)
+        // The FOURTH result kind: the user's own saved internet radio stations, which
+        // search3 does not index at all (Subsonic has no station-search endpoint), so
+        // the match is handler-side over the full list. One UNCACHED
+        // getInternetRadioStations per submitted query is the stated cost: a station
+        // cache would buy an invalidation contract with `station add`/`station rm`/
+        // `playlistadd Stations` whose failure mode (a stale list making
+        // `add station/<name>` fail on a station just imported) is worse than the round
+        // trip.
+        //
+        // A FETCH FAILURE omits BOTH the `X-Hits: station` line and the station blocks,
+        // and still returns artists/albums/songs. Never `station 0`: that is an active
+        // lie, and the preamble's whole purpose is that a zero-hit kind is STATED rather
+        // than inferred. Absence of a claim beats a false claim, and a searchall must
+        // not ACK because the internet-radio endpoint hiccuped.
+        let query_lower = query.to_lowercase();
+        let stations: Option<Vec<Station>> = match self.client.get_internet_radio_stations().await {
+            Ok(all) => Some(all.into_iter().filter(|s| station_matches(s, &query_lower)).collect()),
+            Err(e) => {
+                tracing::warn!(error = %e, "searchall: station list unavailable; omitting the station kind");
+                None
+            }
+        };
+
+        MpdResponse::Pairs(search_all_pairs(
+            &hits.artists,
+            &hits.albums,
+            stations.as_deref(),
+            &songs,
+        ))
     }
 
     async fn search_filtered(&self, filters: Vec<(String, String)>, exact: bool) -> MpdResponse {
@@ -10828,6 +11009,154 @@ fn station_browse_pairs(s: &Station) -> Vec<(String, String)> {
         ("Title".to_string(), s.name.clone()),
         ("Name".to_string(), s.name.clone()),
     ]
+}
+
+/// What `station add <url> <name>` must DO against the stations that already exist.
+/// Computed by [`station_upsert`] from ONE live list, so the whole idempotence rule is
+/// a pure function that needs no server to test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StationUpsert {
+    /// Nothing carries this url or this name: create it.
+    Create,
+    /// One station is the same thing under a stale url or a stale name: rewrite it.
+    Update(StationId),
+    /// This exact (url, name) pair is already saved. ZERO writes - the second run of an
+    /// import is the NORMAL case, not an error.
+    Unchanged,
+    /// The url belongs to one station while the name belongs to a DIFFERENT one.
+    /// Refused, because it is the only branch that would create UNREACHABLE state:
+    /// [`station_for_name`] returns the FIRST match, so a duplicate name makes every
+    /// station past the first unaddressable by `add station/<name>` forever.
+    Conflict,
+}
+
+/// Decide what saving `(url, name)` means against the CURRENT station set.
+///
+/// The url is the identity (a station IS its stream), the name is the label, and a
+/// change to either is the user editing his source-of-truth `.pls` collection - so both
+/// "the url moved" (KFJC archive urls rotate, NTS moves endpoints) and "he renamed it"
+/// resolve to an UPDATE rather than a refusal or a duplicate. Name equality uses the
+/// SAME `eq_ignore_ascii_case` rule [`station_for_name`] resolves with, so "already
+/// there" means exactly "a later `add station/<name>` will find it".
+///
+/// Pure (no network, no lock): the caller does the one getInternetRadioStations fetch
+/// and then executes the verdict.
+fn station_upsert(stations: &[Station], url: &str, name: &str) -> StationUpsert {
+    let by_url = stations.iter().find(|s| s.stream_url == url);
+    let by_name = station_for_name(stations, name);
+    match (by_url, by_name) {
+        // The same row under both keys: either nothing to do, or a pure rename/re-point
+        // of a row that is unambiguously the same station.
+        (Some(u), Some(n)) if u.id == n.id => {
+            if u.name == name {
+                StationUpsert::Unchanged
+            } else {
+                // Same station, same url, but the CASING of the name changed. Rewrite so
+                // the saved label matches the .pls byte for byte.
+                StationUpsert::Update(u.id.clone())
+            }
+        }
+        // The name is already spoken for by a DIFFERENT station: refuse rather than
+        // mint a second row that could never be addressed by name.
+        (Some(_), Some(_)) => StationUpsert::Conflict,
+        (None, Some(n)) => StationUpsert::Update(n.id.clone()),
+        (Some(u), None) => StationUpsert::Update(u.id.clone()),
+        (None, None) => StationUpsert::Create,
+    }
+}
+
+/// Assemble the whole `searchall` frame: the `X-Hits` count preamble, then one block per
+/// hit in the kind order the client renders. PURE, so the wire contract (which kinds are
+/// claimed, in which order, and what a missing kind looks like) is testable with no
+/// server at all.
+///
+/// The count preamble is load-bearing: the protocol otherwise makes an empty RESULT and
+/// an empty FILTER byte-identical (both a bare OK), so this is the only way a zero-hit
+/// kind can be stated explicitly rather than inferred. `returned == cap` is rendered by
+/// the client as "server cap", never "200+": search3 is called with a fixed song cap and
+/// no over-request, so a full page is not evidence that more exist.
+///
+/// `stations` is `None` when the station list could NOT be fetched, and that omits both
+/// its tally line and its blocks - never `station 0`, which would be an active lie about
+/// a set we did not see.
+fn search_all_pairs(
+    artists: &[Artist],
+    albums: &[Album],
+    stations: Option<&[Station]>,
+    songs: &[Song],
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    pairs.push(("X-Hits".to_string(), format!("artist {} {}", artists.len(), SEARCH3_ARTIST_CAP)));
+    pairs.push(("X-Hits".to_string(), format!("album {} {}", albums.len(), SEARCH3_ALBUM_CAP)));
+    // TWO tokens, no cap: the station match runs handler-side over the FULL saved set,
+    // so there is no server cap to report and claiming one would be a lie.
+    if let Some(st) = stations {
+        pairs.push(("X-Hits".to_string(), format!("station {}", st.len())));
+    }
+    pairs.push(("X-Hits".to_string(), format!("song {} {}", songs.len(), SEARCH3_SONG_CAP)));
+    // Artist and album blocks are byte-identical in shape to what lsinfo already emits,
+    // so the client parses them with machinery it already has.
+    for a in artists {
+        pairs.push(("directory".to_string(), format!("artist/{}", a.id.0)));
+        pairs.push(("Artist".to_string(), a.name.clone()));
+        pairs.push(("X-AlbumCount".to_string(), a.album_count.to_string()));
+    }
+    for al in albums {
+        pairs.push(("directory".to_string(), format!("album/{}", al.id.0)));
+        pairs.push(("Album".to_string(), al.name.clone()));
+        pairs.push(("Artist".to_string(), al.artist.clone()));
+        pairs.push(("X-SongCount".to_string(), al.song_count.to_string()));
+    }
+    // Stations sit BETWEEN albums and songs: an ordinary query matches zero of them, so
+    // the top of the list stays byte-identical to what it always was, and a handful of
+    // stations can never be buried under a 200-song page.
+    for s in stations.into_iter().flatten() {
+        pairs.extend(station_hit_pairs(s));
+    }
+    for s in songs {
+        pairs.extend(browse_song_pairs(s));
+    }
+    pairs
+}
+
+/// Does this saved station match a `searchall` query? A lowercase SUBSTRING test on the
+/// NAME only, never on the url - `searchall http` must not return every saved station,
+/// and a url is not something a human searches for.
+///
+/// Deliberately asymmetric with [`station_for_name`] (exact, ASCII-case-folded): FIND is
+/// substring, RESOLVE is exact. They never need to agree, because a hit row enqueues by
+/// the CANONICAL name baked into its uri, never by the typed query.
+fn station_matches(s: &Station, query_lower: &str) -> bool {
+    s.name.to_lowercase().contains(query_lower)
+}
+
+/// The host of a stream url, for the Find row's trailer: what actually distinguishes
+/// "NTS Infinite Mixtapes 1" from "NTS Radio Live 1" at a glance. Extracted DAEMON-side
+/// so the client stays a dumb column fitter. `None` when there is no host to show
+/// (the url is not `scheme://host...`), so a trailer is never a blank column.
+fn stream_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map(|(_, r)| r)?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Strip userinfo and the port, keeping only what reads as a source.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    (!host.is_empty()).then_some(host)
+}
+
+/// `searchall` hit pairs for one saved station. The uri is `station/<name>` (NOT the raw
+/// stream url the `Stations` browse dir emits): it is the one shape the client's Find
+/// parser can classify by prefix AND the one shape `enqueue_uri` already resolves, so
+/// the wire and the enqueue path agree with zero new plumbing. `file:` because a station
+/// is a leaf, `Title:` because the Find parser already maps that key to a row label.
+fn station_hit_pairs(s: &Station) -> Vec<(String, String)> {
+    let mut pairs = vec![
+        ("file".to_string(), format!("station/{}", s.name)),
+        ("Title".to_string(), s.name.clone()),
+    ];
+    if let Some(host) = stream_host(&s.stream_url) {
+        pairs.push(("X-StreamHost".to_string(), host.to_string()));
+    }
+    pairs
 }
 
 /// Resolve a saved station's raw stream URL by NAME, matching case-insensitively
@@ -14920,7 +15249,72 @@ mod tests {
                 && v == "https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
             "the resolved station image surfaces as X-CoverArt: {cur:?}"
         );
+        // THE TITLE WART: with a real station name known and NO track title anywhere,
+        // `Title` is the station name, NOT the 50-character url. `file:` still is.
+        assert!(
+            cur.iter().any(|(k, v)| k == "Title" && v == "4 To The Floor"),
+            "Title is the station name, never the raw URL: {cur:?}"
+        );
+        assert!(
+            !cur.iter().any(|(k, v)| k == "Title" && v == NTS),
+            "the raw URL must not ride the Title pair: {cur:?}"
+        );
         assert!(cur.iter().any(|(k, v)| k == "file" && v == NTS), "file: stays the raw URL");
+    }
+
+    // The Title fix must NOT touch a stream that DOES carry ICY: the crammed icy-title
+    // is a real now-playing line and rides Title unchanged (b47f2ad, at the currentsong
+    // level rather than only at apply_stream_meta).
+    #[tokio::test]
+    async fn currentsong_icy_title_survives_the_station_name_fill() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS".to_string()), Some("Live Show".to_string()));
+        h.state.lock().unwrap().station_identity = Some((QueueId(qid), nts_identity()));
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur.iter().any(|(k, v)| k == "Title" && v == "Live Show"),
+            "the ICY now-playing line wins over the station name: {cur:?}"
+        );
+        // The identity still outranks ICY on Name, exactly as before.
+        assert!(cur.iter().any(|(k, v)| k == "Name" && v == "4 To The Floor"), "{cur:?}");
+    }
+
+    // Same, for a RECOGNIZED hit: Title stays the BARE track title, so a client composing
+    // "Artist - Title" never prints the artist twice.
+    #[tokio::test]
+    async fn currentsong_recognized_bare_title_survives_the_station_name_fill() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta_full(
+            QueueId(qid),
+            StreamMeta {
+                name: Some("NTS".to_string()),
+                title: Some("Ron Trent - YNF".to_string()),
+                artist: Some("Ron Trent".to_string()),
+                track_title: Some("YNF".to_string()),
+                ..Default::default()
+            },
+        );
+        h.state.lock().unwrap().station_identity = Some((QueueId(qid), nts_identity()));
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur.iter().any(|(k, v)| k == "Title" && v == "YNF"),
+            "the BARE recognized title survives: {cur:?}"
+        );
+        assert!(cur.iter().any(|(k, v)| k == "Artist" && v == "Ron Trent"), "{cur:?}");
     }
 
     // Read-time NAME priority: an NTS-classified station identity (whose mere presence
@@ -16208,6 +16602,127 @@ mod tests {
         assert_eq!(get("Artist"), Some("Ron Trent"));
     }
 
+    // ── a stream row's Title is never the raw URL when a station name is known ──
+
+    #[test]
+    fn fill_stream_title_from_name_replaces_the_url_placeholder() {
+        // The wart: an NTS mixtape carries NO ICY, so song_pairs left Title as the raw
+        // url while the resolved identity named it on Name. Title becomes that name.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), NTS.to_string()),
+            ("Name".to_string(), "4 To The Floor".to_string()),
+        ];
+        fill_stream_title_from_name(&mut pairs, NTS);
+        let get = |k: &str| pairs.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("Title"), Some("4 To The Floor"));
+        assert_eq!(get("file"), Some(NTS), "the url still rides file:, untouched");
+        assert_eq!(get("Name"), Some("4 To The Floor"));
+    }
+
+    #[test]
+    fn fill_stream_title_from_name_never_overwrites_a_real_title() {
+        // A RECOGNIZED bare track title (the songrec path) must survive verbatim: the
+        // Artist pair carries the performer, so re-cramming or replacing Title would
+        // make every "Artist - Title" client wrong.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), "YNF".to_string()),
+            ("Name".to_string(), "4 To The Floor".to_string()),
+            ("Artist".to_string(), "Ron Trent".to_string()),
+        ];
+        fill_stream_title_from_name(&mut pairs, NTS);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some("YNF")
+        );
+
+        // A crammed ICY now-playing line is equally a real title.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), "Ron Trent - YNF".to_string()),
+            ("Name".to_string(), "NTS".to_string()),
+        ];
+        fill_stream_title_from_name(&mut pairs, NTS);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some("Ron Trent - YNF")
+        );
+    }
+
+    #[test]
+    fn fill_stream_title_from_name_leaves_the_url_when_nothing_named_the_stream() {
+        // No Name at all: the url stays on Title, HONESTLY - nothing knows better.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), NTS.to_string()),
+        ];
+        fill_stream_title_from_name(&mut pairs, NTS);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some(NTS)
+        );
+
+        // A whitespace-only Name is not a usable label either.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), NTS.to_string()),
+            ("Name".to_string(), "   ".to_string()),
+        ];
+        fill_stream_title_from_name(&mut pairs, NTS);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some(NTS)
+        );
+    }
+
+    #[test]
+    fn fill_stream_title_from_name_pins_the_name_equals_url_hole() {
+        // THE KNOWN HOLE, documented so it cannot silently change: a station saved by
+        // `playlistadd Stations <url>` gets its label from resolve_station_name, whose
+        // fallback is the RAW URL. Name == url leaves Title as the url - there is no
+        // better name to show, so this is honest rather than fixable at render time.
+        // NOTE this is an OUTCOME pin, not a guard: the row renders identically whether
+        // the helper copies Name over Title or declines to, so no mutation of the helper
+        // can make it fail. It is here to record the hole, not to defend a mechanism.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), NTS.to_string()),
+            ("Name".to_string(), NTS.to_string()),
+        ];
+        fill_stream_title_from_name(&mut pairs, NTS);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some(NTS)
+        );
+    }
+
+    #[test]
+    fn fill_stream_title_from_name_fills_a_blank_or_missing_title() {
+        // A blank Title is a placeholder too.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Title".to_string(), "  ".to_string()),
+            ("Name".to_string(), "4 To The Floor".to_string()),
+        ];
+        fill_stream_title_from_name(&mut pairs, NTS);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some("4 To The Floor")
+        );
+
+        // No Title pair at all: one is appended rather than the row going titleless.
+        let mut pairs = vec![
+            ("file".to_string(), NTS.to_string()),
+            ("Name".to_string(), "4 To The Floor".to_string()),
+        ];
+        fill_stream_title_from_name(&mut pairs, NTS);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some("4 To The Floor")
+        );
+    }
+
     // ── saved internet radio stations (task cchte88) ───────────────────────
 
     #[test]
@@ -16315,6 +16830,211 @@ mod tests {
         assert_eq!(found.name, "NTS 1", "the canonical (saved) name is carried, not the query casing");
         assert_eq!(found.stream_url, "https://n/1");
         assert!(station_for_name(&stations, "nope").is_none());
+    }
+
+    // ── the named, idempotent station upsert (`station add`) ───────────────────
+
+    /// One saved station, for the pure upsert/search helpers.
+    fn st(id: &str, name: &str, url: &str) -> Station {
+        Station {
+            id: StationId(id.into()),
+            name: name.into(),
+            stream_url: url.into(),
+            home_page_url: None,
+        }
+    }
+
+    #[test]
+    fn station_upsert_covers_every_branch() {
+        let saved = vec![
+            st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
+            st("2", "KFJC 89.7 FM", "http://netcast.kfjc.org/kfjc-320k-aac"),
+        ];
+
+        // Neither key matches: a genuinely new station.
+        assert_eq!(
+            station_upsert(&saved, "https://audio.wavefarm.org/weatherwarlock.mp3", "Weather Warlock"),
+            StationUpsert::Create
+        );
+
+        // The EXACT pair is already saved: zero writes. This is the idempotence path.
+        assert_eq!(
+            station_upsert(&saved, "https://stream-mixtape-geo.ntslive.net/mixtape5", "NTS 4 To The Floor"),
+            StationUpsert::Unchanged
+        );
+
+        // He renamed the .pls: same url, new label -> rewrite the row, never a duplicate.
+        assert_eq!(
+            station_upsert(&saved, "https://stream-mixtape-geo.ntslive.net/mixtape5", "NTS Four To The Floor"),
+            StationUpsert::Update(StationId("1".into()))
+        );
+        // Even a pure CASING change rewrites, so the saved label matches the .pls byte
+        // for byte (station_for_name would already have resolved it either way).
+        assert_eq!(
+            station_upsert(&saved, "http://netcast.kfjc.org/kfjc-320k-aac", "KFJC 89.7 fm"),
+            StationUpsert::Update(StationId("2".into()))
+        );
+
+        // The endpoint moved (KFJC archive urls rotate, NTS moves endpoints): the .pls
+        // is the source of truth, so his edit TAKES EFFECT rather than being refused.
+        assert_eq!(
+            station_upsert(&saved, "http://netcast.kfjc.org/kfjc-256k-aac", "kfjc 89.7 fm"),
+            StationUpsert::Update(StationId("2".into()))
+        );
+
+        // The url is station 1's while the name is station 2's: the ONLY refusal, because
+        // a duplicate name makes every station past the first unaddressable forever.
+        assert_eq!(
+            station_upsert(&saved, "https://stream-mixtape-geo.ntslive.net/mixtape5", "KFJC 89.7 FM"),
+            StationUpsert::Conflict
+        );
+    }
+
+    #[test]
+    fn station_upsert_second_import_writes_nothing() {
+        // Feed the decision the list its own creates would have produced: importing the
+        // same collection twice must yield 22 Unchanged, never 44 stations.
+        let pls: Vec<(&str, &str)> = vec![
+            ("NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
+            ("NTS Radio Live 2 - Los Angeles", "http://stream-relay-geo.ntslive.net/stream2"),
+            ("Moon Mission Recordings, Tokyo Deep and Electronic", "http://uk5.internet-radio.com:8306/stream"),
+            ("Oxigenio 102.6 FM Lisboa", "http://proic1.evspt.com:80/oxigenio_aac"),
+            ("The Lot Radio - NYC", "https://www.lvpr.tv/?v=85c28sa2o8wppm58&lowLatency=false&muted=false"),
+        ];
+        // First run: every entry is a Create against a growing set.
+        let mut saved: Vec<Station> = Vec::new();
+        for (i, (name, url)) in pls.iter().enumerate() {
+            assert_eq!(station_upsert(&saved, url, name), StationUpsert::Create, "{name}");
+            saved.push(st(&i.to_string(), name, url));
+        }
+        // Second run: every entry is Unchanged, so the importer writes nothing at all.
+        for (name, url) in &pls {
+            assert_eq!(station_upsert(&saved, url, name), StationUpsert::Unchanged, "{name}");
+        }
+        assert_eq!(saved.len(), pls.len(), "no station was minted twice");
+    }
+
+    // ── stations as the FOURTH searchall result kind ───────────────────────────
+
+    #[test]
+    fn station_matches_is_name_substring_never_url() {
+        let s = st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5");
+        // Substring, case-insensitive: FIND is loose where station_for_name is exact.
+        assert!(station_matches(&s, "nts"));
+        assert!(station_matches(&s, "floor"));
+        assert!(station_matches(&s, "4 to the floor"));
+        assert!(!station_matches(&s, "kfjc"));
+        // The URL is NEVER searched: `searchall http` must not return every station.
+        assert!(!station_matches(&s, "http"));
+        assert!(!station_matches(&s, "ntslive.net"));
+    }
+
+    #[test]
+    fn stream_host_is_the_bare_host() {
+        assert_eq!(stream_host("https://stream-mixtape-geo.ntslive.net/mixtape5"), Some("stream-mixtape-geo.ntslive.net"));
+        // An explicit port and a query string both drop out of the trailer.
+        assert_eq!(stream_host("http://proic1.evspt.com:80/oxigenio_aac"), Some("proic1.evspt.com"));
+        assert_eq!(
+            stream_host("https://www.lvpr.tv/?v=85c28sa2o8wppm58&lowLatency=false&muted=false"),
+            Some("www.lvpr.tv")
+        );
+        // A bare homepage with no path still has a host (earthsongradio.com).
+        assert_eq!(stream_host("http://earthsongradio.com"), Some("earthsongradio.com"));
+        // Nothing host-shaped yields no trailer at all, never a blank column.
+        assert_eq!(stream_host("not a url"), None);
+        assert_eq!(stream_host("http://"), None);
+    }
+
+    #[test]
+    fn station_hit_pairs_carry_the_enqueueable_uri() {
+        let s = st("1", "Moon Mission Recordings, Tokyo Deep and Electronic", "http://uk5.internet-radio.com:8306/stream");
+        let p = station_hit_pairs(&s);
+        // `station/<name>` is BOTH the shape the Find parser classifies by prefix and the
+        // shape `enqueue_uri` already resolves - one uri, no new plumbing. A name with a
+        // comma and spaces rides it VERBATIM.
+        assert_eq!(
+            p.iter().find(|(k, _)| k == "file").map(|(_, v)| v.as_str()),
+            Some("station/Moon Mission Recordings, Tokyo Deep and Electronic")
+        );
+        assert_eq!(
+            p.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.as_str()),
+            Some("Moon Mission Recordings, Tokyo Deep and Electronic")
+        );
+        assert_eq!(
+            p.iter().find(|(k, _)| k == "X-StreamHost").map(|(_, v)| v.as_str()),
+            Some("uk5.internet-radio.com")
+        );
+        // The RAW stream url is deliberately NOT the uri here (that is the `lsinfo
+        // Stations` shape, which ncmpcpp's add-the-row path depends on).
+        assert!(!p.iter().any(|(_, v)| v.starts_with("http")), "{p:?}");
+    }
+
+    #[test]
+    fn search_all_pairs_places_stations_between_albums_and_songs() {
+        let artists = vec![Artist {
+            id: ArtistId("ar1".into()),
+            name: "Ron Trent".into(),
+            album_count: 3,
+            starred: false,
+            cover_art: None,
+        }];
+        let albums = vec![Album {
+            id: AlbumId("al1".into()),
+            name: "Warm".into(),
+            artist: "Ron Trent".into(),
+            artist_id: None,
+            year: None,
+            genre: None,
+            cover_art: None,
+            song_count: 9,
+        }];
+        let stations = vec![
+            st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
+            st("2", "NTS Radio Live 1 - London", "http://stream-relay-geo.ntslive.net/stream"),
+        ];
+        let pairs = search_all_pairs(&artists, &albums, Some(&stations), &[]);
+
+        // The tally preamble: the station kind sits THIRD, between album and song, and
+        // carries TWO tokens (no server cap, because the match is handler-side).
+        let hits: Vec<&str> =
+            pairs.iter().filter(|(k, _)| k == "X-Hits").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(hits, vec!["artist 1 20", "album 1 50", "station 2", "song 0 200"]);
+
+        // The blocks follow the same order, so a station can never be buried under a
+        // 200-song page.
+        let uris: Vec<&str> = pairs
+            .iter()
+            .filter(|(k, _)| k == "directory" || k == "file")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            uris,
+            vec![
+                "artist/ar1",
+                "album/al1",
+                "station/NTS 4 To The Floor",
+                "station/NTS Radio Live 1 - London",
+            ]
+        );
+        assert!(pairs.iter().any(|(k, v)| k == "X-StreamHost" && v == "stream-mixtape-geo.ntslive.net"));
+    }
+
+    #[test]
+    fn search_all_pairs_omits_the_station_kind_when_the_list_is_unavailable() {
+        // A station-list fetch failure must NOT ACK the whole searchall and must NOT
+        // claim `station 0` - absence of a claim beats a false claim about a set we
+        // never saw. Artists/albums/songs still come back.
+        let pairs = search_all_pairs(&[], &[], None, &[]);
+        let hits: Vec<&str> =
+            pairs.iter().filter(|(k, _)| k == "X-Hits").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(hits, vec!["artist 0 20", "album 0 50", "song 0 200"]);
+        assert!(!pairs.iter().any(|(_, v)| v.starts_with("station")), "{pairs:?}");
+
+        // A successful fetch that matched NOTHING is different, and says so.
+        let pairs = search_all_pairs(&[], &[], Some(&[]), &[]);
+        let hits: Vec<&str> =
+            pairs.iter().filter(|(k, _)| k == "X-Hits").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(hits, vec!["artist 0 20", "album 0 50", "station 0", "song 0 200"]);
     }
 
     #[test]

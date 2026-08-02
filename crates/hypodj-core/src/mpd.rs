@@ -266,6 +266,14 @@ pub enum MpdCommand {
     /// hypodj extension. See [`RadioCmd`], [`RadioSeed`] and [`parse_radio`].
     Radio(RadioCmd),
 
+    /// `station add <streamUrl> <name>` / `station rm <name>` - the NAMED, idempotent
+    /// saved-station write surface. `add` is an UPSERT decided against ONE live
+    /// getInternetRadioStations, so importing the same set twice writes nothing; the
+    /// idempotence lives HERE rather than in whichever client drives it. NOT a standard
+    /// MPD command; a hypodj extension in the same house style as `radio`/`searchall`.
+    /// See [`StationCmd`] and [`parse_station`].
+    Station(StationCmd),
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
@@ -294,6 +302,43 @@ pub enum RadioCmd {
     Off,
     /// `radio status` - report the live arm + mode + the seed the walk would use.
     Status,
+}
+
+/// A parsed `station` subcommand (the NAMED, idempotent saved-station write surface).
+///
+/// Distinct from [`RadioCmd`] on purpose: a saved internet radio station is a THING the
+/// user keeps and can search for, while `radio` is a generator. The two never share a
+/// code path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StationCmd {
+    /// `station add <streamUrl> <name>` - UPSERT a station under an EXPLICIT name.
+    /// Unlike `playlistadd Stations <url>` (whose label is always derived, falling back
+    /// to the raw url), this carries the name the caller chose - which is what makes a
+    /// `.pls` `Title1` expressible at all.
+    Add { url: String, name: String },
+    /// `station rm <name>` - delete the saved station carrying that name. The undo half
+    /// of `add`: a gesture that writes to the user's server is removable by the same tool.
+    Rm { name: String },
+}
+
+/// Parse a `station` request. EXACTLY the arities the two shapes need
+/// (`add <url> <name>` = 3 args, `rm <name>` = 2): a wrong arity, an unknown keyword,
+/// and a bare `station` are all a loud (no-op-safe) [`MpdCommand::Unsupported`] rather
+/// than a guess, because every shape of this verb WRITES to the user's server and a
+/// misparsed write is not recoverable by re-reading. Values are taken VERBATIM (the
+/// tokenizer already unquoted them), so a name with spaces, commas or non-ASCII
+/// survives whole.
+fn parse_station(args: &[String], line: &str) -> MpdCommand {
+    match args.first().map(|s| s.as_str()) {
+        Some("add") if args.len() == 3 => MpdCommand::Station(StationCmd::Add {
+            url: args[1].clone(),
+            name: args[2].clone(),
+        }),
+        Some("rm") if args.len() == 2 => {
+            MpdCommand::Station(StationCmd::Rm { name: args[1].clone() })
+        }
+        _ => MpdCommand::Unsupported(line.to_string()),
+    }
 }
 
 /// What a `radio` start seeds FROM. Deliberately tiny: one seed per gesture, mirroring
@@ -1235,6 +1280,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "identify" => MpdCommand::Identify,
         "continuation" => parse_continuation(&args, line),
         "radio" => parse_radio(&args, line),
+        "station" => parse_station(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -1356,6 +1402,44 @@ mod parse_tests {
         assert!(matches!(parse("radio song/s1 song/s2"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("radio on off"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("radio something jazzy please"), MpdCommand::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_station_add_and_rm() {
+        // `add` carries the url and the EXPLICIT name, both verbatim.
+        assert!(matches!(
+            parse("station add http://example.org/s \"My Station\""),
+            MpdCommand::Station(StationCmd::Add { url, name })
+                if url == "http://example.org/s" && name == "My Station"
+        ));
+        // A name with a comma / parens / non-ASCII is ONE quoted token and survives whole:
+        // this is exactly a `.pls` Title1.
+        assert!(matches!(
+            parse("station add http://uk5.internet-radio.com:8306/stream \"Moon Mission Recordings, Tokyo Deep and Electronic\""),
+            MpdCommand::Station(StationCmd::Add { name, .. })
+                if name == "Moon Mission Recordings, Tokyo Deep and Electronic"
+        ));
+        assert!(matches!(
+            parse("station add https://s.example/x \"Radio Oxigénio (Lisboa)\""),
+            MpdCommand::Station(StationCmd::Add { name, .. })
+                if name == "Radio Oxigénio (Lisboa)"
+        ));
+        assert!(matches!(
+            parse("station rm \"NTS 4 To The Floor\""),
+            MpdCommand::Station(StationCmd::Rm { name }) if name == "NTS 4 To The Floor"
+        ));
+        // ARITY and unknown keywords are LOUD: every shape of this verb WRITES to the
+        // user's server, so a misparse must never reach a create/update/delete.
+        assert!(matches!(parse("station"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("station add"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("station add http://example.org/s"), MpdCommand::Unsupported(_)));
+        assert!(matches!(
+            parse("station add http://example.org/s name extra"),
+            MpdCommand::Unsupported(_)
+        ));
+        assert!(matches!(parse("station rm"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("station rm a b"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("station wat x y"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

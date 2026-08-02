@@ -57,6 +57,18 @@ pub fn resolve(
     (host, port)
 }
 
+/// The directory of `.pls` files `dj stations import` reads when given no PATH, from
+/// `HYPODJ_STATIONS_DIR`. Set declaratively in the session env (home-manager), so the
+/// user's own path never enters the repo and a `.pls` added next month is picked up by
+/// the same zero-argument gesture. A blank value is treated as UNSET (an empty string in
+/// the environment is a mistake, never a request to import the current directory), and
+/// unset yields `None` so the caller prints a usage line rather than guessing a path.
+pub fn stations_dir(env: &Env) -> Option<std::path::PathBuf> {
+    env.v("HYPODJ_STATIONS_DIR")
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| std::path::PathBuf::from(v.trim()))
+}
+
 /// Split a "host:port" spec on the LAST ':' if the tail parses as a port. A bare
 /// host (no colon, or a trailing non-numeric) returns None so it is used as-is.
 fn split_hostspec(s: &str) -> Option<(String, String)> {
@@ -119,6 +131,22 @@ mod tests {
     fn flags_win() {
         let m = env_of(&[("HYPODJ_HOST", "1.2.3.4"), ("HYPODJ_PORT", "6601")]);
         assert_eq!(resolve_with(Some("host"), Some(9999), m), ("host".into(), 9999));
+    }
+
+    #[test]
+    fn stations_dir_is_set_unset_or_blank() {
+        let m = env_of(&[("HYPODJ_STATIONS_DIR", "/home/u/radio-streams")]);
+        let env = Env { get: &|k| m.get(k).cloned() };
+        assert_eq!(stations_dir(&env), Some(std::path::PathBuf::from("/home/u/radio-streams")));
+
+        let m = env_of(&[]);
+        let env = Env { get: &|k| m.get(k).cloned() };
+        assert_eq!(stations_dir(&env), None, "unset never guesses a path");
+
+        // A blank value is a mistake in the environment, not a request to import ".".
+        let m = env_of(&[("HYPODJ_STATIONS_DIR", "   ")]);
+        let env = Env { get: &|k| m.get(k).cloned() };
+        assert_eq!(stations_dir(&env), None);
     }
 
     #[test]

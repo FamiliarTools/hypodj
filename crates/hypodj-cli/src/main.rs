@@ -3,7 +3,9 @@
 //! runs directly; anything else is sent to the daemon as `nl "<phrase>"`, echoed,
 //! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
 
+mod pls;
 mod render;
+mod stations;
 
 use std::io::{BufRead, Write};
 
@@ -26,6 +28,12 @@ USAGE:
                            (\"radio random\" to start cold, \"radio off\" to stop)
   dj vol <0-100>          set volume
   dj clear                clear the queue (asks first)
+  dj stations import [PATH ...] [--dry-run]
+                          save every .pls under PATH as an internet radio
+                           station (idempotent: a second run writes nothing).
+                           With no PATH, reads $HYPODJ_STATIONS_DIR
+  dj stations list | rm <name>
+                          list / remove saved stations
   dj <anything else>      natural language: e.g. \"fade out\", \"stop after this
                            album\", \"wake me at 7 with jazz\" - echoed + confirmed
 
@@ -92,6 +100,15 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
             // recognize a bare-favorite phrase, and the TUI already splits this
             // way. Collapsing repeated internal whitespace is fine for the NL
             // reconstruction (route joins the words back with single spaces).
+            // `stations` is a FILESYSTEM gesture, not a phrase: its arguments are
+            // PATHS, and several of the real .pls files carry spaces in their names.
+            // So keep the argv boundaries the shell already established, verbatim,
+            // instead of re-splitting a path into fragments that name nothing.
+            "stations" => {
+                words.push(a);
+                words.extend(it.by_ref());
+                break;
+            }
             _ => {
                 words.extend(a.split_whitespace().map(str::to_string));
                 for rest in it.by_ref() {
@@ -111,6 +128,22 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
     };
     if parsed.help {
         print!("{HELP}");
+        return Ok(());
+    }
+
+    // `stations` is intercepted BEFORE route(): route is deliberately a pure
+    // verb-vs-NL split and is SHARED with dj-gui, so a filesystem gesture does not
+    // belong in it - and left to the fallthrough, "stations import" would be sent to
+    // the NL translator.
+    if parsed.words.first().is_some_and(|w| w == "stations") {
+        let env = Env { get: &|k| std::env::var(k).ok() };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        // A partial import is reported in full and THEN exits non-zero, so a script
+        // sees the failure while the files that did land stay landed.
+        if !stations::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
@@ -378,6 +411,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_keeps_station_paths_whole() {
+        // `stations` takes PATHS, not phrase words. Several of the real .pls files carry
+        // spaces and a comma in their names, so re-splitting an argv element on
+        // whitespace would turn one real path into fragments that name nothing.
+        let p = parse_args(v(&[
+            "stations",
+            "import",
+            "/home/u/radio streams/Moon Mission Recordings, Tokyo Deep and Electronic.pls",
+            "--dry-run",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.words,
+            v(&[
+                "stations",
+                "import",
+                "/home/u/radio streams/Moon Mission Recordings, Tokyo Deep and Electronic.pls",
+                "--dry-run",
+            ])
+        );
+        // The leading flags still parse, and `stations` still reaches the gesture.
+        let p = parse_args(v(&["--port", "6612", "stations", "import", "/a b/c"])).unwrap();
+        assert_eq!(p.port, Some(6612));
+        assert_eq!(p.words, v(&["stations", "import", "/a b/c"]));
+    }
+
+    #[test]
     fn parse_args_unquoted_words_match_quoted_form() {
         // Quoted and unquoted phrasings produce IDENTICAL tokens on both surfaces.
         let quoted = parse_args(v(&["fav current music"])).unwrap();
@@ -408,7 +468,7 @@ mod tests {
 
 /// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm; bare
 /// Enter, "n", EOF (Ctrl-D), all mean No.
-fn confirm(question: &str) -> bool {
+pub(crate) fn confirm(question: &str) -> bool {
     print!("{question} [y/N] ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();

@@ -314,6 +314,13 @@ fn render_now(f: &mut Frame, area: Rect, state: &TuiState) {
 /// and the station name rides a subtle second line whenever it is NOT already the
 /// headline. A library song (no `Name`) keeps its `Title` headline and no station line.
 /// Pure/testable.
+///
+/// The `title_is_url` branch is now DEAD against a current daemon, which puts the
+/// resolved station name on `Title` itself rather than the raw url. It is kept
+/// deliberately: the deployed build can lag master by several merges (the user switches
+/// by hand), and an OLDER daemon still serves the url there. Against a new daemon the
+/// rendered pane is byte-identical either way - `Title` equals `Name`, so the other
+/// branch produces the same headline and the station sub-line filters itself out.
 pub fn stream_headline(np: &NowPlaying) -> (String, Option<String>) {
     let title_is_url = np.title.is_some() && np.title == np.file;
     let headline = if title_is_url {
@@ -640,6 +647,24 @@ mod tests {
         let (headline, station) = stream_headline(&np);
         assert_eq!(headline, "4 To The Floor", "the station name replaces the raw URL");
         assert_eq!(station, None, "no duplicate station line when it is already the headline");
+    }
+
+    #[test]
+    fn stream_headline_on_a_current_daemon_shows_one_name_not_two() {
+        // The shape a CURRENT daemon serves after the Title fix: it resolved the station
+        // name and put it on `Title` as well as `Name`, so the client no longer has to
+        // work around a url in the title. The pane must be byte-identical to what the
+        // old workaround produced - ONE headline, and no duplicate station sub-line
+        // repeating the same words directly beneath it.
+        let np = NowPlaying {
+            title: Some("4 To The Floor".into()),
+            name: Some("4 To The Floor".into()),
+            file: Some("https://stream-mixtape-geo.ntslive.net/mixtape5".into()),
+            ..NowPlaying::default()
+        };
+        let (headline, station) = stream_headline(&np);
+        assert_eq!(headline, "4 To The Floor");
+        assert_eq!(station, None, "the name is already the headline - never printed twice");
     }
 
     #[test]
@@ -1228,6 +1253,44 @@ mod tests {
         assert!(out.contains("Sweden"), "song row:\n{out}");
         assert!(out.contains("1 artist / 1 album / 1 song"), "tallies in the title:\n{out}");
         assert!(out.contains("12 albums"), "the right-aligned trailer survives:\n{out}");
+    }
+
+    #[test]
+    fn find_station_rows_render_between_albums_and_songs_at_the_default_60x24() {
+        // The fourth kind has to fit the SAME five content rows the other three share at
+        // 60x24 - no header row, kind in the one-character gutter, tally in the title.
+        use crate::find::{FindKind, FindRow};
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Find;
+        s.find.phase = crate::find::Phase::Done;
+        s.find.hits.tallies = vec![
+            (FindKind::Album, 1, None),
+            // Two tokens on the wire, so no cap - and the title must not claim one.
+            (FindKind::Station, 2, None),
+            (FindKind::Song, 1, None),
+        ];
+        s.find.hits.rows = vec![
+            FindRow { kind: FindKind::Album, label: "NTS Sessions".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None },
+            FindRow { kind: FindKind::Station, label: "NTS 4 To The Floor".into(), uri: "station/NTS 4 To The Floor".into(), trailer: "stream-mixtape-geo.ntslive.net".into(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Station, label: "KFJC 89.7 FM".into(), uri: "station/KFJC 89.7 FM".into(), trailer: "netcast.kfjc.org".into(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: None },
+        ];
+        let lines = render_to_lines(&s);
+        let out = lines.join("\n");
+        assert!(out.contains(")  NTS 4 To The Floor"), "station row with its ) sigil:\n{out}");
+        assert!(out.contains(")  KFJC 89.7 FM"), "the second station row too:\n{out}");
+        assert!(out.contains("=  NTS Sessions"), "the album row keeps its = sigil:\n{out}");
+        assert!(
+            out.contains("1 album / 2 stations / 1 song"),
+            "the station tally sits between album and song, with no (server cap):\n{out}"
+        );
+        assert!(!out.contains("server cap"), "a station kind has no cap to claim:\n{out}");
+        // The trailer is the HOST - the only thing that tells two NTS stations apart.
+        assert!(out.contains("netcast.kfjc.org"), "the host trailer survives:\n{out}");
+        // Rows are painted in the display order, not just present somewhere.
+        let row_of = |needle: &str| lines.iter().position(|l| l.contains(needle));
+        let (alb, st, song) = (row_of("NTS Sessions"), row_of("KFJC 89.7 FM"), row_of("Sweden"));
+        assert!(alb < st && st < song, "album, then stations, then songs: {alb:?} {st:?} {song:?}");
     }
 
     #[test]
