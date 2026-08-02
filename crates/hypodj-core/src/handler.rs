@@ -3899,21 +3899,14 @@ impl HypodjHandler {
         }
         let query = crate::library_match::search_query(title)?;
 
-        let found = match tokio::time::timeout(
+        let found = bounded_library_lookup(
             LIBRARY_MATCH_BUDGET,
             self.client.search3(&query),
+            artist,
+            title,
+            track.album.as_deref(),
         )
-        .await
-        {
-            Ok(Ok(hits)) => crate::library_match::best_library_match(
-                &hits.songs,
-                artist,
-                title,
-                track.album.as_deref(),
-            ),
-            // A timeout or a server error is a miss, never an error out of identify.
-            Ok(Err(_)) | Err(_) => None,
-        };
+        .await;
         self.library_match_cache.put(key, found.clone());
         found
     }
@@ -8487,6 +8480,31 @@ fn stream_cover_source(st: &State, qid: QueueId) -> Option<StreamCoverSource> {
                 .as_ref()
                 .and_then(|(q, u)| (*q == qid).then(|| StreamCoverSource::Remote(u.clone())))
         })
+}
+
+/// Bound one library `search3` by `budget` and run the pure matcher over its hits.
+///
+/// Split out of [`HypodjHandler::lookup_library_match`] so the TIMEOUT wiring is
+/// unit-testable with a synthetic `search` future under a paused clock, with no server
+/// and no wall-clock sleep (the project's fake-clock rule for all time-based logic; the
+/// same reason `recognize::run_bounded` exists).
+///
+/// EVERY failure is a plain "no match": a timeout, a server error and an empty result all
+/// return `None`, so a Navidrome outage can never turn an otherwise good recognition into
+/// an identify error and decay the auto-identify cadence.
+async fn bounded_library_lookup(
+    budget: Duration,
+    search: impl std::future::Future<Output = Result<crate::subsonic::SearchHits, crate::subsonic::SubsonicError>>,
+    artist: &str,
+    title: &str,
+    rec_album: Option<&str>,
+) -> Option<crate::library_match::LibraryMatch> {
+    match tokio::time::timeout(budget, search).await {
+        Ok(Ok(hits)) => {
+            crate::library_match::best_library_match(&hits.songs, artist, title, rec_album)
+        }
+        Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 /// The outcome of one shared [`HypodjHandler::identify_inner`] recognition, so BOTH the
@@ -15122,6 +15140,74 @@ mod tests {
             }
             other => panic!("expected Binary, got {other:?}"),
         }
+    }
+
+    /// Build a `SearchHits` carrying just the songs the matcher reads.
+    fn hits_of(songs: Vec<Song>) -> crate::subsonic::SearchHits {
+        crate::subsonic::SearchHits { artists: vec![], albums: vec![], songs }
+    }
+
+    fn lib_song(id: &str, title: &str, artist: &str) -> Song {
+        let mut s = playlist_test_song(id);
+        s.title = title.to_string();
+        s.artist = Some(artist.to_string());
+        s
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn library_lookup_budget_timeout_degrades_to_no_match() {
+        // FAKE-CLOCKED (never wall-clock): a search that outlives the budget must yield a
+        // plain no-match, so the recognition still decorates from Shazam and the attempt
+        // still counts as a HIT rather than decaying the auto-identify cadence.
+        let slow = async {
+            tokio::time::sleep(LIBRARY_MATCH_BUDGET * 2).await;
+            Ok(hits_of(vec![lib_song("s1", "Blessings", "Calvin Harris")]))
+        };
+        let got = bounded_library_lookup(
+            LIBRARY_MATCH_BUDGET,
+            slow,
+            "Calvin Harris",
+            "Blessings",
+            None,
+        )
+        .await;
+        assert_eq!(got, None, "a search past the budget is a miss, never an error");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn library_lookup_inside_the_budget_matches() {
+        // The same wiring, answering in time, resolves through the pure matcher.
+        let quick = async {
+            tokio::time::sleep(LIBRARY_MATCH_BUDGET / 2).await;
+            Ok(hits_of(vec![lib_song("s1", "Blessings", "Calvin Harris")]))
+        };
+        let got = bounded_library_lookup(
+            LIBRARY_MATCH_BUDGET,
+            quick,
+            "Calvin Harris",
+            "Blessings",
+            None,
+        )
+        .await
+        .expect("a match");
+        assert_eq!(got.song_id, SongId("s1".into()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn library_lookup_server_error_is_a_miss_not_an_error() {
+        // A Navidrome outage must never turn a good recognition into an identify error.
+        let failed = async {
+            Err(crate::subsonic::SubsonicError::Request("boom".into()))
+        };
+        let got = bounded_library_lookup(
+            LIBRARY_MATCH_BUDGET,
+            failed,
+            "Calvin Harris",
+            "Blessings",
+            None,
+        )
+        .await;
+        assert_eq!(got, None);
     }
 
     #[test]
