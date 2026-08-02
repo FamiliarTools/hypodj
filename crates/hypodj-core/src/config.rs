@@ -285,6 +285,13 @@ pub struct ContinuationConfig {
     /// in `radio` mode. Default 20.
     #[serde(default = "d_autofill_count")]
     pub autofill_count: u32,
+    /// How many tracks to keep AHEAD of the play position, so an armed walk is visible
+    /// in the up-next list instead of materialising one track at a time at the drain
+    /// edge. `0` restores the old drain-edge-only behavior exactly. Unused in `radio`
+    /// mode. Default 5 - enough to see where the walk is going without the queue
+    /// running far ahead of what you would actually sit through.
+    #[serde(default = "d_lookahead")]
+    pub lookahead: u32,
 }
 
 /// Manual (not derived) so a MISSING `[continuation]` section - which the top-level
@@ -297,6 +304,7 @@ impl Default for ContinuationConfig {
             station: None,
             mode: ContinuationMode::Radio,
             autofill_count: d_autofill_count(),
+            lookahead: d_lookahead(),
         }
     }
 }
@@ -305,6 +313,12 @@ pub const DEFAULT_AUTOFILL_COUNT: u32 = 20;
 
 fn d_autofill_count() -> u32 {
     DEFAULT_AUTOFILL_COUNT
+}
+
+pub const DEFAULT_LOOKAHEAD: u32 = 5;
+
+fn d_lookahead() -> u32 {
+    DEFAULT_LOOKAHEAD
 }
 
 /// `[restart]` config for the smooth-restart (sleep-fade-out on SIGTERM + resume

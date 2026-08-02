@@ -1680,6 +1680,10 @@ pub struct HypodjHandler {
     /// Read locklessly at the drain edge; floor-clamped to 1 on set so a misconfig can
     /// never yield a zero-length refill that pointlessly fetches then honest-stops.
     autofill_count: AtomicU32,
+    /// How many tracks to keep AHEAD of the play position (`[continuation].lookahead`,
+    /// default 5; `0` restores drain-edge-only refilling). Lockless: read on every
+    /// track advance.
+    lookahead: AtomicU32,
     /// TEST-ONLY autofill fetch hook. In a `#[cfg(test)]` build [`Self::autofill_fetch`]
     /// pops a scripted per-drain result from here instead of calling `client.similar`
     /// (which needs a live server the sandbox lacks); when the script is empty it falls
@@ -2163,6 +2167,7 @@ impl HypodjHandler {
             continuation_mode: Mutex::new(ContinuationMode::Radio),
             configured_continuation_mode: Mutex::new(ContinuationMode::Radio),
             autofill_count: AtomicU32::new(crate::config::DEFAULT_AUTOFILL_COUNT),
+            lookahead: AtomicU32::new(crate::config::DEFAULT_LOOKAHEAD),
             #[cfg(test)]
             autofill_test: Mutex::new(AutofillTestHook::default()),
             #[cfg(test)]
@@ -5188,6 +5193,10 @@ impl HypodjHandler {
     /// [`Self::configured_continuation_mode`], which is what `radio off` restores after
     /// a `radio <thing>` gesture forced the live mode to autofill. Two separate short
     /// locks, never nested.
+    pub fn set_lookahead(&self, lookahead: u32) {
+        self.lookahead.store(lookahead, Ordering::Relaxed);
+    }
+
     pub fn set_continuation_mode(&self, mode: ContinuationMode, autofill_count: u32) {
         *self.continuation_mode.lock().unwrap() = mode;
         *self.configured_continuation_mode.lock().unwrap() = mode;
@@ -5899,10 +5908,13 @@ impl HypodjHandler {
                 None => 0,
             }
         };
+        let mut prefetch_came_back_empty = false;
         if ahead == 0 {
             if let Some(seed_id) = start.seed_id.clone() {
                 let mode = if audible { AutofillStart::Behind } else { AutofillStart::Gesture };
-                queued += self.autofill_once(Some(seed_id), mode).await;
+                let got = self.autofill_once(Some(seed_id), mode).await;
+                prefetch_came_back_empty = got == 0;
+                queued += got;
             }
         }
         // A gesture that ends with NOTHING audible and NOTHING queued did not start a
@@ -5932,12 +5944,27 @@ impl HypodjHandler {
         self.notify_change();
         self.checkpoint(self.last_elapsed_secs()).await;
         self.reschedule_continuation_warm().await;
-        MpdResponse::pairs()
+        let mut b = MpdResponse::pairs()
             .pair("radio", "on")
             .pair("radio_seed", start.label)
             .pair("radio_from", start.from)
-            .pair("radio_queued", queued.to_string())
-            .build()
+            .pair("radio_queued", queued.to_string());
+        // A deck that IS audible but has nothing ahead and got an empty prefetch is a
+        // radio that ends when this track does. The `!audible && queued == 0` ACK above
+        // cannot catch it - something is playing, so the gesture did work - and from
+        // the outside the result is indistinguishable from a broken feature: press r,
+        // one song, silence, no explanation. Observed live on a C418 seed the backend
+        // has no neighbours for, which is a common case in this library, not an edge
+        // one. Say so instead. Deliberately NOT a fallback ladder to genre or random:
+        // the walk promises SIMILAR, and quietly playing something else would be a
+        // different and worse lie than stopping.
+        if audible && prefetch_came_back_empty {
+            b = b.pair(
+                "radio_note",
+                "no similar songs came back for that seed - the walk ends when this track does",
+            );
+        }
+        b.build()
     }
 
     /// Where the `radio` gesture finds the deck when it placed nothing of its own.
@@ -6173,6 +6200,21 @@ impl HypodjHandler {
 
     /// Reset the live-elapsed counter (a new Playing id / a Stop edge).
     pub fn reset_elapsed(&self) {
+        // A Stopped edge that lands while the deck is HOLDING an entry under a pending
+        // pause intent is the nothing-loaded terminal (halt_failed_advance, or an
+        // offline restore), not a transport stop. The whole point of that terminal is
+        // that the entry is held so a play gesture - or a returning server - picks it
+        // up WHERE IT WAS, and `restore` deliberately seeds last_elapsed_ms from the
+        // saved elapsed_secs to make that true across a restart. Zeroing here undid
+        // that on the first failed load: the checkpoint then persisted 0.0, so a user
+        // two minutes into a track when the server died got the right track back and
+        // started it at 0:00. An ordinary `stop` has no pending intent and still zeroes.
+        {
+            let st = self.state.lock().unwrap();
+            if st.pending_pause && st.current.is_some() {
+                return;
+            }
+        }
         self.last_elapsed_ms.store(0, Ordering::Relaxed);
     }
 
@@ -6902,6 +6944,20 @@ impl HypodjHandler {
                 // `volume` persists across loadfile replace), so play WITHOUT the
                 // resync that play_index performs for fresh-play gestures.
                 let _ = self.play_index_inner(idx, false).await;
+                // LOOKAHEAD: top the walk up while music is still ahead, instead of
+                // only at the drain edge. Refilling only when the queue is EXHAUSTED
+                // means the up-next list is always empty, so an endless radio is
+                // indistinguishable from a queue about to run out - you can never SEE
+                // what is coming, which is most of what makes a mix feel infinite
+                // rather than merely not-stopping.
+                //
+                // Safe to call on every advance because `autofill_once` carries the
+                // real rate limit itself: a hard ceiling of one fetch per
+                // AUTOFILL_MIN_INTERVAL in ANY execution. So a skip-heavy minute
+                // cannot hammer the server no matter how often this fires - the fuse,
+                // not this trigger, is the bound. It also no-ops unless the walk is
+                // armed and in Autofill mode.
+                self.top_up_lookahead().await;
             }
             None => {
                 // SLICE-2 LANDED-COMMIT: a warmed continuation station AUTO-ADVANCED at
@@ -7155,6 +7211,42 @@ impl HypodjHandler {
     /// Lock discipline mirrors [`Self::try_continuation`]: the std `Mutex<State>` is
     /// released BEFORE the `similar` await; the seed resolve, the fetch, and the filter
     /// all run lock-free; the append is one pure mutation under a single short lock scope.
+    /// Keep `continuation.lookahead` tracks ahead of the play position so the walk is
+    /// VISIBLE in the up-next list rather than materialising one track at a time at the
+    /// drain edge.
+    ///
+    /// Cheap and safe to call on every track change: it reads one short lock, returns
+    /// immediately unless the walk is armed in Autofill mode with too little ahead, and
+    /// delegates the actual bound to `autofill_once`'s instant-EOF fuse rather than
+    /// inventing a second rate limit that could drift from it.
+    async fn top_up_lookahead(&self) {
+        let want = self.lookahead.load(Ordering::Relaxed) as usize;
+        if want == 0 {
+            return;
+        }
+        if *self.continuation_mode.lock().unwrap() != ContinuationMode::Autofill {
+            return;
+        }
+        let ahead = {
+            let st = self.state.lock().unwrap();
+            if !st.continuation {
+                return;
+            }
+            match st.current {
+                Some(i) => st.queue.len().saturating_sub(i + 1),
+                None => 0,
+            }
+        };
+        if ahead >= want {
+            return;
+        }
+        // `Behind`, never `Walk`: a top-up runs while something is ALREADY PLAYING, so
+        // it must only append. `Walk` is the drain-edge start mode and repoints the
+        // deck at the first appended track - correct when the queue just ran out, a
+        // silent skip of the track you are listening to when it did not.
+        self.autofill_once(None, AutofillStart::Behind).await;
+    }
+
     async fn autofill_once(&self, seed_override: Option<SongId>, start: AutofillStart) -> usize {
         // 1. One short lock: armed? fuse? snapshot the dedup ring; stamp the fetch time.
         let (n, seen) = {
@@ -11928,6 +12020,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn radio_hand_start_then_drain_walks_a_fresh_seed() {
         let Some((h, _events)) = handler_with_null_player() else { return };
+        // This test pins the DRAIN-EDGE walk specifically: that the refill after the
+        // gesture's batch seeds from that batch's last track. The lookahead top-up is
+        // an additional, earlier fetch (covered by its own tests), and leaving it on
+        // here would consume a scripted batch and shift which fetch is "fetch 2"
+        // without changing the property under test.
+        h.set_lookahead(0);
         h.set_continuation_mode(ContinuationMode::Radio, 1);
         h.push_radio_songs(Ok(vec![autofill_song("S1")]));
         h.push_autofill_batch(Ok(vec![autofill_song("p1")])); // the gesture's prefetch
@@ -12105,6 +12203,130 @@ mod tests {
             ContinuationMode::Radio,
             "the mode override was put back too"
         );
+    }
+
+    // The walk must be VISIBLE: refilling only at the drain edge leaves the up-next
+    // list permanently empty, so an endless radio looks exactly like a queue about to
+    // run out.
+    #[tokio::test(start_paused = true)]
+    async fn the_walk_tops_up_while_music_is_still_ahead() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_lookahead(3);
+        h.enqueue_song_for_test(autofill_song("a")).await;
+        h.enqueue_song_for_test(autofill_song("b")).await;
+        h.play_for_test(0).await;
+        // Arm WITHOUT the start gesture: a `radio <thing>` start prefetches, which
+        // stamps the instant-EOF fuse, and the top-up would then be correctly refused
+        // for the next AUTOFILL_MIN_INTERVAL. `radio on` is the arm-only verb.
+        h.handle(MpdCommand::Radio(RadioCmd::On)).await;
+
+        // One track ahead, lookahead wants three: a top-up must fire even though the
+        // queue is NOT drained.
+        h.push_autofill_batch(Ok(vec![autofill_song("c"), autofill_song("d")]));
+        let before = h.state.lock().unwrap().queue.len();
+        h.top_up_lookahead().await;
+        let after = h.state.lock().unwrap().queue.len();
+        assert!(
+            after > before,
+            "topped up while music was still ahead ({before} -> {after})"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookahead_of_zero_restores_drain_edge_only_refilling() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_lookahead(0);
+        h.enqueue_song_for_test(autofill_song("a")).await;
+        h.play_for_test(0).await;
+        h.push_autofill_batch(Ok(Vec::new()));
+        h.handle(radio(RadioSeed::Current)).await;
+
+        h.push_autofill_batch(Ok(vec![autofill_song("c")]));
+        let before = h.state.lock().unwrap().queue.len();
+        h.top_up_lookahead().await;
+        assert_eq!(
+            h.state.lock().unwrap().queue.len(),
+            before,
+            "0 is the documented opt-out and must fetch nothing"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disarmed_walk_never_tops_up() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_lookahead(5);
+        h.enqueue_song_for_test(autofill_song("a")).await;
+        h.play_for_test(0).await;
+        h.push_autofill_batch(Ok(vec![autofill_song("c")]));
+        let before = h.state.lock().unwrap().queue.len();
+        h.top_up_lookahead().await;
+        assert_eq!(
+            h.state.lock().unwrap().queue.len(),
+            before,
+            "no arm, no fetch - the top-up must never turn the walk on by itself"
+        );
+    }
+
+    // A gesture whose prefetch comes back EMPTY over an audible deck is a radio that
+    // ends when this track does. The !audible ACK cannot catch it (something IS
+    // playing), and silence with no explanation reads as a broken feature.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_gesture_says_so_when_no_similar_songs_came_back() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        h.push_autofill_batch(Ok(Vec::new())); // the backend has no neighbours for this seed
+        let rep = h.handle(radio(RadioSeed::Current)).await;
+
+        // It still armed and it is still playing - the gesture worked.
+        assert_eq!(pair(&rep, "radio"), Some("on"));
+        assert_eq!(
+            pair(&rep, "radio_note"),
+            Some("no similar songs came back for that seed - the walk ends when this track does"),
+            "an empty prefetch over an audible deck must be STATED, not left to be \
+             discovered as silence"
+        );
+    }
+
+    // The same gesture with a real batch must NOT carry the warning - a note that fires
+    // on the happy path is noise the user learns to ignore.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_gesture_with_a_real_batch_carries_no_warning() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        h.push_autofill_batch(Ok(vec![autofill_song("next-a"), autofill_song("next-b")]));
+        let rep = h.handle(radio(RadioSeed::Current)).await;
+        assert_eq!(pair(&rep, "radio"), Some("on"));
+        assert_eq!(pair(&rep, "radio_note"), None);
+    }
+
+    // The nothing-loaded terminal holds the ENTRY so a gesture picks it up where it was;
+    // it must hold the PLAYHEAD too, or the right track restarts at 0:00.
+    #[tokio::test(start_paused = true)]
+    async fn the_held_terminal_keeps_the_playhead_but_an_ordinary_stop_zeroes_it() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("now")).await;
+        h.play_for_test(0).await;
+        h.last_elapsed_ms.store(125_000, Ordering::Relaxed);
+
+        // The held terminal: an entry is held under a pending pause intent.
+        {
+            let mut st = h.state.lock().unwrap();
+            st.pending_pause = true;
+            assert!(st.current.is_some(), "precondition: an entry is held");
+        }
+        h.reset_elapsed();
+        assert_eq!(
+            h.last_elapsed_secs(),
+            125.0,
+            "the terminal exists to be picked up WHERE IT WAS, so the position survives"
+        );
+
+        // An ordinary stop has no pending intent and still zeroes.
+        h.state.lock().unwrap().pending_pause = false;
+        h.reset_elapsed();
+        assert_eq!(h.last_elapsed_secs(), 0.0);
     }
 
     // `is_true_drain` returns false whenever repeat or random is set over a non-empty

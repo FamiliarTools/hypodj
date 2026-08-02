@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
     // unless `[continuation].mode = "autofill"` is set. Shares the ONE `continuation
     // on|off` arming toggle - mode only selects which mechanism fires at the drain.
     handler.set_continuation_mode(cfg.continuation.mode, cfg.continuation.autofill_count);
+    handler.set_lookahead(cfg.continuation.lookahead);
     // Auto-identify (task bspk8v5): plumb the `[recognize]` config (auto toggle +
     // floor-clamped re-identify interval). Default ON, so a no-ICY Shazam-matchable
     // stream names itself; ICY still wins when present, and the backoff + single-flight

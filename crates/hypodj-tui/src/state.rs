@@ -1073,7 +1073,16 @@ impl TuiState {
                 let (uri, label) = (it.uri.clone(), it.title.clone());
                 match uri {
                     Some(uri) => self.radio_from_uri(&uri, &label),
-                    None => None,
+                    // A queue row with no uri is a raw stream (an internet radio
+                    // station), which has no library id to seed a walk from. Every
+                    // sibling branch sets a reason first; returning bare here made `r`
+                    // a SILENTLY dead key - it did nothing and said nothing, which
+                    // reads as a broken binding rather than an inapplicable one.
+                    None => {
+                        self.status_msg =
+                            Some("that row is a stream, not a library track".into());
+                        None
+                    }
                 }
             }
         }
