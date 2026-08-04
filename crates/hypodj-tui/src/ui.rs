@@ -17,6 +17,23 @@ use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState}
 /// (Queue/Albums/Playlists), then the Now Playing pane (album art + up-next
 /// preview), and the command/confirm line. Now Playing sits BELOW the list, just
 /// above the command box.
+/// Rows to give the Now Playing pane, scaled to the terminal height.
+///
+/// The art slot is whatever is left after the pane's text rows, and pane size is the
+/// DOMINANT term in cover fidelity - measured PSNR against the source rises faster with
+/// area than with any glyph upgrade (plain half-blocks at 30x15 beat sextants at 12x6).
+/// So take the extra rows where they exist and stay out of the way where they do not: a
+/// short terminal keeps exactly the historical 12, because on 24 rows a bigger pane
+/// leaves the queue list unusable, and a cover is worth less than seeing what is playing
+/// next.
+fn now_playing_h(total: u16) -> u16 {
+    match total {
+        0..=29 => 12,
+        30..=39 => 15,
+        _ => 18,
+    }
+}
+
 pub fn render(f: &mut Frame, state: &TuiState) {
     // A blank top and bottom margin row give the frame breathing room; the bottom
     // bar is a single borderless row (thin + less prominent than the old 3-row
@@ -25,7 +42,7 @@ pub fn render(f: &mut Frame, state: &TuiState) {
         Constraint::Length(1),  // top breathing margin (blank)
         Constraint::Length(1),  // screen tabs
         Constraint::Min(3),     // active list
-        Constraint::Length(12), // Now Playing: album art + up-next preview
+        Constraint::Length(now_playing_h(f.area().height)),
         Constraint::Length(1),  // command / search / status / ambient wave (thin)
         Constraint::Length(1),  // bottom breathing margin (blank)
     ])
@@ -742,10 +759,12 @@ mod tests {
     }
 
     #[test]
-    fn stream_cover_renders_halfblocks_in_art_pane() {
+    fn stream_cover_renders_image_cells_in_art_pane() {
         // A playing STREAM with a recognized cover and a decoded AlbumArt lights the
-        // now-playing art pane (task kmrhj8m): the pane renders U+2580 half-block
-        // cells, not the image-less placeholder text.
+        // now-playing art pane (task kmrhj8m): the pane renders IMAGE cells, not the
+        // image-less placeholder text. The stub cover is a flat 1x1, so the sextant
+        // renderer resolves every cell to the full block - which is exactly the glyph
+        // a flat cell must produce, and still proves the art path ran.
         use crate::album_color::Palette;
         let mut s = TuiState::new();
         s.now.state = Some("play".into());
@@ -756,8 +775,12 @@ mod tests {
         s.art = Some(crate::art::AlbumArt::for_test(pal));
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(
-            out.contains('\u{2580}'),
-            "the art pane renders half-block cover cells for a stream:\n{out}"
+            out.contains('\u{2588}'),
+            "the art pane renders cover cells for a stream:\n{out}"
+        );
+        assert!(
+            !out.contains("no cover"),
+            "the placeholder must not appear when art is present:\n{out}"
         );
     }
 
