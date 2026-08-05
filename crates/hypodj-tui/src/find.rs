@@ -97,6 +97,11 @@ pub struct FindRow {
     pub song_count: Option<u32>,
     /// The owning album uri for a song row, so the queue gutter can mark it.
     pub album_uri: Option<String>,
+    /// The RAW artist credit on an album or song row, kept SEPARATE from `trailer` -
+    /// which is a COMPOSED display string ("C418   4:05") and would feed garbage into
+    /// the library query "go to artist" runs. Empty on an artist row (the artist IS the
+    /// row, and its name is the label) and on a station (a stream has no credit).
+    pub artist: Option<String>,
 }
 
 /// A parsed result set, plus what the server said about its own caps.
@@ -468,6 +473,9 @@ fn flush_block(
     songs: &mut Vec<FindRow>,
 ) {
     let Some(b) = b else { return };
+    // The RAW credit, captured BEFORE the trailer composes it with a track count or a
+    // duration: the trailer is a display string and "go to artist" needs a query term.
+    let artist = if b.artist.is_empty() { None } else { Some(b.artist.clone()) };
     let plural = |n: u32, one: &str| {
         if n == 1 {
             format!("{n} {one}")
@@ -513,6 +521,7 @@ fn flush_block(
         // album's true track total, so album_mark may legitimately claim Full.
         song_count: if b.kind == FindKind::Album { b.count } else { None },
         album_uri: b.album_uri,
+        artist,
     });
 }
 
@@ -529,6 +538,7 @@ mod tests {
             trailer: String::new(),
             song_count: None,
             album_uri: None,
+            artist: None,
         }
     }
 
@@ -759,6 +769,30 @@ mod tests {
         assert_eq!(hits.rows[0].label, "C418", "artist row: Artist is the name");
         assert_eq!(hits.rows[1].label, "Sweden", "song row: Title is the name");
         assert!(hits.rows[1].trailer.contains("C418"), "song row: Artist is the credit");
+    }
+
+    #[test]
+    fn the_raw_credit_is_kept_beside_the_composed_trailer_never_read_out_of_it() {
+        // "go to artist" runs a real library QUERY, and the trailer is a COMPOSED
+        // display string ("C418   4:05") that would feed garbage into it. So the raw
+        // credit rides its own field, and the trailer keeps composing exactly as it did.
+        let p = pairs(&[
+            ("file", "song/s1"), ("Title", "Sweden"), ("Artist", "C418"), ("Time", "245"),
+            ("directory", "album/b1"), ("Album", "Volume Alpha"), ("Artist", "C418"),
+            ("X-SongCount", "24"),
+            ("directory", "artist/a1"), ("Artist", "C418"),
+            ("directory", "station/NTS 1"), ("X-StreamHost", "ntslive.net"),
+        ]);
+        let hits = parse_searchall_hits(&p);
+        let by = |k: FindKind| hits.rows.iter().find(|r| r.kind == k).unwrap();
+        assert_eq!(by(FindKind::Song).artist.as_deref(), Some("C418"));
+        assert_eq!(by(FindKind::Song).trailer, "C418   4:05", "the trailer still composes");
+        assert_eq!(by(FindKind::Album).artist.as_deref(), Some("C418"));
+        assert_eq!(by(FindKind::Album).trailer, "C418   24 tracks");
+        // An artist row IS the artist (its name is the label), and a station has no
+        // credit at all - neither has a separate artist to go to.
+        assert_eq!(by(FindKind::Artist).artist, None);
+        assert_eq!(by(FindKind::Station).artist, None);
     }
 
     #[test]

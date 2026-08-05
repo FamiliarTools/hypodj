@@ -14,6 +14,7 @@ use hypodj_client::route::{route, Action};
 
 use crate::find::{Find, Focus};
 use crate::keymap;
+use crate::menu::{classify, ArtistRef, Avail, Menu, MenuAction, Origin, PlayHow, Target, TargetKind};
 
 /// Vim-style scrolloff: keep this many rows of context above/below the cursor.
 const SCROLLOFF: usize = 3;
@@ -107,18 +108,24 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 uri: v.clone(),
                 is_dir: true,
                 song_count: None,
+                artist: None,
+                album_uri: None,
             }),
             "file" => rows.push(BrowseRow {
                 label: path_tail(v).to_string(),
                 uri: v.clone(),
                 is_dir: false,
                 song_count: None,
+                artist: None,
+                album_uri: None,
             }),
             "playlist" => rows.push(BrowseRow {
                 label: v.clone(),
                 uri: v.clone(),
                 is_dir: false,
                 song_count: None,
+                artist: None,
+                album_uri: None,
             }),
             "Album" | "Genre" => {
                 if let Some(last) = rows.last_mut() {
@@ -141,10 +148,24 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                     }
                 }
             }
+            // The credit is folded into the label the eye reads AND kept raw, because
+            // the composed `"<title> - <artist>"` is a display string: querying with it
+            // would find nothing, so "go to artist" needs the name on its own.
             "Artist" => {
                 if let Some(last) = rows.last_mut() {
                     if !last.is_dir {
                         last.label = format!("{} - {}", last.label, v);
+                        last.artist = Some(v.clone());
+                    }
+                }
+            }
+            // The owning album of a song row. `lsinfo` already carries it (the daemon's
+            // `push_song_tags` emits it beside `Album`), so an opened album's rows can
+            // reach their album exactly as a queue row can.
+            "X-AlbumUri" => {
+                if let Some(last) = rows.last_mut() {
+                    if !last.is_dir {
+                        last.album_uri = Some(v.clone());
                     }
                 }
             }
@@ -191,6 +212,14 @@ pub fn queue_mark_glyph(mark: QueueMark) -> char {
         QueueMark::Partial => '~',
         QueueMark::None => ' ',
     }
+}
+
+/// Drop a present-but-BLANK credit. An empty `Artist:` pair is on the wire as often
+/// as a missing one, and "go to artist" turns its value into a real library query - so
+/// a blank has to read as ABSENT ("this listing carries no artist") rather than build a
+/// live row that submits nothing and closes the menu with no feedback.
+fn named(v: Option<String>) -> Option<String> {
+    v.filter(|s| !s.trim().is_empty())
 }
 
 /// The last `/`-separated segment of a browse path, used as a fallback row label.
@@ -248,6 +277,13 @@ pub struct BrowseRow {
     /// `X-SongCount` pair. Drives the full-vs-partial queue marker; `None` when the
     /// listing does not carry it (song rows, playlists, missing count).
     pub song_count: Option<u32>,
+    /// The artist credit on a song row (`Artist`), kept alongside the label the same
+    /// pair is folded into, so "go to artist" has a NAME to query with instead of the
+    /// composed `"<title> - <artist>"` display string.
+    pub artist: Option<String>,
+    /// The owning album on a song row (`X-AlbumUri`), so "go to album" works from a
+    /// drilled listing exactly as it does from the queue.
+    pub album_uri: Option<String>,
 }
 
 /// A self-contained browse list with its own cursor, scroll offset, nav stack, and
@@ -494,6 +530,13 @@ pub struct TuiState {
     /// Whether the daemon reports audio is playing (from the latest viz frame); gates
     /// the level wave between the live field and the resting hairline.
     pub viz_playing: bool,
+    /// The open row CONTEXT MENU, if any. An OVERLAY like `help_open`, never a fifth
+    /// [`Mode`]: `Mode` is the text-routing discriminant (a typed buffer plus a caret)
+    /// and the menu has neither, so a variant there would force a dead arm into every
+    /// `match self.mode`. Intercepted at the very top of `key_normal` (above the help
+    /// intercept, which `open_menu` closes), so while it is open it is a true modal and
+    /// its rows can never describe a row the cursor has since left.
+    pub menu: Option<Menu>,
     /// Whether the `?` help overlay is open. Normal-mode-only modal: while open, only
     /// `?`/Esc/q resolve (toggle-close), everything else is swallowed.
     pub help_open: bool,
@@ -571,6 +614,7 @@ impl Default for TuiState {
             viz_active: false,
             viz_env: 0.0,
             viz_playing: false,
+            menu: None,
             help_open: false,
             help_scroll: 0,
             term_bg: crate::album_color::TermBg::dark_default(),
@@ -608,7 +652,15 @@ impl TuiState {
     /// y/N prompt is pushed INLINE into the chat scrollback so it reads as part of
     /// the conversation (ui.rs skips the centered popup for Screen::Dj); on the
     /// other screens the popup carries it.
+    ///
+    /// A plan lands ASYNCHRONOUSLY, so it can arrive with the row menu open (the user
+    /// submitted a phrase, then went on browsing). `Mode::Confirm` routes keys to
+    /// `key_confirm`, which is not where the menu's modal intercept lives, so a menu
+    /// left standing would be drawn over the y/N prompt with every one of its keys
+    /// dead. The confirm takes the screen: close it, exactly as `open_menu` closes
+    /// help in the other direction.
     pub fn enter_confirm(&mut self, pending: Pending) {
+        self.menu = None;
         if self.screen == Screen::Dj {
             if let Some(trust) = &pending.trust {
                 self.push_dj_log(trust.clone());
@@ -677,6 +729,15 @@ impl TuiState {
     }
 
     fn key_normal(&mut self, key: KeyEvent) -> Option<Intent> {
+        // The row context menu is the OUTERMOST modal - above the help intercept, and
+        // `open_menu` closes help, so the two are mutually exclusive by construction.
+        // It must be first because it is a SNAPSHOT of one row: letting a nav key
+        // through would move the cursor out from under rows that still describe the old
+        // one, and letting `>`/`p` through would act on something the popup does not
+        // even name.
+        if self.menu.is_some() {
+            return self.key_menu(key);
+        }
         // The help overlay is a true modal: while open, ONLY `?`/Esc/q toggle it
         // closed and every other key is swallowed (never leaks to nav/transport).
         if self.help_open {
@@ -829,8 +890,29 @@ impl TuiState {
             Act::PlaySel => self.enter_action(),
             // Space ADDS the selected browse row to the queue (Queue: no-op).
             Act::Enqueue => self.enqueue_selected(),
-            // `o` OPENS (drills into) the selected browse directory.
-            Act::Open => self.open_selected(),
+            // `l` / Right DRILLS into the selected browse directory - the body `o` ran
+            // before the menu took that key, moved verbatim.
+            Act::BrowseIn => self.open_selected(),
+            // `o` opens the context menu for the row under the cursor, on EVERY screen
+            // and every row kind. An empty list has no row to describe, so it says so
+            // rather than flashing an empty popup.
+            Act::Menu => {
+                match self.cursor_target() {
+                    Some(t) => self.open_menu(t),
+                    None => self.status_msg = Some("nothing here".into()),
+                }
+                None
+            }
+            // `O` opens the same menu for what is PLAYING, from anywhere - the one row
+            // the cursor may not be able to reach at all (it is not on this screen, or
+            // the queue is scrolled away).
+            Act::MenuCurrent => {
+                match self.now_target() {
+                    Some(t) => self.open_menu(t),
+                    None => self.status_msg = Some("nothing is playing".into()),
+                }
+                None
+            }
             // Back out of a browse drill-down (Queue / a browse root: no-op).
             Act::BrowseBack => self.browse_back(),
             // `?` opens the help overlay (a normal-mode modal); the modal intercept at
@@ -945,12 +1027,12 @@ impl TuiState {
 
     /// Enter always PLAYS the selection: Queue plays the selected row; an album/dir
     /// row enqueues the whole album and plays its first track; a song row enqueues
-    /// and plays; Playlists loads the selected playlist. Drilling-in moved to `o`.
+    /// and plays; Playlists loads the selected playlist. Drilling-in is `l` / Right.
     fn enter_action(&mut self) -> Option<Intent> {
         match self.screen {
             // Dj Enter is handled in key_dj (submit the query), never here.
             Screen::Dj => None,
-            // Enter ALWAYS plays the selection, on every screen (drilling-in is `o`).
+            // Enter ALWAYS plays the selection, on every screen (drilling-in is `l`).
             // On an album row that enqueues the whole album and plays its first
             // track, exactly as the Albums tab does.
             Screen::Find if !self.find.drilling => {
@@ -1212,7 +1294,7 @@ impl TuiState {
         Some(intent)
     }
 
-    /// `o`: OPEN (drill into) the selected browse directory. A song row or the Queue
+    /// `l` / Right: DRILL into the selected browse directory. A song row or the Queue
     /// screen is a no-op (Enter is the play verb there).
     fn open_selected(&mut self) -> Option<Intent> {
         // A hit row is not a `Browse` row, so claim it before active_browse(). Album
@@ -1243,6 +1325,325 @@ impl TuiState {
         } else {
             None
         }
+    }
+
+    /// The thing under the cursor, as a [`Target`]. THE resolver: the per-screen "what
+    /// is selected" match, written ONCE here instead of a seventh time per action.
+    ///
+    /// The Find HIT list is not a `Browse`, so it is claimed BEFORE `active_browse()`,
+    /// which returns None off-drill and would otherwise fall through to the QUEUE row
+    /// while the visible list sat still - the bug every hand-rolled copy of this match
+    /// has to remember. An empty list yields `None`, so the caller can say "nothing
+    /// here" rather than opening a popup over nothing.
+    fn cursor_target(&self) -> Option<Target> {
+        if self.screen == Screen::Find && !self.find.drilling {
+            let row = self.find.current_row()?;
+            return Some(Target {
+                // The hit's KIND is already decided by the uri prefix daemon-side
+                // (`Block::start`), so classifying the uri here reproduces it exactly
+                // rather than translating one enum into another.
+                kind: classify(Some(&row.uri), false),
+                origin: Origin::FindHit,
+                label: row.label.clone(),
+                uri: Some(row.uri.clone()),
+                album_uri: row.album_uri.clone(),
+                artist: named(row.artist.clone()),
+                artist_uri: None,
+                match_uri: None,
+            });
+        }
+        match self.screen {
+            // The DJ ask line owns every printable key, so `o` is text there and never
+            // reaches dispatch; unreachable rather than meaningful.
+            Screen::Dj => None,
+            Screen::Queue => {
+                let it = self.queue.get(self.selected)?;
+                Some(Target {
+                    kind: classify(it.uri.as_deref(), false),
+                    // The MPD `Pos`, not the row index: `play`/`delete` address by
+                    // position and the two only coincide while the queue is dense.
+                    origin: Origin::Queue { pos: it.pos },
+                    label: it.title.clone(),
+                    uri: it.uri.clone(),
+                    album_uri: it.album_uri.clone(),
+                    artist: named(it.artist.clone()),
+                    artist_uri: None,
+                    match_uri: None,
+                })
+            }
+            Screen::Albums | Screen::Playlists | Screen::Find => {
+                // A Playlists row is a NAME, not a browse path (see `BrowseRow::uri`),
+                // which no uri prefix can reveal - the SCREEN is the only thing that
+                // knows, so it is the only place that can say so.
+                let playlists = self.screen == Screen::Playlists;
+                let b = match self.screen {
+                    Screen::Albums => &self.albums,
+                    Screen::Playlists => &self.playlists,
+                    _ => &self.find.drill,
+                };
+                let row = b.rows.get(b.selected)?;
+                Some(Target {
+                    kind: if playlists {
+                        TargetKind::Playlist
+                    } else {
+                        classify(Some(&row.uri), row.is_dir)
+                    },
+                    origin: Origin::Browse,
+                    label: row.label.clone(),
+                    uri: Some(row.uri.clone()),
+                    album_uri: row.album_uri.clone(),
+                    artist: named(row.artist.clone()),
+                    artist_uri: None,
+                    match_uri: None,
+                })
+            }
+        }
+    }
+
+    /// The playing track as a [`Target`] (`O`). A `song/` file is a LibrarySong whose
+    /// `album_uri` comes from `currentsong`'s `X-AlbumUri`; anything else is a Stream
+    /// carrying `match_uri`, so a RECOGNIZED radio track keeps every library action
+    /// exactly as `C-s` already does for starring - the stream url stays `uri` because
+    /// the playing entry is never rewritten.
+    fn now_target(&self) -> Option<Target> {
+        let file = self.now.file.clone()?;
+        // What the eye sees on the now-playing card: the track title, else the station
+        // name, else the bare url - never a blank popup heading.
+        let label = self
+            .now
+            .title
+            .clone()
+            .or_else(|| self.now.name.clone())
+            .unwrap_or_else(|| file.clone());
+        Some(Target {
+            kind: classify(Some(&file), false),
+            origin: Origin::NowPlaying,
+            label,
+            uri: Some(file),
+            album_uri: self.now.album_uri.clone(),
+            artist: named(self.now.artist.clone()),
+            artist_uri: None,
+            match_uri: self.now.match_uri.clone(),
+        })
+    }
+
+    /// Open the menu on a resolved target. Closes help first so the two modals are
+    /// mutually exclusive by construction rather than by an ordering the intercepts
+    /// have to agree on.
+    fn open_menu(&mut self, target: Target) {
+        self.help_open = false;
+        self.help_scroll = 0;
+        self.menu = Some(Menu::new(target, self.queue.len()));
+    }
+
+    /// The menu's own key handling while it is open. A true modal: motion moves the
+    /// popup, Enter (or `l`/Right, matching the drill key) runs the highlighted row,
+    /// any [`crate::menu::MenuItem::hotkey`] runs its row directly, `q`/Esc close, and
+    /// everything else is SWALLOWED - never leaked to nav or transport.
+    fn key_menu(&mut self, key: KeyEvent) -> Option<Intent> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // The readline chords first: crossterm delivers C-n as `Char('n') + CONTROL`,
+        // so the plain-char arms below would otherwise claim them.
+        if ctrl {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(m) = self.menu.as_mut() {
+                    match c {
+                        'n' => m.move_selection(1),
+                        'p' => m.move_selection(-1),
+                        _ => {}
+                    }
+                }
+            }
+            return None;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.menu = None;
+                None
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(m) = self.menu.as_mut() {
+                    m.move_selection(1);
+                }
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(m) = self.menu.as_mut() {
+                    m.move_selection(-1);
+                }
+                None
+            }
+            KeyCode::Char('g') => {
+                if let Some(m) = self.menu.as_mut() {
+                    m.selected = 0;
+                }
+                None
+            }
+            KeyCode::Char('G') => {
+                if let Some(m) = self.menu.as_mut() {
+                    m.selected = m.rows.len().saturating_sub(1);
+                }
+                None
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                let i = self.menu.as_ref()?.selected;
+                self.run_menu_row(i)
+            }
+            // A direct pick. An unclaimed letter is swallowed, not leaked: the popup
+            // names its whole vocabulary, so a key it does not list means nothing here.
+            KeyCode::Char(c) => {
+                let i = self.menu.as_ref().and_then(|m| m.pick(c))?;
+                self.run_menu_row(i)
+            }
+            _ => None,
+        }
+    }
+
+    /// Run the row at `i`. A BLOCKED row states its reason and leaves the menu OPEN
+    /// (a refusal is information, and the next row is one keystroke away); a live row
+    /// dispatches and closes. Dispatch runs BEFORE the close so it can still read the
+    /// snapshot target (its label, and the uri `guard_pos` re-checks).
+    fn run_menu_row(&mut self, i: usize) -> Option<Intent> {
+        let picked = self.menu.as_mut().and_then(|m| {
+            let avail = m.rows.get(i)?.avail.clone();
+            m.selected = i;
+            Some(avail)
+        })?;
+        match picked {
+            Avail::No(why) => {
+                self.status_msg = Some(why.to_string());
+                None
+            }
+            Avail::Yes(action) => {
+                let intent = self.run_menu_action(action);
+                self.menu = None;
+                intent
+            }
+        }
+    }
+
+    /// Run one resolved [`MenuAction`]. EXHAUSTIVE, so a new action cannot be built in
+    /// `rows_for` without a compiler error here - the same lockstep `apply_act` gives
+    /// `Act`. Every arm is the EXISTING verb: no new `Intent` variant ships with the
+    /// menu, and the radio row routes through `radio_from_uri` so the popup and the
+    /// bare `r` key share one gate and one set of reason strings.
+    fn run_menu_action(&mut self, a: MenuAction) -> Option<Intent> {
+        match a {
+            MenuAction::OpenContents(u) => Some(Intent::BrowseInto(u)),
+            MenuAction::Play(PlayHow::QueuePos(p)) => {
+                self.guard_pos(p).map(|p| Intent::Command(format!("play {p}")))
+            }
+            MenuAction::Play(PlayHow::Enqueue(u)) => Some(Intent::Enqueue { uri: u, play: true }),
+            MenuAction::Play(PlayHow::LoadPlaylist(n)) => Some(Intent::LoadPlaylist(n)),
+            MenuAction::Enqueue(u) => Some(Intent::Enqueue { uri: u, play: false }),
+            MenuAction::GoToAlbum(u) => {
+                let label = self.menu_label();
+                self.reveal(u, &label)
+            }
+            MenuAction::GoToArtist(ArtistRef::Uri(u)) => {
+                let label = self.menu_label();
+                self.reveal(u, &label)
+            }
+            // No artist uri exists on the wire yet, so this is a real library QUERY -
+            // it lands on the Find hits, whose first section is Artists. The query line
+            // is filled with the name so the screen says what it asked.
+            MenuAction::GoToArtist(ArtistRef::Name(n)) => {
+                self.screen = Screen::Find;
+                self.find.drilling = false;
+                self.find.drill_loading = false;
+                self.find.focus = Focus::Results;
+                self.find.query = n.clone();
+                self.drop_stale_hits();
+                self.submit_find(n)
+            }
+            MenuAction::Radio(u) => {
+                let label = self.menu_label();
+                self.radio_from_uri(&u, &label)
+            }
+            MenuAction::Favorite(u) => Some(Intent::Command(format!("playlistadd Starred {u}"))),
+            MenuAction::RemoveFromQueue(p) => {
+                self.guard_pos(p).map(|p| Intent::Command(format!("delete {p}")))
+            }
+        }
+    }
+
+    /// The open menu's target label, for status wording.
+    fn menu_label(&self) -> String {
+        self.menu.as_ref().map(|m| m.target.label.clone()).unwrap_or_default()
+    }
+
+    /// Re-check a snapshot queue position against the row the menu was built from.
+    /// The event loop already closes the menu when a refresh changes `queue.len()`;
+    /// this catches the SAME-LENGTH reorder that length alone misses, so `play`/`delete`
+    /// can never act on a row that slid under the popup.
+    fn guard_pos(&mut self, pos: usize) -> Option<usize> {
+        let want = self.menu.as_ref().and_then(|m| m.target.uri.clone());
+        match self.queue.iter().find(|it| it.pos == pos) {
+            Some(it) if it.uri == want => Some(pos),
+            _ => {
+                self.status_msg = Some("the queue moved - reopen the menu".into());
+                None
+            }
+        }
+    }
+
+    /// Reveal a browse uri in the FIND drill: the one pane that shows an arbitrary path
+    /// without disturbing another screen's cursor or nav stack (it starts at depth 0
+    /// with a deliberately empty stack, and `h`/Esc returns to the hits at no round
+    /// trip). Revealing into the Albums tab instead would clobber THAT tab's cursor and
+    /// stack. No new Intent: the screen flip is local state and `browse_into` already
+    /// handles the Find-off-drill case.
+    ///
+    /// The hits underneath are kept ONLY when the menu was opened on one of them - the
+    /// case where "back out to the hits is free" means anything, and where a key that
+    /// beats the drill in still acts on the row the popup just named. Revealed from a
+    /// queue row, an album or the playing track, they answer a question from some
+    /// earlier session of use and are dropped (see [`drop_stale_hits`]).
+    ///
+    /// [`drop_stale_hits`]: Self::drop_stale_hits
+    fn reveal(&mut self, uri: String, label: &str) -> Option<Intent> {
+        let from_hits = self.menu.as_ref().is_some_and(|m| m.target.origin == Origin::FindHit);
+        self.screen = Screen::Find;
+        self.find.drilling = false;
+        self.find.drill_loading = false;
+        self.find.focus = Focus::Results;
+        if !from_hits {
+            self.drop_stale_hits();
+        }
+        self.last_search.clear();
+        self.status_msg = Some(format!("showing {label}"));
+        Some(Intent::BrowseInto(uri))
+    }
+
+    /// Drop the visible hits, because the screen is about to answer a DIFFERENT
+    /// question than the one they answered.
+    ///
+    /// The query line can leave a stale answer standing while the next one flies - the
+    /// renderer keeps it deliberately legible - because focus stays on the TEXT there
+    /// and every key is swallowed as input. A menu jump cannot: it lands the cursor on
+    /// the RESULTS half at once, and `find.hits`/`find.selected` are only replaced when
+    /// the response lands. For that whole round trip Enter would enqueue and PLAY, `s`
+    /// would star and `r` would seed a radio from a row belonging to a search nobody is
+    /// looking at - invisible, wrong, and in the `s` case a write into the user's
+    /// library. The rows go with the question.
+    fn drop_stale_hits(&mut self) {
+        self.find.hits = crate::find::FindHits::default();
+        self.find.selected = 0;
+        self.find.offset.set(0);
+    }
+
+    /// Submit a library query. Factored out of `key_find`'s Enter arm so the menu's
+    /// "go to artist (search)" and the query line are ONE submit path and cannot drift
+    /// on history, the in-flight phase, or the echoed query. An empty query sends
+    /// nothing and records nothing.
+    fn submit_find(&mut self, q: String) -> Option<Intent> {
+        if q.is_empty() {
+            return None;
+        }
+        self.find.push_history(&q);
+        self.find.phase = crate::find::Phase::Loading(q.clone());
+        self.find.submitted = q.clone();
+        Some(Intent::Find(q))
     }
 
     /// The labels of the active list, as the eye sees them, for search matching.
@@ -1592,16 +1993,11 @@ impl TuiState {
                 None
             }
             KeyCode::Enter => {
-                // Step 2 sends the query; step 1 only records it, so the screen is
-                // usable and the history ring is exercised without a socket.
+                // The ONE submit path, shared with the menu's "go to artist (search)"
+                // so the two cannot drift on history, the in-flight phase or the
+                // echoed query.
                 let q = self.find.query.trim().to_string();
-                if q.is_empty() {
-                    return None;
-                }
-                self.find.push_history(&q);
-                self.find.phase = crate::find::Phase::Loading(q.clone());
-                self.find.submitted = q.clone();
-                Some(Intent::Find(q))
+                self.submit_find(q)
             }
             KeyCode::Char(c) => {
                 self.find.query.push(c);
@@ -1960,6 +2356,7 @@ mod tests {
             trailer: String::new(),
             song_count: None,
             album_uri: None,
+            artist: None,
         };
         // The Find HIT list: all three kinds seed. The ARTIST row's first working
         // action - Enter emits an Enqueue the daemon rejects outright.
@@ -2043,6 +2440,7 @@ mod tests {
             trailer: String::new(),
             song_count: None,
             album_uri: None,
+            artist: None,
         }];
         assert_eq!(s.handle_key(ch('r')), Some(cmd("radio song/s1")), "the HIT row, not song/0");
         assert_eq!(s.selected, 0, "and the queue cursor never moved");
@@ -2089,6 +2487,7 @@ mod tests {
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(),
             trailer: String::new(), song_count: None, album_uri: None,
+            artist: None,
         }];
         s.mark_disconnected();
         // The outstanding query can never land on the dead socket, so the spinner
@@ -2124,12 +2523,12 @@ mod tests {
         s.screen = Screen::Find;
         s.find.focus = Focus::Results;
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(), trailer: String::new(), song_count: None, album_uri: None },
-            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
         ];
-        assert_eq!(s.handle_key(ch('o')), Some(Intent::BrowseInto("album/9".into())));
+        assert_eq!(s.handle_key(ch('l')), Some(Intent::BrowseInto("album/9".into())));
         s.find.selected = 1;
-        assert_eq!(s.handle_key(ch('o')), None, "a song row has nothing to drill into");
+        assert_eq!(s.handle_key(ch('l')), None, "a song row has nothing to drill into");
     }
 
     #[test]
@@ -2147,6 +2546,7 @@ mod tests {
             trailer: "uk5.internet-radio.com".into(),
             song_count: None,
             album_uri: None,
+            artist: None,
         };
         let fresh = || {
             let mut s = TuiState::new();
@@ -2189,10 +2589,11 @@ mod tests {
             Some("a saved station is a stream - play it, then C-s marks what is on")
         );
 
-        // `o`: a station is a leaf. Drilling would paint an empty bordered box over the
-        // hits, so it says so instead.
+        // `l`: a station is a leaf. Drilling would paint an empty bordered box over the
+        // hits, so it says so instead. (This was `o` until the context menu took that
+        // key; the drill body is unchanged, only the key that reaches it.)
         let mut s = fresh();
-        assert_eq!(s.handle_key(ch('o')), None);
+        assert_eq!(s.handle_key(ch('l')), None);
         assert_eq!(
             s.status_msg.as_deref(),
             Some("a station has nothing to open - enter plays it")
@@ -2218,10 +2619,13 @@ mod tests {
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(),
             trailer: String::new(), song_count: None, album_uri: None,
+            artist: None,
         }];
         s.find.drilling = true;
         s.find.drill.rows = vec![crate::state::BrowseRow {
             label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None,
+            artist: None,
+            album_uri: None,
         }];
         // `h` must NOT emit a BrowseBack: the drill sits at depth 0 with an empty
         // stack, so that would re-fetch `lsinfo ""` - the whole artist root.
@@ -2251,12 +2655,12 @@ mod tests {
         s.screen = Screen::Find;
         s.find.focus = Focus::Results;
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
-            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
         ];
         s.find.drill.rows = vec![
-            crate::state::BrowseRow { label: "x".into(), uri: "song/8".into(), is_dir: false, song_count: None },
-            crate::state::BrowseRow { label: "y".into(), uri: "song/9".into(), is_dir: false, song_count: None },
+            crate::state::BrowseRow { label: "x".into(), uri: "song/8".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
+            crate::state::BrowseRow { label: "y".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
         ];
         s.find.drilling = true;
         s.handle_key(ch('j'));
@@ -2274,7 +2678,7 @@ mod tests {
         s.screen = Screen::Find;
         s.find.hits.rows = vec![];
         s.find.drill.rows = vec![
-            crate::state::BrowseRow { label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None },
+            crate::state::BrowseRow { label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
         ];
         s.find.drilling = true;
         assert_eq!(s.active_labels(), vec!["Sweden".to_string()]);
@@ -2305,8 +2709,8 @@ mod tests {
         s.find.query.clear();
         s.find.focus = Focus::Results;
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None },
-            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
         ];
         s.handle_key(ch('j'));
         assert_eq!(s.find.selected, 1, "the hit cursor moved");
@@ -2343,6 +2747,7 @@ mod tests {
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(),
             trailer: String::new(), song_count: None, album_uri: None,
+            artist: None,
         }];
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
@@ -2364,6 +2769,7 @@ mod tests {
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(),
             trailer: String::new(), song_count: None, album_uri: None,
+            artist: None,
         }];
         assert_eq!(
             s.handle_key(ch('s')),
@@ -2401,6 +2807,7 @@ mod tests {
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Song, label: "a".into(), uri: "song/1".into(),
             trailer: String::new(), song_count: None, album_uri: None,
+            artist: None,
         }];
         s.handle_key(key(KeyCode::Tab));
         assert_eq!(s.find.focus, Focus::Results);
@@ -2753,8 +3160,8 @@ mod tests {
         s.selected = 2; // the queue cursor sits on song/33 and must not be touched
         s.screen = Screen::Albums;
         s.albums.rows = vec![
-            BrowseRow { label: "Sun Ra".into(), uri: "album/a1".into(), is_dir: true, song_count: None },
-            BrowseRow { label: "Takuya Nakamura".into(), uri: "album/a2".into(), is_dir: true, song_count: None },
+            BrowseRow { label: "Sun Ra".into(), uri: "album/a1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, },
+            BrowseRow { label: "Takuya Nakamura".into(), uri: "album/a2".into(), is_dir: true, song_count: None, artist: None, album_uri: None, },
         ];
         s.albums.selected = 1;
         assert_eq!(
@@ -2771,6 +3178,8 @@ mod tests {
             uri: "list/recent".into(),
             is_dir: true,
             song_count: None,
+            artist: None,
+            album_uri: None,
         });
         s.albums.selected = 2;
         assert_eq!(s.handle_key(ch('s')), None);
@@ -2789,6 +3198,8 @@ mod tests {
             uri: "Starred".into(),
             is_dir: false,
             song_count: None,
+            artist: None,
+            album_uri: None,
         }];
         assert_eq!(s.handle_key(ch('s')), None);
         assert_eq!(
@@ -2820,18 +3231,26 @@ mod tests {
     }
 
     #[test]
-    fn o_opens_selected_dir() {
+    fn l_drills_the_selected_dir_exactly_as_o_used_to() {
+        // The no-regression test for the rebind: `o` now opens the context menu, and the
+        // drill it used to be moved VERBATIM onto `l` / Right. Every assertion here is
+        // the one `o` carried before, so the behavior is provably unchanged.
         let mut s = TuiState::new();
         s.albums.rows = vec![brow("X", "album/9", true), brow("song", "song/7", false)];
         s.screen = Screen::Albums;
         // A dir row -> BrowseInto.
-        assert_eq!(s.handle_key(ch('o')), Some(Intent::BrowseInto("album/9".into())));
+        assert_eq!(s.handle_key(ch('l')), Some(Intent::BrowseInto("album/9".into())));
+        // Right is the same binding, so it must reach the same Act.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Right)),
+            Some(Intent::BrowseInto("album/9".into()))
+        );
         // A song row -> no-op.
         s.albums.selected = 1;
-        assert_eq!(s.handle_key(ch('o')), None);
+        assert_eq!(s.handle_key(ch('l')), None);
         // Queue -> no-op.
         s.screen = Screen::Queue;
-        assert_eq!(s.handle_key(ch('o')), None);
+        assert_eq!(s.handle_key(ch('l')), None);
     }
 
     #[test]
@@ -3026,7 +3445,7 @@ mod tests {
     }
 
     fn brow(label: &str, uri: &str, is_dir: bool) -> BrowseRow {
-        BrowseRow { label: label.into(), uri: uri.into(), is_dir, song_count: None }
+        BrowseRow { label: label.into(), uri: uri.into(), is_dir, song_count: None, artist: None, album_uri: None, }
     }
 
     #[test]
@@ -3143,11 +3562,13 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[0],
-            BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true, song_count: None }
+            BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, }
         );
         assert_eq!(
             rows[1],
-            BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false, song_count: None }
+            // The credit is folded into the label the eye reads AND kept raw: the
+            // composed "T - A" is a display string, so "go to artist" needs "A" alone.
+            BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: Some("A".into()), album_uri: None, }
         );
         assert_eq!(
             rows[2],
@@ -3156,6 +3577,8 @@ mod tests {
                 uri: "Starred".into(),
                 is_dir: false,
                 song_count: None,
+                artist: None,
+                album_uri: None,
             }
         );
     }
@@ -3314,4 +3737,543 @@ mod tests {
         assert!(s.connected);
         assert!(s.status_msg.as_ref().unwrap().contains("re-run"));
     }
+    // The row context menu.
+
+    /// A Find hit row, with only the fields a menu fixture actually states.
+    fn hit_row(
+        kind: crate::find::FindKind,
+        label: &str,
+        uri: &str,
+        artist: Option<&str>,
+    ) -> crate::find::FindRow {
+        crate::find::FindRow {
+            kind,
+            label: label.into(),
+            uri: uri.into(),
+            trailer: String::new(),
+            song_count: None,
+            album_uri: None,
+            artist: artist.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cursor_target_names_the_row_the_eye_is_on_for_every_screen() {
+        use crate::find::{FindKind, Focus};
+        use crate::menu::{Origin, TargetKind};
+        // The trap this resolver exists to avoid: a POPULATED queue under every other
+        // screen. A per-screen match that forgets to claim the Find hits (or the
+        // playlists) falls through to `self.queue[self.selected]` and describes a row
+        // the user is not even looking at.
+        let fresh = || {
+            let mut s = TuiState::new();
+            let mut it = item(0);
+            it.album_uri = Some("album/queue".into());
+            it.artist = Some("Queue Artist".into());
+            s.apply_snapshot(NowPlaying::default(), vec![it, item(1)]);
+            s.albums.rows = vec![brow("Volume Alpha", "album/9", true)];
+            s.playlists.rows = vec![brow("Starred", "Starred", false)];
+            s.find.hits.rows = vec![hit_row(FindKind::Album, "Hit", "album/hit", Some("C418"))];
+            s.find.drill.rows = vec![BrowseRow {
+                label: "Sweden - C418".into(),
+                uri: "song/drill".into(),
+                is_dir: false,
+                song_count: None,
+                artist: Some("C418".into()),
+                album_uri: Some("album/drill".into()),
+            }];
+            s
+        };
+
+        let s = fresh();
+        let t = s.cursor_target().expect("the queue row");
+        assert_eq!(t.origin, Origin::Queue { pos: 0 });
+        assert_eq!(t.kind, TargetKind::LibrarySong);
+        assert_eq!(t.uri.as_deref(), Some("song/0"));
+        assert_eq!(t.album_uri.as_deref(), Some("album/queue"));
+        assert_eq!(t.artist.as_deref(), Some("Queue Artist"));
+
+        let mut s = fresh();
+        s.screen = Screen::Albums;
+        let t = s.cursor_target().expect("the album row");
+        assert_eq!((t.kind, t.origin), (TargetKind::Album, Origin::Browse));
+        assert_eq!(t.uri.as_deref(), Some("album/9"));
+
+        // A playlist row is a NAME; no uri prefix can reveal that, so the SCREEN says it.
+        let mut s = fresh();
+        s.screen = Screen::Playlists;
+        let t = s.cursor_target().expect("the playlist row");
+        assert_eq!(t.kind, TargetKind::Playlist);
+        assert_eq!(t.uri.as_deref(), Some("Starred"));
+
+        // Off-drill, Find shows the HITS - which are not a `Browse`, so a resolver that
+        // consulted active_browse() first would silently return the QUEUE row here.
+        let mut s = fresh();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        let t = s.cursor_target().expect("the hit row");
+        assert_eq!((t.kind, t.origin), (TargetKind::Album, Origin::FindHit));
+        assert_eq!(t.uri.as_deref(), Some("album/hit"));
+        assert_eq!(t.artist.as_deref(), Some("C418"));
+
+        // Drilling, the same screen shows the drill rows instead.
+        s.find.drilling = true;
+        let t = s.cursor_target().expect("the drilled row");
+        assert_eq!((t.kind, t.origin), (TargetKind::LibrarySong, Origin::Browse));
+        assert_eq!(t.uri.as_deref(), Some("song/drill"));
+        assert_eq!(t.album_uri.as_deref(), Some("album/drill"));
+        assert_eq!(t.artist.as_deref(), Some("C418"));
+
+        // An empty list has no row to describe - never a popup over nothing.
+        let mut s = TuiState::new();
+        assert!(s.cursor_target().is_none(), "an empty queue has no target");
+        s.screen = Screen::Albums;
+        assert!(s.cursor_target().is_none(), "an empty browse has no target");
+        s.screen = Screen::Find;
+        assert!(s.cursor_target().is_none(), "an empty hit list has no target");
+        // The DJ ask line owns every printable key, so `o` never reaches dispatch there.
+        s.screen = Screen::Dj;
+        assert!(s.cursor_target().is_none());
+    }
+
+    #[test]
+    fn a_queue_target_carries_the_mpd_pos_not_the_row_index() {
+        // `play` / `delete` address by POSITION, and the two only coincide while the
+        // queue is dense. A resolver that handed the row index over would delete the
+        // wrong track on any sparse listing.
+        let mut s = TuiState::new();
+        let mut a = item(0);
+        a.pos = 7;
+        let mut b = item(1);
+        b.pos = 11;
+        s.apply_snapshot(NowPlaying::default(), vec![a, b]);
+        s.selected = 1;
+        assert_eq!(
+            s.cursor_target().unwrap().origin,
+            crate::menu::Origin::Queue { pos: 11 }
+        );
+    }
+
+    #[test]
+    fn o_opens_the_menu_on_every_screen_and_esc_closes_it() {
+        use crate::find::{FindKind, Focus};
+        let screens = [Screen::Queue, Screen::Albums, Screen::Playlists, Screen::Find];
+        for screen in screens {
+            let mut s = TuiState::new();
+            s.apply_snapshot(NowPlaying::default(), vec![item(0)]);
+            s.albums.rows = vec![brow("Volume Alpha", "album/9", true)];
+            s.playlists.rows = vec![brow("Starred", "Starred", false)];
+            s.find.hits.rows = vec![hit_row(FindKind::Song, "Sweden", "song/1", None)];
+            s.find.focus = Focus::Results;
+            s.screen = screen;
+            assert_eq!(s.handle_key(ch('o')), None, "{screen:?}: opening emits no intent");
+            let menu = s.menu.as_ref().unwrap_or_else(|| panic!("{screen:?} has no menu"));
+            assert!(!menu.rows.is_empty(), "{screen:?}: an empty menu is a dead popup");
+            // The cursor parks on the first LIVE row, so Enter is never a refusal.
+            assert!(
+                matches!(menu.rows[menu.selected].avail, crate::menu::Avail::Yes(_)),
+                "{screen:?}: the preselected row is blocked"
+            );
+            assert_eq!(s.handle_key(key(KeyCode::Esc)), None);
+            assert!(s.menu.is_none(), "{screen:?}: Esc closes the menu");
+        }
+    }
+
+    #[test]
+    fn o_on_an_empty_list_says_so_instead_of_flashing_an_empty_popup() {
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ch('o')), None);
+        assert!(s.menu.is_none());
+        assert_eq!(s.status_msg.as_deref(), Some("nothing here"));
+    }
+
+    #[test]
+    fn shift_o_opens_the_playing_track_and_says_so_when_nothing_is() {
+        use crate::menu::{Origin, TargetKind};
+        // Nothing playing: a reason, never a silently dead key.
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ch('O')), None);
+        assert!(s.menu.is_none());
+        assert_eq!(s.status_msg.as_deref(), Some("nothing is playing"));
+
+        // A library song, reached from a screen whose cursor is somewhere else entirely
+        // - which is the whole point of `O`.
+        let now = NowPlaying {
+            file: Some("song/5".into()),
+            title: Some("Sweden".into()),
+            album_uri: Some("album/7".into()),
+            artist: Some("C418".into()),
+            ..NowPlaying::default()
+        };
+        s.apply_snapshot(now, vec![item(0)]);
+        s.screen = Screen::Albums;
+        s.albums.rows = vec![brow("Elsewhere", "album/99", true)];
+        assert_eq!(s.handle_key(ch('O')), None);
+        let m = s.menu.as_ref().expect("the playing track has a menu");
+        assert_eq!(m.target.origin, Origin::NowPlaying);
+        assert_eq!(m.target.kind, TargetKind::LibrarySong);
+        assert_eq!(m.target.label, "Sweden");
+        assert_eq!(m.target.album_uri.as_deref(), Some("album/7"));
+    }
+
+    #[test]
+    fn shift_o_on_a_recognized_stream_keeps_the_library_actions() {
+        use crate::menu::{MenuAction, TargetKind};
+        let mut s = TuiState::new();
+        let now = NowPlaying {
+            file: Some("https://stream-relay.ntslive.net/1".into()),
+            name: Some("NTS 1".into()),
+            match_uri: Some("song/42".into()),
+            ..NowPlaying::default()
+        };
+        s.apply_now(now);
+        s.handle_key(ch('O'));
+        let m = s.menu.as_ref().unwrap();
+        assert_eq!(m.target.kind, TargetKind::Stream);
+        assert_eq!(m.target.label, "NTS 1", "the station name, not the bare url");
+        // The star and the radio seed both come off the MATCHED track, exactly as C-s
+        // already does - the stream url stays the target's own uri.
+        assert!(m.rows.iter().any(|r| r.avail
+            == crate::menu::Avail::Yes(MenuAction::Favorite("song/42".into()))));
+        assert!(m.rows.iter().any(|r| r.avail
+            == crate::menu::Avail::Yes(MenuAction::Radio("song/42".into()))));
+    }
+
+    #[test]
+    fn the_open_menu_swallows_every_key_it_does_not_claim() {
+        // A true modal: a transport key must not act on something the popup does not
+        // even name, and a nav key must not move the cursor out from under a snapshot.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1), item(2)]);
+        s.handle_key(ch('o'));
+        assert!(s.menu.is_some());
+        assert_eq!(s.handle_key(ch('>')), None, "next track is swallowed");
+        assert_eq!(s.handle_key(ch(':')), None, "the command line is swallowed");
+        assert_eq!(s.handle_key(ch('s')), Some(cmd("playlistadd Starred song/0")),
+            "a hotkey runs its OWN row - `s` is the menu's star, not the global one");
+        s.handle_key(ch('o'));
+        assert_eq!(s.mode, Mode::Normal, "and no mode change leaked through");
+        assert_eq!(s.selected, 0, "the queue cursor never moved");
+        assert!(s.menu.is_some(), "and the menu is still open");
+        // j/k move the POPUP, not the list underneath.
+        let before = s.menu.as_ref().unwrap().selected;
+        s.handle_key(ch('j'));
+        assert_eq!(s.menu.as_ref().unwrap().selected, before + 1);
+        assert_eq!(s.selected, 0);
+        s.handle_key(ch('G'));
+        let last = s.menu.as_ref().unwrap().rows.len() - 1;
+        assert_eq!(s.menu.as_ref().unwrap().selected, last);
+        s.handle_key(ch('g'));
+        assert_eq!(s.menu.as_ref().unwrap().selected, 0);
+        // `p` is the menu's OWN "play now" hotkey, so it jumps to the row the popup
+        // names - the global pause never sees it, which is the property that matters.
+        assert_eq!(s.handle_key(ch('p')), Some(cmd("play 0")));
+        assert!(s.menu.is_none());
+    }
+
+    #[test]
+    fn the_menu_and_the_help_overlay_are_never_both_open() {
+        // Mutually exclusive BY CONSTRUCTION rather than by an ordering the two
+        // intercepts would each have to remember.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0)]);
+        s.handle_key(ch('?'));
+        assert!(s.help_open);
+        // With help open, `o` is swallowed by the help modal (it is the inner one).
+        s.handle_key(ch('o'));
+        assert!(s.menu.is_none(), "the help modal swallows it");
+        s.handle_key(key(KeyCode::Esc));
+        s.handle_key(ch('o'));
+        assert!(s.menu.is_some());
+        s.help_open = true;
+        s.open_menu(s.cursor_target().unwrap());
+        assert!(!s.help_open, "opening the menu closes help");
+    }
+
+    #[test]
+    fn go_to_album_reveals_the_album_in_the_find_drill() {
+        // The one pane that can show an arbitrary path without clobbering another
+        // screen's cursor or nav stack. `drilling` stays false so main.rs takes the
+        // Find-ENTRY branch of browse_into (depth 0, empty stack, free back-out).
+        let mut s = TuiState::new();
+        let mut it = item(0);
+        it.album_uri = Some("album/7".into());
+        s.apply_snapshot(NowPlaying::default(), vec![it]);
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('b')), Some(Intent::BrowseInto("album/7".into())));
+        assert_eq!(s.screen, Screen::Find);
+        assert!(!s.find.drilling);
+        assert_eq!(s.find.focus, crate::find::Focus::Results);
+        assert!(s.menu.is_none(), "a run row closes the menu");
+        assert_eq!(s.status_msg.as_deref(), Some("showing t0"));
+    }
+
+    #[test]
+    fn go_to_artist_runs_a_real_library_query_and_marks_it_in_flight() {
+        // There is no artist uri on the wire yet, so this is a SEARCH - and the row
+        // says so. It must go through the same submit path Enter on the query line
+        // uses, or the two would drift on history / phase / the echoed query.
+        let mut s = TuiState::new();
+        let mut it = item(0);
+        it.artist = Some("Alice Coltrane".into());
+        s.apply_snapshot(NowPlaying::default(), vec![it]);
+        s.handle_key(ch('o'));
+        let row = s
+            .menu
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|r| r.item == crate::menu::MenuItem::GoToArtist)
+            .unwrap();
+        assert_eq!(row.label, "go to artist (search)", "honest about being a search");
+        assert_eq!(s.handle_key(ch('t')), Some(Intent::Find("Alice Coltrane".into())));
+        assert_eq!(s.screen, Screen::Find);
+        assert_eq!(s.find.query, "Alice Coltrane", "the screen says what it asked");
+        assert_eq!(s.find.submitted, "Alice Coltrane");
+        assert_eq!(
+            s.find.phase,
+            crate::find::Phase::Loading("Alice Coltrane".into()),
+            "the spinner turns while it is in flight"
+        );
+        assert_eq!(s.find.history.first().map(String::as_str), Some("Alice Coltrane"));
+    }
+
+    #[test]
+    fn a_blocked_pick_says_why_and_leaves_the_menu_open() {
+        // A refusal is information, and the next row is one keystroke away - so the
+        // popup must NOT close under the user for a key that did nothing.
+        let mut s = TuiState::new();
+        // A queue song with no album uri: the family applies, this listing lacks it.
+        s.apply_snapshot(NowPlaying::default(), vec![item(0)]);
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('b')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("this listing carries no album uri"));
+        assert!(s.menu.is_some(), "the menu stays open on a refusal");
+        // And picking a live row from the still-open menu works.
+        assert_eq!(s.handle_key(ch('p')), Some(cmd("play 0")));
+        assert!(s.menu.is_none());
+    }
+
+    #[test]
+    fn a_letter_the_menu_does_not_list_is_swallowed_not_leaked() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0)]);
+        s.handle_key(ch('o'));
+        // `a` (add to queue) is absent on a queue row - it is already queued.
+        assert_eq!(s.handle_key(ch('a')), None);
+        assert!(s.menu.is_some());
+        assert_eq!(s.status_msg, None, "an unlisted key means nothing here, silently");
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_row_and_l_is_the_same_gesture() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1)]);
+        s.selected = 1;
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(cmd("play 1")));
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('l')), Some(cmd("play 1")), "l runs it too");
+    }
+
+    #[test]
+    fn a_same_length_reorder_under_the_popup_refuses_rather_than_acting() {
+        // The event loop closes the menu when the queue LENGTH changes; this is the
+        // reorder that length alone cannot see, so dispatch re-checks the uri at the
+        // snapshot pos before playing or deleting.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1)]);
+        s.selected = 1;
+        s.handle_key(ch('o'));
+        // The rows swap places, keeping both the length and the positions.
+        let mut a = item(1);
+        a.pos = 0;
+        let mut b = item(0);
+        b.pos = 1;
+        s.apply_snapshot(NowPlaying::default(), vec![a, b]);
+        assert_eq!(s.handle_key(ch('x')), None, "remove refuses on a moved row");
+        assert_eq!(s.status_msg.as_deref(), Some("the queue moved - reopen the menu"));
+        // And the same guard covers the jump.
+        s.handle_key(ch('o'));
+        s.selected = 1;
+        assert_eq!(s.handle_key(ch('p')), Some(cmd("play 1")), "an unmoved row still runs");
+    }
+
+    #[test]
+    fn remove_from_queue_deletes_the_snapshot_position() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1), item(2)]);
+        s.selected = 2;
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('x')), Some(cmd("delete 2")));
+        assert!(s.menu.is_none());
+    }
+
+    #[test]
+    fn the_menu_radio_row_shares_the_bare_r_keys_gate_and_its_reasons() {
+        use crate::find::{FindKind, Focus};
+        // One gate, one set of reason strings: the popup row and `r` cannot drift.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![hit_row(FindKind::Album, "Volume Alpha", "album/9", None)];
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('r')), Some(cmd("radio album/9")));
+        assert_eq!(s.status_msg.as_deref(), Some("radio from Volume Alpha"));
+    }
+
+    #[test]
+    fn a_playlist_row_loads_from_the_menu_exactly_as_enter_does() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Playlists;
+        s.playlists.rows = vec![brow("Starred", "Starred", false)];
+        s.handle_key(ch('o'));
+        // Row 0 is the blocked "open contents"; the cursor parks on the load below it.
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(Intent::LoadPlaylist("Starred".into())));
+    }
+
+    #[test]
+    fn an_album_row_opens_its_contents_from_the_menu_just_as_l_drills_it() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        s.albums.rows = vec![brow("Volume Alpha", "album/9", true)];
+        s.handle_key(ch('o'));
+        // OpenContents is row 0 and preselected, so `o` then Enter still drills.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::BrowseInto("album/9".into()))
+        );
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_move_the_menu_cursor() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0)]);
+        s.handle_key(ch('o'));
+        s.handle_key(ctrl('n'));
+        assert_eq!(s.menu.as_ref().unwrap().selected, 1);
+        s.handle_key(ctrl('p'));
+        assert_eq!(s.menu.as_ref().unwrap().selected, 0);
+        assert_eq!(s.selected, 0, "and never the queue underneath");
+    }
+
+    #[test]
+    fn parse_browse_keeps_the_raw_artist_and_the_album_uri_off_a_song_row() {
+        // Both are pairs `lsinfo` ALREADY carries; the client simply never read them.
+        let pairs: Vec<(String, String)> = vec![
+            ("file".into(), "song/9".into()),
+            ("Title".into(), "Sweden".into()),
+            ("Artist".into(), "C418".into()),
+            ("X-AlbumUri".into(), "album/7".into()),
+            // A dir row must take neither: the pair means something else there.
+            ("directory".into(), "album/1".into()),
+            ("Album".into(), "Volume Alpha".into()),
+        ];
+        let rows = parse_browse(&pairs);
+        assert_eq!(rows[0].label, "Sweden - C418", "the eye still reads the credit");
+        assert_eq!(rows[0].artist.as_deref(), Some("C418"), "and the query gets it raw");
+        assert_eq!(rows[0].album_uri.as_deref(), Some("album/7"));
+        assert_eq!(rows[1].artist, None);
+        assert_eq!(rows[1].album_uri, None);
+    }
+
+    #[test]
+    fn a_menu_jump_to_find_never_leaves_the_previous_querys_hits_actionable() {
+        use crate::find::{FindKind, Focus};
+        // THE hazard of landing the cursor on the results half: `find.hits` and
+        // `find.selected` are only replaced when the response lands, so for the whole
+        // round trip the PREVIOUS query's rows are the visible AND actionable list,
+        // with the old cursor index intact. Enter would enqueue and PLAY an unrelated
+        // track over what is playing, and `s` would write a star into the user's
+        // library. The query line does not have this hole because it keeps focus on the
+        // text, where those keys are captured as input.
+        let stale = |s: &mut TuiState| {
+            s.find.hits.rows = vec![
+                hit_row(FindKind::Song, "Sweden", "song/9", None),
+                hit_row(FindKind::Song, "Wet Hands", "song/1", None),
+            ];
+            s.find.selected = 1;
+        };
+        let queue_row = || {
+            let mut it = item(0);
+            it.artist = Some("Alice Coltrane".into());
+            it.album_uri = Some("album/7".into());
+            it
+        };
+
+        // "go to artist (search)": the window is the whole searchall round trip.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![queue_row()]);
+        stale(&mut s);
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('t')), Some(Intent::Find("Alice Coltrane".into())));
+        assert_eq!(s.find.focus, Focus::Results);
+        assert!(s.find.hits.rows.is_empty(), "the rows go with the question");
+        assert_eq!(s.find.selected, 0);
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), None, "nothing to play but the old answer");
+        assert_eq!(s.handle_key(ch('s')), None, "and nothing to star into the library");
+
+        // "go to album" from a queue row: the window is one key-drain frame, because
+        // main.rs drains every pending key before dispatch runs `browse_into` (which is
+        // what sets `drilling`). Same rows, same keys, same wrong track.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![queue_row()]);
+        stale(&mut s);
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('b')), Some(Intent::BrowseInto("album/7".into())));
+        assert!(!s.find.drilling, "main.rs still takes the Find-ENTRY branch");
+        assert!(s.find.hits.rows.is_empty());
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), None);
+
+        // But revealing FROM a hit keeps them: that is the one case where backing out
+        // to the hits means something, and a key that beats the drill in still acts on
+        // the row the popup itself named - not on a stranger.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.focus = Focus::Results;
+        s.find.hits.rows = vec![crate::find::FindRow {
+            album_uri: Some("album/7".into()),
+            ..hit_row(FindKind::Song, "Sweden", "song/9", None)
+        }];
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('b')), Some(Intent::BrowseInto("album/7".into())));
+        assert_eq!(s.find.hits.rows.len(), 1, "backing out of the drill is still free");
+    }
+
+    #[test]
+    fn a_confirm_arriving_over_the_menu_closes_it_instead_of_stranding_it() {
+        // A plan lands ASYNCHRONOUSLY, so it can arrive while the popup is open (the
+        // user submitted a phrase, then went on browsing). `Mode::Confirm` routes keys
+        // to `key_confirm`, and the menu's modal intercept lives in `key_normal` - so a
+        // menu left standing is drawn over the y/N prompt with every one of its keys
+        // dead, and the first Esc silently cancels the plan the user asked for while the
+        // popup sits there unchanged.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0)]);
+        s.handle_key(ch('o'));
+        assert!(s.menu.is_some());
+        s.enter_confirm(Pending { steps: vec!["[1] fade out".into()], ..Default::default() });
+        assert!(s.menu.is_none(), "the confirm takes the screen");
+        assert_eq!(s.mode, Mode::Confirm);
+        // And the prompt answers for itself, on the FIRST press - not after an Esc
+        // spent closing a popup the user could not act on anyway.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), Some(Intent::ConfirmCancel));
+    }
+
+    #[test]
+    fn a_blank_artist_pair_reads_as_absent_not_as_an_empty_query() {
+        // An empty `Artist:` is on the wire as often as a missing one. Left live, the
+        // row would submit nothing and close the menu with no feedback at all.
+        let mut s = TuiState::new();
+        let mut it = item(0);
+        it.artist = Some("   ".into());
+        s.apply_snapshot(NowPlaying::default(), vec![it]);
+        assert_eq!(s.cursor_target().unwrap().artist, None);
+        s.handle_key(ch('o'));
+        assert_eq!(s.handle_key(ch('t')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("this listing carries no artist"));
+        assert!(s.menu.is_some(), "and it is a stated refusal, not a silent close");
+    }
 }
+

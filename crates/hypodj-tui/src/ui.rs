@@ -73,11 +73,80 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     if state.mode == Mode::Confirm && state.screen != Screen::Dj {
         render_confirm_popup(f, list_area, state);
     }
+    // The row context menu sits ABOVE the confirm popup (its keys are intercepted
+    // first, so it must also be the one the eye sees first) and BELOW the help overlay
+    // - which cannot be open at the same time anyway, since `open_menu` closes it. It
+    // gets the FULL frame as its region, like the help overlay and unlike the two-line
+    // confirm: eight rows plus a heading and a border ring do not fit the list band on
+    // a 24-row terminal (`now_playing_h` takes 12 of them), and a menu that silently
+    // truncates its last row - `remove from queue` - is worse than one that overlaps
+    // the pane below.
+    if let Some(menu) = &state.menu {
+        render_menu(f, f.area(), menu, state);
+    }
     // The `?` help overlay sits above everything else (a normal-mode modal). It gets
     // the FULL frame as its region so the two-column table has room to breathe.
     if state.help_open {
         render_help_overlay(f, f.area(), state);
     }
+}
+
+/// The geometry every overlay here shares: a popup sized to its CONTENT (plus the
+/// border ring and a one-column side pad), clamped inside `region` and centered in it.
+/// Extracted so the help, confirm and menu popups cannot drift into three subtly
+/// different boxes - and so a short terminal clamps them all the same way.
+fn centered_popup(region: Rect, lines: &[Line]) -> Rect {
+    let content_h = lines.len() as u16 + 2;
+    let content_w = lines
+        .iter()
+        .map(|l| l.width() as u16)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(4);
+    let w = content_w.min(region.width).max(1);
+    let h = content_h.min(region.height).max(1);
+    let x = region.x + (region.width.saturating_sub(w)) / 2;
+    let y = region.y + (region.height.saturating_sub(h)) / 2;
+    Rect { x, y, width: w, height: h }
+}
+
+/// The row CONTEXT MENU popup. Rendered from the EXACT `Vec<MenuRow>` dispatch
+/// consumes, so it is its own help and there is no second table to drift: a blocked
+/// row is drawn DIM (its reason goes to the status line when picked, where there is
+/// room for a sentence), and the heading names the target plus where it came from -
+/// the same song reached from the queue and from a Find hit offers different rows, so
+/// the origin has to be visible.
+fn render_menu(f: &mut Frame, region: Rect, menu: &crate::menu::Menu, state: &TuiState) {
+    use crate::menu::Avail;
+    // A legible fg for the detected background, the same INFO policy the help overlay
+    // uses, so the two modals read as one visual system on light and dark terminals.
+    let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
+    let base = Style::default().fg(fg);
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled(menu.target.label.clone(), base.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("  ({})", menu.target.origin.word()),
+            base.add_modifier(Modifier::DIM),
+        ),
+    ])];
+    for (i, row) in menu.rows.iter().enumerate() {
+        let blocked = matches!(row.avail, Avail::No(_));
+        let mut style = if blocked { base.add_modifier(Modifier::DIM) } else { base };
+        if i == menu.selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {}  {} ", row.item.hotkey(), row.label),
+            style,
+        )));
+    }
+    let popup = centered_popup(region, &lines);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(base)
+        .title(Span::styled("Menu", base.add_modifier(Modifier::BOLD)));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).block(block).style(base), popup);
 }
 
 /// The `?` help overlay: a centered, bordered popup laid out in two columns from the
@@ -156,17 +225,11 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
         lines = render_col(&groups);
     }
 
-    let content_h = lines.len() as u16 + 2;
-    let content_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).saturating_add(4);
-    let w = content_w.min(region.width).max(1);
-    let h = content_h.min(region.height).max(1);
-    let x = region.x + (region.width.saturating_sub(w)) / 2;
-    let y = region.y + (region.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = centered_popup(region, &lines);
     // The inner text height (popup minus the top/bottom border rows). When the table is
     // taller than this, the overlay SCROLLS instead of silently truncating: the offset
     // is clamped to the last full page so a short terminal can still reach every binding.
-    let inner_h = h.saturating_sub(2);
+    let inner_h = popup.height.saturating_sub(2);
     let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
     let scroll = state.help_scroll.min(max_scroll);
     let title = if max_scroll > 0 {
@@ -1031,7 +1094,7 @@ mod tests {
         // The `quit` binding is off-screen at the top but becomes reachable by scrolling:
         // walk the offsets and assert it appears at some page (proving nothing is lost to
         // truncation). Over-scroll clamps to the last page, never panics.
-        let reachable = (0..40u16).any(|off| {
+        let reachable = (0..80u16).any(|off| {
             s.help_scroll = off;
             render_to_lines_sized(&s, 60, 12).join("\n").contains("quit")
         });
@@ -1047,6 +1110,131 @@ mod tests {
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(out.contains("[browse]"), "browse-scoped binding tagged:\n{out}");
         assert!(out.contains("[queue]"), "queue-scoped binding tagged:\n{out}");
+    }
+
+    /// A queue-song menu with NO album uri, so the popup carries both a live and a
+    /// blocked row - the two things the render has to tell apart.
+    fn menu_state() -> TuiState {
+        use crate::menu::{Menu, Origin, Target, TargetKind};
+        let mut s = TuiState::new();
+        s.apply_snapshot(
+            hypodj_client::model::NowPlaying::default(),
+            vec![hypodj_client::model::QueueItem {
+                pos: 0,
+                title: "Sweden".into(),
+                artist: Some("C418".into()),
+                uri: Some("song/1".into()),
+                album_uri: None,
+            }],
+        );
+        let target = Target {
+            kind: TargetKind::LibrarySong,
+            origin: Origin::Queue { pos: 0 },
+            label: "Sweden".into(),
+            uri: Some("song/1".into()),
+            album_uri: None,
+            artist: Some("C418".into()),
+            artist_uri: None,
+            match_uri: None,
+        };
+        s.menu = Some(Menu::new(target, 1));
+        s
+    }
+
+    #[test]
+    fn the_menu_popup_renders_its_rows_its_target_and_where_it_came_from() {
+        let s = menu_state();
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("Menu"), "the popup is titled:\n{out}");
+        assert!(out.contains("Sweden"), "it names its target:\n{out}");
+        assert!(out.contains("queue row"), "and where the target came from:\n{out}");
+        // The rendered rows ARE the ones dispatch consumes, so the popup is its own
+        // help and there is no second table to drift.
+        for want in [
+            "play now",
+            "go to album",
+            "go to artist (search)",
+            "start a radio from here",
+            "star",
+            "remove from queue",
+        ] {
+            assert!(out.contains(want), "row {want:?} rendered:\n{out}");
+        }
+        // The direct-pick letters are visible in the gutter, so the vocabulary is
+        // learnable without a second lookup.
+        assert!(out.contains("p  play now"), "hotkey gutter:\n{out}");
+        assert!(out.contains("x  remove from queue"), "hotkey gutter:\n{out}");
+    }
+
+    #[test]
+    fn a_blocked_menu_row_is_drawn_dim_and_the_preselected_one_reversed() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+        let s = menu_state();
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| super::render(f, &s)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // The buffer is indexed by CELL, and the frame is full of multi-byte box
+        // characters - so the needle has to be located by CHAR position, never by the
+        // byte offset `str::find` returns.
+        let style_of = |needle: &str| {
+            let want: Vec<char> = needle.chars().collect();
+            for y in 0..buf.area.height {
+                let line: Vec<char> = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect();
+                if let Some(x) = line.windows(want.len()).position(|w| w == want.as_slice()) {
+                    return buf[(x as u16, y)].style();
+                }
+            }
+            panic!("{needle:?} is not on screen");
+        };
+        assert!(
+            style_of("go to album").add_modifier.contains(Modifier::DIM),
+            "a blocked row is dim - the reason itself goes to the status line, where a \
+             sentence fits"
+        );
+        assert!(
+            !style_of("start a radio from here").add_modifier.contains(Modifier::DIM),
+            "a live row is not"
+        );
+        assert!(
+            style_of("play now").add_modifier.contains(Modifier::REVERSED),
+            "the cursor parks on the first LIVE row, so Enter is never a refusal"
+        );
+    }
+
+    #[test]
+    fn no_leftover_debug_printing_ships_in_this_file() {
+        // Scaffolding written to diagnose popup geometry is easy to leave standing: it
+        // prints on every `--nocapture` run and on every failing run of this binary
+        // (including the one `nix/clients.nix` runs in the sandbox), burying the
+        // assertion that actually failed. The instance this guards against was worse
+        // than noise - it located its needle with `str::find`, a BYTE offset, and fed
+        // that straight back as a CELL column, which is precisely the mistake `style_of`
+        // exists to prevent: it printed the style of an unrelated cell and sat one
+        // multi-byte box glyph away from an out-of-bounds buffer index, inside a test
+        // whose assertions never read it. The renderer speaks through the buffer and
+        // the assertion message; nothing here has anything to say on stdout.
+        //
+        // The needles are split so this test is not its own counter-example.
+        let src = include_str!("ui.rs");
+        for needle in [concat!("print", "ln!"), concat!("db", "g!")] {
+            assert!(!src.contains(needle), "leftover {needle} in the renderer or its tests");
+        }
+    }
+
+    #[test]
+    fn the_menu_popup_still_fits_a_cramped_terminal() {
+        // 40x12 is the small end this has to survive: the popup clamps to its region
+        // rather than drawing outside it (which would panic in ratatui).
+        let s = menu_state();
+        let out = render_to_lines_sized(&s, 40, 12);
+        assert_eq!(out.len(), 12);
+        assert!(out.iter().all(|l| l.chars().count() == 40));
+        let joined = out.join("\n");
+        assert!(joined.contains("play now"), "the popup is still legible:\n{joined}");
     }
 
     #[test]
@@ -1209,6 +1397,8 @@ mod tests {
         s.find.drill.rows = vec![crate::state::BrowseRow {
             label: "Minecraft - Volume Alpha".into(), uri: "album/9".into(),
             is_dir: true, song_count: Some(24),
+            artist: None,
+            album_uri: None,
         }];
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("find> c418"), "the query that produced this branch stays visible:\n{out}");
@@ -1292,9 +1482,9 @@ mod tests {
             (FindKind::Song, 1, None),
         ];
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Artist, label: "C418".into(), uri: "artist/1".into(), trailer: "12 albums".into(), song_count: None, album_uri: None },
-            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None },
-            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: Some("album/2".into()) },
+            FindRow { kind: FindKind::Artist, label: "C418".into(), uri: "artist/1".into(), trailer: "12 albums".into(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: Some("album/2".into()), artist: None, },
         ];
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("@  C418"), "artist row with its @ sigil:\n{out}");
@@ -1319,10 +1509,10 @@ mod tests {
             (FindKind::Song, 1, None),
         ];
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Album, label: "NTS Sessions".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None },
-            FindRow { kind: FindKind::Station, label: "NTS 4 To The Floor".into(), uri: "station/NTS 4 To The Floor".into(), trailer: "stream-mixtape-geo.ntslive.net".into(), song_count: None, album_uri: None },
-            FindRow { kind: FindKind::Station, label: "KFJC 89.7 FM".into(), uri: "station/KFJC 89.7 FM".into(), trailer: "netcast.kfjc.org".into(), song_count: None, album_uri: None },
-            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: None },
+            FindRow { kind: FindKind::Album, label: "NTS Sessions".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Station, label: "NTS 4 To The Floor".into(), uri: "station/NTS 4 To The Floor".into(), trailer: "stream-mixtape-geo.ntslive.net".into(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Station, label: "KFJC 89.7 FM".into(), uri: "station/KFJC 89.7 FM".into(), trailer: "netcast.kfjc.org".into(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: None, artist: None, },
         ];
         let lines = render_to_lines(&s);
         let out = lines.join("\n");
@@ -1362,6 +1552,7 @@ mod tests {
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(),
             trailer: "3:03".into(), song_count: None, album_uri: None,
+            artist: None,
         }];
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("searching"), "the in-flight title:\n{out}");
@@ -2186,18 +2377,7 @@ fn render_confirm_popup(f: &mut Frame, region: Rect, state: &TuiState) {
     )));
 
     // Size the popup to the content, clamped inside the region (with borders).
-    let content_h = lines.len() as u16 + 2;
-    let content_w = lines
-        .iter()
-        .map(|l| l.width() as u16)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(4);
-    let w = content_w.min(region.width).max(1);
-    let h = content_h.min(region.height).max(1);
-    let x = region.x + (region.width.saturating_sub(w)) / 2;
-    let y = region.y + (region.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = centered_popup(region, &lines);
     let block = Block::default().borders(Borders::ALL).title("Confirm");
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(lines).block(block), popup);

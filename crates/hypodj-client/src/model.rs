@@ -22,6 +22,12 @@ pub struct NowPlaying {
     pub name: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// The playing track's album as a BROWSE uri (`album/<id>`), from the `currentsong`
+    /// `X-AlbumUri` pair the daemon already emits via `push_song_tags` - the same pair
+    /// `playlistinfo` carries per queue row. `album` above is the album's NAME, which is
+    /// a display string; this is the handle a client can navigate with. `None` for a raw
+    /// stream (no library album).
+    pub album_uri: Option<String>,
     /// The current song's uri from `currentsong` `file` (`song/<id>` for a library
     /// track, an `http(s)://...` URL for a raw stream). Needed to favorite the
     /// current track (`playlistadd Starred <uri>`); a stream has no star surface.
@@ -234,6 +240,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         name: find(current, "Name").map(str::to_string),
         artist: find(current, "Artist").map(str::to_string),
         album: find(current, "Album").map(str::to_string),
+        album_uri: find(current, "X-AlbumUri").map(str::to_string),
         file: find(current, "file").map(str::to_string),
         starred: find(current, "X-Starred").is_some(),
         cover: find(current, "X-CoverArt").map(str::to_string),
@@ -650,6 +657,25 @@ mod tests {
         let q = parse_queue(&pairs);
         assert_eq!(q[0].album_uri.as_deref(), Some("album/al-9"));
         assert_eq!(q[1].album_uri, None);
+    }
+
+    #[test]
+    fn now_playing_reads_the_current_songs_album_uri() {
+        // The SAME pair `playlistinfo` carries per row: `push_song_tags` emits it on
+        // `currentsong` too, and the client simply never read it. `Album` is the album's
+        // NAME (a display string); this is the handle a client can navigate with.
+        let current = p(&[
+            ("file", "song/1"),
+            ("Title", "Sweden"),
+            ("Album", "Volume Alpha"),
+            ("X-AlbumUri", "album/al-9"),
+        ]);
+        let np = now_playing(&[], &current);
+        assert_eq!(np.album.as_deref(), Some("Volume Alpha"), "still the name");
+        assert_eq!(np.album_uri.as_deref(), Some("album/al-9"), "and now the uri");
+        // A raw stream carries no album at all -> None, never a guessed one.
+        let stream = p(&[("file", "http://stream.example/live"), ("Title", "Live")]);
+        assert_eq!(now_playing(&[], &stream).album_uri, None);
     }
 
     #[test]
