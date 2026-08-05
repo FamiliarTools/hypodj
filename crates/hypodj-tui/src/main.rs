@@ -13,6 +13,7 @@ mod album_color;
 mod art;
 mod find;
 mod keymap;
+mod menu;
 mod sigil;
 mod state;
 mod ui;
@@ -569,6 +570,15 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
         RespKind::Snapshot { now, queue, version } => {
             match queue {
                 Some(q) => {
+                    // An open context menu is a SNAPSHOT of one row, and a
+                    // pos-addressed target (play / delete) is only valid for the queue
+                    // it was built from. A length change means rows moved under the
+                    // popup, so close it rather than let it describe a row that is no
+                    // longer there; dispatch additionally re-checks the uri at the
+                    // snapshot pos, which catches a same-length reorder.
+                    if state.menu.as_ref().is_some_and(|m| m.queue_len != q.len()) {
+                        state.menu = None;
+                    }
                     state.apply_snapshot(now, q);
                     state.queue_version = version;
                 }
