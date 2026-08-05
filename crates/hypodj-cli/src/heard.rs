@@ -6,12 +6,17 @@
 //! a count, repeats collapsed over a window - about the size of the files the user
 //! actually kept by hand.
 //!
-//! The RENDER lives daemon-side and that is forced rather than stylistic: the state
-//! directory is mode 0700 under the systemd unit, so this process cannot read the
-//! ledger file at all, and the client is pure MPD/TCP with no knowledge of the state
-//! dir. So this module is a PRINTER: it turns argv into one `heard` verb line and puts
-//! the daemon's lines on stdout, verbatim and in order - the coverage line first,
-//! because a thin file must read as a thin sample and never as a quiet evening.
+//! The RENDER lives daemon-side and that is forced rather than stylistic: the client is
+//! pure MPD/TCP with no knowledge of the state dir, and the render JOINS each ledger row
+//! to the tape segment still on disk beside it - a directory only the daemon can see. So
+//! this module is a PRINTER: it turns argv into one `heard` verb line and puts the
+//! daemon's lines on stdout, verbatim and in order - the coverage line first, because a
+//! thin file must read as a thin sample and never as a quiet evening.
+//!
+//! It also carries the tape's two PINS. `mark` keeps the audio of what it marked
+//! (`crate::tape` daemon-side), the tape is a rolling cache under a byte budget, and
+//! `heard keep <n>` is how a segment survives the sweep. They are actions rather than
+//! views, so they ride the same verb and print the same way: whatever the daemon says.
 
 use hypodj_client::mpd::{MpdConn, MpdError};
 
@@ -21,10 +26,15 @@ usage:
   dj heard all             every row, owned included, no cap (redirect it to a file)
   dj heard marks           every mark you pressed, across the retained sessions
   dj heard limit <n>       the last session, capped at n unowned rows
+  dj heard keep <n>        pin tape segment n so the sweep never evicts it
+  dj heard drop <n>        release that pin again
 
-Flag spellings work too (--all, --marks, --limit n). The first line is always the
-COVERAGE line: it prints its own inputs, because the recognizer samples a stream on a
-clock and a short file is a thin sample, not a quiet evening.";
+Flag spellings work too (--all, --marks, --limit n); keep/drop are ACTIONS, not views,
+so they are words only. The first line is always the COVERAGE line: it prints its own
+inputs, because the recognizer samples a stream on a clock and a short file is a thin
+sample, not a quiet evening. A marked row that kept audio carries `[tape <n>: ...]` -
+that <n> is the one keep/drop take, and the tape is a rolling cache, so a row can
+honestly outlive its sound.";
 
 /// Run the `heard` gesture. `words` are the argv tokens AFTER the leading `heard`.
 ///
@@ -84,6 +94,17 @@ fn verb_line(words: &[String]) -> Option<String> {
             Ok(n) if n > 0 => Some(format!("heard limit {n}")),
             _ => None,
         },
+        // The tape's two pins. Word-only on purpose: every OTHER form here is a VIEW,
+        // and a view is safe to mistype into (you read the wrong thing and look again),
+        // while these two change what survives the next sweep. A flag spelling would buy
+        // a shell hand nothing and cost the distinction.
+        //
+        // The index is 1-based and comes from the daemon's own render, so a zero names
+        // nothing and is a usage error here rather than a round trip that ACKs.
+        word @ ("keep" | "drop") if rest.len() == 1 => match rest[0].parse::<usize>() {
+            Ok(n) if n > 0 => Some(format!("heard {word} {n}")),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -118,6 +139,25 @@ mod tests {
         assert_eq!(line(&["limit", "5"]), line(&["--limit", "5"]));
         assert_eq!(line(&["limit", "5"]), Some("heard limit 5".to_string()));
         assert_eq!(line(&["-n", "40"]), Some("heard limit 40".to_string()));
+    }
+
+    #[test]
+    fn the_tape_pins_are_word_only_and_carry_the_rendered_index() {
+        // `mark` keeps audio, the tape is a rolling cache under a byte budget, and this
+        // is the ONLY way a segment survives the sweep. Without these arms `dj heard
+        // keep 3` printed the usage and exited non-zero on a gesture the daemon fully
+        // supports.
+        assert_eq!(line(&["keep", "3"]), Some("heard keep 3".to_string()));
+        assert_eq!(line(&["drop", "3"]), Some("heard drop 3".to_string()));
+        assert_eq!(line(&["keep", "12"]), Some("heard keep 12".to_string()));
+        // 1-based, from the daemon's own render: a zero names nothing.
+        assert_eq!(line(&["keep", "0"]), None);
+        assert_eq!(line(&["keep", "x"]), None);
+        assert_eq!(line(&["keep"]), None);
+        assert_eq!(line(&["keep", "1", "2"]), None);
+        assert_eq!(line(&["drop", "-1"]), None);
+        // Word-only: a flag spelling would blur an ACTION into the views around it.
+        assert_eq!(line(&["--keep", "3"]), None);
     }
 
     #[test]

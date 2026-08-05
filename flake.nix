@@ -74,6 +74,12 @@
             pkgs.pkg-config
             pkgs.rust-analyzer
             pkgs.clippy
+            # The daemon's own runtime tools (see nix/package.nix). Not a convenience:
+            # the exactness of the songrec sample and the tape's re-cut are ffmpeg
+            # behaviours, and a test that cannot run them proves nothing about the
+            # formats his stations actually serve. Same derivation the wrapper puts on
+            # the daemon's PATH, so the devshell and production agree.
+            pkgs.ffmpeg-headless
           ];
           buildInputs = [
             # provides libmpv + mpv.pc for libmpv2 (Phase 1); the foundation is

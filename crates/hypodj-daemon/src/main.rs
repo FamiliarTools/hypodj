@@ -320,6 +320,60 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("heard ledger disabled by config");
     }
 
+    // THE TAPE. Root: an explicit [tape].dir wins, else <state_dir>/tape - the same shape
+    // the heard root uses, and a SIBLING of `store/` for the same structural reason: the
+    // store's reconciler owns its directory exclusively and deletes everything in it that
+    // is not a valid cached song, and its scan is non-recursive so a nested directory would
+    // be invisible to the index while still sitting in that root. With neither, the tape is
+    // disabled with a warn (resume's posture: never fatal, and `mark` behaves exactly as it
+    // did without it).
+    if cfg.tape.enable {
+        let tape_root = cfg
+            .tape
+            .dir
+            .clone()
+            .or_else(|| state_dir.as_ref().map(|d| d.join("tape")));
+        match tape_root {
+            None => tracing::warn!(
+                "tape enabled but no directory resolves (set [tape].dir or [restart].state_dir); marks will keep no audio"
+            ),
+            // mpv writes the dump file itself, and its flat command syntax C-unescapes
+            // inside double quotes - so a root carrying a quote, a backslash or a newline
+            // is MANGLED rather than merely risky. One check closes the class; running
+            // without the tape beats handing mpv an ambiguous path.
+            Some(root) if !hypodj_core::tape::root_is_safe(&root) => tracing::warn!(
+                dir = %root.display(),
+                "the tape directory contains a quote, backslash or newline, which mpv's command syntax would mangle; running without the tape"
+            ),
+            // OWNERSHIP, claimed once and before a single press can sweep. The tape's
+            // eviction deletes by ABSENCE OF A PAIR, so pointed at a directory that is not
+            // its own it destroys the contents on the first `mark`. Same guard, same
+            // sentence shape and same non-fatal posture as the offline store's.
+            Some(root) => match hypodj_core::tape::claim_ownership(&root) {
+                Err(e) => tracing::warn!(
+                    dir = %root.display(),
+                    error = %e,
+                    "the tape directory is not hypodj's to sweep; running without the tape"
+                ),
+                Ok(()) => {
+                    handler.set_tape(
+                        root.clone(),
+                        cfg.tape.max_bytes,
+                        cfg.tape.back_secs,
+                        cfg.tape.max_secs,
+                    );
+                    tracing::info!(
+                        dir = %root.display(),
+                        max_bytes = cfg.tape.max_bytes,
+                        "tape open; a mark keeps the sound"
+                    );
+                }
+            },
+        }
+    } else {
+        tracing::info!("tape disabled by config");
+    }
+
     if let Some(dir) = &state_dir {
         let path = dir.join("resume.toml");
         handler.set_state_path(path.clone());

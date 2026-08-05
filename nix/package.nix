@@ -42,6 +42,13 @@ rustPlatform.buildRustPackage {
   doCheck = true;
   cargoTestFlags = [ "-p" "hypodj-core" ];
 
+  # ffmpeg/ffprobe for the check phase too, not only the wrapper. The exactness of the
+  # 12.000 s songrec sample and the tape's `-c copy` re-cut are ffmpeg behaviours that
+  # differ by CODEC (a cut flush against a declared duration is exact on PCM and short on
+  # mp3), so the tests that prove them have to be able to run a real one. Already in this
+  # derivation's closure via the wrapper below, so it costs no extra build.
+  nativeCheckInputs = [ ffmpeg-headless ];
+
   # libmpv2-sys uses pkg-config to find mpv at build time.
   PKG_CONFIG_PATH = "${mpv-unwrapped.dev}/lib/pkgconfig";
 

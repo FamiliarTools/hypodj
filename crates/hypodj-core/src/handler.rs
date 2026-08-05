@@ -396,6 +396,12 @@ struct RetiredTitle {
     raw: String,
     /// When it stopped being the live title.
     retired: Instant,
+    /// The entry-relative PLAYBACK POSITION at which it started standing, carried across
+    /// the rotation from the live stamp. This is what gives `mark previous` a BOTH-ENDED
+    /// cut - the single strongest outcome in the tape feature.
+    started_pos: Option<f64>,
+    /// The position at which it stopped being live (== where the incoming line began).
+    retired_pos: Option<f64>,
 }
 
 /// A resolved library counterpart PLUS what makes it still true (see
@@ -440,6 +446,23 @@ enum TitleSource {
 struct TitleStamp {
     since: Instant,
     source: TitleSource,
+    /// The entry-relative PLAYBACK POSITION at which this line started standing.
+    ///
+    /// THE TIMEBASE DISCIPLINE, and it must ride beside the `Instant` rather than replace
+    /// it. mpv's cache dump indexes the STREAM's own timeline - the one `time-pos` and
+    /// `seekable-ranges` report - while every boundary the daemon knows is stamped in wall
+    /// clock. Across a pause, an underrun or a buffering stall those two clocks diverge,
+    /// and a wall-clock boundary converted to a cache offset by subtraction lands in the
+    /// wrong place. Ages still come off `since`; CUTS come off this.
+    ///
+    /// The source is `HypodjHandler::last_elapsed_secs`, one relaxed atomic load: no
+    /// syscall, no allocation, no write, no fsync, which is what the DIRECTOR SPINE can
+    /// afford. It is a lossy ~1 Hz copy off a droppable broadcast, so a stamped edge
+    /// carries up to about a second of error at each end - the same order as the residual
+    /// ICY error the design study already names. Reading mpv here to do better is not
+    /// available: it would be a blocking FFI call under the State lock, exactly the class
+    /// 97bcd61 removed.
+    pos: Option<f64>,
 }
 
 /// The live now-playing line for `qid` with its provenance and age, or `None` when
@@ -462,6 +485,28 @@ fn live_title(st: &State, qid: QueueId) -> Option<(String, TitleSource, u64)> {
         stamp.map(|s| s.source).unwrap_or(TitleSource::Icy),
         stamp.map(|s| s.since.elapsed().as_secs()).unwrap_or(0),
     ))
+}
+
+/// THE POSITION STAMPS the tape cuts from, and the ONE line that keeps a Shazam hit from
+/// minting a track name through the back door: only a stamp whose source is
+/// [`TitleSource::Icy`] may contribute a boundary.
+///
+/// Our own recognitions stamp `stream_title_since` too (with [`TitleSource::Recognized`]),
+/// so keying on the slot alone would let a hit masquerade as a station-asserted edge and,
+/// the moment `tape::TRACK_SHAPE_PROVEN` is flipped, mint a track-shaped filename from a
+/// guess. `mark` makes exactly this discrimination when it reads [`live_title`]; the tape
+/// reads the same stamp through THIS function, which is a free `&State` reader precisely so
+/// the gate is one testable line rather than an inline read a test can only re-implement.
+fn cut_stamps_for(st: &State, qid: QueueId) -> crate::tape::CutStamps {
+    let icy_start_pos = st.stream_title_since.and_then(|(sq, stamp)| {
+        (sq == qid && stamp.source == TitleSource::Icy).then_some(stamp.pos).flatten()
+    });
+    let (prev_start_pos, prev_end_pos) = st
+        .prev_icy
+        .as_ref()
+        .and_then(|(pq, r)| (*pq == qid).then(|| (r.started_pos, r.retired_pos)))
+        .unwrap_or((None, None));
+    crate::tape::CutStamps { icy_start_pos, prev_start_pos, prev_end_pos }
 }
 
 /// The confident library counterpart for `qid`, but ONLY while its provenance still
@@ -559,6 +604,7 @@ fn apply_icy_stream_meta(
     name: Option<String>,
     title: Option<String>,
     now: Instant,
+    pos: Option<f64>,
 ) -> IcyTransition {
     let new_title = title
         .as_deref()
@@ -582,13 +628,27 @@ fn apply_icy_stream_meta(
     let old_source = st
         .stream_title_since
         .and_then(|(q, s)| (q == queue_id).then_some(s.source));
+    // Where the outgoing line STARTED, so the retirement below can carry a both-ended
+    // span rather than only its end.
+    let old_pos = st
+        .stream_title_since
+        .and_then(|(q, s)| (q == queue_id).then_some(s.pos))
+        .flatten();
 
     // TRAP 1: the station retracted its own line.
     if new_title.is_none() {
         if let (Some(old), Some(TitleSource::Icy)) = (old_title, old_source) {
             meta.title = None;
             clear_recognized_tags(&mut meta);
-            st.prev_icy = Some((queue_id, RetiredTitle { raw: old, retired: now }));
+            st.prev_icy = Some((
+                queue_id,
+                RetiredTitle {
+                    raw: old,
+                    retired: now,
+                    started_pos: old_pos,
+                    retired_pos: pos,
+                },
+            ));
             st.stream_meta = Some((queue_id, meta));
             st.stream_title_since = None;
             return IcyTransition::Cleared;
@@ -606,19 +666,33 @@ fn apply_icy_stream_meta(
             .stream_title_since
             .and_then(|(q, s)| (q == queue_id).then_some(s.since))
             .unwrap_or(now);
-        st.stream_title_since = Some((queue_id, TitleStamp { since, source: TitleSource::Icy }));
+        // The POSITION survives a repeat exactly as the age does: a station re-asserting
+        // the same line did not restart the track, so its start edge has not moved.
+        st.stream_title_since = Some((
+            queue_id,
+            TitleStamp { since, source: TitleSource::Icy, pos: old_pos.or(pos) },
+        ));
         return IcyTransition::NoChange;
     }
 
     // Retire the outgoing title so a press made moments later can NAME it instead of
     // the daemon guessing. A pure memory move under the caller's existing lock.
     if let Some(old) = old_title {
-        st.prev_icy = Some((queue_id, RetiredTitle { raw: old, retired: now }));
+        st.prev_icy = Some((
+            queue_id,
+            RetiredTitle {
+                raw: old,
+                retired: now,
+                started_pos: old_pos,
+                retired_pos: pos,
+            },
+        ));
     }
     meta.title = Some(raw.clone());
     clear_recognized_tags(&mut meta);
     st.stream_meta = Some((queue_id, meta));
-    st.stream_title_since = Some((queue_id, TitleStamp { since: now, source: TitleSource::Icy }));
+    st.stream_title_since =
+        Some((queue_id, TitleStamp { since: now, source: TitleSource::Icy, pos }));
     IcyTransition::Changed { raw }
 }
 
@@ -695,6 +769,11 @@ fn recognize_hit_row(
     library: Option<&crate::library_match::LibraryMatch>,
     station: Option<&str>,
     url: &str,
+    // `offset_secs` is Shazam's own position reading, when it sent one. Recorded as a
+    // labelled GUESS and nothing more: it is a search window, not a cut point, and it
+    // never earns a name (see `recognize::parse_recognize_offset`). It has been arriving
+    // on stdout all along and serde was dropping it.
+    offset_secs: Option<f64>,
 ) -> crate::heard::HeardRow {
     crate::heard::HeardRow {
         src: Some("recognize".to_string()),
@@ -709,6 +788,7 @@ fn recognize_hit_row(
         album: track.album.clone().or_else(|| library.and_then(|m| m.album.clone())),
         year: library.and_then(|m| m.year),
         isrc: track.isrc.clone(),
+        shazam_offset_ms: offset_secs.map(|o| (o * 1000.0) as i64),
         ..crate::heard::HeardRow::now("heard")
     }
 }
@@ -2126,6 +2206,27 @@ pub struct HypodjHandler {
     /// The render-time dedupe window, seconds (`[heard].dedupe_window_secs`). Read
     /// locklessly when a `heard` request is built.
     heard_dedupe_window_secs: AtomicU64,
+    /// THE TAPE root ([`crate::tape`]), or `None` when no directory resolved, the section
+    /// is disabled, or the configured path is one mpv would mangle. `None` degrades the
+    /// TAPE and nothing else: `mark` still resolves the same subject, stars the same
+    /// thing and writes the same row.
+    tape_dir: Mutex<Option<PathBuf>>,
+    /// `[tape].max_bytes`, `[tape].back_secs` and `[tape].max_secs`, read locklessly at
+    /// press time. Meaningless while `tape_dir` is `None`.
+    tape_max_bytes: AtomicU64,
+    tape_back_secs: AtomicU64,
+    tape_max_secs: AtomicU64,
+    /// SINGLE FLIGHT for the tape, in the exact shape of [`Self::recognizing`].
+    ///
+    /// This is not politeness, it is the actor's structural hazard: the mpv actor's
+    /// command arm `continue`s WITHOUT pumping `wait_event`, so a burst of queued dumps
+    /// starves EOF and TimePos for the SUM of their durations, and the command channel
+    /// holds 32. Key repeat, or a mark landing while a recognition dump is in flight,
+    /// would be exactly that burst. A loser records `busy` on its row and never queues a
+    /// command, so a press is always exactly ONE command.
+    taping: AtomicBool,
+    /// A process-wide counter for unique in-flight dump temp names.
+    tape_seq: AtomicU64,
     /// The song id currently protected from eviction as the PENDING-SKIP TARGET, so
     /// the protection is a SINGLE SLOT rather than an ever-growing set: installing a
     /// new skip target releases the previous one, and any track becoming current
@@ -2270,7 +2371,13 @@ const MAX_CONSECUTIVE_EOF_FAILURES: u32 = 3;
 /// two of connect, so 8s is generous; a non-ICY stream never emits them, hence the
 /// timer rather than a pure event wait. When ICY DOES arrive, the fire-time gate sees a
 /// non-blank title and retires the slot (ICY wins).
-const AUTO_IDENTIFY_GRACE: Duration = Duration::from_secs(8);
+///
+/// RAISED FROM 8s, and derived rather than guessed: the sample now comes off mpv's own
+/// cache, which must hold at least `recognize::RECOGNIZE_MIN_DUMP_SECS` before a
+/// fingerprint is possible at all. Firing at 8s would fire straight into the thin-cache
+/// hole and spend a retry wait every single time a stream starts. It costs nothing now
+/// that identify names the audio BEFORE the fire rather than the 11s after it.
+const AUTO_IDENTIFY_GRACE: Duration = Duration::from_secs(15);
 
 /// Saturation ceiling for the TRANSPORT-failure backoff exponent. The re-identify delay
 /// is `interval * 2^min(misses, this)`, so at the cap the delay is `interval * 8`
@@ -2608,6 +2715,12 @@ impl HypodjHandler {
             // No ledger until the daemon plumbs one: every append is then a no-op and
             // playback is byte-identical to a ledger-less build.
             heard_ledger: Mutex::new(None),
+            tape_dir: Mutex::new(None),
+            tape_max_bytes: AtomicU64::new(crate::config::DEFAULT_TAPE_MAX_BYTES),
+            tape_back_secs: AtomicU64::new(crate::config::DEFAULT_TAPE_BACK_SECS),
+            tape_max_secs: AtomicU64::new(crate::config::DEFAULT_TAPE_MAX_SECS),
+            taping: AtomicBool::new(false),
+            tape_seq: AtomicU64::new(0),
             self_ref: OnceLock::new(),
             heard_dir: Mutex::new(None),
             heard_dedupe_window_secs: AtomicU64::new(
@@ -4258,7 +4371,11 @@ impl HypodjHandler {
     pub(crate) fn set_stream_meta(&self, queue_id: QueueId, name: Option<String>, title: Option<String>) {
         let row = {
             let mut st = self.state.lock().unwrap();
-            match apply_icy_stream_meta(&mut st, queue_id, name, title, Instant::now()) {
+            // The position is read BEFORE the lock body needs it and costs one relaxed
+            // atomic load - the only position source the spine can afford (see
+            // `TitleStamp::pos`).
+            let pos = Some(self.last_elapsed_secs());
+            match apply_icy_stream_meta(&mut st, queue_id, name, title, Instant::now(), pos) {
                 IcyTransition::Changed { raw } => {
                     // Build the row while the lock is already held (station + url are
                     // both state reads), then DROP the lock before the send below.
@@ -4297,6 +4414,7 @@ impl HypodjHandler {
     /// leaving a dead-code warning.
     #[cfg(test)]
     pub(crate) fn set_stream_meta_full(&self, queue_id: QueueId, meta: StreamMeta) {
+        let elapsed = self.last_elapsed_secs();
         {
             let mut st = self.state.lock().unwrap();
             // WHOLESALE replace, deliberately unchanged: this is the recognize path,
@@ -4312,7 +4430,15 @@ impl HypodjHandler {
             if changed {
                 st.stream_title_since = Some((
                     queue_id,
-                    TitleStamp { since: Instant::now(), source: TitleSource::Recognized },
+                    TitleStamp {
+                        since: Instant::now(),
+                        source: TitleSource::Recognized,
+                        // A position IS stamped, but it can never mint a track name: the
+                        // tape reads the SOURCE first and refuses anything not
+                        // TitleSource::Icy. Kept because it is still an honest record of
+                        // where our own write happened.
+                        pos: Some(elapsed),
+                    },
                 ));
             }
         }
@@ -4338,6 +4464,7 @@ impl HypodjHandler {
         cover_url: Option<String>,
         library: Option<crate::library_match::LibraryMatch>,
     ) {
+        let elapsed = self.last_elapsed_secs();
         {
             let mut st = self.state.lock().unwrap();
             let names = meta.title.clone();
@@ -4349,7 +4476,12 @@ impl HypodjHandler {
             // station announcement (see [`TitleSource`]).
             st.stream_title_since = Some((
                 queue_id,
-                TitleStamp { since: Instant::now(), source: TitleSource::Recognized },
+                TitleStamp {
+                    since: Instant::now(),
+                    source: TitleSource::Recognized,
+                    // See the sibling write above: stamped, but never a track-name door.
+                    pos: Some(elapsed),
+                },
             ));
             if let Some(url) = cover_url {
                 st.recognized_cover = Some((queue_id, url));
@@ -4645,8 +4777,8 @@ impl HypodjHandler {
     async fn mark(&self, target: crate::heard::MarkTarget) -> MpdResponse {
         use crate::heard::{MarkEntry, MarkInput, MarkSubject};
 
-        // ── ONE lock: snapshot everything the decision and the row need ──────
-        let (input, qid, url, song, song_label, live_match) = {
+        // ── ONE lock: snapshot everything the decision, the row and the TAPE need ──
+        let (input, qid, url, song, song_label, live_match, cut_stamps, tape_titles) = {
             let st = self.state.lock().unwrap();
             let cur = st.reported_current().and_then(|i| st.queue.get(i));
             let (entry, qid, url, song, song_label) = match cur.map(|it| (it.id, &it.entry)) {
@@ -4706,6 +4838,23 @@ impl HypodjHandler {
                     })
                 }),
             };
+            let cut_stamps = qid.map(|q| cut_stamps_for(&st, q)).unwrap_or_default();
+            // The verbatim lines for the sidecar. The LIVE one only when it is really the
+            // station's, for the same reason the positions are gated.
+            let tape_icy = qid.and_then(|q| {
+                st.stream_title_since
+                    .and_then(|(sq, stamp)| (sq == q && stamp.source == TitleSource::Icy).then_some(()))
+                    .and_then(|()| {
+                        st.stream_meta
+                            .as_ref()
+                            .and_then(|(mq, m)| (*mq == q).then(|| m.title.clone()).flatten())
+                    })
+            });
+            let tape_prev = qid.and_then(|q| {
+                st.prev_icy
+                    .as_ref()
+                    .and_then(|(pq, r)| (*pq == q).then(|| r.raw.clone()))
+            });
             (
                 MarkInput {
                     target,
@@ -4723,6 +4872,8 @@ impl HypodjHandler {
                 song,
                 song_label,
                 live_match,
+                cut_stamps,
+                (tape_icy, tape_prev),
             )
         };
 
@@ -4735,6 +4886,40 @@ impl HypodjHandler {
             url: url.clone(),
             ..crate::heard::HeardRow::now("mark")
         };
+
+        // ── THE TAPE, RULE 0: dump WIDE and IMMEDIATELY ─────────────────────
+        // Here, not later. This sits between `mark_decision` (which touches no lock, no
+        // clock and no network) and the two awaits `mark` already has - the ownership
+        // lookup and the star round trip - either of which can outlast a skip. The cache
+        // is destroyed by every skip and station change, so the race window is ~6 ms
+        // rather than a Subsonic round trip. WHETHER TO KEEP the bytes is decided
+        // afterwards, on a local file (see the discard rule below the star).
+        let tape_plan = crate::tape::cut_for(&subject, &cut_stamps);
+        let mut pending: Option<PendingTape> = None;
+        let mut tape_outcome: Option<String> = None;
+        if let (Some(plan), Some(root)) = (tape_plan, self.tape_root()) {
+            match TapingGuard::acquire(&self.taping) {
+                Some(guard) => {
+                    // HELD ACROSS THE DUMP AND NOTHING ELSE. The hazard the flag exists
+                    // for is the mpv command - the actor's command arm does not pump
+                    // events, so two dumps starve EOF for the sum of their durations - and
+                    // that hazard ends when `tape_capture` returns. Holding it on through
+                    // the Subsonic lookup, the star and the commit (easily seconds) would
+                    // make a UI gesture refuse an auto-identify that fires inside the
+                    // window, and the identify path reads a refusal as a transport miss
+                    // and doubles its cadence. A press must never poison the cadence.
+                    let captured = self.tape_capture(&root, plan, qid).await;
+                    drop(guard);
+                    match captured {
+                        Ok(p) => pending = Some(p),
+                        Err(why) => tape_outcome = Some(why),
+                    }
+                }
+                // Key repeat, or a recognition dump already in flight. Impatience must
+                // never queue a second command at the actor.
+                None => tape_outcome = Some("a capture is already in flight".to_string()),
+            }
+        }
 
         // The subject text to resolve ownership for, and the sentence skeleton. Only the
         // arms that produced an UNAMBIGUOUS subject put anything in `resolve`.
@@ -4884,6 +5069,47 @@ impl HypodjHandler {
             }
         }
 
+        // ── THE TAPE, STEP C: decide, then commit ───────────────────────────
+        // The DISCARD RULE, and it is what answers the only real objection to hanging
+        // audio off `mark`. If the star succeeded on a resolved library counterpart the
+        // dump is DELETED: he owns the studio master, and a radio rip of a track he has
+        // just starred is a worse copy with worse provenance. On the ICY stations - which
+        // gave 43 of his 59 logged tracks - that is the COMMON path, so the tape fills up
+        // with exactly the case the design calls honestly UNSOLVED, which is the case
+        // audio is worth anything for.
+        if let Some(p) = pending.take() {
+            if starred && owned.is_some() {
+                drop(p);
+                tape_outcome = Some("you already own the master".to_string());
+            } else {
+                let (icy_title, prev_icy) = tape_titles.clone();
+                let side = crate::tape::TapeSidecar {
+                    // Formatted HERE, not on the spine: this runs in the commit path,
+                    // off the director task, so the timezone lookup chrono does is
+                    // affordable. Left empty it made every sidecar carry a blank field
+                    // beside a perfectly good `at_unix`, which reads as a bug in a file
+                    // whose whole job is to be trustworthy about when.
+                    at: crate::heard::format_local(row.at_unix),
+                    at_unix: row.at_unix,
+                    station: station.clone(),
+                    url: url.clone(),
+                    icy_title,
+                    prev_icy,
+                    mark_at_unix: row.at_unix,
+                    ..Default::default()
+                };
+                match self.tape_commit(p, side).await {
+                    Ok(done) => {
+                        row.tape = Some(done.id);
+                        row.tape_secs = Some(done.secs);
+                        row.cut = Some(done.cut);
+                    }
+                    Err(why) => tape_outcome = Some(why),
+                }
+            }
+        }
+        row.tape_outcome = tape_outcome.clone();
+
         // ── the sentence, which IS what the human reads ──────────────────────
         if sentence.is_empty() {
             sentence = match (&subject, &owned) {
@@ -4923,6 +5149,19 @@ impl HypodjHandler {
             );
         }
 
+        // The TAPE clause, appended LAST and never displacing the sentence about the
+        // subject: a degraded tape degrades the tape, never the mark. It also never claims
+        // a boundary - the duration is the observed one and the cut word is the same one
+        // in the filename and the sidecar.
+        if let (Some(secs), Some(cut)) = (row.tape_secs, row.cut.as_deref()) {
+            sentence.push_str(&format!(
+                " - kept {} of audio ({cut}); `dj heard` has it",
+                crate::heard::human_secs(secs)
+            ));
+        } else if let Some(why) = &row.tape_outcome {
+            sentence.push_str(&format!(" - no audio kept ({why})"));
+        }
+
         // A MOMENT kicks exactly ONE recognition, through the SAME single-flight guard
         // every other caller takes. If one is already in flight it does NOT queue a
         // second: impatience can never create an extra call against an IP-keyed limiter.
@@ -4946,6 +5185,9 @@ impl HypodjHandler {
         // rather than reporting a success it did not achieve.
         let recorded = self.heard_enabled();
         let kind = row.kind.clone().unwrap_or_else(|| "track".to_string());
+        let tape_id = row.tape.clone();
+        let tape_secs = row.tape_secs;
+        let tape_cut = row.cut.clone();
         let ambiguous = row.ambiguous;
         let age = row.subject_age_secs;
         if recorded {
@@ -4963,18 +5205,35 @@ impl HypodjHandler {
         if let Some(a) = age {
             b = b.pair("mark_subject_age", a.to_string());
         }
+        if let Some(id) = tape_id {
+            b = b.pair("mark_tape", id);
+        }
+        if let Some(secs) = tape_secs {
+            b = b.pair("mark_tape_secs", secs.to_string());
+        }
+        if let Some(cut) = tape_cut {
+            b = b.pair("mark_cut", cut);
+        }
         b.build()
     }
 
     /// READ BACK the heard ledger.
     ///
-    /// Rendered DAEMON-side, which is forced rather than stylistic: the state directory
-    /// is mode 0700 under the systemd unit so a client process cannot read the file at
-    /// all, and the client tools are pure MPD/TCP with no knowledge of the state dir. The
-    /// file read runs in `spawn_blocking` (a few hundred lines of `std::fs`), never on
-    /// the spine and never under the state lock, and all the selection, ordering and
-    /// formatting lives in one pure function over `Vec<HeardRow>` so the whole view is
-    /// unit-testable on fixtures.
+    /// Rendered DAEMON-side, which is forced rather than stylistic: the client tools are
+    /// pure MPD/TCP with no knowledge of the state dir, and the render joins ledger rows
+    /// to the tape's own on-disk contents, which only the daemon can see. The file read
+    /// runs in `spawn_blocking` (a few hundred lines of `std::fs`), never on the spine and
+    /// never under the state lock, and all the selection, ordering and formatting lives in
+    /// one pure function over `Vec<HeardRow>` so the whole view is unit-testable on
+    /// fixtures.
+    ///
+    /// A CORRECTION to what this comment used to assert: the state directory is NOT 0700.
+    /// The deployed systemd unit sets `StateDirectory=hypodj` with no `StateDirectoryMode`,
+    /// so it is 0755 on disk and the client tools run as the same user - which is why a
+    /// tape segment's PATH is rendered here and `mpv <that path>` works from his shell with
+    /// no new machinery at all. Daemon-side rendering is the right shape regardless; it
+    /// just is not forced by permissions today. If the directory is ever tightened, a
+    /// `heard play <n>` becomes necessary and that is the trigger to build it.
     async fn heard(&self, q: crate::heard::HeardQuery) -> MpdResponse {
         let dir = self.heard_dir.lock().unwrap().clone();
         let Some(dir) = dir else {
@@ -4985,13 +5244,29 @@ impl HypodjHandler {
                 )
                 .build();
         };
+        let tape_root = self.tape_root();
+        if let crate::heard::HeardAction::Keep { n, on } = q.action {
+            return self.heard_keep(tape_root, n, on).await;
+        }
+        // Kept for the summary line below: the read-back has to say WHERE, and no client
+        // can derive it - the client tools are pure MPD/TCP and know nothing of the state
+        // dir. Without the path a segment is a number he cannot open.
+        let tape_where = tape_root.clone();
         let q = crate::heard::HeardQuery {
             dedupe_window_secs: self.heard_dedupe_window_secs.load(Ordering::Relaxed),
             ..q
         };
         let view = q.view;
-        let read = tokio::task::spawn_blocking(move || crate::heard::read_for(&dir, view)).await;
-        let (rows, unreadable) = match read {
+        let read = tokio::task::spawn_blocking(move || {
+            // ONE blocking hop for both halves: the ledger text and the tape's own
+            // chronological order, which is the single source of the `[n]` numbering the
+            // render prints and `heard keep <n>` resolves against.
+            let ledger = crate::heard::read_for(&dir, view);
+            let ids = tape_root.map(|r| crate::tape::segment_ids(&r)).unwrap_or_default();
+            (ledger, ids)
+        })
+        .await;
+        let ((rows, unreadable), tape_ids) = match read {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "heard: read task failed");
@@ -4999,10 +5274,62 @@ impl HypodjHandler {
             }
         };
         let mut b = MpdResponse::pairs();
-        for line in crate::heard::render(&rows, unreadable, &q) {
+        for line in crate::heard::render(&rows, unreadable, &q, &tape_ids) {
             b = b.pair("heard", line);
         }
+        if !tape_ids.is_empty() {
+            // WHERE, said once rather than repeated on every row. The segments are
+            // `<id>.mkv` in this directory, named oldest-first exactly as the `[n]`
+            // numbering counts, and the state dir is 0755 under the deployed unit - so
+            // `mpv <this path>/<tab complete>` works from his shell today and needs no
+            // `heard play <n>` to exist. A number he cannot open is not a pointer.
+            let path = tape_where
+                .map(|r| r.display().to_string())
+                .unwrap_or_else(|| "the tape".to_string());
+            b = b.pair(
+                "heard",
+                format!(
+                    "{} tape segment(s) in {path}; `heard keep <n>` pins one against eviction",
+                    tape_ids.len()
+                ),
+            );
+        }
         b.build()
+    }
+
+    /// `heard keep <n>` / `heard drop <n>`: pin or unpin tape segment `n` against
+    /// eviction, by the SAME index the render prints.
+    ///
+    /// A pinned pair still COUNTS against `[tape].max_bytes` - a budget that excludes pins
+    /// lies - but is never the thing deleted; if pins alone exceed the budget the sweep
+    /// warns and the next press is refused honestly rather than deleting something he
+    /// flagged. One sidecar rewrite in `spawn_blocking`, never on the spine.
+    async fn heard_keep(&self, root: Option<PathBuf>, n: usize, on: bool) -> MpdResponse {
+        let Some(root) = root else {
+            return MpdResponse::pairs()
+                .pair("heard", "no tape configured (set [tape].dir or a state directory)")
+                .build();
+        };
+        let done = tokio::task::spawn_blocking(move || {
+            let ids = crate::tape::segment_ids(&root);
+            let Some(id) = ids.get(n - 1).cloned() else {
+                return Err(format!("there is no tape segment {n} (the tape holds {})", ids.len()));
+            };
+            crate::tape::set_keep(&root, &id, on)
+                .map(|()| id)
+                .map_err(|e| format!("could not update segment {n}: {e}"))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("the tape task failed: {e}")));
+        match done {
+            Ok(id) if on => MpdResponse::pairs()
+                .pair("heard", format!("kept: {id} will not be evicted"))
+                .build(),
+            Ok(id) => MpdResponse::pairs()
+                .pair("heard", format!("released: {id} can be evicted again"))
+                .build(),
+            Err(why) => MpdResponse::pairs().pair("heard", why).build(),
+        }
     }
 
     /// Star one library song, reusing the exact `playlistadd Starred` semantics (bust
@@ -5038,6 +5365,54 @@ impl HypodjHandler {
             st.library_match = Some((qid, MatchProvenance { m, names, at: Instant::now() }));
         }
         self.notify_change();
+    }
+
+    /// Dump ONE recognition sample off mpv's own demuxer cache.
+    ///
+    /// THERE IS NO FALLBACK TO THE OLD HTTP FETCH, and that is a decision rather than an
+    /// omission. The only case that ever argued for one is a stream whose cache holds less
+    /// than a fingerprint's worth of audio: the seconds right after a load, right after a
+    /// warm switch, and after a stop. Two facts kill it. The daemon SEES that case exactly
+    /// - `DumpFailure::TooThin` is typed and carries the number - so it is never a silent
+    /// failure. And the correct response to "the cache will hold enough in eight more
+    /// seconds" is to WAIT eight seconds and dump again, which costs zero bytes, zero wifi
+    /// wakes, and less wall time than the 11 s refetch it replaces. Waiting strictly
+    /// dominates refetching, and keeping a 9.73 s / 401 KB path that runs only at the
+    /// moment the daemon knows least would be keeping the least-exercised, fastest-rotting
+    /// code in the module. ONE retry, bounded by the caller's own timeout, is the whole
+    /// mechanism.
+    ///
+    /// The wait rides `tokio::time::sleep`, which is VIRTUAL under
+    /// `#[tokio::test(start_paused = true)]` - no wall clock anywhere.
+    async fn recognize_sample(&self) -> Result<crate::tape::TmpGuard, SampleError> {
+        use crate::recognize::{RECOGNIZE_BACK_SECS, RECOGNIZE_MIN_DUMP_SECS};
+        let path = crate::recognize::temp_dump_path();
+        let guard = crate::tape::TmpGuard(path.clone());
+        let max_secs = self.tape_max_secs.load(Ordering::Relaxed) as f64;
+        // Single-flight WITH the mark gesture, HELD PER COMMAND rather than for the whole
+        // call: two dumps queued at the actor would starve EOF for the sum of their
+        // durations, but the deficit wait below is up to ~14 s of pure sleeping, and a
+        // press during it deserves its audio rather than "a capture is already in flight".
+        let first = {
+            let _taping = TapingGuard::acquire(&self.taping).ok_or(SampleError::Busy)?;
+            self.player
+                .dump_cache(RECOGNIZE_BACK_SECS, 0.0, max_secs, RECOGNIZE_MIN_DUMP_SECS, &path)
+                .await
+        };
+        let deficit = match first {
+            Ok(_) => return Ok(guard),
+            Err(crate::player::DumpFailure::TooThin { available }) => {
+                (RECOGNIZE_MIN_DUMP_SECS - available).max(0.0) + 1.0
+            }
+            Err(e) => return Err(SampleError::Failed(e.to_string())),
+        };
+        tokio::time::sleep(Duration::from_secs_f64(deficit)).await;
+        let _taping = TapingGuard::acquire(&self.taping).ok_or(SampleError::Busy)?;
+        self.player
+            .dump_cache(RECOGNIZE_BACK_SECS, 0.0, max_secs, RECOGNIZE_MIN_DUMP_SECS, &path)
+            .await
+            .map(|_| guard)
+            .map_err(|e| SampleError::Failed(e.to_string()))
     }
 
     /// The SHARED recognition body for BOTH the manual `identify` verb (`auto = None`)
@@ -5101,11 +5476,17 @@ impl HypodjHandler {
 
         // Snapshot the ICY/now-playing title latched for THIS qid at capture START (task
         // why1cp6). The surfacing step compares against it to tell a REAL ICY title that
-        // landed DURING the up-to-40s capture (a foreign title ICY-wins must protect) from
-        // one already present (which the recognized hit legitimately supersedes). Own writes
+        // landed DURING the attempt (a foreign title ICY-wins must protect) from one
+        // already present (which the recognized hit legitimately supersedes). Own writes
         // happen only at completion below, never mid-capture, so any CHANGE to a different
         // non-blank title during the window is unambiguously fresh ICY. For the auto cadence
         // the fire gate already guarantees this is blank or our own prior hit.
+        //
+        // THE WINDOW COLLAPSED, and the logic is unchanged because of it rather than in
+        // spite of it: the capture used to be an up-to-40s realtime download, so a real
+        // ICY title could easily land inside it. The sample now comes off mpv's cache in
+        // ~6 ms, so the only remaining window is the Shazam round trip. Still real, still
+        // re-checked.
         let title_at_capture = {
             let st = self.state.lock().unwrap();
             st.stream_meta
@@ -5115,10 +5496,46 @@ impl HypodjHandler {
                 .filter(|t| !t.is_empty())
         };
 
-        // Heavy work off the reactor; no std lock is held across this await.
+        // THE SAMPLE, off mpv's OWN cache. The url is still read above and still cloned
+        // here because `url_for_row` feeds every ledger row this attempt writes - only the
+        // sample's SOURCE changed, not the lock scope.
+        //
+        // What this deleted: `ffmpeg -i <url> -t 11`, a full side-band re-download of a
+        // stream already in RAM, at 0.17 s CPU / 9.73 s wall / 401 KB per call, roughly 65
+        // bytes pulled per byte of fingerprint sent. There is no fallback to it and that is
+        // deliberate - see `recognize_sample`.
         let url_for_row = url.clone();
-        let track = match crate::recognize::recognize_stream_url(url).await {
-            Ok(Some(track)) => track,
+        let _ = url;
+        let sample = match self.recognize_sample().await {
+            Ok(s) => s,
+            // CONTENTION IS NOT A MISS. Another capture (a `mark` press, most often) owns
+            // the one command the actor may block on, so nothing was attempted: no ledger
+            // row can honestly blame the network for it, and the backoff must not double.
+            // Rearm one interval out, exactly as the in-flight debounce above does.
+            Err(SampleError::Busy) => {
+                if let Some(id) = auto {
+                    self.rearm_auto_identify_after_skip(id);
+                }
+                return IdentifyOutcome::Busy;
+            }
+            Err(SampleError::Failed(why)) => {
+                tracing::warn!(reason = %why, "identify: no usable audio in the cache");
+                self.append_heard(crate::heard::HeardRow {
+                    after_mark,
+                    ..miss_row("transport", station.as_deref(), &url_for_row)
+                });
+                self.rearm_auto_identify_after_attempt(qid, AttemptOutcome::TransportMiss, None);
+                return IdentifyOutcome::Error(why);
+            }
+        };
+        // Declared without an initializer deliberately: every other arm below returns, so
+        // there is exactly one path that reads this and it is the one that assigns it.
+        let offset_secs: Option<f64>;
+        let track = match crate::recognize::recognize_local_sample(&sample.0).await {
+            Ok(Some(hit)) => {
+                offset_secs = hit.offset_secs;
+                hit.track
+            }
             Ok(None) => {
                 // CONTENT miss: Shazam was reached and does not know this audio. Leave
                 // any prior ICY stream_meta untouched, record the miss, and back off on
@@ -5242,6 +5659,7 @@ impl HypodjHandler {
                 library.as_ref(),
                 station.as_deref(),
                 &url_for_row,
+                offset_secs,
             )
         });
 
@@ -6427,6 +6845,180 @@ impl HypodjHandler {
     /// silent drop instead of reporting a success it did not achieve.
     fn heard_enabled(&self) -> bool {
         self.heard_ledger.lock().unwrap().is_some()
+    }
+
+    /// Register THE TAPE root and its budget, plumbed once at daemon startup like
+    /// [`Self::set_heard_ledger`]. Absent (disabled, no state dir, or a path mpv would
+    /// mangle) every press behaves exactly as it did before the tape existed.
+    pub fn set_tape(&self, dir: PathBuf, max_bytes: u64, back_secs: u64, max_secs: u64) {
+        *self.tape_dir.lock().unwrap() = Some(dir);
+        self.tape_max_bytes.store(max_bytes, Ordering::Relaxed);
+        self.tape_back_secs.store(back_secs, Ordering::Relaxed);
+        self.tape_max_secs.store(max_secs, Ordering::Relaxed);
+    }
+
+    /// The tape root, when the feature is live.
+    fn tape_root(&self) -> Option<PathBuf> {
+        self.tape_dir.lock().unwrap().clone()
+    }
+
+    /// RULE 0, STEP A: dump WIDE and IMMEDIATELY, deciding nothing about boundaries.
+    ///
+    /// The cache is VOLATILE - a warm switch destroyed 110 s of history while the dump
+    /// still returned success and wrote a zero-byte file - so the press gets bytes on disk
+    /// first (~6 ms) and reasons afterwards, on a local file, with no clock pressure.
+    ///
+    /// The pre-sweep is deliberate: the budget is enforced by MAKING ROOM rather than by
+    /// observing the disk (`hypodj-core` has no `libc`/`rustix`/`nix` dependency and std
+    /// exposes no free-space API; adding a crate for one `statvfs` fails the
+    /// minimal-footprint bar). It is a directory read plus at most a few unlinks in
+    /// `spawn_blocking`, which is nothing like the Subsonic round trip this dump used to
+    /// sit behind - and the honest limitation is that it bounds hypodj's own footprint,
+    /// not the disk.
+    async fn tape_capture(
+        &self,
+        root: &std::path::Path,
+        plan: crate::tape::CutPlan,
+        // The entry the CALLER snapshotted under the State lock. Compared against the
+        // entry the ACTOR was holding when it ran the dump, because those can differ.
+        expect: Option<QueueId>,
+    ) -> Result<PendingTape, String> {
+        let max_bytes = self.tape_max_bytes.load(Ordering::Relaxed);
+        let sweep_root = root.to_path_buf();
+        let pre = tokio::task::spawn_blocking(move || {
+            let _ = std::fs::create_dir_all(&sweep_root);
+            crate::tape::sweep(&sweep_root, max_bytes, 1)
+        })
+        .await
+        .unwrap_or_default();
+        if pre.over_budget_on_pins {
+            return Err("no room: every segment left is one you flagged keep".to_string());
+        }
+
+        let seq = self.tape_seq.fetch_add(1, Ordering::Relaxed);
+        let tmp = crate::tape::tmp_path(root, seq);
+        let mut back = self.tape_back_secs.load(Ordering::Relaxed) as f64;
+        let max_secs = self.tape_max_secs.load(Ordering::Relaxed) as f64;
+        // REACH THE EDGE THE PLAN NAMES. `back_secs` is a fixed ask, but an ICY track can
+        // easily have started before it - `mark previous` puts no bound at all on how old
+        // the retired line is - and a window that stops short of the stamped start cannot
+        // be narrowed to it, so `local_cut` honestly degrades the whole press to a window.
+        // Asking for the edge instead is what makes the exact cut reachable on the stations
+        // that actually publish one. The ask stays an ask: `max_secs` is applied ON the
+        // actor after the cache-state read, so this can never widen the blocked time.
+        if let Some(start_pos) = plan.start_pos.filter(|p| p.is_finite()) {
+            let want = (self.last_elapsed_secs() - start_pos) + crate::tape::EDGE_LEAD_SECS;
+            if want.is_finite() && want > back {
+                back = want;
+            }
+        }
+        // ONE command, never a loop: the actor's command arm does not pump events, so a
+        // queue of dumps would starve EOF for the sum of their durations. `fwd = 0.0` -
+        // the future half of the study's proposed window is deliberately NOT built (see
+        // the tape module doc); a press 30 s into a track still yields that track's first
+        // 30 s, which is more than enough to recognise what was heard.
+        let outcome = self
+            .player
+            .dump_cache(back, 0.0, max_secs, crate::tape::TAPE_MIN_SECS, &tmp)
+            .await
+            .map_err(|e| e.to_string())?;
+        // PROVENANCE. MPD `next` advances the handler's reported current IMMEDIATELY
+        // while the warm switch lands one to two seconds later, so a press inside that
+        // window snapshots the NEW entry and mpv dumps the OLD entry's audio. Observed
+        // live, twice, in both directions, with the codec proving it: a sidecar naming an
+        // mp3 station over aac bytes. The station and url that will be written come from
+        // the caller's snapshot, so if the actor was holding something else the label
+        // would be a lie about whose audio this is - and a wrong label is the one thing
+        // this feature must never produce. Refuse rather than mislabel; the TmpGuard
+        // drops the bytes on the way out.
+        if !crate::tape::attributable(expect.map(|q| q.0), outcome.entry.map(|q| q.0)) {
+            return Err(
+                "the track changed while the tape was being taken; nothing kept".to_string()
+            );
+        }
+        Ok(PendingTape { root: root.to_path_buf(), tmp: crate::tape::TmpGuard(tmp), outcome, plan })
+    }
+
+    /// RULE 0, STEP B and C: verify at the SECOND layer, refine, then commit sidecar-last.
+    ///
+    /// Layer 1 (a byte count on the actor thread) already ran inside the dump. This is the
+    /// layer that catches what a byte count cannot - non-empty but structurally garbage,
+    /// or truncated mid-frame - and it is also the ONLY source of the duration that goes
+    /// into both the filename and the sidecar, so it can never be skipped without losing
+    /// the record.
+    ///
+    /// All of it in `spawn_blocking`: two subprocesses, a rename and one fsyncing sidecar
+    /// write, none of which may go near the spine.
+    async fn tape_commit(&self, pending: PendingTape, mut side: crate::tape::TapeSidecar) -> Result<TapeCommitted, String> {
+        let PendingTape { root, tmp, outcome, plan } = pending;
+        let max_bytes = self.tape_max_bytes.load(Ordering::Relaxed);
+        let station = side.station.clone();
+        let icy_title = side.icy_title.clone();
+        tokio::task::spawn_blocking(move || {
+            let src = tmp.0.clone();
+            // LAYER 2.
+            let probed = crate::tape::probe_secs(&src)
+                .ok_or_else(|| "the capture would not probe as audio".to_string())?;
+            if probed < crate::tape::TAPE_MIN_SECS {
+                return Err(format!("only {probed:.0}s of audio came back"));
+            }
+
+            // REFINEMENT, on a local file: narrow to a stamped ICY edge when one exists.
+            // A failed re-cut keeps the WIDE file - a narrower file that does not exist is
+            // worse than a wide one that does - and honestly downgrades the cut label with
+            // it, so the record never claims a boundary the bytes do not have.
+            // The dump begins at `outcome.start` on the ENTRY timeline; ffmpeg indexes the
+            // local file from zero. `local_cut` does that translation AND the containment
+            // check that keeps the label attached to the bytes: a boundary the dumped
+            // window does not hold degrades to `Cut::Window` there rather than being
+            // clamped to zero while the `icy-edge` claim survives into the record.
+            let local = crate::tape::local_cut(&plan, outcome.start, outcome.end);
+            let mut cut = local.cut;
+            let mut path = src.clone();
+            let mut secs = probed;
+            let mut truncated = local.truncated_at_press;
+            if let Some(off) = local.start {
+                let narrowed = src.with_extension(format!("cut.{}", crate::tape::SEGMENT_EXT));
+                if crate::tape::recut(&src, &narrowed, off, local.end) {
+                    secs = crate::tape::probe_secs(&narrowed).unwrap_or(secs);
+                    path = narrowed;
+                } else {
+                    cut = crate::tape::Cut::Window;
+                    truncated = false;
+                }
+            }
+
+            let id = crate::tape::segment_name(
+                cut,
+                &crate::tape::stamp(side.at_unix),
+                station.as_deref(),
+                icy_title.as_deref(),
+                secs,
+            );
+            side.requested_start = outcome.start;
+            side.requested_end = outcome.end;
+            side.observed_secs = secs;
+            side.pos_at_dump = Some(outcome.pos_at_dump);
+            side.bof_cached = outcome.bof_cached;
+            side.cut = cut.as_str().to_string();
+            side.truncated_at_press = truncated;
+            let id = crate::tape::commit(&root, &path, &id, side).map_err(|e| e.to_string())?;
+            // The re-cut consumed the narrowed file; the original temp (if a re-cut
+            // happened) is still there and the guard below unlinks it.
+            if path == src {
+                // The temp WAS the committed file; it has been renamed away, so the guard
+                // must not chase it. Otherwise the original stays behind the narrowed copy
+                // and the guard unlinks it on the way out.
+                tmp.release();
+            } else {
+                drop(tmp);
+            }
+            // AFTER the commit, so the budget is honoured against what is really on disk.
+            crate::tape::sweep(&root, max_bytes, 1);
+            Ok(TapeCommitted { id, secs: secs.round().max(0.0) as u64, cut: cut.as_str().to_string() })
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("the capture task failed: {e}")))
     }
 
     /// Register the handler's own `Arc`, WEAKLY. Called once by the daemon right after
@@ -9851,10 +10443,16 @@ fn auto_identify_gate(st: &State, id: TimerId, play: PlayState) -> AutoIdentifyG
             }
         }
     }
-    // (4) The deck must be genuinely PLAYING to capture: a paused stream would grab
-    // silence/stale audio. PAUSED (still our stream, no foreign ICY) re-arms keeping
-    // provenance so the resume edge does not re-identify; STOPPED disarms (a stop is
-    // terminal - resume/next re-arms a fresh grace).
+    // (4) THE PAUSED ARM, on its honest premise. It used to rest on "a paused stream would
+    // grab silence/stale audio", which is now FALSE: mpv's Pause is only
+    // `set_property("pause", true)`, so the file stays loaded, the demuxer stays alive, and
+    // the last seconds before the pause point are exactly what he was hearing. The MANUAL
+    // and mark-kicked paths therefore PROCEED on a paused deck, which is a real capability
+    // gain. The AUTO cadence still re-arms, for a different and now correctly stated
+    // reason: re-fingerprinting a FROZEN playhead spends a call against an IP-keyed limiter
+    // on a guaranteed duplicate of the last one. STOPPED disarms (a stop is terminal -
+    // resume/next re-arms a fresh grace), and a stop really does unload the entry, so there
+    // is no cache to read either.
     match play {
         PlayState::Playing => AutoIdentifyGate::Proceed,
         PlayState::Paused => AutoIdentifyGate::RearmPaused,
@@ -9937,6 +10535,64 @@ impl BackoffKind {
 fn auto_identify_delay(interval_secs: u64, kind: BackoffKind, misses: u32) -> Duration {
     let factor = 1u64 << misses.min(kind.cap());
     Duration::from_secs(interval_secs.saturating_mul(factor))
+}
+
+/// A dump that landed on disk and has not been committed yet.
+///
+/// Rule 0 in a type: bytes first, decisions afterwards. Dropping it (the `starred`
+/// discard path, or any early return) unlinks the temp through [`crate::tape::TmpGuard`],
+/// so a press can never leave a nameless file in the tape root.
+struct PendingTape {
+    root: PathBuf,
+    tmp: crate::tape::TmpGuard,
+    outcome: crate::player::DumpOutcome,
+    plan: crate::tape::CutPlan,
+}
+
+/// What a successful commit put on disk, for the ledger row.
+struct TapeCommitted {
+    id: String,
+    secs: u64,
+    cut: String,
+}
+
+/// Why one recognition sample could not be dumped.
+///
+/// TWO SHAPES, and the split is the whole point: `Busy` means NOTHING WAS ATTEMPTED - the
+/// single-flight flag was held by another capture - while `Failed` means the dump ran and
+/// the cache could not serve it. Collapsing them into one string is what let a `mark` press
+/// write a `[transport]` ledger row and back the auto cadence off to `interval * 8`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SampleError {
+    /// Another capture holds the actor's one dump slot.
+    Busy,
+    /// The dump was issued and produced nothing usable.
+    Failed(String),
+}
+
+/// SINGLE FLIGHT for the tape, in the exact shape of [`RecognizingGuard`].
+///
+/// Held ACROSS THE mpv COMMAND and nothing else, because that is exactly the hazard: the
+/// actor's command arm `continue`s without pumping `wait_event`, so N queued dumps starve
+/// EOF and TimePos for the sum of their durations. A loser issues no command at all - it
+/// records `busy` on its row (the press) or returns [`SampleError::Busy`] (the recognition,
+/// where a refusal must never be recorded as a transport miss).
+///
+/// It is deliberately NOT held across the Subsonic lookups, the star or the commit that
+/// follow a press. Those are seconds long and are not an actor hazard, and holding through
+/// them let one UI gesture refuse an auto-identify and double its cadence.
+struct TapingGuard<'a>(&'a AtomicBool);
+
+impl<'a> TapingGuard<'a> {
+    fn acquire(flag: &'a AtomicBool) -> Option<Self> {
+        (!flag.swap(true, Ordering::AcqRel)).then_some(TapingGuard(flag))
+    }
+}
+
+impl Drop for TapingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Resets the handler's in-flight `identify` debounce flag on drop (task f7vnd3i),
@@ -16706,6 +17362,597 @@ mod tests {
             MpdResponse::Pairs(p) => p,
             other => panic!("mark must answer with pairs, never an ACK: {other:?}"),
         }
+    }
+
+    // ── the tape ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_press_releases_the_dump_slot_before_it_talks_to_the_server() {
+        // The width of the hold is the defect, and it is one `drop` in a body no unit test
+        // can time deterministically: the Subsonic lookup and the star are network awaits
+        // a headless handler never reaches, and with a null player the dump fails in
+        // microseconds, so there is no window to observe. A structural guard is the honest
+        // floor here, in the same shape `tape.rs` and `recognize.rs` already use.
+        //
+        // What it pins: between acquiring the tape flag and calling `tape_commit`, the
+        // guard is DROPPED. Held on instead, a press would refuse any auto-identify that
+        // fires during the lookup + star + commit - and `identify_inner` reads a refusal
+        // as a transport failure and doubles its cadence out to `interval * 8`.
+        let whole = include_str!("handler.rs");
+        let src = whole.split("mod tests {").next().expect("a production half");
+        let after = src
+            .split("match TapingGuard::acquire(&self.taping) {")
+            .nth(1)
+            .expect("the press acquires the tape flag");
+        let commit_at = after.find("self.tape_commit(").expect("the press commits");
+        let drop_at = after.find("drop(guard);").expect("the press releases the flag");
+        assert!(
+            drop_at < commit_at,
+            "the tape flag must be released before the commit, not after it"
+        );
+        let held = &after[..drop_at];
+        assert!(held.contains("self.tape_capture("), "it IS held across the dump");
+        assert!(
+            !held.contains("lookup_library_match(") && !held.contains("star_song("),
+            "and across nothing else - a UI gesture must not poison the identify cadence"
+        );
+    }
+
+    /// A fresh tape root, removed FIRST and LAST (the `heard::test_dir` rig). Every tape
+    /// test here removes its own directory in both directions.
+    fn tape_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "hypodj-tapetest-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut v: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mark_on_a_headless_deck_still_answers_pairs_and_keeps_no_audio() {
+        // A degraded tape degrades the TAPE, never the mark. The headless actor has no
+        // demuxer cache, so the dump must fail honestly and the press must still resolve
+        // its subject, write its row, and answer Pairs rather than an ACK.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let (ledger, ldir) = ledger_rig("tape-null");
+        let tdir = tape_dir("null");
+        h.set_heard_ledger(ledger, ldir.clone(), 1800);
+        h.set_tape(tdir.clone(), 64 * 1024 * 1024, 300, 1200);
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("A - One".into()));
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        let pairs = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert!(pair_of(&pairs, "mark_result").is_some(), "the mark still speaks");
+        assert!(pair_of(&pairs, "mark_tape").is_none(), "no segment can exist headless");
+        let sentence = pair_of(&pairs, "mark_result").unwrap();
+        assert!(sentence.contains("no audio kept"), "the reply says so plainly: {sentence}");
+
+        // session + the ICY heard row + the mark row.
+        let rows = settle_rows(&ldir, 3).await;
+        let mark = rows.iter().find(|r| r.ev == "mark").expect("the mark row");
+        assert_eq!(mark.tape, None);
+        assert_eq!(mark.tape_secs, None);
+        assert!(mark.tape_outcome.is_some(), "the row records WHY, not a silent absence");
+        // And nothing nameless is left behind in the tape root.
+        assert_eq!(dir_names(&tdir), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&ldir);
+        let _ = std::fs::remove_dir_all(&tdir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mark_on_a_library_song_never_even_tries_to_capture() {
+        // He already owns it: the audio is in `store/` or one download away with real
+        // provenance and a SongId, and mpv's cache for a local file IS the file. So the
+        // press must not touch the tape at all - not a refusal, not a temp file, not an
+        // outcome word. Same answer `identify` gives on the same input.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let (ledger, ldir) = ledger_rig("tape-song");
+        let tdir = tape_dir("song");
+        h.set_heard_ledger(ledger, ldir.clone(), 1800);
+        h.set_tape(tdir.clone(), 64 * 1024 * 1024, 300, 1200);
+        h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        h.play_for_test(0).await;
+
+        let pairs = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        let sentence = pair_of(&pairs, "mark_result").unwrap();
+        assert!(!sentence.contains("audio"), "the sentence must not mention audio: {sentence}");
+        assert!(pair_of(&pairs, "mark_tape").is_none());
+
+        let rows = settle_rows(&ldir, 2).await;
+        let mark = rows.iter().find(|r| r.ev == "mark").expect("the mark row");
+        assert_eq!(mark.tape, None);
+        assert_eq!(mark.tape_outcome, None, "no attempt was made, so there is nothing to explain");
+        // The directory is not even created: nothing ran.
+        assert!(!tdir.exists(), "a library mark must not touch the tape root at all");
+        let _ = std::fs::remove_dir_all(&ldir);
+        let _ = std::fs::remove_dir_all(&tdir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_tape_single_flight_records_busy_instead_of_queueing_a_second_dump() {
+        // THE actor hazard: the command arm does not pump `wait_event`, so N queued dumps
+        // starve EOF and TimePos for the sum of their durations. Key repeat must therefore
+        // cost ZERO extra commands. Holding the flag by hand stands in for a capture
+        // already in flight.
+        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
+        let (ledger, ldir) = ledger_rig("tape-busy");
+        let tdir = tape_dir("busy");
+        h.set_heard_ledger(ledger, ldir.clone(), 1800);
+        h.set_tape(tdir.clone(), 64 * 1024 * 1024, 300, 1200);
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("A - One".into()));
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        h.taping.store(true, Ordering::Release);
+        let pairs = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(
+            probe.dump.load(Ordering::Relaxed),
+            0,
+            "a losing press must issue NO command at the actor"
+        );
+        let sentence = pair_of(&pairs, "mark_result").unwrap();
+        assert!(sentence.contains("already in flight"), "{sentence}");
+        h.taping.store(false, Ordering::Release);
+
+        let rows = settle_rows(&ldir, 3).await;
+        let mark = rows.iter().find(|r| r.ev == "mark").expect("the mark row");
+        assert_eq!(mark.tape_outcome.as_deref(), Some("a capture is already in flight"));
+        let _ = std::fs::remove_dir_all(&ldir);
+        let _ = std::fs::remove_dir_all(&tdir);
+    }
+
+    /// Is a real ffmpeg toolchain reachable? The daemon's own wrapper puts it on PATH in
+    /// production and the devshell / nix check inputs supply it here; a machine without it
+    /// skips, the same posture `handler_with_null_player` takes.
+    fn ffmpeg_available() -> bool {
+        ["ffmpeg", "ffprobe"].iter().all(|tool| {
+            std::process::Command::new(tool)
+                .arg("-version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// `secs` of tone in matroska at `path`, the container `dump-cache` writes.
+    fn fake_dump(path: &Path, secs: f64) {
+        let raw = path.with_extension("src.mp3");
+        for args in [
+            vec![
+                "-nostdin".to_string(), "-loglevel".into(), "error".into(), "-y".into(),
+                "-f".into(), "lavfi".into(),
+                "-i".into(), format!("sine=frequency=440:sample_rate=44100:duration={secs}"),
+                "-c:a".into(), "libmp3lame".into(),
+                raw.display().to_string(),
+            ],
+            vec![
+                "-nostdin".to_string(), "-loglevel".into(), "error".into(), "-y".into(),
+                "-i".into(), raw.display().to_string(),
+                "-c".into(), "copy".into(),
+                path.display().to_string(),
+            ],
+        ] {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "ffmpeg failed: {args:?}");
+        }
+        let _ = std::fs::remove_file(&raw);
+    }
+
+    fn dump_outcome(start: f64, end: f64) -> crate::player::DumpOutcome {
+        crate::player::DumpOutcome {
+            bytes: 1,
+            start,
+            end,
+            pos_at_dump: end,
+            pos_after: Some(end),
+            bof_cached: false,
+            entry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_commit_writes_a_real_pair_narrows_a_contained_edge_and_sweeps_after() {
+        // THE WRITE PATH, end to end through the shipped code: probe, re-cut, name,
+        // sidecar, rename, budget sweep. Nothing in the tree exercised it - `NullPlayer`
+        // never replies `Ok` to a dump, so `tape_commit` was unreachable from every handler
+        // test - which meant the entry-timeline arithmetic, the sidecar population, the
+        // release/drop branch and the ONLY enforcement of `[tape].max_bytes` against real
+        // committed audio all shipped unproven.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        if !ffmpeg_available() {
+            return;
+        }
+        let tdir = tape_dir("commit");
+        std::fs::create_dir_all(&tdir).unwrap();
+        h.set_tape(tdir.clone(), 64 * 1024 * 1024, 300, 1200);
+
+        // An ICY track that started 40 s into a 60 s window: contained, so the re-cut is
+        // real and the icy-open claim is about the bytes.
+        let tmp = crate::tape::tmp_path(&tdir, 1);
+        fake_dump(&tmp, 60.0);
+        let pending = PendingTape {
+            root: tdir.clone(),
+            tmp: crate::tape::TmpGuard(tmp.clone()),
+            outcome: dump_outcome(940.0, 1000.0),
+            plan: crate::tape::CutPlan {
+                cut: crate::tape::Cut::IcyOpen,
+                start_pos: Some(980.0),
+                end_pos: None,
+            },
+        };
+        let side = crate::tape::TapeSidecar {
+            at_unix: 1_785_000_000,
+            station: Some("Modular Station".into()),
+            url: Some("https://stream.example/modular".into()),
+            icy_title: Some("Kassem Mosse - Untitled".into()),
+            mark_at_unix: 1_785_000_000,
+            ..Default::default()
+        };
+        let done = h.tape_commit(pending, side).await.expect("the commit lands");
+
+        assert!(crate::tape::segment_path(&tdir, &done.id).exists(), "the audio pair half");
+        let written = crate::tape::read_sidecar(&tdir, &done.id).expect("the sidecar half");
+        assert_eq!(written.id, done.id, "self-describing if found alone");
+        assert_eq!(written.cut, "icy-open");
+        assert!(written.truncated_at_press);
+        assert_eq!(written.requested_start, 940.0, "echoed from the ACTOR, not the caller");
+        assert_eq!(written.requested_end, 1000.0);
+        assert_eq!(written.station.as_deref(), Some("Modular Station"));
+        assert_eq!(written.mark_at_unix, 1_785_000_000);
+        // The re-cut really narrowed: a 60 s dump trimmed at +40 s is about 20 s, and the
+        // OBSERVED duration is the ffprobe reading rather than the arithmetic.
+        assert!(
+            (18.0..24.0).contains(&written.observed_secs),
+            "a 40s offset into a 60s window must trim, got {}",
+            written.observed_secs
+        );
+        assert!((done.secs as f64 - written.observed_secs).abs() <= 1.0);
+        // The name still claims nothing while TRACK_SHAPE_PROVEN is false.
+        assert!(done.id.contains("modular-station"));
+        assert!(!done.id.contains("kassem"), "an unproven edge never names a track: {}", done.id);
+        // Neither the temp nor the intermediate narrowed file survives.
+        assert!(!tmp.exists(), "the wide temp is unlinked once the narrow one committed");
+        let leftovers: Vec<String> = dir_names(&tdir)
+            .into_iter()
+            .filter(|n| n.starts_with("tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "nothing nameless is left behind: {leftovers:?}");
+
+        // AND THE BUDGET, against real committed audio. A second press under a byte
+        // budget of 1 evicts the older pair - the post-commit sweep is the only thing
+        // enforcing `[tape].max_bytes`, and nothing had ever run it on a real segment.
+        h.set_tape(tdir.clone(), 1, 300, 1200);
+        let tmp2 = crate::tape::tmp_path(&tdir, 2);
+        fake_dump(&tmp2, 30.0);
+        let second = h
+            .tape_commit(
+                PendingTape {
+                    root: tdir.clone(),
+                    tmp: crate::tape::TmpGuard(tmp2.clone()),
+                    outcome: dump_outcome(2000.0, 2030.0),
+                    plan: crate::tape::CutPlan {
+                        cut: crate::tape::Cut::Window,
+                        start_pos: None,
+                        end_pos: None,
+                    },
+                },
+                crate::tape::TapeSidecar { at_unix: 1_785_003_600, ..Default::default() },
+            )
+            .await
+            .expect("the second commit lands");
+        assert_eq!(
+            crate::tape::segment_ids(&tdir),
+            vec![second.id.clone()],
+            "the oldest unkept pair is evicted by the post-commit sweep"
+        );
+        assert!(!crate::tape::sidecar_path(&tdir, &done.id).exists(), "and its sidecar with it");
+        let _ = std::fs::remove_dir_all(&tdir);
+    }
+
+    #[tokio::test]
+    async fn a_boundary_the_dump_does_not_hold_is_committed_as_a_window() {
+        // `mark previous` has no age bound, so a track that ended before the window a
+        // press could dump is routine. Clamping the offset to zero and keeping the label
+        // committed a file containing NONE of the named track under `cut = "icy-edge"` -
+        // "the file is that track, start to end". The audio must survive; the CLAIM must
+        // not.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        if !ffmpeg_available() {
+            return;
+        }
+        let tdir = tape_dir("overclaim");
+        std::fs::create_dir_all(&tdir).unwrap();
+        h.set_tape(tdir.clone(), 64 * 1024 * 1024, 300, 1200);
+
+        let tmp = crate::tape::tmp_path(&tdir, 1);
+        fake_dump(&tmp, 60.0);
+        let done = h
+            .tape_commit(
+                PendingTape {
+                    root: tdir.clone(),
+                    tmp: crate::tape::TmpGuard(tmp),
+                    outcome: dump_outcome(940.0, 1000.0),
+                    // The previous track ran [100, 640] - six minutes before the window.
+                    plan: crate::tape::CutPlan {
+                        cut: crate::tape::Cut::IcyEdge,
+                        start_pos: Some(100.0),
+                        end_pos: Some(640.0),
+                    },
+                },
+                crate::tape::TapeSidecar {
+                    at_unix: 1_785_000_000,
+                    station: Some("Modular Station".into()),
+                    prev_icy: Some("Someone - Else".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the audio is still kept");
+
+        let written = crate::tape::read_sidecar(&tdir, &done.id).expect("a sidecar");
+        assert_eq!(written.cut, "window", "the label moves to what the bytes support");
+        assert_eq!(done.cut, "window", "and the ledger row says the same");
+        assert!(!written.truncated_at_press);
+        assert!(
+            written.observed_secs > 55.0,
+            "the WIDE file is kept whole - a wider window is never a lie, got {}",
+            written.observed_secs
+        );
+        assert!(done.id.ends_with(&format!("-w{}s", done.secs)), "a window name: {}", done.id);
+        let _ = std::fs::remove_dir_all(&tdir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_press_never_poisons_the_identify_cadence_with_a_transport_miss() {
+        // The tape single-flight exists for ONE hazard, the mpv command. Held on through
+        // the Subsonic lookup, the star and the commit - easily seconds - it made an
+        // auto-identify that fired inside the window fail, and `identify_inner` read that
+        // refusal exactly like an unreachable endpoint: a `[transport]` ledger row plus the
+        // full exponential out to `interval * 8`, because the human pressed a key.
+        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
+        let (ledger, ldir) = ledger_rig("tape-cadence");
+        h.set_heard_ledger(ledger, ldir.clone(), 1800);
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), None);
+
+        // Stand in for a capture in flight, which is all a press is from here.
+        h.taping.store(true, Ordering::Release);
+        let out = h.identify_inner(None, None).await;
+        assert!(
+            matches!(out, IdentifyOutcome::Busy),
+            "contention is BUSY, never a miss"
+        );
+        assert_eq!(
+            probe.dump.load(Ordering::Relaxed),
+            0,
+            "and it issues no command at the actor"
+        );
+        h.taping.store(false, Ordering::Release);
+
+        // The ledger must carry NO row blaming the network for a local collision.
+        let rows = settle_rows(&ldir, 1).await;
+        assert!(
+            !rows.iter().any(|r| r.outcome.as_deref() == Some("transport")),
+            "a press must never write a transport miss: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_thin_cache_waits_the_deficit_and_retries_exactly_once() {
+        // The reason there is NO fallback to the old 9.73 s / 401 KB refetch: the daemon
+        // SEES the thin-cache case exactly (DumpFailure::TooThin carries the number), and
+        // waiting the deficit costs zero bytes and less wall time than the refetch it
+        // replaces. Virtual time throughout - `advance` proves the wait really elapsed
+        // rather than the call returning instantly.
+        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
+        let start = tokio::time::Instant::now();
+        let sampling = h.recognize_sample();
+        tokio::pin!(sampling);
+        // Drive it INTO the wait, then look at the single-flight flag. The wait is pure
+        // sleeping - up to ~14 s of it - and holding the actor's one dump slot through it
+        // would refuse a real `mark` press for that whole stretch with "a capture is
+        // already in flight" while nothing was actually in flight.
+        tokio::select! {
+            _ = &mut sampling => panic!("it must still be waiting the deficit"),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        assert!(
+            !h.taping.load(Ordering::Acquire),
+            "the dump slot is FREE across the deficit wait; only the command holds it"
+        );
+        let res = sampling.await;
+        assert!(res.is_err(), "the headless actor holds no cache either way");
+        assert_eq!(
+            probe.dump.load(Ordering::Relaxed),
+            2,
+            "exactly one retry: never a spin, never a third command"
+        );
+        let waited = start.elapsed();
+        let expected = Duration::from_secs_f64(
+            crate::recognize::RECOGNIZE_MIN_DUMP_SECS - crate::player::PROBE_THIN_AVAILABLE + 1.0,
+        );
+        assert_eq!(waited, expected, "it waits the deficit it was told, and no more");
+        assert!(waited < crate::recognize::RECOGNIZE_TIMEOUT, "and stays inside the outer bound");
+        // The single-flight guard is RELEASED on the way out, so a later press is not
+        // wedged by a failed sample.
+        assert!(!h.taping.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heard_keep_pins_a_segment_by_the_number_the_render_prints() {
+        // The `[n]` numbering has ONE source - the tape's own chronological order - so the
+        // render and `heard keep <n>` can never disagree. A number past the end refuses
+        // honestly rather than pinning something arbitrary.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let (ledger, ldir) = ledger_rig("tape-keep");
+        let tdir = tape_dir("keep");
+        std::fs::create_dir_all(&tdir).unwrap();
+        for id in ["20260801-1000-a-w300s", "20260802-1000-b-w300s"] {
+            std::fs::write(crate::tape::segment_path(&tdir, id), b"audio").unwrap();
+            std::fs::write(
+                crate::tape::sidecar_path(&tdir, id),
+                toml::to_string(&crate::tape::TapeSidecar {
+                    id: id.to_string(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        h.set_heard_ledger(ledger, ldir.clone(), 1800);
+        h.set_tape(tdir.clone(), 64 * 1024 * 1024, 300, 1200);
+
+        let out = h
+            .handle(MpdCommand::Heard(crate::heard::HeardQuery {
+                action: crate::heard::HeardAction::Keep { n: 2, on: true },
+                ..Default::default()
+            }))
+            .await;
+        let MpdResponse::Pairs(p) = out else { panic!("heard keep must answer pairs") };
+        assert!(p.iter().any(|(_, v)| v.contains("20260802-1000-b-w300s")), "{p:?}");
+        assert!(crate::tape::read_sidecar(&tdir, "20260802-1000-b-w300s").unwrap().keep);
+        assert!(!crate::tape::read_sidecar(&tdir, "20260801-1000-a-w300s").unwrap().keep);
+
+        // And the number the render prints is the same number.
+        assert_eq!(
+            crate::heard::tape_index(&crate::tape::segment_ids(&tdir), "20260802-1000-b-w300s"),
+            Some(2)
+        );
+
+        let out = h
+            .handle(MpdCommand::Heard(crate::heard::HeardQuery {
+                action: crate::heard::HeardAction::Keep { n: 9, on: true },
+                ..Default::default()
+            }))
+            .await;
+        let MpdResponse::Pairs(p) = out else { panic!("heard keep must answer pairs") };
+        assert!(p.iter().any(|(_, v)| v.contains("there is no tape segment 9")), "{p:?}");
+        let _ = std::fs::remove_dir_all(&ldir);
+        let _ = std::fs::remove_dir_all(&tdir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_read_back_says_where_the_audio_is_because_no_client_can_derive_it() {
+        // A `[tape 2: 5m, window]` annotation is a number, and a number he cannot open is
+        // not a pointer. The client tools are pure MPD/TCP and know nothing of the state
+        // directory, so the ONE place that can name the path is here. The directory is
+        // 0755 under the deployed unit, so naming it is the whole of `heard play <n>`.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let (ledger, ldir) = ledger_rig("tape-where");
+        let tdir = tape_dir("where");
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(crate::tape::segment_path(&tdir, "20260801-1000-a-w300s"), b"audio").unwrap();
+        h.set_heard_ledger(ledger, ldir.clone(), 1800);
+        h.set_tape(tdir.clone(), 64 * 1024 * 1024, 300, 1200);
+
+        let out = h.handle(MpdCommand::Heard(crate::heard::HeardQuery::default())).await;
+        let MpdResponse::Pairs(p) = out else { panic!("heard must answer pairs") };
+        let joined = p.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains(&tdir.display().to_string()),
+            "the read-back names the directory the segments are in:\n{joined}"
+        );
+        assert!(joined.contains("1 tape segment(s)"), "{joined}");
+        assert!(joined.contains("`heard keep <n>`"), "and how to pin one:\n{joined}");
+        let _ = std::fs::remove_dir_all(&ldir);
+        let _ = std::fs::remove_dir_all(&tdir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_icy_flip_stamps_a_position_but_a_recognition_never_opens_the_track_door() {
+        // THE single most load-bearing line of the naming code. Our own recognitions stamp
+        // `stream_title_since` too, with TitleSource::Recognized - so keying a boundary on
+        // the slot alone would let a Shazam hit masquerade as a station-asserted edge and
+        // mint a track name through the back door. The tape reads the SOURCE first.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.note_elapsed_ms(60_000);
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("A - One".into()));
+        {
+            let st = h.state.lock().unwrap();
+            let (_, stamp) = st.stream_title_since.expect("the ICY line is stamped");
+            assert_eq!(stamp.source, TitleSource::Icy);
+            assert_eq!(stamp.pos, Some(60.0), "the position rides beside the Instant");
+        }
+        // A flip carries the OUTGOING line's start across the rotation, which is what gives
+        // `mark previous` a both-ended cut.
+        h.note_elapsed_ms(300_000);
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("B - Two".into()));
+        {
+            let st = h.state.lock().unwrap();
+            let (_, prev) = st.prev_icy.as_ref().expect("the outgoing line is retired");
+            assert_eq!(prev.started_pos, Some(60.0));
+            assert_eq!(prev.retired_pos, Some(300.0));
+            // The SAME reader the mark path uses, opening on a station line - so the
+            // refusal asserted below is about the SOURCE and not about an inert function.
+            let icy = cut_stamps_for(&st, QueueId(qid));
+            assert_eq!(icy.prev_start_pos, Some(60.0));
+            assert_eq!(icy.prev_end_pos, Some(300.0));
+            assert_eq!(icy.icy_start_pos, Some(300.0), "a STATION line IS a boundary");
+        }
+
+        // Now OUR OWN write, on a fresh entry with no ICY at all.
+        let qid2 = h.enqueue_stream_for_test("https://example.test/mixtape").await;
+        h.play_for_test(1).await;
+        h.note_elapsed_ms(120_000);
+        h.set_stream_surface(
+            QueueId(qid2),
+            StreamMeta { title: Some("Ours - Recognized".into()), ..Default::default() },
+            None,
+            None,
+        );
+        let stamps = {
+            let st = h.state.lock().unwrap();
+            let (_, stamp) = st.stream_title_since.expect("our own line is stamped too");
+            assert_eq!(stamp.source, TitleSource::Recognized);
+            assert_eq!(stamp.pos, Some(120.0), "stamped, but not a door");
+            // THE PRODUCTION READER ITSELF, not a copy of it. `mark` calls exactly this
+            // function; a test that re-implemented the source check inline would pass with
+            // the gate deleted from the daemon.
+            cut_stamps_for(&st, QueueId(qid2))
+        };
+        assert_eq!(stamps.icy_start_pos, None, "a recognized line contributes NO boundary");
+        assert_eq!(
+            crate::tape::cut_for(
+                &crate::heard::MarkSubject::Icy { raw: "Ours - Recognized".into(), age_secs: 90 },
+                &stamps
+            )
+            .unwrap()
+            .cut,
+            crate::tape::Cut::Window,
+            "so the cut stays a window and the filename can never claim a track"
+        );
     }
 
     #[tokio::test(start_paused = true)]

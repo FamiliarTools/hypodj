@@ -89,3 +89,87 @@ The sidecar beside each segment records station name, stream URL, wall clock, th
 On the streams he actually listens to most, this design does not cut - it crops. The measurements say so without ambiguity: zero silence detections in 45 s of NTS 2 down to -30 dBFS, and spectral flux firing 73 times in those 45 s on beats that beatmatching aligns straight through the transition. There is no ICY line to change and no content signal to find. So for an NTS mixtape the honest deliverable is "an 8-minute file that certainly contains what you heard", occasionally narrowed by a Shazam offset that arrives maybe one time in five and drifts with the DJ's pitch fader. Everywhere the cut is exact - Modular Station - he already had a perfect free tracklist and used to paste it by hand. The capture is genuinely retroactive, genuinely free, and genuinely removes the duplicate fetch; the *intelligent boundary detection* in the ask is the part I am delivering least of, precisely where he needs it most, and I would rather say that than ship a flux-threshold detector that produces confident cuts on the beat.
 
 The second weakest point is narrower but would bite in production: I tried twice to bound the RAM ring and failed both times, and my better measurement only proved that the obvious knob governs a different pool than the one dump-cache reads. Until `demuxer-max-bytes` is pinned and RSS is watched across a real multi-hour evening, "the ring is free because it already exists" is true about CPU and network and unverified about memory.
+## What the implementation confirmed, and what it did not
+
+Recorded here rather than in a commit message, because the next person to touch this
+will read the study and not the log.
+
+**Confirmed live, against real libmpv 0.41.0** (`cargo test -p hypodj-core -- --ignored
+live_bounded_dump`, a local socket serving a WAV, `ao=null` throughout, no network):
+
+- A bounded `dump-cache` off a filled cache returns real audio: non-zero bytes, an
+  `ffprobe` duration within 2 s of the requested span, and a `time-pos` reading taken on
+  the same thread in the same instant.
+- The exact-12.000 s cut is byte-exactly **384,044** bytes of mono 16 kHz PCM, with BOTH
+  `-fflags +bitexact` and `-flags +bitexact` (without them ffmpeg writes a 34-byte
+  LIST/INFO chunk and the file is 384,078). The size is now asserted before songrec is
+  ever spawned, so a slice that would silently re-anchor every offset by
+  `(duration - 12) / 2` becomes a loud local failure costing zero Shazam calls.
+
+  **CORRECTED, and the correction is the whole point of the assertion.** That claim held
+  only because the live proof's source was a WAV. A declared container duration is not a
+  decodable duration: on the mp3-in-matroska windows `dump-cache` actually produces, a cut
+  sited flush against `ffprobe`'s `format=duration` comes back SHORT every time - 383,220 B
+  of 384,044 on a 25 s window, 383,724 on a 13 s one, 383,436 on a 90 s one - because mp3
+  carries encoder delay plus 26.12 ms frame granularity. The byte check therefore rejected
+  every sample on his main stations and every attempt was logged as a `transport` miss on
+  the full exponential, without a single Shazam call ever being spent. The cut now leaves
+  `recognize::SONGREC_TAIL_MARGIN_SECS` (0.25 s) of slack at the end and, via a
+  `RECOGNIZE_MIN_DUMP_SECS` of 13.5, at least 1.25 s at the head - an output-side `-ss`
+  inside roughly the first 0.7 s of an mp3 window measured 384,046 B, two samples LONG. The
+  regression test builds mp3, AAC and PCM matroska windows with a real ffmpeg and runs the
+  shipped cut over all three, because a PCM-only proof is structurally incapable of seeing
+  this class.
+- **The volatility rule reproduces against shipped code.** A dump issued immediately
+  after a `SwitchWarmed` (`playlist-play-index 1` + `playlist-remove 0`) FAILS rather
+  than handing back a named file. Nothing that returns `Ok` here has zero bytes, and
+  nothing with zero bytes ever acquires a name.
+
+**Also settled, measured rather than assumed:** one container for everything. A 12 s
+window dumped as `.mkv` is 196,592 B (`ffprobe`: `matroska,webm` / `mp3` / 12.042 s)
+against 308,132 B as `.ts`. Matroska takes mp3, AAC and the HLS elementary streams, and
+it removes the class where a bare mpegts/AAC slice makes songrec emit
+`symphonia_codec_aac` errors that `classify_songrec` cannot classify - which would
+silently convert content misses into transport misses on the full exponential.
+
+**Corrected:** the mpv manual's percent-length form `%n%string` did NOT work against mpv
+0.41.0 (tried twice, with a byte-correct length, with and without the `raw` prefix: no
+file, no error). `raw dump-cache <start> <end> "<path>"` DID work on a path containing a
+space and a `$`. The shipped form is therefore `raw` plus plain double quotes, and the
+residual class - a path containing `"` or `\` - is closed by validating the configured
+tape root once at resolution and running WITHOUT the tape rather than handing mpv an
+ambiguous string.
+
+**STILL UNMEASURED, and the track filename shape is gated on it.** Does an ICY title
+flip land at the PLAYHEAD or at the read position? The basis is a changelog (mpv 0.29.0,
+issue #2453), not a measurement. If it is wrong, mpv holds a steady ~16 s of forward
+cache and an `icy-edge` cut is the previous track shifted 16 s - missing its last 16 s
+and opening with 16 s of the one before. Audible, and precisely the lie discovered on
+playback. So `tape::TRACK_SHAPE_PROVEN` is `false`: both ICY cuts still TRIM (the file
+really is narrower and cleaner) but the NAME stays a window and claims nothing. To flip
+it: on a real ICY station, note the `time-pos` at an `IcyTransition::Changed`, dump
+`[flip_pos - 25, flip_pos + 10]`, locate the audible join, and report the offset. Inside
+about 2 s passes.
+
+**Two more things the label had to be taught, both about claiming more than the bytes
+support.** A [`CutPlan`] is stamped on the entry timeline while the dump is whatever window
+the cache could serve, and `mark previous` puts no age bound on the retired ICY line - so a
+track that ended six minutes ago was routinely stamped outside a 300 s window. Subtracting
+and clamping at zero produced a re-cut that copied the WHOLE window while the sidecar, the
+ledger row and the sentence all still said `icy-edge` ("the file is that track, start to
+end") about a file containing none of it. `tape::local_cut` now checks CONTAINMENT of both
+edges and moves the label to `window` when the dump does not hold them - a wider file is
+never a lie - and `tape_capture` widens its back-ask to reach a stamped start (plus
+`EDGE_LEAD_SECS`) so the exact cut is actually reachable on the stations that publish one.
+Separately, the tape root is now CLAIMED with a `.hypodj-tape` marker at startup exactly as
+the store claims its own: `sweep` deletes by absence of a pair, so `[tape].dir` pointed at
+any directory holding `.mkv` files would have taken them on the first press.
+
+**Still unproven, unchanged from above:** the RAM ceiling. `demuxer-max-bytes` is now
+pinned explicitly at init (that block previously set no cache options at all), but its
+bite was measured once and never confirmed, and the relationship between the packet cache
+and the stream-level byte cache is unestablished - a local probe read
+`file-cache-bytes = 988,082` with `cache-on-disk` off alongside `total-bytes = 627,104`,
+which reproduces the study's observation and shows the manual is wrong about that key,
+without establishing which pool bounds what. Nobody should call the ring free about
+MEMORY until RSS has been watched across a real multi-hour evening.

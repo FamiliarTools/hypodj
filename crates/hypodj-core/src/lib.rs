@@ -35,5 +35,6 @@ pub mod scrobble;
 pub mod station_identity;
 pub mod store;
 pub mod subsonic;
+pub mod tape;
 pub mod timer;
 pub mod viz;

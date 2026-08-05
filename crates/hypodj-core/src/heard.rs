@@ -152,6 +152,44 @@ pub struct HeardRow {
     /// the clock it is modelling even on a session with too few samples to derive one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_secs: Option<u64>,
+    /// The TAPE segment id this press kept, when it kept one ([`crate::tape`]). The join
+    /// is one-way and lossy BY DESIGN: the ledger's retention is about text
+    /// (`keep_sessions`) and the tape's is about audio (`max_bytes`), the two are
+    /// independent, and a row whose segment has been swept renders as the moment it always
+    /// was, annotated that the audio is gone. A sidecar is self-contained, so the other
+    /// direction reads fine too.
+    ///
+    /// Absent on a press that took no audio at all - a library song (he owns it), or a
+    /// press whose star succeeded on a resolved counterpart (a radio rip of a track he now
+    /// has starred is a worse copy with worse provenance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tape: Option<String>,
+    /// The segment's OBSERVED duration, whole seconds - the ffprobe reading, never the
+    /// window that was asked for. `u64` rather than a float because [`HeardRow`] derives
+    /// `Eq`, and because the filename carries the same rounded number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tape_secs: Option<u64>,
+    /// How the segment's boundaries were decided (`crate::tape::Cut::as_str`): `window`,
+    /// `icy-open` or `icy-edge`. The honesty label, recorded beside the pointer so the row
+    /// claims exactly what the filename claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<String>,
+    /// Why no audio was kept, when the press tried and could not. An honest sentence
+    /// beats a silently absent field: the two look identical in a file otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tape_outcome: Option<String>,
+    /// Shazam's own `matches[0].offset`, MILLISECONDS, when it sent one. It has been
+    /// arriving on stdout all along and serde was silently dropping it.
+    ///
+    /// A SEARCH WINDOW, NEVER A CUT POINT. There is no confidence field in the envelope;
+    /// the number reports position in the STUDIO recording, so a DJ's pitch fader skews it
+    /// linearly with elapsed time; and a track dropped in at its second chorus makes
+    /// `now - offset` land in the previous track's tail. It narrows a search. It never
+    /// authorises a cut and it never reaches a filename. Milliseconds as an `i64` (and
+    /// signed - a NEGATIVE offset is the strong case, the track began inside our own
+    /// capture) because [`HeardRow`] derives `Eq` and an `f64` cannot live on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shazam_offset_ms: Option<i64>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -280,6 +318,22 @@ pub fn spawn_heard_ledger(dir: PathBuf, keep_sessions: u32, interval_secs: u64) 
     HeardLedger { tx }
 }
 
+
+/// Format unix seconds as a local RFC3339 stamp, falling back to the raw epoch.
+///
+/// Deliberately a free function rather than inline: it must be callable from the tape
+/// commit path too, and it must NEVER be called from the director spine - chrono re-reads
+/// TZ and lstats /etc/localtime when its per-thread cache is stale, which is a syscall
+/// under the State lock (see `HeardRow::now`).
+pub fn format_local(at_unix: u64) -> String {
+    chrono::DateTime::from_timestamp(at_unix as i64, 0)
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+        })
+        .unwrap_or_else(|| at_unix.to_string())
+}
+
 /// Serialize a batch into one newline-terminated buffer. A row that fails to serialize
 /// is DROPPED with a warn rather than written partially, so one row is always one line
 /// and the line-oriented reader cannot desynchronize. JSON escaping is what makes an ICY
@@ -293,12 +347,7 @@ fn encode_batch(rows: &[HeardRow]) -> String {
         let row = &{
             let mut r = row.clone();
             if r.at.is_empty() {
-                r.at = chrono::DateTime::from_timestamp(r.at_unix as i64, 0)
-                    .map(|utc| {
-                        utc.with_timezone(&chrono::Local)
-                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-                    })
-                    .unwrap_or_else(|| r.at_unix.to_string());
+                r.at = format_local(r.at_unix);
             }
             r
         };
@@ -747,6 +796,20 @@ pub enum HeardView {
     Marks,
 }
 
+/// What a `heard` request ASKS FOR, as opposed to which view it renders.
+///
+/// Two tokens on the EXISTING verb rather than a new one, which is what keeps
+/// `MpdCommand` at zero new variants and `ADVERTISED_MPD_VERSION` untouched by
+/// construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeardAction {
+    /// Read the ledger back (every view).
+    Render,
+    /// Pin tape segment `n` (1-based, in the tape's own chronological order - the same
+    /// number the render prints beside a taped row) against eviction, or unpin it.
+    Keep { n: usize, on: bool },
+}
+
 /// A parsed `heard` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeardQuery {
@@ -757,6 +820,8 @@ pub struct HeardQuery {
     /// enough: real duplicates are interleaved A,B,A,B, which consecutive-dedupe
     /// suppresses none of.
     pub dedupe_window_secs: u64,
+    /// What the request asks for; [`HeardAction::Render`] for every read-back form.
+    pub action: HeardAction,
 }
 
 impl Default for HeardQuery {
@@ -765,6 +830,7 @@ impl Default for HeardQuery {
             view: HeardView::Recent,
             limit: HEARD_DEFAULT_LIMIT,
             dedupe_window_secs: 1800,
+            action: HeardAction::Render,
         }
     }
 }
@@ -941,31 +1007,42 @@ fn never_sampled_pct(interval_secs: u64, track_secs: f64) -> u64 {
 
 /// Render the ledger for a human. PURE over the rows, so every view is unit-testable
 /// on fixtures and runs unconditionally in the sandbox.
-pub fn render(rows: &[HeardRow], unreadable: usize, q: &HeardQuery) -> Vec<String> {
+///
+/// `tape_ids` is every segment currently ON DISK, oldest first (`tape::segment_ids`). It
+/// is the SINGLE source of the `[n]` numbering a taped row prints and `heard keep <n>`
+/// resolves against, so the two can never disagree - and a row whose segment has since
+/// been swept simply finds no index and says the audio is gone, which is the honest half
+/// of a rolling cache rather than a defect.
+pub fn render(
+    rows: &[HeardRow],
+    unreadable: usize,
+    q: &HeardQuery,
+    tape_ids: &[String],
+) -> Vec<String> {
     match q.view {
-        HeardView::Marks => render_marks(rows),
-        HeardView::All => render_all(rows, unreadable),
-        HeardView::Recent => render_recent(rows, unreadable, q),
+        HeardView::Marks => render_marks(rows, tape_ids),
+        HeardView::All => render_all(rows, unreadable, tape_ids),
+        HeardView::Recent => render_recent(rows, unreadable, q, tape_ids),
     }
 }
 
-fn render_marks(rows: &[HeardRow]) -> Vec<String> {
+fn render_marks(rows: &[HeardRow], tape_ids: &[String]) -> Vec<String> {
     let marks: Vec<&HeardRow> = rows.iter().filter(|r| r.ev == "mark").collect();
     if marks.is_empty() {
         return vec!["no marks recorded yet".to_string()];
     }
     let mut out = vec![format!("{} marks, oldest first", marks.len())];
     for r in marks {
-        out.push(mark_line(r));
+        out.push(mark_line(r, tape_ids));
     }
     out
 }
 
-fn render_all(rows: &[HeardRow], unreadable: usize) -> Vec<String> {
+fn render_all(rows: &[HeardRow], unreadable: usize, tape_ids: &[String]) -> Vec<String> {
     let mut out = vec![coverage_line(rows, unreadable)];
     for r in rows.iter().filter(|r| r.ev != "session") {
         out.push(match r.ev.as_str() {
-            "mark" => mark_line(r),
+            "mark" => mark_line(r, tape_ids),
             "miss" => format!(
                 "{}  [{}] {}",
                 hhmm(r),
@@ -978,7 +1055,12 @@ fn render_all(rows: &[HeardRow], unreadable: usize) -> Vec<String> {
     out
 }
 
-fn render_recent(rows: &[HeardRow], unreadable: usize, q: &HeardQuery) -> Vec<String> {
+fn render_recent(
+    rows: &[HeardRow],
+    unreadable: usize,
+    q: &HeardQuery,
+    tape_ids: &[String],
+) -> Vec<String> {
     let mut out = vec![coverage_line(rows, unreadable)];
 
     // MARKS first and visually separated: a press is an event and is NEVER deduped.
@@ -987,7 +1069,7 @@ fn render_recent(rows: &[HeardRow], unreadable: usize, q: &HeardQuery) -> Vec<St
     if !marks.is_empty() {
         out.push(format!("marked ({})", marks.len()));
         for r in &marks {
-            out.push(mark_line(r));
+            out.push(mark_line(r, tape_ids));
         }
         out.push(String::new());
     }
@@ -1051,7 +1133,14 @@ fn heard_line(row: &HeardRow, tag_owned: bool) -> String {
     line
 }
 
-fn mark_line(row: &HeardRow) -> String {
+/// The 1-based position of `id` in the tape's own chronological order, or `None` when the
+/// segment is no longer on disk. The one place the `[n]` numbering is derived, shared by
+/// the render and by `heard keep <n>`.
+pub fn tape_index(tape_ids: &[String], id: &str) -> Option<usize> {
+    tape_ids.iter().position(|s| s == id).map(|i| i + 1)
+}
+
+fn mark_line(row: &HeardRow, tape_ids: &[String]) -> String {
     let mut line = format!("{}  * {}", hhmm(row), row_text(row));
     if row.ambiguous {
         if let Some(prev) = &row.prev_raw {
@@ -1069,6 +1158,19 @@ fn mark_line(row: &HeardRow) -> String {
     }
     if let Some(url) = row.url.as_deref().filter(|u| !u.trim().is_empty()) {
         line.push_str(&format!("  {url}"));
+    }
+    // The audio, last, and only ever as much as is TRUE. A segment still on disk gets its
+    // number, its observed duration and its cut label; one that has been swept says so
+    // rather than printing a number that resolves to nothing.
+    if let Some(id) = row.tape.as_deref().filter(|t| !t.trim().is_empty()) {
+        let secs = row.tape_secs.map(human_secs).unwrap_or_else(|| "?".to_string());
+        let cut = row.cut.as_deref().unwrap_or("window");
+        match tape_index(tape_ids, id) {
+            Some(n) => line.push_str(&format!("  [tape {n}: {secs}, {cut}]")),
+            None => line.push_str("  [tape swept]"),
+        }
+    } else if let Some(why) = row.tape_outcome.as_deref().filter(|w| !w.trim().is_empty()) {
+        line.push_str(&format!("  [no tape: {why}]"));
     }
     line
 }
@@ -1435,7 +1537,7 @@ mod tests {
             owned: true,
             ..row(1500, "mark", "D - Marked")
         });
-        let out = render(&rows, 0, &HeardQuery::default());
+        let out = render(&rows, 0, &HeardQuery::default(), &[]);
         assert!(out[0].starts_with("coverage:"), "{:?}", out);
         let joined = out.join("\n");
         let mark_at = joined.find("D - Marked").expect("the mark is rendered");
@@ -1458,7 +1560,7 @@ mod tests {
             .collect();
         rows.push(HeardRow { owned: true, ..row(9000, "heard", "C - Owned") });
         let q = HeardQuery { view: HeardView::All, ..Default::default() };
-        let out = render(&rows, 0, &q);
+        let out = render(&rows, 0, &q, &[]);
         // 41 rows plus the coverage line, nothing capped away.
         assert_eq!(out.len(), 42, "{out:?}");
         assert!(out.iter().any(|l| l.contains("C - Owned") && l.contains("[owned]")), "{out:?}");
@@ -1466,17 +1568,73 @@ mod tests {
 
     #[test]
     fn render_marks_is_oldest_first_and_honest_when_empty() {
-        let out = render(&[row(1000, "heard", "A - B")], 0, &HeardQuery { view: HeardView::Marks, ..Default::default() });
+        let out = render(&[row(1000, "heard", "A - B")], 0, &HeardQuery { view: HeardView::Marks, ..Default::default() }, &[]);
         assert_eq!(out, vec!["no marks recorded yet".to_string()]);
 
         let rows = vec![
             HeardRow { ev: "mark".into(), ..row(1000, "mark", "First - Mark") },
             HeardRow { ev: "mark".into(), ..row(2000, "mark", "Second - Mark") },
         ];
-        let out = render(&rows, 0, &HeardQuery { view: HeardView::Marks, ..Default::default() });
+        let out = render(&rows, 0, &HeardQuery { view: HeardView::Marks, ..Default::default() }, &[]);
         assert_eq!(out.len(), 3);
         assert!(out[1].contains("First - Mark"), "{out:?}");
         assert!(out[2].contains("Second - Mark"), "{out:?}");
+    }
+
+    #[test]
+    fn a_marked_row_shows_its_audio_and_says_when_the_audio_is_gone() {
+        // The tape is a ROLLING CACHE, not an archive: `keep_sessions` (text) and
+        // `max_bytes` (audio) are independent by construction, so a row outliving its
+        // segment is DESIGNED FOR. It must read as the moment it always was, annotated
+        // that the sound was swept - never as a number that resolves to nothing.
+        let ids = vec![
+            "20260801-1000-a-w300s".to_string(),
+            "20260802-1000-b-w300s".to_string(),
+        ];
+        let here = HeardRow {
+            ev: "mark".into(),
+            tape: Some("20260802-1000-b-w300s".into()),
+            tape_secs: Some(312),
+            cut: Some("window".into()),
+            ..row(1000, "mark", "Something - Heard")
+        };
+        let gone = HeardRow {
+            ev: "mark".into(),
+            tape: Some("20250101-0000-old-w300s".into()),
+            tape_secs: Some(300),
+            cut: Some("window".into()),
+            ..row(2000, "mark", "Older - Moment")
+        };
+        let refused = HeardRow {
+            ev: "mark".into(),
+            tape_outcome: Some("only 3s is buffered so far".into()),
+            ..row(3000, "mark", "Too - Early")
+        };
+        let q = HeardQuery { view: HeardView::Marks, ..Default::default() };
+        let out = render(&[here, gone, refused], 0, &q, &ids);
+        assert!(out[1].contains("[tape 2: 5m, window]"), "{out:?}");
+        assert!(out[2].contains("[tape swept]"), "{out:?}");
+        assert!(!out[2].contains("tape 0"), "a swept segment gets no number: {out:?}");
+        assert!(out[3].contains("[no tape: only 3s is buffered so far]"), "{out:?}");
+        // The numbering has ONE source, shared with `heard keep <n>`.
+        assert_eq!(tape_index(&ids, "20260801-1000-a-w300s"), Some(1));
+        assert_eq!(tape_index(&ids, "nope"), None);
+    }
+
+    #[test]
+    fn a_marked_row_never_prints_a_tape_it_does_not_have() {
+        // The common ICY path: the star succeeded, so the rip was deleted. The row must
+        // read exactly as it did before the tape existed, plus nothing.
+        let plain = HeardRow {
+            ev: "mark".into(),
+            starred: true,
+            owned: true,
+            ..row(1000, "mark", "Owned - Track")
+        };
+        let q = HeardQuery { view: HeardView::Marks, ..Default::default() };
+        let out = render(&[plain], 0, &q, &["20260801-1000-a-w300s".to_string()]);
+        assert!(!out[1].contains("tape"), "{out:?}");
+        assert!(out[1].contains("[starred]"), "{out:?}");
     }
 
     #[test]

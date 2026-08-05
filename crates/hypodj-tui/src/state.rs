@@ -501,6 +501,21 @@ pub struct TuiState {
     /// is taller than the terminal; nav keys scroll it and the renderer clamps it to the
     /// real max so a short terminal can still reach every binding. Reset when help opens.
     pub help_scroll: u16,
+    /// The daemon's `heard` read-back, one entry per rendered line, or empty when the
+    /// overlay has never been asked for. THE TAPE'S ONLY WINDOW in this process: `mark`
+    /// keeps audio, and the segment outlives by weeks the one-line banner that announced
+    /// it, so the read-back needs a surface with more than one row. Rendered daemon-side
+    /// (it joins ledger text to the audio actually on disk), so these are printed
+    /// verbatim and in order and this process interprets nothing.
+    pub heard_lines: Vec<String>,
+    /// Whether the heard/tape overlay is open. A normal-mode modal in the exact shape of
+    /// [`Self::help_open`]: `t`/Esc/q close it, j/k/PgUp/PgDn scroll, everything else is
+    /// swallowed. Modal rather than a transient banner because reading a ledger takes
+    /// longer than the next keypress.
+    pub heard_open: bool,
+    /// The overlay's vertical scroll offset (rows), clamped by the renderer against the
+    /// real content so a short terminal can still reach the last row. Reset on open.
+    pub heard_scroll: u16,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -573,6 +588,9 @@ impl Default for TuiState {
             viz_playing: false,
             help_open: false,
             help_scroll: 0,
+            heard_lines: Vec::new(),
+            heard_open: false,
+            heard_scroll: 0,
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             truecolor: false,
@@ -664,6 +682,21 @@ impl TuiState {
         self.status_msg = Some("reconnected - re-run the phrase".to_string());
     }
 
+    /// Park the daemon's `heard` read-back and open the overlay on it.
+    ///
+    /// Called when the reply LANDS, so the panel is never painted around an answer that
+    /// has not arrived. An empty reply cannot open it: the daemon always renders at
+    /// least a coverage line or a reason, so nothing at all means an older daemon, and
+    /// the worker turns that into a sentence on the bar rather than an empty box.
+    pub fn open_heard(&mut self, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        self.heard_lines = lines;
+        self.heard_open = true;
+        self.heard_scroll = 0;
+    }
+
     /// Map a key to an Intent (or pure state change). The dispatch is per-mode.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
         // Any keypress dismisses a stale banner; the action below may set a new one.
@@ -701,6 +734,32 @@ impl TuiState {
                 }
                 KeyCode::PageUp => {
                     self.help_scroll = self.help_scroll.saturating_sub(10);
+                }
+                _ => {}
+            }
+            return None;
+        }
+        // The heard/tape overlay is the same true modal, and deliberately the same keys:
+        // its own letter, Esc or q close it, j/k/PgUp/PgDn scroll. A ledger takes longer
+        // to read than the next keypress, so it must NOT be dismissed by any key the way
+        // a one-line banner is.
+        if self.heard_open {
+            match key.code {
+                KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.heard_open = false;
+                    self.heard_scroll = 0;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.heard_scroll = self.heard_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.heard_scroll = self.heard_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.heard_scroll = self.heard_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.heard_scroll = self.heard_scroll.saturating_sub(10);
                 }
                 _ => {}
             }
@@ -826,6 +885,13 @@ impl TuiState {
             // `s` stars the SELECTED row; C-s stars the CURRENT playing track.
             Act::FavSelected => self.favorite_selected(),
             Act::FavCurrent => self.favorite_current(),
+            // `t` reads the tape back. `marks` rather than the default view because
+            // THIS key exists for the presses and the audio they kept, and a marked row
+            // is the only row that can carry a segment. The overlay opens when the reply
+            // lands (see `open_heard`), never optimistically: a key that painted an
+            // empty panel and then filled it would be claiming an answer it does not
+            // have yet.
+            Act::Heard => Some(Intent::Command("heard marks".into())),
             Act::PlaySel => self.enter_action(),
             // Space ADDS the selected browse row to the queue (Queue: no-op).
             Act::Enqueue => self.enqueue_selected(),
@@ -2740,6 +2806,83 @@ mod tests {
         s.apply_snapshot(now, vec![item(0), stream]);
         s.selected = 1;
         assert_eq!(s.handle_key(ch('s')), Some(Intent::Command("mark".into())));
+    }
+
+    #[test]
+    fn t_asks_the_daemon_for_the_marks_and_their_audio() {
+        // `mark` keeps the audio of what it marked, and the segment outlives by weeks the
+        // one-line banner that announced it. Without a key for the read-back the only
+        // route was `:heard` typed from memory or leaving for `dj heard` at a shell - a
+        // gesture whose result you cannot look at again.
+        //
+        // `marks` rather than the default view: a marked row is the ONLY row that can
+        // carry a segment, so this key asks for exactly what it is about.
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ch('t')), Some(Intent::Command("heard marks".into())));
+        // And it does NOT open optimistically: a panel painted around an answer still in
+        // flight would be claiming to show something it does not have.
+        assert!(!s.heard_open, "the overlay waits for the reply");
+    }
+
+    #[test]
+    fn the_tape_overlay_is_a_modal_that_scrolls_and_swallows_everything_else() {
+        // A ledger takes longer to read than the next keypress, so this must NOT be
+        // dismissed the way a one-line banner is (any key). Same contract as help.
+        let mut s = TuiState::new();
+        s.open_heard(vec!["3 marks, oldest first".into(), "23:17  * NTS 2  [tape 2: 5m, window]".into()]);
+        assert!(s.heard_open);
+        assert_eq!(s.heard_scroll, 0);
+        // Scrolls.
+        assert_eq!(s.handle_key(ch('j')), None);
+        assert_eq!(s.heard_scroll, 1);
+        assert_eq!(s.handle_key(ch('k')), None);
+        assert_eq!(s.heard_scroll, 0);
+        // Under-scroll saturates rather than wrapping to the last page.
+        assert_eq!(s.handle_key(ch('k')), None);
+        assert_eq!(s.heard_scroll, 0);
+        // Transport and nav keys are SWALLOWED: `p` must not pause the music under a
+        // panel the human is reading, and `>` must not skip the very track being read
+        // about.
+        assert_eq!(s.handle_key(ch('p')), None);
+        assert_eq!(s.handle_key(ch('>')), None);
+        assert_eq!(s.handle_key(ctrl('s')), None, "and a mark cannot fire from under it");
+        assert!(s.heard_open, "none of that closed it either");
+        // Its own letter closes it, and the scroll resets so the next open starts at the
+        // top rather than wherever the last read ended.
+        s.heard_scroll = 4;
+        assert_eq!(s.handle_key(ch('t')), None);
+        assert!(!s.heard_open);
+        assert_eq!(s.heard_scroll, 0);
+        // Esc and q close it too, exactly as they close help.
+        s.open_heard(vec!["a".into(), "b".into()]);
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), None);
+        assert!(!s.heard_open);
+        s.open_heard(vec!["a".into(), "b".into()]);
+        assert_eq!(s.handle_key(ch('q')), None);
+        assert!(!s.heard_open, "q closes the panel rather than quitting the program");
+    }
+
+    #[test]
+    fn an_empty_read_back_never_opens_an_empty_panel() {
+        // The daemon always renders at least a coverage line or a reason, so nothing at
+        // all means an OLDER daemon - which the worker turns into a sentence on the bar.
+        // An empty box would be a key that answered with a blank stare.
+        let mut s = TuiState::new();
+        s.open_heard(Vec::new());
+        assert!(!s.heard_open);
+        assert!(s.heard_lines.is_empty());
+    }
+
+    #[test]
+    fn help_wins_over_the_tape_panel_so_the_modals_cannot_stack() {
+        // Both are normal-mode modals and `?` is checked first; with help open, `t` must
+        // scroll nothing and close nothing - it is swallowed like every other key.
+        let mut s = TuiState::new();
+        s.open_heard(vec!["a".into(), "b".into()]);
+        s.help_open = true;
+        assert_eq!(s.handle_key(ch('t')), None);
+        assert!(s.help_open, "help still owns the keyboard");
+        assert!(s.heard_open, "and the panel under it is untouched");
     }
 
     #[test]

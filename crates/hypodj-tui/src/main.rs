@@ -591,6 +591,13 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             state.status_msg = Some(msg);
             clear_refresh_gate(tx, state);
         }
+        RespKind::Heard(lines) => {
+            // The ledger read-back, whole. It opens ON ARRIVAL rather than at the
+            // keypress so the panel never stands empty around an answer still in
+            // flight, and it does NOT touch the refresh gate: reading is not a mutation
+            // and `heard` cannot move the queue.
+            state.open_heard(lines);
+        }
         RespKind::KnobUnknown(line) => {
             // Graceful knob -> setvol fallback: an OLD daemon ACKs `unknown command
             // "knob"`. Compute a setvol from the last-known volume so the volume keys
