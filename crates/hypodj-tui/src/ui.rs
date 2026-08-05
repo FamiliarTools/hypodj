@@ -1174,6 +1174,32 @@ mod tests {
     }
 
     #[test]
+    fn the_mark_sentence_is_actually_drawn_on_the_bottom_bar() {
+        // The whole gesture rests on the human SEEING what the press did. The worker
+        // turns a `mark_result` pair into a Banner and the render loop parks it in
+        // `status_msg`; this is the last link - that it lands on the bar at the harness
+        // default 60x24, where the ambient wave would otherwise be. A press that
+        // succeeds and shows nothing is the bug this replaces.
+        let mut s = TuiState::new();
+        s.status_msg = Some("noted: Sun Ra - Space at 21:14".into());
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("noted: Sun Ra - Space"), "the mark sentence is drawn:\n{out}");
+
+        // The AMBIGUOUS answer is the one that stars nothing and asks for a word back,
+        // so its lead must be legible at this width rather than starting off-screen.
+        let mut s = TuiState::new();
+        s.status_msg = Some("marked, but which one: \"A - One\" started 6s ago".into());
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("marked, but which one"), "the ambiguity is stated:\n{out}");
+
+        // And the refusal path: a row that cannot be starred says WHY on the same bar.
+        let mut s = TuiState::new();
+        s.status_msg = Some("can't star a smart list".into());
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("can't star a smart list"), "the reason is drawn:\n{out}");
+    }
+
+    #[test]
     fn find_drill_keeps_the_query_visible_above_the_browse_list() {
         let mut s = TuiState::new();
         s.screen = crate::state::Screen::Find;

@@ -399,6 +399,31 @@ fn command_worker(
     }
 }
 
+/// The banner a SUCCESSFUL command reply deserves, or None when the verb had nothing
+/// to say (which is almost all of them - `play`, `next`, `setvol` answer with a bare
+/// OK and the queue itself is the feedback).
+///
+/// Two hypodj verbs exist precisely to answer in words:
+/// - `mark` returns `mark_result`, the one sentence the human reads. Without this the
+///   press would be exactly as silent as the bug it replaces.
+/// - `heard` returns one `heard` pair per rendered line, the FIRST of which is the
+///   mandatory coverage line. The bottom bar is one line, so that is the one shown,
+///   with a count pointing at `dj heard` for the rest rather than pretending there is
+///   no more.
+///
+/// Pure over the pairs, so the whole rule is testable without a socket.
+pub fn success_banner(pairs: &[(String, String)]) -> Option<String> {
+    if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "mark_result") {
+        return Some(v.clone());
+    }
+    let mut heard = pairs.iter().filter(|(k, _)| k == "heard").map(|(_, v)| v.as_str());
+    let first = heard.next()?;
+    match heard.count() {
+        0 => Some(first.to_string()),
+        n => Some(format!("{first}  (+{n} more - run `dj heard`)")),
+    }
+}
+
 /// Run one Req against the command socket, sending any response(s) on `tx`. Returns
 /// true iff a transport drop was seen (caller reconnects). An ACK becomes a friendly
 /// Banner (never a drop); the socket stays live.
@@ -418,7 +443,17 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             Err(Fail::Down) => true,
         },
         Req::Command(line) => match conn.command(&line) {
-            Ok(_) => false,
+            Ok(pairs) => {
+                // A command that SUCCEEDED and had something to say must say it. Most
+                // MPD verbs answer with nothing and stay silent, but `mark` and `heard`
+                // exist to tell the human something, and dropping their pairs on the
+                // floor is the silent-success hole a radio star shipped with: it worked,
+                // and nothing on screen changed at all.
+                if let Some(b) = success_banner(&pairs) {
+                    send(RespKind::Banner(b));
+                }
+                false
+            }
             Err(MpdError::Ack(m)) => {
                 // Graceful knob -> setvol fallback for an old daemon: hand the render
                 // thread the line so it can compute a setvol from the last volume.
@@ -847,5 +882,62 @@ mod tests {
         );
         // No steps at all still yields a generic acknowledgment (never silence).
         assert_eq!(command_armed_line(&[]), "armed");
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn a_mark_reply_becomes_a_banner_so_success_is_never_silent() {
+        use super::success_banner;
+        // THE silent-success hole: starring a radio track's library match succeeded and
+        // nothing on screen changed at all. `mark_result` IS the sentence the human
+        // reads, so it must reach the bottom bar.
+        assert_eq!(
+            success_banner(&pairs(&[
+                ("mark_result", "starred your copy: Takuya Nakamura - Cosmos"),
+                ("mark_kind", "track"),
+                ("mark_starred", "1"),
+            ])),
+            Some("starred your copy: Takuya Nakamura - Cosmos".to_string())
+        );
+        // The ambiguous reply - the one that stars NOTHING - must be just as visible,
+        // because it is the one asking the human for the two explicit words.
+        let ambiguous = "marked, but which one: \"A - One\" started 6s ago, or \"B - Two\" \
+                         which just ended - say `mark this` or `mark previous`";
+        assert_eq!(
+            success_banner(&pairs(&[("mark_result", ambiguous), ("mark_ambiguous", "1")])),
+            Some(ambiguous.to_string())
+        );
+    }
+
+    #[test]
+    fn a_heard_reply_banners_the_coverage_line_and_counts_the_rest() {
+        use super::success_banner;
+        // The bottom bar is ONE line, and the coverage line is the mandated first one -
+        // so it is the one shown, with the rest counted rather than pretended away.
+        let coverage = "sampled 9 times over 4h12m on NTS 2 - 1 named, 6 no-match";
+        assert_eq!(
+            success_banner(&pairs(&[("heard", coverage)])),
+            Some(coverage.to_string())
+        );
+        assert_eq!(
+            success_banner(&pairs(&[
+                ("heard", coverage),
+                ("heard", "21:14  Takuya Nakamura - Cosmos"),
+                ("heard", "21:02  Sun Ra - Space Is The Place"),
+            ])),
+            Some(format!("{coverage}  (+2 more - run `dj heard`)"))
+        );
+    }
+
+    #[test]
+    fn an_ordinary_verb_stays_silent() {
+        use super::success_banner;
+        // `play`, `next`, `setvol` answer with a bare OK and the queue is the feedback -
+        // banners there would be noise, so the rule keys off the pairs, not the verb.
+        assert_eq!(success_banner(&[]), None);
+        assert_eq!(success_banner(&pairs(&[("volume", "42"), ("state", "play")])), None);
     }
 }

@@ -241,14 +241,49 @@ pub enum MpdCommand {
     /// mutates the queue, never arms. See [`FieldCmd`] and [`parse_field`].
     Field(FieldCmd),
 
-    /// `identify` - ON-DEMAND now-playing RECOGNITION for the current raw
-    /// stream (task f7vnd3i). Captures a short side-band clip of the SAME stream
-    /// URL and fingerprints it with `songrec` (open-source Shazam), then surfaces
-    /// the recognized artist / title into the same MPD `Name`/`Title` path as ICY
-    /// metadata. On-demand only (never continuous), so the Shazam endpoint is not
-    /// hammered. NOT a standard MPD command; a hypodj extension. See
+    /// `identify` - now-playing RECOGNITION for the current raw stream (task f7vnd3i).
+    /// Captures a short side-band clip of the SAME stream URL and fingerprints it with
+    /// `songrec` (open-source Shazam), then surfaces the recognized artist / title into
+    /// the same MPD `Name`/`Title` path as ICY metadata.
+    ///
+    /// NOT on-demand only. This verb shares `identify_inner` with an AUTOMATIC cadence
+    /// that has run on no-ICY streams since 7d57c9e (`[recognize].auto`, default ON):
+    /// it fires 8s after a stream starts and then on a rate-limited clock (>= 300s,
+    /// with a content/transport split backoff), and the `mark` gesture kicks a one-shot
+    /// through the same path. What actually protects the endpoint is the layering, not
+    /// the absence of automation: ONE single-flight guard across every caller, an
+    /// interval floor, the backoff, and the ICY-wins disarm that keeps the cadence off
+    /// every station whose titles already name themselves.
+    ///
+    /// NOT a standard MPD command; a hypodj extension, and like its siblings
+    /// (`mark`, `heard`, `knob`, `nl`, `continuation`, `radio`, `station`, `searchall`)
+    /// it is deliberately ABSENT from the `commands` advertisement - that list names the
+    /// real MPD surface, which is what `ADVERTISED_MPD_VERSION` tracks. See
     /// [`crate::handler::HypodjHandler::identify`].
     Identify,
+
+    /// `mark` / `mark this` / `mark previous` - the MARK GESTURE: record what is
+    /// playing, and star it when it is owned.
+    ///
+    /// The press is structurally LATE (a recognition capture starts when the key is
+    /// pressed), so on a track that just ended a naive implementation names the wrong
+    /// thing. The resolution is that the daemon NEVER picks between two plausible
+    /// subjects: a settled STATION title is unambiguous and is starred if owned; a title
+    /// that flipped inside the settle window records BOTH candidates and stars neither,
+    /// and `this` / `previous` are the explicit words that resolve it. A line the
+    /// RECOGNIZER wrote is never read as a station announcement - nothing re-asserts it,
+    /// so it is a subject only while it is fresh. NOT a standard
+    /// MPD command; a hypodj extension, absent from `commands`. See
+    /// [`crate::heard::MarkTarget`] and [`crate::handler::HypodjHandler::mark`].
+    Mark(crate::heard::MarkTarget),
+
+    /// `heard` / `heard all` / `heard marks` / `heard limit <n>` - READ BACK the heard
+    /// ledger. Rendered DAEMON-side rather than client-side, which is forced rather
+    /// than stylistic: the state directory is mode 0700 under the systemd unit, so a
+    /// client process cannot read the ledger at all, and the client tools have no
+    /// knowledge of the state dir. NOT a standard MPD command; a hypodj extension,
+    /// absent from `commands`. See [`crate::heard::HeardQuery`].
+    Heard(crate::heard::HeardQuery),
 
     /// `continuation on|off` / `continuation [status]` - the startle-safe opt-in for
     /// end-of-queue CONTINUATION radio: when the play queue drains, flow into a
@@ -388,6 +423,46 @@ fn parse_continuation(args: &[String], line: &str) -> MpdCommand {
         None | Some("status") => MpdCommand::Continuation(ContinuationCmd::Status),
         Some("on") | Some("1") => MpdCommand::Continuation(ContinuationCmd::On),
         Some("off") | Some("0") => MpdCommand::Continuation(ContinuationCmd::Off),
+        _ => MpdCommand::Unsupported(line.to_string()),
+    }
+}
+
+/// Parse a `mark` request. At most ONE argument (the same arity discipline as
+/// [`parse_continuation`]): the bare form decides from the stream shape, `this` and
+/// `previous` are the two explicit words that resolve a press the daemon refused to
+/// guess at. Any other keyword, and any second argument, is a loud (no-op-safe)
+/// [`MpdCommand::Unsupported`] ACK rather than a silently wrong subject - which on this
+/// verb would mean a wrong row and possibly a wrong star.
+fn parse_mark(args: &[String], line: &str) -> MpdCommand {
+    if args.len() > 1 {
+        return MpdCommand::Unsupported(line.to_string());
+    }
+    match args.first().map(|s| s.as_str()) {
+        None => MpdCommand::Mark(crate::heard::MarkTarget::Auto),
+        Some("this") | Some("current") => MpdCommand::Mark(crate::heard::MarkTarget::This),
+        Some("previous") | Some("prev") | Some("last") => {
+            MpdCommand::Mark(crate::heard::MarkTarget::Previous)
+        }
+        _ => MpdCommand::Unsupported(line.to_string()),
+    }
+}
+
+/// Parse a `heard` request: the bare form, `all`, `marks`, or `limit <n>`. Subcommand
+/// WORDS rather than flags, matching every other hypodj verb here. A bad limit, an
+/// unknown keyword or a stray extra argument is a loud Unsupported ACK.
+fn parse_heard(args: &[String], line: &str) -> MpdCommand {
+    use crate::heard::{HeardQuery, HeardView};
+    let base = HeardQuery::default();
+    match args.first().map(|s| s.as_str()) {
+        None => MpdCommand::Heard(base),
+        Some("all") if args.len() == 1 => MpdCommand::Heard(HeardQuery { view: HeardView::All, ..base }),
+        Some("marks") if args.len() == 1 => {
+            MpdCommand::Heard(HeardQuery { view: HeardView::Marks, ..base })
+        }
+        Some("limit") if args.len() == 2 => match args[1].parse::<usize>() {
+            Ok(n) if n > 0 => MpdCommand::Heard(HeardQuery { limit: n, ..base }),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
         _ => MpdCommand::Unsupported(line.to_string()),
     }
 }
@@ -1278,6 +1353,8 @@ pub fn parse(line: &str) -> MpdCommand {
         "wake" => parse_wake(&args, line),
         "field" => parse_field(&args, line),
         "identify" => MpdCommand::Identify,
+        "mark" => parse_mark(&args, line),
+        "heard" => parse_heard(&args, line),
         "continuation" => parse_continuation(&args, line),
         "radio" => parse_radio(&args, line),
         "station" => parse_station(&args, line),
@@ -1470,6 +1547,43 @@ mod parse_tests {
         // The `identify` custom verb (task f7vnd3i) parses to its own command, never
         // Unsupported, so dispatch cannot forget the on-demand recognition path.
         assert!(matches!(parse("identify"), MpdCommand::Identify));
+    }
+
+    #[test]
+    fn parses_the_mark_verb_and_its_two_explicit_resolutions() {
+        use crate::heard::MarkTarget;
+        assert!(matches!(parse("mark"), MpdCommand::Mark(MarkTarget::Auto)));
+        assert!(matches!(parse("mark this"), MpdCommand::Mark(MarkTarget::This)));
+        assert!(matches!(parse("mark current"), MpdCommand::Mark(MarkTarget::This)));
+        assert!(matches!(parse("mark previous"), MpdCommand::Mark(MarkTarget::Previous)));
+        assert!(matches!(parse("mark prev"), MpdCommand::Mark(MarkTarget::Previous)));
+        assert!(matches!(parse("mark last"), MpdCommand::Mark(MarkTarget::Previous)));
+        // A wrong subject on THIS verb means a wrong row and possibly a wrong star, so
+        // anything unrecognized is a loud no-op ACK rather than a silent Auto.
+        assert!(matches!(parse("mark next"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("mark this one"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("mark previous please"), MpdCommand::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_the_heard_verb_and_its_views() {
+        use crate::heard::{HeardView, HEARD_DEFAULT_LIMIT};
+        match parse("heard") {
+            MpdCommand::Heard(q) => {
+                assert_eq!(q.view, HeardView::Recent);
+                assert_eq!(q.limit, HEARD_DEFAULT_LIMIT);
+            }
+            other => panic!("expected Heard, got {other:?}"),
+        }
+        assert!(matches!(parse("heard all"), MpdCommand::Heard(q) if q.view == HeardView::All));
+        assert!(matches!(parse("heard marks"), MpdCommand::Heard(q) if q.view == HeardView::Marks));
+        assert!(matches!(parse("heard limit 5"), MpdCommand::Heard(q) if q.limit == 5));
+        // A zero, a non-number, an unknown keyword and a stray argument all ACK loud.
+        assert!(matches!(parse("heard limit 0"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("heard limit x"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("heard limit"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("heard everything"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("heard all now"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

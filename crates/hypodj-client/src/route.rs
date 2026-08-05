@@ -170,6 +170,17 @@ fn route_one(verb: &str, args: &[String]) -> Action {
         // round trip and `radio` means the same thing here, on the TUI `:` line, and
         // in raw ncmpcpp.
         "radio" => Action::Command("radio".into()),
+        // The MARK gesture, same shape as `radio`: the bare form ACTS and the DAEMON
+        // resolves the subject, because only it holds the previous ICY title, the
+        // subject ages and the provenance-stamped library match. Routed here so `:mark`
+        // on the TUI command line means exactly what Ctrl-s means, instead of being
+        // handed to a translator that has no mark action at all.
+        "mark" => Action::Command("mark".into()),
+        // Reading the heard ledger back. Rendered DAEMON-side (the state directory is
+        // mode 0700, so no client can read the file), so the client only forwards the
+        // verb. `dj heard` is intercepted BEFORE route() for its flag forms; this arm
+        // is what makes `:heard` work on the TUI command line.
+        "heard" => Action::Command("heard".into()),
         "clear" => Action::ClearConfirm,
         "help" => Action::Help,
         // vol/volume alone (no scalar) is under-specified -> NL.
@@ -213,6 +224,18 @@ fn route_two(verb: &str, arg: &str, args: &[String]) -> Action {
         // "radio this", "radio it", "radio current" - the natural phrasings of the
         // bare gesture, which the daemon spells `radio this`.
         "radio" if is_filler_noun(arg) => Action::Command("radio this".into()),
+        // The two EXPLICIT words that resolve a mark the daemon refused to guess at,
+        // passed through verbatim. Anything else after `mark` is NOT forwarded: on this
+        // verb a wrong subject means a wrong row and possibly a wrong star, so an
+        // unrecognized tail stays NL rather than silently becoming the bare gesture.
+        "mark" if matches!(arg, "this" | "current" | "previous" | "prev" | "last") => {
+            Action::Command(format!("mark {arg}"))
+        }
+        // "mark it", "mark song", "mark track" - the natural phrasings of the bare
+        // gesture, which the daemon spells `mark this`.
+        "mark" if is_filler_noun(arg) => Action::Command("mark this".into()),
+        // The heard views the daemon's parser accepts, passed through verbatim.
+        "heard" if matches!(arg, "all" | "marks") => Action::Command(format!("heard {arg}")),
         // Any other two-token phrase (including "play something") is NL.
         _ => Action::Nl(args.join(" ")),
     }
@@ -402,6 +425,38 @@ mod tests {
         );
         // Nothing else regressed into the radio arm.
         assert_eq!(r("next"), Action::Command("next".into()));
+    }
+
+    #[test]
+    fn route_mark_bare_acts_and_the_two_resolutions_pass_through() {
+        // The bare gesture ACTS and the DAEMON resolves the subject, exactly like
+        // `radio`: the client holds none of what the decision needs.
+        assert_eq!(r("mark"), Action::Command("mark".into()));
+        // The two explicit words that resolve an ambiguous press.
+        assert_eq!(r("mark this"), Action::Command("mark this".into()));
+        assert_eq!(r("mark current"), Action::Command("mark current".into()));
+        assert_eq!(r("mark previous"), Action::Command("mark previous".into()));
+        assert_eq!(r("mark prev"), Action::Command("mark prev".into()));
+        assert_eq!(r("mark last"), Action::Command("mark last".into()));
+        // Natural phrasings of the bare gesture collapse to `mark this`.
+        assert_eq!(r("mark it"), Action::Command("mark this".into()));
+        assert_eq!(r("mark song"), Action::Command("mark this".into()));
+        // A real target is NOT the bare gesture. On THIS verb a wrong subject means a
+        // wrong row and possibly a wrong star, so it stays NL rather than marking
+        // whatever happens to be on air.
+        assert_eq!(r("mark miles davis"), Action::Nl("mark miles davis".into()));
+        assert_eq!(r("mark the whole album"), Action::Nl("mark the whole album".into()));
+    }
+
+    #[test]
+    fn route_heard_and_its_views() {
+        // `:heard` on the TUI command line must reach the daemon verb, never the NL
+        // translator (which has no heard action and would answer with a hint).
+        assert_eq!(r("heard"), Action::Command("heard".into()));
+        assert_eq!(r("heard all"), Action::Command("heard all".into()));
+        assert_eq!(r("heard marks"), Action::Command("heard marks".into()));
+        // An unknown view is NOT forwarded blind - it stays NL.
+        assert_eq!(r("heard everything"), Action::Nl("heard everything".into()));
     }
 
     #[test]

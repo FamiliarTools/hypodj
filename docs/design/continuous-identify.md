@@ -32,11 +32,13 @@ I was wrong on one number and it matters. I said flattening the miss backoff was
 
 Two losses compound, and only one of them is Shazam's fault.
 
-**Sampling loss:** a blind 300s clock against ~4-minute club edits never samples about 45% of tracks at all. Those produce no hit line and no miss line - no trace whatsoever.
+**Sampling loss:** a blind 300s clock against ~4-minute club edits never samples a large share of tracks at all. Those produce no hit line and no miss line - no trace whatsoever.
+
+**Correction to the 45% figure, made while implementing this.** 45% is the MEMORYLESS model, `e^(-L/I) = e^(-0.8) = 0.449`. The daemon does not run a memoryless clock: the cadence is PERIODIC (a fixed rearm, doubling on misses), and a periodic sampler's never-sampled fraction is `1 - L/I` for `I > L`. That is **20% at I=300 and 60% at I=600**, so the number quoted here was both the wrong model and, at the interval this document then recommends, an understatement. Note which direction that cuts: the 600s content-miss cap recommended in section 3 makes the true never-sampled fraction WORSE, not better - which strengthens rather than weakens the argument that a thin file must read as a thin sample. The shipped coverage line prints the periodic figure with `L`, `I` and the model named, so the estimate can be checked instead of trusted (`heard.rs::coverage_line`).
 
 **Recognition loss:** on white labels, club edits and modular improv, unknown. The honest evidence is n=2: one hit on NTS 1 live, one `no match` on "4 To The Floor".
 
-Realistically that is **15-25% of mixtape tracks named**, and a short file next morning is indistinguishable from a quiet evening. So every render carries a coverage line: `sampled 9 times over 4h; ~45% of tracks never sampled`. A thin sample must read as a thin sample.
+Realistically that is **15-25% of mixtape tracks named**, and a short file next morning is indistinguishable from a quiet evening. So every render carries a coverage line, with its model and inputs printed: `sampled 9 times over 4h12m on NTS 2 - 1 named, 6 no-match, 1 network, 1 timeout; this is SAMPLER YIELD, not a hit rate. A periodic 600s clock never samples about 60% of 240s tracks (periodic model 1 - L/I, L=240 assumed)`. A thin sample must read as a thin sample. A session where ICY named everything and the recognizer never ran reads as exactly that, never as a failure.
 
 The refuters also killed my "Stalled means rate-limited" heuristic, correctly, and handed me something better that I missed: **songrec's stderr already says which failure it is**, and recognize.rs:164 sets `.stderr(Stdio::null())`. With a file input it prints `No match for this song` and exits, or `Network unreachable` and exits, and on a genuine 429 it prints nothing and hangs forever. Capture stderr - it is a one-word change on an existing `.output()` call - and you get the taxonomy free: content miss, transport failure, and timeout-with-silent-stderr as the only 429 suspicion. No timing inference, no false day-long self-suspension.
 

@@ -224,6 +224,25 @@ struct State {
     /// song never inherits a station's label and a stale slot from a prior stream
     /// never leaks onto a new entry. EPHEMERAL: never persisted to resume.toml.
     stream_meta: Option<(QueueId, StreamMeta)>,
+    /// When the LIVE now-playing title in [`Self::stream_meta`] started standing AND WHO
+    /// WROTE IT, keyed by the same qid. The mark gesture's whole honest-subject rule is
+    /// an age comparison against this, but the age means OPPOSITE things per writer: an
+    /// old ICY line has SETTLED (the station is still announcing it), an old recognized
+    /// line has DECAYED (nothing re-confirms it). Reading the text without the source is
+    /// what let a press an hour after a mixtape hit star an hour-old track - see
+    /// [`TitleSource`] and [`live_title`], the one reader everything goes through. A
+    /// `tokio::time::Instant`, so every age in the mark path is VIRTUAL under
+    /// `#[tokio::test(start_paused = true)]` with no clock plumbing. EPHEMERAL: never
+    /// persisted; cleared with `stream_meta`.
+    stream_title_since: Option<(QueueId, TitleStamp)>,
+    /// The ICY title this entry was showing BEFORE the current one, keyed by the same
+    /// qid. Nothing carried the previous title before this: `set_stream_meta` replaced
+    /// the slot wholesale, so on a press made moments after a flip the daemon had no
+    /// way to name what had just ended. It does not GUESS between the two - it records
+    /// both and stars neither - but it cannot even do that without retaining this.
+    /// A pure memory move written under the SAME lock that already replaces
+    /// `stream_meta`, so it is spine-safe by construction. EPHEMERAL: never persisted.
+    prev_icy: Option<(QueueId, RetiredTitle)>,
     /// The recognized Shazam cover-art URL for the current raw stream (task
     /// f7vnd3i), keyed by the LATCHED [`QueueId`] it belongs to, or `None` when no
     /// on-demand `identify` has matched the current entry. Surfaced toward the
@@ -241,7 +260,16 @@ struct State {
     /// the art pane to LOCAL library bytes and fills album/date/genre that Shazam left
     /// blank. EPHEMERAL: never persisted; cleared on every play edge alongside
     /// `stream_meta` so a stale match can never leak onto a new track.
-    library_match: Option<(QueueId, crate::library_match::LibraryMatch)>,
+    ///
+    /// CARRIES ITS PROVENANCE, and that is a correctness fix rather than bookkeeping.
+    /// The slot is written at exactly ONE site (an identify HIT) and used to be retired
+    /// at exactly one site (a qid change), so the no-match, error, Advanced and
+    /// IcyLanded exit paths all left it standing: on a mixtape a single hit at 20:00
+    /// kept `X-MatchUri` pointing at that track for the rest of the entry, and a star an
+    /// hour later silently starred a track from an hour ago. Every reader now goes
+    /// through [`live_library_match`], which honors the slot only while its provenance
+    /// still stands. See [`MatchProvenance`].
+    library_match: Option<(QueueId, MatchProvenance)>,
     /// End-of-queue CONTINUATION-radio arming toggle (`continuation on|off`). When
     /// ON and a station is configured, the [`Self::advance_on_eof`] drain edge flows
     /// into the continuation station instead of stopping silent. Default OFF and
@@ -359,6 +387,332 @@ struct ContinuationWarm {
     title: String,
 }
 
+/// An ICY title that has been superseded on the SAME stream entry (see
+/// [`State::prev_icy`]). Kept so the mark gesture can NAME what just ended instead of
+/// guessing, and so `mark previous` has something exact to act on.
+#[derive(Debug, Clone)]
+struct RetiredTitle {
+    /// The verbatim ICY line, never a re-rendered split.
+    raw: String,
+    /// When it stopped being the live title.
+    retired: Instant,
+}
+
+/// A resolved library counterpart PLUS what makes it still true (see
+/// [`State::library_match`]).
+///
+/// The slot alone cannot say whether it still describes what is playing, which is how
+/// the stale-match wrong-star happened. These two fields answer that:
+/// - `names` is the now-playing title the match was resolved FOR. While the live stream
+///   title still equals it, the match is by definition current.
+/// - `at` is when it resolved. With NO live title at all (a mixtape) there is nothing to
+///   compare against, so freshness is the only honest bound and it is a short one.
+#[derive(Debug, Clone)]
+struct MatchProvenance {
+    m: crate::library_match::LibraryMatch,
+    /// The title this match was resolved for, or `None` when it was resolved with no
+    /// title in play at all.
+    names: Option<String>,
+    at: Instant,
+}
+
+/// WHO wrote the now-playing line standing in [`State::stream_meta`].
+///
+/// The two are not interchangeable and the whole stale-subject class comes from having
+/// treated them as one field with no provenance:
+/// - an ICY line is the STATION saying what is on air right now, and it is re-asserted
+///   (or cleared) by the station itself, so age is evidence that it has SETTLED;
+/// - a recognized line is OUR OWN write from a songrec hit. It named what was on air
+///   when it resolved and NOTHING ever re-confirms or retracts it, so age is evidence
+///   that it has DECAYED. On the mixtapes - where auto-identify is the only writer -
+///   the difference is a wrong star an hour later versus an honest "moment".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleSource {
+    /// Announced by the station over ICY.
+    Icy,
+    /// Written by our own recognition ([`HypodjHandler::set_stream_surface`]).
+    Recognized,
+}
+
+/// When the live title started standing, and who wrote it. `Copy`, so the whole thing
+/// rides the existing `Option<(QueueId, _)>` slot with no allocation.
+#[derive(Debug, Clone, Copy)]
+struct TitleStamp {
+    since: Instant,
+    source: TitleSource,
+}
+
+/// The live now-playing line for `qid` with its provenance and age, or `None` when
+/// nothing is standing. The ONE reader every subject decision goes through, so no caller
+/// can read the text without also seeing who wrote it.
+///
+/// An unstamped title (only reachable from a test that seeds `stream_meta` directly)
+/// reads as freshly-arrived ICY, which is the shape every production writer stamps.
+fn live_title(st: &State, qid: QueueId) -> Option<(String, TitleSource, u64)> {
+    let raw = st
+        .stream_meta
+        .as_ref()
+        .and_then(|(mq, m)| (*mq == qid).then(|| m.title.as_deref()).flatten())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?
+        .to_string();
+    let stamp = st.stream_title_since.and_then(|(sq, s)| (sq == qid).then_some(s));
+    Some((
+        raw,
+        stamp.map(|s| s.source).unwrap_or(TitleSource::Icy),
+        stamp.map(|s| s.since.elapsed().as_secs()).unwrap_or(0),
+    ))
+}
+
+/// The confident library counterpart for `qid`, but ONLY while its provenance still
+/// stands. PURE over a `&State` snapshot, so the whole staleness rule is one testable
+/// function that every reader shares (`X-MatchUri`, the cover source, the mark verb) -
+/// which is what makes it structurally impossible for one of them to drift back into
+/// serving a stale match.
+///
+/// It stands when the qid matches AND either
+/// (a) a STATION title still equals the title the match was resolved for, or
+/// (b) no station title names the entry and the match is younger than
+///     [`crate::heard::MATCH_SUBJECT_FRESH_SECS`].
+/// A station title that DIFFERS retires it immediately: the stream moved on.
+///
+/// Branch (a) is deliberately restricted to [`TitleSource::Icy`]. On the identify path
+/// ONE write publishes both the live title and the provenance `names` from the SAME
+/// string, so comparing them would be self-satisfying: the equality holds forever and
+/// the slot would never retire on exactly the no-ICY mixtapes it was written for. A
+/// title we recognized ourselves is therefore no evidence at all, and freshness is the
+/// only honest bound left.
+fn live_library_match(st: &State, qid: QueueId) -> Option<&crate::library_match::LibraryMatch> {
+    let (q, prov) = st.library_match.as_ref()?;
+    if *q != qid {
+        return None;
+    }
+    match live_title(st, qid) {
+        // A STATION title names the entry: the match holds only while it is THAT title.
+        // A match resolved without a subject is superseded the moment one arrives.
+        Some((live, TitleSource::Icy, _)) => prov
+            .names
+            .as_deref()
+            .and_then(|names| (live == names).then_some(&prov.m)),
+        // Our own recognized line, or no line at all (the mixtape case): freshness.
+        Some((_, TitleSource::Recognized, _)) | None => (prov.at.elapsed()
+            < Duration::from_secs(crate::heard::MATCH_SUBJECT_FRESH_SECS))
+        .then_some(&prov.m),
+    }
+}
+
+/// What one ICY dispatch did to the live title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IcyTransition {
+    /// A genuinely NEW title is now standing. Carries it verbatim, for the ledger row.
+    Changed { raw: String },
+    /// The station RETRACTED its title and none is standing now. The outgoing line is
+    /// retired (so `mark previous` can still name it) but nothing new arrived, so there
+    /// is no row to write - a row records what played, not what stopped.
+    Cleared,
+    /// Nothing about the title moved: a name-only dispatch over a recognized line, an
+    /// identical repeat, or a blank over a blank. No rotation, no age reset, no row.
+    NoChange,
+}
+
+/// Drop the split recognition tags from an overlay. They described the track the
+/// recognizer named; once the station's own line moves (or is retracted) they would put
+/// a stale artist beside a fresh line - or beside no line at all.
+fn clear_recognized_tags(meta: &mut StreamMeta) {
+    meta.artist = None;
+    meta.track_title = None;
+    meta.album = None;
+    meta.date = None;
+    meta.genre = None;
+    meta.label = None;
+}
+
+/// Apply one ICY dispatch to the stream overlays, and report whether the TITLE actually
+/// moved. PURE over `&mut State` plus the caller's clock reading, so the two traps below
+/// are unit-testable under a paused clock with no player and no lock ceremony.
+///
+/// TRAP 1, a MISSING `icy-title`. mpv observes the WHOLE `metadata` property map
+/// (`observe_property("metadata", Format::Node, 3)`, player.rs) and `select_icy_metadata`
+/// drops blank values, so a dispatch reaching here with `title: None` does NOT mean "this
+/// dispatch carried no title information" - it means the map has no non-blank `icy-title`
+/// RIGHT NOW, which is what a station sends between tracks (`StreamTitle=''`). Latching
+/// the old line through that is how a track that already ended keeps ageing past
+/// [`crate::heard::MARK_SETTLE_SECS`] and gets starred five minutes later. So an ICY
+/// retraction CLEARS the ICY line - and retires it into `prev_icy`, so nothing is lost
+/// and `mark previous` can still name it.
+///
+/// It clears only an ICY-sourced line, though. A title WE recognized was never the
+/// station's to retract, and the mixtapes send `icy-name` with no `icy-title` by
+/// definition - so on exactly the streams auto-identify serves, a wholesale clear would
+/// wipe every recognition the moment the station name arrived. See [`TitleSource`].
+///
+/// TRAP 2, an IDENTICAL REPEAT. mpv fires `metadata` on any map change and nothing
+/// upstream compares against the prior value, so the same title can arrive twice. The
+/// comparison happens BEFORE anything moves, so a repeat rotates nothing, resets no age,
+/// and emits no row. (Genuinely interleaved repeats - the real A,B,A,B shape - are still
+/// logged faithfully and collapsed at RENDER time, never suppressed at the source.) It
+/// does re-stamp the SOURCE, because a station repeating a line is the station claiming
+/// it, even if we had written that same text ourselves first.
+fn apply_icy_stream_meta(
+    st: &mut State,
+    queue_id: QueueId,
+    name: Option<String>,
+    title: Option<String>,
+    now: Instant,
+) -> IcyTransition {
+    let new_title = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    // Whatever this entry is already showing. A slot belonging to a DIFFERENT qid is not
+    // ours to read (a track change routes through clear_stream_meta_except, but a
+    // dispatch can land on either side of that edge).
+    let existing = st
+        .stream_meta
+        .as_ref()
+        .and_then(|(q, m)| (*q == queue_id).then(|| m.clone()));
+
+    let mut meta = existing.clone().unwrap_or_default();
+    if let Some(n) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        meta.name = Some(n.to_string());
+    }
+
+    let old_title = existing.as_ref().and_then(|m| m.title.clone());
+    let old_source = st
+        .stream_title_since
+        .and_then(|(q, s)| (q == queue_id).then_some(s.source));
+
+    // TRAP 1: the station retracted its own line.
+    if new_title.is_none() {
+        if let (Some(old), Some(TitleSource::Icy)) = (old_title, old_source) {
+            meta.title = None;
+            clear_recognized_tags(&mut meta);
+            st.prev_icy = Some((queue_id, RetiredTitle { raw: old, retired: now }));
+            st.stream_meta = Some((queue_id, meta));
+            st.stream_title_since = None;
+            return IcyTransition::Cleared;
+        }
+        // Nothing latched, or a recognized line this dispatch has no standing to touch.
+        st.stream_meta = Some((queue_id, meta));
+        return IcyTransition::NoChange;
+    }
+
+    let raw = new_title.expect("checked above");
+    if old_title.as_deref() == Some(raw.as_str()) {
+        // TRAP 2: an identical repeat. The age survives; only the provenance moves.
+        st.stream_meta = Some((queue_id, meta));
+        let since = st
+            .stream_title_since
+            .and_then(|(q, s)| (q == queue_id).then_some(s.since))
+            .unwrap_or(now);
+        st.stream_title_since = Some((queue_id, TitleStamp { since, source: TitleSource::Icy }));
+        return IcyTransition::NoChange;
+    }
+
+    // Retire the outgoing title so a press made moments later can NAME it instead of
+    // the daemon guessing. A pure memory move under the caller's existing lock.
+    if let Some(old) = old_title {
+        st.prev_icy = Some((queue_id, RetiredTitle { raw: old, retired: now }));
+    }
+    meta.title = Some(raw.clone());
+    clear_recognized_tags(&mut meta);
+    st.stream_meta = Some((queue_id, meta));
+    st.stream_title_since = Some((queue_id, TitleStamp { since: now, source: TitleSource::Icy }));
+    IcyTransition::Changed { raw }
+}
+
+/// The best STATION label known for `qid`, or `None`. Priority mirrors the cover chain:
+/// a resolved station identity outranks the ICY `icy-name`, because an NTS mixtape sends
+/// an empty or generic icy-name while the catalogue carries the real show title. Falls
+/// back to nothing rather than to the URL - a ledger row keeps the url in its own field,
+/// so a raw url in the station column would be noise, not information.
+fn station_label(st: &State, qid: QueueId) -> Option<String> {
+    st.station_identity
+        .as_ref()
+        .and_then(|(q, i)| (*q == qid).then(|| i.name.clone()).flatten())
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| {
+            st.stream_meta
+                .as_ref()
+                .and_then(|(q, m)| (*q == qid).then(|| m.name.clone()).flatten())
+                .filter(|n| !n.trim().is_empty())
+        })
+}
+
+/// The station label for a sentence, falling back to a neutral phrase rather than to a
+/// raw URL (a URL reads as noise mid-sentence and the row carries it in its own field).
+fn station_or(station: &Option<String>) -> String {
+    station.clone().unwrap_or_else(|| "this stream".to_string())
+}
+
+/// The stream URL of the entry latched to `qid`, or `None` when it is gone or is a
+/// library song.
+fn stream_url_for(st: &State, qid: QueueId) -> Option<String> {
+    st.queue.iter().find(|it| it.id == qid.0).and_then(|it| match &it.entry {
+        QueueEntry::Stream { url, .. } => Some(url.clone()),
+        QueueEntry::Song(_) => None,
+    })
+}
+
+/// One automatic ICY row. NEVER starred and never owned: a star stays something the
+/// human pressed.
+fn icy_heard_row(
+    raw: &str,
+    class: crate::heard::IcyClass,
+    station: Option<&str>,
+    url: Option<&str>,
+) -> crate::heard::HeardRow {
+    let (artist, title) = crate::heard::split_icy_title(raw);
+    crate::heard::HeardRow {
+        src: Some("icy".to_string()),
+        station: station.map(str::to_string),
+        url: url.map(str::to_string),
+        kind: Some(class.as_str().to_string()),
+        raw: Some(raw.to_string()),
+        artist,
+        title,
+        ..crate::heard::HeardRow::now("heard")
+    }
+}
+
+/// One recognition MISS row. `outcome` carries songrec's own taxonomy word, which is
+/// what makes the two backoff curves auditable in the file after the fact.
+fn miss_row(outcome: &str, station: Option<&str>, url: &str) -> crate::heard::HeardRow {
+    crate::heard::HeardRow {
+        src: Some("recognize".to_string()),
+        station: station.map(str::to_string),
+        url: Some(url.to_string()),
+        outcome: Some(outcome.to_string()),
+        ..crate::heard::HeardRow::now("miss")
+    }
+}
+
+/// One recognition HIT row. Records ownership but never a star.
+fn recognize_hit_row(
+    track: &crate::recognize::RecognizedTrack,
+    now_playing: Option<&str>,
+    library: Option<&crate::library_match::LibraryMatch>,
+    station: Option<&str>,
+    url: &str,
+) -> crate::heard::HeardRow {
+    crate::heard::HeardRow {
+        src: Some("recognize".to_string()),
+        station: station.map(str::to_string),
+        url: Some(url.to_string()),
+        kind: Some("track".to_string()),
+        raw: now_playing.map(str::to_string),
+        artist: track.artist.clone(),
+        title: track.title.clone(),
+        owned: library.is_some(),
+        match_uri: library.map(|m| format!("song/{}", m.song_id.0)),
+        album: track.album.clone().or_else(|| library.and_then(|m| m.album.clone())),
+        year: library.and_then(|m| m.year),
+        isrc: track.isrc.clone(),
+        ..crate::heard::HeardRow::now("heard")
+    }
+}
+
 /// The pending auto-identify slot (see [`State::pending_auto_identify`], task
 /// bspk8v5). Guard-scoped like [`ContinuationWarm`]: the held [`TimerGuard`] cancels
 /// the armed timer on drop (RAII disarm), so every disarm edge is one field write.
@@ -374,10 +728,19 @@ struct AutoIdentify {
     /// timer; a late fire of a cancelled id tombstones (the timer live-set idiom).
     #[allow(dead_code)]
     guard: TimerGuard,
-    /// Consecutive no-match/error count, driving the exponential backoff (delay =
-    /// interval * 2^misses, saturating at [`AUTO_IDENTIFY_MAX_MISSES`] so an
-    /// unmatchable mix decays to one attempt per interval*8, never hammering Shazam).
-    misses: u32,
+    /// Consecutive CONTENT-miss count (Shazam was reached and did not know the audio),
+    /// driving its own backoff capped at ONE doubling ([`AUTO_IDENTIFY_MAX_CONTENT_MISSES`]).
+    /// A content miss says nothing about whether the NEXT track is recognizable, so
+    /// decaying it to interval*8 only bought 40 minutes of deafness on a mixtape.
+    content_misses: u32,
+    /// Consecutive TRANSPORT-failure count (the network, the endpoint, a stalled
+    /// capture), keeping the FULL exponential up to [`AUTO_IDENTIFY_MAX_MISSES`] - when
+    /// the path is broken, backing off hard is exactly right.
+    transport_misses: u32,
+    /// Which kind the LAST completed attempt was, so a re-arm that is neither a hit nor
+    /// a miss (a paused fire) resumes at the position it was already at. `None` until
+    /// the first miss.
+    last_miss: Option<BackoffKind>,
     /// The now-playing title THIS slot last wrote via `set_stream_meta` (own-hit
     /// provenance). The fire gate compares live `stream_meta.title` against it: an equal
     /// title is our own hit (PROCEED - keep the cadence), a DIFFERENT non-blank title is
@@ -589,6 +952,9 @@ impl Default for State {
             vol_dither_state: 0x8B7F_A1C2_D3E4_F506,
             // No live stream metadata until a stream connects and pushes ICY tags.
             stream_meta: None,
+            // No ICY title is standing, and nothing has been retired, until one arrives.
+            stream_title_since: None,
+            prev_icy: None,
             // No recognized cover until an on-demand `identify` matches.
             recognized_cover: None,
             // No library counterpart until a recognition resolves one.
@@ -1736,6 +2102,30 @@ pub struct HypodjHandler {
     /// a SHORT scope that clones the `Arc` out - the store's own methods are then
     /// called with NO handler lock held.
     audio_store: Mutex<Option<Arc<AudioStore>>>,
+    /// The HEARD LEDGER handle ([`crate::heard`]), plumbed once at daemon startup when a
+    /// ledger directory resolves. `Mutex<Option<..>>` rather than `OnceLock` for the
+    /// same reason as [`Self::audio_store`]: an unset ledger (no state dir, the feature
+    /// disabled) is a valid, PERMANENT state, not a not-yet. Cloned out under a short
+    /// lock and never held across an await.
+    ///
+    /// A missing ledger degrades the RECORD only. Every write site is
+    /// [`Self::append_heard`], which no-ops without one, and the `mark` verb says so out
+    /// loud rather than reporting a success it did not achieve.
+    heard_ledger: Mutex<Option<crate::heard::HeardLedger>>,
+    /// A WEAK self-reference, registered once by the daemon. The `mark` gesture's
+    /// no-ICY branch must KICK a recognition without waiting up to 40s for it, and
+    /// `tokio::spawn` needs an owned `'static` handle that the `&self` MPD dispatch does
+    /// not have. WEAK so it can never keep the handler alive (the same posture the
+    /// store's server-back hook takes). Unset in a raw handler, in which case the kick
+    /// is honestly reported as skipped rather than silently dropped.
+    self_ref: OnceLock<std::sync::Weak<HypodjHandler>>,
+    /// Where the ledger's session files live, so the `heard` read-back can find the
+    /// newest one. Separate from the handle because reading is a different capability
+    /// from writing (and the read runs in `spawn_blocking`, never on any hot path).
+    heard_dir: Mutex<Option<PathBuf>>,
+    /// The render-time dedupe window, seconds (`[heard].dedupe_window_secs`). Read
+    /// locklessly when a `heard` request is built.
+    heard_dedupe_window_secs: AtomicU64,
     /// The song id currently protected from eviction as the PENDING-SKIP TARGET, so
     /// the protection is a SINGLE SLOT rather than an ever-growing set: installing a
     /// new skip target releases the previous one, and any track becoming current
@@ -1882,11 +2272,25 @@ const MAX_CONSECUTIVE_EOF_FAILURES: u32 = 3;
 /// non-blank title and retires the slot (ICY wins).
 const AUTO_IDENTIFY_GRACE: Duration = Duration::from_secs(8);
 
-/// Saturation ceiling for the auto-identify no-match backoff exponent. The re-identify
-/// delay is `interval * 2^min(misses, this)`, so at the cap the delay is `interval * 8`
-/// (40 min at the default 300s interval): an all-night unmatchable mix costs one short
-/// capture per ~40 min, never a tight loop, and a later matchable track still gets named.
+/// Saturation ceiling for the TRANSPORT-failure backoff exponent. The re-identify delay
+/// is `interval * 2^min(misses, this)`, so at the cap the delay is `interval * 8`
+/// (40 min at the default 300s interval). When the network or the endpoint is broken,
+/// backing off this hard is exactly right - the failure is about the PATH, and hammering
+/// a path that is down helps nobody.
 const AUTO_IDENTIFY_MAX_MISSES: u32 = 3;
+
+/// Saturation ceiling for the CONTENT-miss backoff exponent: ONE doubling, so the
+/// cadence goes 300s, then 600s, and stays flat there.
+///
+/// A content miss means Shazam was REACHED and did not know that audio. It says nothing
+/// whatsoever about whether the next track is recognizable, so decaying it to
+/// `interval * 8` bought only 40 minutes of deafness on exactly the material (the
+/// mixtapes) where the recognizer is the ONLY hope. The measured cost of the flat cap is
+/// ~48 calls a day instead of 96 on the old fused curve, while the next recognizable
+/// track is caught within ten minutes instead of forty. Splitting the two kinds is what
+/// residual (a)'s stderr taxonomy exists to make possible: before it, both arrived as an
+/// indistinguishable empty stdout.
+const AUTO_IDENTIFY_MAX_CONTENT_MISSES: u32 = 1;
 
 /// The perceptual dB at which the wake/resume ramp-in first becomes HEARABLE, 20 dB
 /// above the -60 dB synth floor. The resume path reads the wall-clock LEAD - the
@@ -2201,6 +2605,14 @@ impl HypodjHandler {
             // No store until the daemon plumbs one: a raw handler resolves every
             // play to a stream URL exactly as before.
             audio_store: Mutex::new(None),
+            // No ledger until the daemon plumbs one: every append is then a no-op and
+            // playback is byte-identical to a ledger-less build.
+            heard_ledger: Mutex::new(None),
+            self_ref: OnceLock::new(),
+            heard_dir: Mutex::new(None),
+            heard_dedupe_window_secs: AtomicU64::new(
+                crate::config::DEFAULT_HEARD_DEDUPE_WINDOW_SECS,
+            ),
             store_skip_pin: Mutex::new(None),
             restore_placeholders: Mutex::new(Vec::new()),
             consecutive_eof_failures: AtomicU32::new(0),
@@ -3823,8 +4235,50 @@ impl HypodjHandler {
     /// await (the Mutex-never-across-await invariant); State is mutated through
     /// interior mutability (`&self`), never `&mut self`. Keyed by the latched
     /// identity so the slot can only ever decorate the entry it came from.
+    ///
+    /// ON THE DIRECTOR SPINE. `director.rs` calls this SYNCHRONOUSLY from the same
+    /// `select!` task that drives EOF and queue advance, with no spawn and no timeout,
+    /// so everything here must be a pure memory move: one short lock for the field
+    /// writes, then a LOCK-FREE channel send for the ledger row. "Pure memory move" is
+    /// load-bearing and was once not quite true - the ledger row used to format a LOCAL
+    /// timestamp here, and chrono re-reads TZ and lstats /etc/localtime when its cache
+    /// is stale, which is a syscall under this lock. The row now carries only unix
+    /// seconds off the spine and is formatted in the writer's spawn_blocking hop. NOTHING may write a
+    /// file from here - [`crate::resume::atomic_write_bytes`] does a whole-file rewrite
+    /// plus `sync_all`, and an fsync ahead of the next `player_events.recv()` is an
+    /// AUDIBLE defect (this class already shipped a skip-EOF bleed once).
+    /// [`crate::heard::HeardLedger::append`] is a non-async fn returning `()`, so a
+    /// future edit cannot even await a write from here.
+    ///
+    /// TWO ICY TRAPS, both handled in [`apply_icy_stream_meta`]: an absent `icy-title`
+    /// is the station RETRACTING its line (mpv delivers the whole map, so absent means
+    /// absent) and must clear an ICY-sourced title while leaving a title WE recognized
+    /// alone, and mpv re-fires `metadata` on any map change, so an identical repeat must
+    /// rotate nothing. Neither may emit a row.
     pub(crate) fn set_stream_meta(&self, queue_id: QueueId, name: Option<String>, title: Option<String>) {
-        self.set_stream_meta_full(queue_id, StreamMeta { name, title, ..Default::default() });
+        let row = {
+            let mut st = self.state.lock().unwrap();
+            match apply_icy_stream_meta(&mut st, queue_id, name, title, Instant::now()) {
+                IcyTransition::Changed { raw } => {
+                    // Build the row while the lock is already held (station + url are
+                    // both state reads), then DROP the lock before the send below.
+                    let class = crate::heard::icy_class(&raw, station_label(&st, queue_id).as_deref());
+                    Some(icy_heard_row(
+                        &raw,
+                        class,
+                        station_label(&st, queue_id).as_deref(),
+                        stream_url_for(&st, queue_id).as_deref(),
+                    ))
+                }
+                // A retraction ends a listen, it does not start one, so there is nothing
+                // to record. The line it retired stays reachable through `mark previous`.
+                IcyTransition::Cleared | IcyTransition::NoChange => None,
+            }
+        };
+        self.notify_change();
+        if let Some(row) = row {
+            self.append_heard(row);
+        }
     }
 
     /// Store a FULL [`StreamMeta`] overlay (station + now-playing line + the split
@@ -3834,10 +4288,33 @@ impl HypodjHandler {
     /// discipline as that method: the std state lock is held ONLY for the field write
     /// and dropped BEFORE `notify_change`, never across an await; mutated through
     /// `&self` interior mutability.
+    ///
+    /// TEST-ONLY since the mark work: the ICY path now goes through
+    /// [`Self::set_stream_meta`] (which must NOT replace wholesale, so a name-only
+    /// dispatch cannot null a latched title) and the recognize path publishes its whole
+    /// overlay through [`Self::set_stream_surface`]. Kept because several tests seed a
+    /// full overlay directly, and `#[cfg(test)]` is how that stays honest rather than
+    /// leaving a dead-code warning.
+    #[cfg(test)]
     pub(crate) fn set_stream_meta_full(&self, queue_id: QueueId, meta: StreamMeta) {
         {
             let mut st = self.state.lock().unwrap();
+            // WHOLESALE replace, deliberately unchanged: this is the recognize path,
+            // which publishes a complete overlay it computed itself. The narrow ICY
+            // entry point above is the one that must not clobber. The title-age stamp
+            // still moves, because the now-playing line genuinely changed.
+            let changed = st
+                .stream_meta
+                .as_ref()
+                .map(|(q, m)| *q != queue_id || m.title != meta.title)
+                .unwrap_or(true);
             st.stream_meta = Some((queue_id, meta));
+            if changed {
+                st.stream_title_since = Some((
+                    queue_id,
+                    TitleStamp { since: Instant::now(), source: TitleSource::Recognized },
+                ));
+            }
         }
         self.notify_change();
     }
@@ -3863,11 +4340,29 @@ impl HypodjHandler {
     ) {
         {
             let mut st = self.state.lock().unwrap();
+            let names = meta.title.clone();
             st.stream_meta = Some((queue_id, meta));
+            // STAMPED AS OURS, and re-stamped on every hit even when the text repeats: a
+            // second hit on the same track is a fresh CONFIRMATION that it is still on
+            // air, which is the only thing that keeps a recognized line current. The
+            // source is what stops the mark path from reading our own write as a settled
+            // station announcement (see [`TitleSource`]).
+            st.stream_title_since = Some((
+                queue_id,
+                TitleStamp { since: Instant::now(), source: TitleSource::Recognized },
+            ));
             if let Some(url) = cover_url {
                 st.recognized_cover = Some((queue_id, url));
             }
-            st.library_match = library.map(|m| (queue_id, m));
+            // The match is STAMPED with what makes it true: the title it was resolved
+            // for and when. Without that stamp the slot outlives its subject on every
+            // exit path but a qid change, which is precisely the stale wrong-star.
+            st.library_match = library.map(|m| {
+                (
+                    queue_id,
+                    MatchProvenance { m, names: names.clone(), at: Instant::now() },
+                )
+            });
         }
         self.notify_change();
     }
@@ -4054,6 +4549,19 @@ impl HypodjHandler {
                 st.library_match = None;
             }
         }
+        // Drop the retired ICY title and the live title's age stamp on the same edge:
+        // both are per-entry facts, and a previous title leaking onto a NEW stream would
+        // make a mark name something from a different station entirely.
+        if let Some((qid, _)) = &st.prev_icy {
+            if keep != Some(*qid) {
+                st.prev_icy = None;
+            }
+        }
+        if let Some((qid, _)) = &st.stream_title_since {
+            if keep != Some(*qid) {
+                st.stream_title_since = None;
+            }
+        }
     }
 
     /// ON-DEMAND now-playing RECOGNITION for the current raw stream (task f7vnd3i).
@@ -4080,7 +4588,7 @@ impl HypodjHandler {
     async fn identify(&self) -> MpdResponse {
         // The MANUAL verb: run the shared body (no auto timer), map the outcome to the
         // exact ACK/pairs surface the verb always emitted.
-        match self.identify_inner(None).await {
+        match self.identify_inner(None, None).await {
             IdentifyOutcome::Hit { track, now_playing, library } => {
                 identify_hit_response(&track, now_playing.as_deref(), library.as_ref())
             }
@@ -4098,6 +4606,440 @@ impl HypodjHandler {
         }
     }
 
+    /// THE MARK GESTURE: record what is playing, and star it when it is owned.
+    ///
+    /// The press is structurally LATE, because a recognition capture starts when the key
+    /// is pressed rather than when the ear caught something. This is resolved per stream
+    /// shape, and the rule that makes it safe is enforced structurally rather than by
+    /// care: THE DAEMON NEVER PICKS BETWEEN TWO PLAUSIBLE SUBJECTS.
+    ///
+    /// The subject is chosen from the live line's PROVENANCE, never from its text alone
+    /// (see [`TitleSource`] and [`live_title`]): only a STATION line may take the settled
+    /// door below, because only a station re-asserts what it announced. A line the
+    /// recognizer wrote is a decaying claim and takes the freshness-bounded door.
+    ///
+    /// - A SETTLED ICY title (at least [`crate::heard::MARK_SETTLE_SECS`] old) is
+    ///   unambiguous: resolve ownership through the existing high-precision matcher and
+    ///   star the local copy, or write a pointer row. This is the path that makes the
+    ///   gesture actually work on the 92% of listening that carries track-level ICY,
+    ///   where auto-identify is disarmed by design and there has never been an ownership
+    ///   path at all.
+    /// - A title that FLIPPED inside that window is genuinely undecidable, so ONE row
+    ///   carries BOTH candidates verbatim, NOTHING is starred, and the reply offers the
+    ///   two explicit words that resolve it. An ambiguous row is not a wrong row; a
+    ///   coin-flip row is.
+    /// - A SHOW or placeholder line is never a track subject: it becomes a show row with
+    ///   a timestamp and a station, which is what reconstructs a tracklist tomorrow.
+    ///   Fabricating a track row from a placeholder is the precise failure this whole
+    ///   path exists to prevent.
+    /// - A RECOGNIZED line younger than [`crate::heard::MATCH_SUBJECT_FRESH_SECS`] is a
+    ///   subject, and the reply speaks its age out loud rather than implying it is live.
+    ///   Past that bound it is not a name at all: nothing re-confirms a recognition, so
+    ///   an old one is a claim about a track that has very likely already ended.
+    /// - With NO ICY and nothing fresh the case stays honestly UNSOLVED: a timestamped,
+    ///   archive-recoverable moment row plus ONE kicked recognition through the existing
+    ///   single-flight, and a reply that does not claim a name.
+    ///
+    /// LOCK/ASYNC DISCIPLINE: one short std lock builds an OWNED snapshot and is dropped
+    /// before every await (the ownership lookup and the star round trip).
+    async fn mark(&self, target: crate::heard::MarkTarget) -> MpdResponse {
+        use crate::heard::{MarkEntry, MarkInput, MarkSubject};
+
+        // ── ONE lock: snapshot everything the decision and the row need ──────
+        let (input, qid, url, song, song_label, live_match) = {
+            let st = self.state.lock().unwrap();
+            let cur = st.reported_current().and_then(|i| st.queue.get(i));
+            let (entry, qid, url, song, song_label) = match cur.map(|it| (it.id, &it.entry)) {
+                Some((id, QueueEntry::Stream { url, .. })) => (
+                    Some(MarkEntry::Stream),
+                    Some(QueueId(id)),
+                    Some(url.clone()),
+                    None,
+                    None,
+                ),
+                Some((_, QueueEntry::Song(s))) => (
+                    Some(MarkEntry::Song),
+                    None,
+                    None,
+                    Some(s.id.clone()),
+                    Some(match &s.artist {
+                        Some(a) if !a.trim().is_empty() => format!("{a} - {}", s.title),
+                        _ => s.title.clone(),
+                    }),
+                ),
+                None => (None, None, None, None, None),
+            };
+            let station = qid.and_then(|q| station_label(&st, q));
+            // The live line WITH ITS PROVENANCE. Only a STATION line may enter the
+            // settled-ICY door: age proves a station line has settled, but it proves a
+            // recognized line has DECAYED, and reading the text without the source is
+            // exactly how a press an hour after a mixtape hit starred an hour-old track.
+            let live = qid.and_then(|q| live_title(&st, q));
+            let (icy_title, icy_age_secs) = match &live {
+                Some((raw, TitleSource::Icy, age)) => (Some(raw.clone()), *age),
+                _ => (None, 0),
+            };
+            let prev_icy = qid.and_then(|q| {
+                st.prev_icy.as_ref().and_then(|(pq, r)| {
+                    (*pq == q).then(|| (r.raw.clone(), r.retired.elapsed().as_secs()))
+                })
+            });
+            // The library match, but ONLY while its provenance still stands - the same
+            // gate `currentsong` reads through, so a press can never star an hour-old
+            // track the way `X-MatchUri` used to point at one.
+            let live_match = qid.and_then(|q| live_library_match(&st, q).cloned());
+            // A line WE recognized goes through the FRESHNESS door instead, whether or
+            // not it resolved a library counterpart - that is the door with the bound on
+            // it, and it is the only honest one for a name nothing re-confirms.
+            let fresh_match = match &live {
+                Some((raw, TitleSource::Recognized, age)) => Some((raw.clone(), *age)),
+                _ => live_match.as_ref().and(qid).and_then(|q| {
+                    st.library_match.as_ref().and_then(|(pq, p)| {
+                        (*pq == q).then(|| {
+                            (
+                                p.names
+                                    .clone()
+                                    .unwrap_or_else(|| "the identified track".to_string()),
+                                p.at.elapsed().as_secs(),
+                            )
+                        })
+                    })
+                }),
+            };
+            (
+                MarkInput {
+                    target,
+                    entry,
+                    station,
+                    icy_title,
+                    icy_age_secs,
+                    prev_icy,
+                    fresh_match,
+                    settle_secs: crate::heard::MARK_SETTLE_SECS,
+                    fresh_secs: crate::heard::MATCH_SUBJECT_FRESH_SECS,
+                },
+                qid,
+                url,
+                song,
+                song_label,
+                live_match,
+            )
+        };
+
+        let subject = crate::heard::mark_decision(&input);
+        let station = input.station.clone();
+        let clock = chrono::Local::now().format("%H:%M").to_string();
+        let mut row = crate::heard::HeardRow {
+            src: Some("mark".to_string()),
+            station: station.clone(),
+            url: url.clone(),
+            ..crate::heard::HeardRow::now("mark")
+        };
+
+        // The subject text to resolve ownership for, and the sentence skeleton. Only the
+        // arms that produced an UNAMBIGUOUS subject put anything in `resolve`.
+        let (sentence, resolve): (String, Option<String>) = match &subject {
+            MarkSubject::Nothing => {
+                return MpdResponse::pairs()
+                    .pair("mark_result", "nothing playing to mark")
+                    .build();
+            }
+            MarkSubject::NoPrevious => {
+                return MpdResponse::pairs()
+                    .pair("mark_result", "nothing has been playing before this on that stream")
+                    .build();
+            }
+            MarkSubject::Song => {
+                let label = song_label.clone().unwrap_or_else(|| "this track".to_string());
+                row.kind = Some("track".to_string());
+                row.raw = Some(label.clone());
+                row.owned = true;
+                (format!("starred {label}"), None)
+            }
+            MarkSubject::Icy { raw, age_secs } => {
+                row.kind = Some("track".to_string());
+                row.raw = Some(raw.clone());
+                row.subject_age_secs = Some(*age_secs);
+                let (a, t) = crate::heard::split_icy_title(raw);
+                row.artist = a;
+                row.title = t;
+                (String::new(), Some(raw.clone()))
+            }
+            MarkSubject::Previous { raw, ended_secs } => {
+                row.kind = Some("track".to_string());
+                row.raw = Some(raw.clone());
+                row.prev_ended_secs = Some(*ended_secs);
+                let (a, t) = crate::heard::split_icy_title(raw);
+                row.artist = a;
+                row.title = t;
+                (String::new(), Some(raw.clone()))
+            }
+            MarkSubject::Ambiguous { raw, age_secs, prev_raw, prev_ended_secs } => {
+                // BOTH candidates on disk, NEITHER starred. Nothing here is wrong, and
+                // resolving it is two explicit words rather than a hidden second-press
+                // mode (a hidden mode on an otherwise stateless key would make a double
+                // press record two rows, one of which is wrong).
+                row.kind = Some("track".to_string());
+                row.raw = Some(raw.clone());
+                row.subject_age_secs = Some(*age_secs);
+                row.ambiguous = true;
+                row.prev_raw = Some(prev_raw.clone());
+                row.prev_ended_secs = Some(*prev_ended_secs);
+                (
+                    format!(
+                        "marked, but which one: \"{raw}\" started {age_secs}s ago, or \"{prev_raw}\" which just ended - say `mark this` or `mark previous`"
+                    ),
+                    None,
+                )
+            }
+            MarkSubject::Show { raw, class } => {
+                row.kind = Some(class.as_str().to_string());
+                row.raw = Some(raw.clone());
+                let sentence = match class {
+                    // A show heading plus a timestamp and a station reconstructs a
+                    // tracklist tomorrow, which is the mechanism that actually converted.
+                    crate::heard::IcyClass::Show => {
+                        format!("marked the show: {raw} at {clock}")
+                    }
+                    // A placeholder names NOTHING, and saying otherwise would be the
+                    // exact fabrication this path exists to prevent.
+                    _ => format!(
+                        "marked this moment on {} at {clock} - the stream is only announcing \"{raw}\", which names no track",
+                        station_or(&station)
+                    ),
+                };
+                (sentence, None)
+            }
+            MarkSubject::FreshMatch { names, age_secs } => {
+                row.kind = Some("track".to_string());
+                row.raw = Some(names.clone());
+                row.subject_age_secs = Some(*age_secs);
+                let (a, t) = crate::heard::split_icy_title(names);
+                row.artist = a;
+                row.title = t;
+                (String::new(), Some(names.clone()))
+            }
+            MarkSubject::Moment => {
+                row.kind = Some("moment".to_string());
+                (
+                    format!(
+                        "marked this moment on {} at {clock} - listening for a name; if the track just ended this will name the next one",
+                        station.clone().unwrap_or_else(|| "this stream".to_string())
+                    ),
+                    None,
+                )
+            }
+        };
+
+        // ── ownership, then the star. No lock held across either await. ──────
+        let mut sentence = sentence;
+        // A recognition that ALREADY resolved a counterpart needs no second search: the
+        // slot it rode through `live_library_match` is the same match a lookup would find.
+        let mut owned: Option<crate::library_match::LibraryMatch> = match &subject {
+            MarkSubject::FreshMatch { .. } => live_match.clone(),
+            _ => None,
+        };
+        // Only a subject read off a LIVE STATION line re-stamps the match slot below.
+        // Re-stamping a pre-existing recognition would let repeated presses extend its
+        // own freshness window forever, which is the staleness this gate exists to bound.
+        let resolved_here =
+            matches!(subject, MarkSubject::Icy { .. } | MarkSubject::Previous { .. });
+        if let (Some(raw), true) = (resolve, owned.is_none()) {
+            let (artist, title) = crate::heard::split_icy_title(&raw);
+            if let (Some(artist), Some(title)) = (artist, title) {
+                let track = crate::recognize::RecognizedTrack {
+                    artist: Some(artist),
+                    title: Some(title),
+                    ..Default::default()
+                };
+                // ONE bounded search3 through the existing cache-backed path. Zero
+                // Shazam contact: this is a library lookup, not a recognition. A bad
+                // `Artist - Title` split cannot produce a WRONG match, because the
+                // matcher requires exact normalized title equality plus both vetoes and
+                // abstains on ambiguity - it yields no match instead.
+                owned = self.lookup_library_match(&track).await;
+            }
+        }
+
+        let mut starred = false;
+        if let Some(m) = &owned {
+            row.owned = true;
+            row.match_uri = Some(format!("song/{}", m.song_id.0));
+            row.album = m.album.clone();
+            row.year = m.year;
+            starred = self.star_song(&m.song_id).await;
+            row.starred = starred;
+            // Publish a match we resolved HERE so the now-playing surface can show the
+            // owned copy too, provenance-stamped with the exact subject text so the very
+            // next ICY flip retires it. Deliberately NOT for a pre-existing fresh match:
+            // re-stamping it would let repeated presses extend its own freshness window
+            // forever, which is the staleness this gate exists to bound.
+            if let (Some(q), true) = (qid, resolved_here) {
+                self.set_library_match(q, m.clone(), row.raw.clone());
+            }
+        } else if let MarkSubject::Song = subject {
+            if let Some(id) = &song {
+                starred = self.star_song(id).await;
+                row.starred = starred;
+            }
+        }
+
+        // ── the sentence, which IS what the human reads ──────────────────────
+        if sentence.is_empty() {
+            sentence = match (&subject, &owned) {
+                (MarkSubject::FreshMatch { age_secs, names }, Some(_)) if starred => format!(
+                    "starred your copy: {names} (identified {} ago; may not be what is playing now)",
+                    crate::heard::human_secs(*age_secs)
+                ),
+                (MarkSubject::FreshMatch { names, .. }, _) => {
+                    format!("noted: {names} on {} at {clock}", station_or(&station))
+                }
+                (MarkSubject::Previous { raw, .. }, Some(_)) if starred => {
+                    format!("starred your copy of the previous track: {raw}")
+                }
+                (MarkSubject::Previous { raw, .. }, _) => format!(
+                    "noted the previous track: {raw} on {} at {clock} - not in your library",
+                    station_or(&station)
+                ),
+                (_, Some(_)) if starred => format!(
+                    "starred your copy: {}",
+                    row.raw.clone().unwrap_or_default()
+                ),
+                (_, Some(_)) => format!(
+                    "you own {} but starring it failed; the listen is recorded",
+                    row.raw.clone().unwrap_or_default()
+                ),
+                _ => format!(
+                    "noted: {} on {} at {clock} - not in your library",
+                    row.raw.clone().unwrap_or_default(),
+                    station_or(&station)
+                ),
+            };
+        }
+        if matches!(subject, MarkSubject::Song) && !starred {
+            sentence = format!(
+                "could not star {}: the server refused",
+                song_label.clone().unwrap_or_else(|| "this track".to_string())
+            );
+        }
+
+        // A MOMENT kicks exactly ONE recognition, through the SAME single-flight guard
+        // every other caller takes. If one is already in flight it does NOT queue a
+        // second: impatience can never create an extra call against an IP-keyed limiter.
+        // The result lands as its OWN row later; this row is never rewritten (the file
+        // is append-only, which is what keeps the write path fsync-free).
+        if matches!(subject, MarkSubject::Moment) {
+            match (self.recognizing.load(Ordering::Acquire), self.arc_self()) {
+                (false, Some(this)) => {
+                    let after = row.at_unix;
+                    tokio::spawn(async move {
+                        this.identify_inner(None, Some(after)).await;
+                    });
+                }
+                // Already recognizing, or no self-reference registered (a raw handler in
+                // a unit test): record the honest outcome rather than pretending.
+                _ => row.outcome = Some("busy".to_string()),
+            }
+        }
+
+        // A missing ledger degrades the RECORD, never the STAR, and the reply says so
+        // rather than reporting a success it did not achieve.
+        let recorded = self.heard_enabled();
+        let kind = row.kind.clone().unwrap_or_else(|| "track".to_string());
+        let ambiguous = row.ambiguous;
+        let age = row.subject_age_secs;
+        if recorded {
+            self.append_heard(row);
+        } else {
+            sentence.push_str(" (not recorded: no heard ledger configured)");
+        }
+
+        let mut b = MpdResponse::pairs()
+            .pair("mark_result", sentence)
+            .pair("mark_kind", kind)
+            .pair("mark_starred", if starred { "1" } else { "0" })
+            .pair("mark_ambiguous", if ambiguous { "1" } else { "0" })
+            .pair("mark_recorded", if recorded { "1" } else { "0" });
+        if let Some(a) = age {
+            b = b.pair("mark_subject_age", a.to_string());
+        }
+        b.build()
+    }
+
+    /// READ BACK the heard ledger.
+    ///
+    /// Rendered DAEMON-side, which is forced rather than stylistic: the state directory
+    /// is mode 0700 under the systemd unit so a client process cannot read the file at
+    /// all, and the client tools are pure MPD/TCP with no knowledge of the state dir. The
+    /// file read runs in `spawn_blocking` (a few hundred lines of `std::fs`), never on
+    /// the spine and never under the state lock, and all the selection, ordering and
+    /// formatting lives in one pure function over `Vec<HeardRow>` so the whole view is
+    /// unit-testable on fixtures.
+    async fn heard(&self, q: crate::heard::HeardQuery) -> MpdResponse {
+        let dir = self.heard_dir.lock().unwrap().clone();
+        let Some(dir) = dir else {
+            return MpdResponse::pairs()
+                .pair(
+                    "heard",
+                    "no heard ledger configured (set [heard].dir or a state directory)",
+                )
+                .build();
+        };
+        let q = crate::heard::HeardQuery {
+            dedupe_window_secs: self.heard_dedupe_window_secs.load(Ordering::Relaxed),
+            ..q
+        };
+        let view = q.view;
+        let read = tokio::task::spawn_blocking(move || crate::heard::read_for(&dir, view)).await;
+        let (rows, unreadable) = match read {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "heard: read task failed");
+                return ack(ACK_ERROR_UNKNOWN, "heard", "could not read the ledger");
+            }
+        };
+        let mut b = MpdResponse::pairs();
+        for line in crate::heard::render(&rows, unreadable, &q) {
+            b = b.pair("heard", line);
+        }
+        b.build()
+    }
+
+    /// Star one library song, reusing the exact `playlistadd Starred` semantics (bust
+    /// the star caches, reflect the heart on any queued copy, notify). Returns whether
+    /// the server confirmed it, so the mark sentence can never claim a star that failed.
+    async fn star_song(&self, id: &SongId) -> bool {
+        match self.client.star(&Favorite::Song(id.clone())).await {
+            Ok(()) => {
+                self.bust_star_caches();
+                self.set_queue_starred(id, true);
+                self.notify_change();
+                true
+            }
+            Err(e) => {
+                tracing::warn!(id = %id.0, error = %e, "mark: starring the owned copy failed");
+                false
+            }
+        }
+    }
+
+    /// Publish a resolved library match for `qid` WITHOUT touching the stream tags -
+    /// the narrow counterpart of [`Self::set_stream_surface`], used by the mark path on
+    /// an ICY stream (where the tags are the station's, not ours to rewrite). Stamped
+    /// with the subject text so the provenance gate retires it on the next title flip.
+    fn set_library_match(
+        &self,
+        qid: QueueId,
+        m: crate::library_match::LibraryMatch,
+        names: Option<String>,
+    ) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.library_match = Some((qid, MatchProvenance { m, names, at: Instant::now() }));
+        }
+        self.notify_change();
+    }
+
     /// The SHARED recognition body for BOTH the manual `identify` verb (`auto = None`)
     /// and the auto-identify cadence (`auto = Some(fired_timer_id)`, task bspk8v5). All
     /// the f7vnd3i safety is inherited: single-flight via the `recognizing` AtomicBool,
@@ -4113,7 +5055,7 @@ impl HypodjHandler {
     /// resets misses and records own-hit provenance; a no-match/error backs off. Because
     /// this rearm runs for the MANUAL path too, a manual completion converges the auto
     /// clock (a hit resets it), so auto can never fire right after a manual hit.
-    async fn identify_inner(&self, auto: Option<TimerId>) -> IdentifyOutcome {
+    async fn identify_inner(&self, auto: Option<TimerId>, after_mark: Option<u64>) -> IdentifyOutcome {
         // Debounce: one recognition at a time (protects the Shazam endpoint).
         if self.recognizing.swap(true, Ordering::AcqRel) {
             // Busy: the in-flight attempt populates the same surfaces. For the auto path,
@@ -4134,15 +5076,22 @@ impl HypodjHandler {
             LibrarySong,
             Nothing,
         }
-        let target = {
+        let (target, station) = {
             let st = self.state.lock().unwrap();
-            match st.reported_current().and_then(|i| st.queue.get(i)) {
+            let t = match st.reported_current().and_then(|i| st.queue.get(i)) {
                 Some(item) => match &item.entry {
                     QueueEntry::Stream { url, .. } => Target::Stream(QueueId(item.id), url.clone()),
                     QueueEntry::Song(_) => Target::LibrarySong,
                 },
                 None => Target::Nothing,
-            }
+            };
+            // The station LABEL for any ledger row this attempt writes, resolved while
+            // the lock is already held. Cloned out; the lock is dropped below.
+            let s = match &t {
+                Target::Stream(qid, _) => station_label(&st, *qid),
+                _ => None,
+            };
+            (t, s)
         };
         let (qid, url) = match target {
             Target::Stream(qid, url) => (qid, url),
@@ -4167,18 +5116,38 @@ impl HypodjHandler {
         };
 
         // Heavy work off the reactor; no std lock is held across this await.
+        let url_for_row = url.clone();
         let track = match crate::recognize::recognize_stream_url(url).await {
             Ok(Some(track)) => track,
             Ok(None) => {
-                // Clean no-match: leave any prior ICY stream_meta untouched; back the
-                // auto cadence off exponentially so an unmatchable mix is not hammered.
-                self.rearm_auto_identify_after_attempt(qid, false, None);
+                // CONTENT miss: Shazam was reached and does not know this audio. Leave
+                // any prior ICY stream_meta untouched, record the miss, and back off on
+                // the CONTENT curve - one doubling, then flat, because a miss here says
+                // nothing about whether the next track is recognizable.
+                self.append_heard(crate::heard::HeardRow {
+                    after_mark,
+                    ..miss_row("no_match", station.as_deref(), &url_for_row)
+                });
+                self.rearm_auto_identify_after_attempt(qid, AttemptOutcome::ContentMiss, None);
                 return IdentifyOutcome::NoMatch;
             }
             Err(e) => {
-                // A subprocess/timeout error counts as a miss for backoff (a dead or
-                // stalling stream decays identically to an unmatchable one).
-                self.rearm_auto_identify_after_attempt(qid, false, None);
+                // TRANSPORT failure (capture, network, rate-limit, timeout, or an
+                // unclassifiable outcome): the PATH is broken, so keep the full
+                // exponential. `outcome_word` carries songrec's own taxonomy into the
+                // ledger, which is what makes the two curves auditable after the fact.
+                if matches!(e, crate::recognize::RecognizeError::Timeout) {
+                    // A timeout with a silent stderr is the ONLY remaining 429
+                    // suspicion, and it is logged as suspicion, never certainty.
+                    tracing::warn!(
+                        "identify timed out; if this repeats the endpoint may be rate-limiting this address (suspicion, not certainty)"
+                    );
+                }
+                self.append_heard(crate::heard::HeardRow {
+                    after_mark,
+                    ..miss_row(e.outcome_word(), station.as_deref(), &url_for_row)
+                });
+                self.rearm_auto_identify_after_attempt(qid, AttemptOutcome::TransportMiss, None);
                 return IdentifyOutcome::Error(e.to_string());
             }
         };
@@ -4260,7 +5229,21 @@ impl HypodjHandler {
         );
         // Rearm the cadence at the interval and record own-hit provenance (so the next
         // fire does not mistake the title WE wrote for a fresh ICY title and disarm).
-        self.rearm_auto_identify_after_attempt(qid, true, now_playing.clone());
+        self.rearm_auto_identify_after_attempt(qid, AttemptOutcome::Hit, now_playing.clone());
+
+        // ONE ledger row for the hit. Off the spine by construction (this whole body runs
+        // on a spawned task or a client task, never on the director), and the append
+        // itself is a lock-free channel send that cannot block regardless.
+        self.append_heard(crate::heard::HeardRow {
+            after_mark,
+            ..recognize_hit_row(
+                &track,
+                now_playing.as_deref(),
+                library.as_ref(),
+                station.as_deref(),
+                &url_for_row,
+            )
+        });
 
         IdentifyOutcome::Hit { track, now_playing, library }
     }
@@ -4310,7 +5293,9 @@ impl HypodjHandler {
             qid,
             timer_id,
             guard,
-            misses: 0,
+            content_misses: 0,
+            transport_misses: 0,
+            last_miss: None,
             last_recognized: None,
         });
     }
@@ -4357,19 +5342,29 @@ impl HypodjHandler {
                 // spine. identify_inner owns the single-flight swap + the cadence rearm.
                 let this = self.clone();
                 tokio::spawn(async move {
-                    this.identify_inner(Some(id)).await;
+                    this.identify_inner(Some(id), None).await;
                 });
             }
         }
     }
 
-    /// Rearm the auto-identify cadence at the tail of a completed attempt (hit or
-    /// non-hit), generation-checked against the captured `qid`. A slot gone or repointed
-    /// to a different qid during the capture -> BAIL (no rearm), so a track change during
-    /// the up-to-40s capture never resurrects a stale timer. A hit rearms at one interval
-    /// and records own-hit provenance in `last_recognized`; a non-hit backs off
-    /// exponentially (`interval * 2^misses`, capped at `interval * 8`).
-    fn rearm_auto_identify_after_attempt(&self, qid: QueueId, hit: bool, recognized: Option<String>) {
+    /// Rearm the auto-identify cadence at the tail of a completed attempt,
+    /// generation-checked against the captured `qid`. A slot gone or repointed to a
+    /// different qid during the capture -> BAIL (no rearm), so a track change during the
+    /// up-to-40s capture never resurrects a stale timer.
+    ///
+    /// A HIT rearms at one interval, records own-hit provenance in `last_recognized`,
+    /// and resets BOTH miss counters. A miss advances only ITS OWN counter and rearms on
+    /// that kind's curve: a CONTENT miss caps at one doubling (300 -> 600s flat), a
+    /// TRANSPORT failure keeps the full exponential (300 -> 2400s). The two counters are
+    /// independent because the two facts are: a broken network says nothing about
+    /// whether the audio is recognizable, and vice versa.
+    fn rearm_auto_identify_after_attempt(
+        &self,
+        qid: QueueId,
+        outcome: AttemptOutcome,
+        recognized: Option<String>,
+    ) {
         let timers = match (self.recognize_auto.load(Ordering::Relaxed), self.plan_timers.get()) {
             (true, Some(t)) => t.clone(),
             _ => {
@@ -4389,18 +5384,33 @@ impl HypodjHandler {
         if slot.qid != qid {
             return;
         }
-        // Delay uses the CURRENT miss count, THEN the count advances (so the first miss
-        // rearms at one interval and each further miss doubles, saturating at *8).
-        let (delay_exp, next_misses) = if hit {
-            (0u32, 0u32)
-        } else {
-            let cur = slot.misses;
-            (cur, (cur + 1).min(AUTO_IDENTIFY_MAX_MISSES))
+        // The delay uses the CURRENT count for this kind, THEN the count advances (so
+        // the first miss rearms at one interval and the next doubles, each kind
+        // saturating at its own cap).
+        let (kind, delay_exp) = match outcome {
+            AttemptOutcome::Hit => {
+                slot.content_misses = 0;
+                slot.transport_misses = 0;
+                slot.last_miss = None;
+                (BackoffKind::Content, 0u32)
+            }
+            AttemptOutcome::ContentMiss => {
+                let cur = slot.content_misses;
+                slot.content_misses = (cur + 1).min(AUTO_IDENTIFY_MAX_CONTENT_MISSES);
+                slot.last_miss = Some(BackoffKind::Content);
+                (BackoffKind::Content, cur)
+            }
+            AttemptOutcome::TransportMiss => {
+                let cur = slot.transport_misses;
+                slot.transport_misses = (cur + 1).min(AUTO_IDENTIFY_MAX_MISSES);
+                slot.last_miss = Some(BackoffKind::Transport);
+                (BackoffKind::Transport, cur)
+            }
         };
-        let (timer_id, guard) = timers.arm(Instant::now() + auto_identify_delay(interval, delay_exp));
+        let (timer_id, guard) =
+            timers.arm(Instant::now() + auto_identify_delay(interval, kind, delay_exp));
         slot.timer_id = timer_id;
         slot.guard = guard;
-        slot.misses = next_misses;
         if let Some(r) = recognized {
             slot.last_recognized = Some(r);
         }
@@ -4428,10 +5438,11 @@ impl HypodjHandler {
         if slot.timer_id != id {
             return;
         }
-        let (timer_id, guard) = timers.arm(Instant::now() + auto_identify_delay(interval, 0));
+        let (timer_id, guard) =
+            timers.arm(Instant::now() + auto_identify_delay(interval, BackoffKind::Content, 0));
         slot.timer_id = timer_id;
         slot.guard = guard;
-        // misses UNCHANGED: a skip is not a miss.
+        // Both miss counts UNCHANGED: a skip is not a miss of either kind.
     }
 
     /// Disarm the auto-identify slot for `qid` if it is the one currently armed (task
@@ -4470,10 +5481,19 @@ impl HypodjHandler {
         if slot.timer_id != id {
             return;
         }
-        let (timer_id, guard) = timers.arm(Instant::now() + auto_identify_delay(interval, slot.misses));
+        // Resume at the position the slot is already at: the LAST miss kind against its
+        // own counter (or one plain interval when nothing has missed yet).
+        let (kind, exp) = match slot.last_miss {
+            Some(BackoffKind::Content) => (BackoffKind::Content, slot.content_misses),
+            Some(BackoffKind::Transport) => (BackoffKind::Transport, slot.transport_misses),
+            None => (BackoffKind::Content, 0),
+        };
+        let (timer_id, guard) =
+            timers.arm(Instant::now() + auto_identify_delay(interval, kind, exp));
         slot.timer_id = timer_id;
         slot.guard = guard;
-        // misses + last_recognized UNCHANGED: a paused fire is neither a hit nor a miss.
+        // Miss counts + last_recognized UNCHANGED: a paused fire is neither a hit nor a
+        // miss.
     }
 
     fn notify_change(&self) {
@@ -5369,6 +6389,56 @@ impl HypodjHandler {
     /// with a handler lock held.
     pub(crate) fn audio_store(&self) -> Option<Arc<AudioStore>> {
         self.audio_store.lock().unwrap().clone()
+    }
+
+    // ── the heard ledger ────────────────────────────────────────────────────
+
+    /// Register the HEARD LEDGER, plumbed once at daemon startup like
+    /// [`Self::set_audio_store`]. `dir` is where its session files live, so the `heard`
+    /// read-back can find the newest one. Absent (no state dir, feature disabled) every
+    /// append no-ops and the `mark` verb says the press was not recorded.
+    pub fn set_heard_ledger(
+        &self,
+        ledger: crate::heard::HeardLedger,
+        dir: PathBuf,
+        dedupe_window_secs: u64,
+    ) {
+        *self.heard_ledger.lock().unwrap() = Some(ledger);
+        *self.heard_dir.lock().unwrap() = Some(dir);
+        self.heard_dedupe_window_secs
+            .store(dedupe_window_secs, Ordering::Relaxed);
+    }
+
+    /// Enqueue one ledger row, or do nothing when no ledger is registered.
+    ///
+    /// THE SPINE CONTRACT lives here: this is a SYNC `&self` method whose entire body is
+    /// a short lock plus a lock-free unbounded-channel send. It performs no I/O, cannot
+    /// block, cannot fail and cannot be awaited - which is what makes calling it from
+    /// `set_stream_meta` (which the director spine invokes synchronously) safe by
+    /// construction rather than by care.
+    pub(crate) fn append_heard(&self, row: crate::heard::HeardRow) {
+        let ledger = self.heard_ledger.lock().unwrap().clone();
+        if let Some(l) = ledger {
+            l.append(row);
+        }
+    }
+
+    /// Whether a ledger is registered, so the `mark` verb can tell a real record from a
+    /// silent drop instead of reporting a success it did not achieve.
+    fn heard_enabled(&self) -> bool {
+        self.heard_ledger.lock().unwrap().is_some()
+    }
+
+    /// Register the handler's own `Arc`, WEAKLY. Called once by the daemon right after
+    /// the `Arc` exists; see [`Self::self_ref`] for why a `&self` dispatch needs it.
+    pub fn set_self_ref(&self, weak: std::sync::Weak<HypodjHandler>) {
+        let _ = self.self_ref.set(weak);
+    }
+
+    /// The owned handle for a spawned task, or `None` when none was registered or the
+    /// handler is already being dropped.
+    fn arc_self(&self) -> Option<Arc<HypodjHandler>> {
+        self.self_ref.get().and_then(|w| w.upgrade())
     }
 
     /// Publish the CURRENT queue window (the playing entry plus the next
@@ -8641,11 +9711,11 @@ fn stream_cover_source(st: &State, qid: QueueId) -> Option<StreamCoverSource> {
         .and_then(|(q, i)| (*q == qid).then(|| i.image_url.clone()).flatten())
         .map(StreamCoverSource::Remote)
         .or_else(|| {
-            st.library_match.as_ref().and_then(|(q, m)| {
-                (*q == qid).then(|| StreamCoverSource::Library {
-                    song_id: m.song_id.clone(),
-                    cover_id: m.cover_id.clone(),
-                })
+            // Through the provenance gate, like every other reader: a match whose
+            // subject has moved on must not keep serving its album art either.
+            live_library_match(st, qid).map(|m| StreamCoverSource::Library {
+                song_id: m.song_id.clone(),
+                cover_id: m.cover_id.clone(),
             })
         })
         .or_else(|| {
@@ -8702,6 +9772,20 @@ enum IdentifyOutcome {
     Nothing,
     /// A recognition was already in flight (single-flight); this attempt was skipped.
     Busy,
+}
+
+/// How a completed attempt should move the auto-identify cadence. The split between the
+/// two miss kinds is the whole point: they used to be fused (both the `Ok(None)` arm and
+/// the `Err` arm called the rearm identically), which is what the songrec stderr
+/// taxonomy exists to break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOutcome {
+    /// A recognized track came back.
+    Hit,
+    /// Shazam was reached and did not know this audio.
+    ContentMiss,
+    /// Shazam could not be reached (capture failure, network, timeout, unclassifiable).
+    TransportMiss,
 }
 
 /// The pure AUTO-IDENTIFY fire decision over a `&State` snapshot (task bspk8v5), shared
@@ -8825,11 +9909,33 @@ fn identify_surface_decision(
     IdentifySurface::Decorate(existing_name)
 }
 
-/// The auto-identify re-identify delay: `interval * 2^min(misses, MAX)`. A hit passes
-/// `misses = 0` (one interval); each consecutive no-match doubles it up to the
-/// `interval * 8` cap. Saturating multiply so a huge configured interval never overflows.
-fn auto_identify_delay(interval_secs: u64, misses: u32) -> Duration {
-    let factor = 1u64 << misses.min(AUTO_IDENTIFY_MAX_MISSES);
+/// Which backoff curve a completed attempt lands on. The two are independent because
+/// they are different facts: content is about the AUDIO, transport is about the PATH.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackoffKind {
+    /// Shazam was reached and did not know this audio.
+    Content,
+    /// Shazam could not be reached (network, endpoint, capture, timeout, unclassifiable).
+    Transport,
+}
+
+impl BackoffKind {
+    /// The saturation ceiling for this curve's exponent.
+    fn cap(self) -> u32 {
+        match self {
+            BackoffKind::Content => AUTO_IDENTIFY_MAX_CONTENT_MISSES,
+            BackoffKind::Transport => AUTO_IDENTIFY_MAX_MISSES,
+        }
+    }
+}
+
+/// The auto-identify re-identify delay: `interval * 2^min(misses, cap(kind))`. A hit
+/// passes `misses = 0` (one interval). CONTENT misses cap at one doubling (300, 600,
+/// 600, ...); TRANSPORT failures keep the full exponential (300, 600, 1200, 2400, ...).
+/// Saturating multiply, so a huge configured interval can never overflow into a tiny
+/// delay.
+fn auto_identify_delay(interval_secs: u64, kind: BackoffKind, misses: u32) -> Duration {
+    let factor = 1u64 << misses.min(kind.cap());
     Duration::from_secs(interval_secs.saturating_mul(factor))
 }
 
@@ -9112,13 +10218,16 @@ impl MpdHandler for HypodjHandler {
                             // (task g96g064 phase 2), so a client can star the copy the
                             // user actually owns. A SEPARATE field from `file:`, which
                             // stays the stream url - the playing entry is never rewritten.
-                            if let Some((q, m)) = &st.library_match {
-                                if *q == cur_qid {
-                                    pairs.push((
-                                        "X-MatchUri".to_string(),
-                                        format!("song/{}", m.song_id.0),
-                                    ));
-                                }
+                            // PROVENANCE-GATED (see `live_library_match`): the slot is
+                            // written only on an identify HIT and used to be retired
+                            // only on a qid change, so on a mixtape a single hit left
+                            // this pointing at that track for the rest of the entry and
+                            // a star an hour later silently starred an hour-old track.
+                            if let Some(m) = live_library_match(&st, cur_qid) {
+                                pairs.push((
+                                    "X-MatchUri".to_string(),
+                                    format!("song/{}", m.song_id.0),
+                                ));
                             }
                             let cover = stream_cover_source(&st, cur_qid).map(|src| match src {
                                 StreamCoverSource::Remote(u) => u,
@@ -9211,6 +10320,8 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Wake(cmd) => self.handle_wake(cmd),
             MpdCommand::Field(cmd) => self.handle_field(cmd),
             MpdCommand::Identify => self.identify().await,
+            MpdCommand::Mark(target) => self.mark(target).await,
+            MpdCommand::Heard(q) => self.heard(q).await,
             MpdCommand::Next => {
                 // A manual `next` always advances (single governs only auto-advance);
                 // random/repeat/consume are honored via plan_next. The transition
@@ -15367,6 +16478,16 @@ mod tests {
 
     // ── library match for a recognized stream track (task g96g064) ─────────
 
+    /// A library-match SLOT stamped as freshly resolved with no subject title, which is
+    /// what `live_library_match` treats as live for MATCH_SUBJECT_FRESH_SECS. Tests that
+    /// want a STALE slot advance the paused clock past that bound instead.
+    fn test_match_slot(
+        qid: QueueId,
+        m: crate::library_match::LibraryMatch,
+    ) -> (QueueId, MatchProvenance) {
+        (qid, MatchProvenance { m, names: None, at: Instant::now() })
+    }
+
     fn test_library_match(song_id: &str, cover: &str) -> crate::library_match::LibraryMatch {
         crate::library_match::LibraryMatch {
             song_id: SongId(song_id.to_string()),
@@ -15387,7 +16508,7 @@ mod tests {
         let qid = h.enqueue_stream_for_test(NTS).await;
         h.play_for_test(0).await;
         h.set_recognized_cover(QueueId(qid), "https://shazam.example/cover.jpg".to_string());
-        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+        h.state.lock().unwrap().library_match = Some(test_match_slot(QueueId(qid), test_library_match("s7", "al-3")));
 
         let cur = match h.handle(MpdCommand::CurrentSong).await {
             MpdResponse::Pairs(p) => p,
@@ -15417,7 +16538,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         let qid = h.enqueue_stream_for_test(NTS).await;
         h.play_for_test(0).await;
-        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+        h.state.lock().unwrap().library_match = Some(test_match_slot(QueueId(qid), test_library_match("s7", "al-3")));
 
         let cur = match h.handle(MpdCommand::CurrentSong).await {
             MpdResponse::Pairs(p) => p,
@@ -15445,7 +16566,7 @@ mod tests {
         assert!(!cur.iter().any(|(k, _)| k == "X-MatchUri"), "no match, no pair: {cur:?}");
 
         h.state.lock().unwrap().library_match =
-            Some((QueueId(qid.wrapping_add(999)), test_library_match("wrong", "c")));
+            Some(test_match_slot(QueueId(qid.wrapping_add(999)), test_library_match("wrong", "c")));
         let cur = match h.handle(MpdCommand::CurrentSong).await {
             MpdResponse::Pairs(p) => p,
             other => panic!("expected Pairs, got {other:?}"),
@@ -15464,7 +16585,7 @@ mod tests {
         h.play_for_test(0).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+            st.library_match = Some(test_match_slot(QueueId(qid), test_library_match("s7", "al-3")));
             st.station_identity = Some((QueueId(qid), nts_identity()));
         }
         let cur = match h.handle(MpdCommand::CurrentSong).await {
@@ -15485,7 +16606,7 @@ mod tests {
         let qid = h.enqueue_stream_for_test(NTS).await;
         h.play_for_test(0).await;
         h.state.lock().unwrap().library_match =
-            Some((QueueId(qid.wrapping_add(999)), test_library_match("wrong", "wrong-cover")));
+            Some(test_match_slot(QueueId(qid.wrapping_add(999)), test_library_match("wrong", "wrong-cover")));
         let cur = match h.handle(MpdCommand::CurrentSong).await {
             MpdResponse::Pairs(p) => p,
             other => panic!("expected Pairs, got {other:?}"),
@@ -15503,7 +16624,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         let qid = h.enqueue_stream_for_test(NTS).await;
         h.play_for_test(0).await;
-        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+        h.state.lock().unwrap().library_match = Some(test_match_slot(QueueId(qid), test_library_match("s7", "al-3")));
 
         h.clear_stream_meta_except(Some(QueueId(qid)));
         assert!(h.state.lock().unwrap().library_match.is_some(), "kept for its own qid");
@@ -15511,9 +16632,574 @@ mod tests {
         h.clear_stream_meta_except(Some(QueueId(qid.wrapping_add(1))));
         assert!(h.state.lock().unwrap().library_match.is_none(), "dropped for another qid");
 
-        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+        h.state.lock().unwrap().library_match = Some(test_match_slot(QueueId(qid), test_library_match("s7", "al-3")));
         h.clear_stream_meta_except(None);
         assert!(h.state.lock().unwrap().library_match.is_none(), "dropped on stop");
+    }
+
+    #[tokio::test]
+    async fn the_commands_advertisement_never_names_a_hypodj_extension() {
+        // `commands` advertises the REAL MPD surface, which is what
+        // ADVERTISED_MPD_VERSION tracks - so a hypodj-native verb must never appear in
+        // it and must never push that version. `mark` and `heard` join the siblings that
+        // already stay out.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let listed: Vec<String> = match h.handle(MpdCommand::Commands).await {
+            MpdResponse::Pairs(p) => p.into_iter().map(|(_, v)| v).collect(),
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        for verb in [
+            "mark", "heard", "identify", "knob", "nl", "plan", "continuation", "radio",
+            "station", "searchall", "field", "sleep", "winddown", "wake",
+        ] {
+            assert!(
+                !listed.iter().any(|c| c == verb),
+                "the hypodj extension `{verb}` must stay out of the commands advertisement"
+            );
+        }
+        assert_eq!(
+            crate::mpd::ADVERTISED_MPD_VERSION,
+            "0.23.0",
+            "adding an extension verb must never move the advertised MPD version"
+        );
+    }
+
+    // ── the mark gesture, the ICY transition, and the provenance gate ────────
+
+    /// A ledger writing into a fresh temp dir, plus that dir. The caller reads the
+    /// session file back to see exactly what the daemon wrote.
+    fn ledger_rig(tag: &str) -> (crate::heard::HeardLedger, PathBuf) {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "hypodj-mark-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ledger = crate::heard::spawn_heard_ledger(dir.clone(), 5, 300);
+        (ledger, dir)
+    }
+
+    /// Yield until `pred` holds. A ledger write hops through `spawn_blocking`, whose
+    /// completion is a REAL-thread event no virtual time can produce; this is scheduling
+    /// slack for the harness, not time-based logic (the `store.rs` rationale).
+    async fn settle_rows(dir: &Path, at_least: usize) -> Vec<crate::heard::HeardRow> {
+        for _ in 0..2000 {
+            if let Some(p) = crate::heard::newest_session(dir) {
+                let (rows, _) = crate::heard::read_session(&p);
+                if rows.len() >= at_least {
+                    return rows;
+                }
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        panic!("the ledger never reached {at_least} rows");
+    }
+
+    fn pair_of(pairs: &[(String, String)], key: &str) -> Option<String> {
+        pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    async fn mark_pairs(h: &HypodjHandler, t: crate::heard::MarkTarget) -> Vec<(String, String)> {
+        match h.handle(MpdCommand::Mark(t)).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("mark must answer with pairs, never an ACK: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_icy_title_change_retires_the_previous_title_and_restamps_its_age() {
+        // Nothing carried the previous title before this, so a press moments after a flip
+        // had no way to name what just ended. The retention is a pure memory move under
+        // the lock `set_stream_meta` already takes, which is what keeps it spine-safe.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("A - One".into()));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        {
+            let st = h.state.lock().unwrap();
+            assert!(st.prev_icy.is_none(), "the first title retires nothing");
+            let (q, at) = st.stream_title_since.expect("the age is stamped");
+            assert_eq!(q, QueueId(qid));
+            assert_eq!(at.since.elapsed().as_secs(), 30);
+        }
+
+        h.set_stream_meta(QueueId(qid), None, Some("B - Two".into()));
+        let st = h.state.lock().unwrap();
+        let (q, prev) = st.prev_icy.as_ref().expect("the outgoing title is retired");
+        assert_eq!(*q, QueueId(qid));
+        assert_eq!(prev.raw, "A - One");
+        assert_eq!(prev.retired.elapsed().as_secs(), 0, "it ended just now");
+        assert_eq!(
+            st.stream_title_since.unwrap().1.since.elapsed().as_secs(),
+            0,
+            "the new title's age restarts"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_identical_icy_repeat_rotates_nothing_and_never_resets_the_age() {
+        // mpv fires `metadata` on ANY map change and nothing upstream compares against
+        // the prior value, so the same title really can arrive twice. A repeat that
+        // reset the age would make a settled subject look fresh, which is exactly the
+        // input that turns an unambiguous press into a refusal.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("A - One".into()));
+        tokio::time::advance(Duration::from_secs(50)).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("A - One".into()));
+
+        let st = h.state.lock().unwrap();
+        assert!(st.prev_icy.is_none(), "an identical repeat retires nothing");
+        assert_eq!(
+            st.stream_title_since.unwrap().1.since.elapsed().as_secs(),
+            50,
+            "the age must survive an identical repeat"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_absent_icy_title_retracts_the_station_line_and_a_mark_stops_naming_it() {
+        // mpv observes the WHOLE `metadata` map and `select_icy_metadata` drops blank
+        // values, so `{name: Some, title: None}` is not "no information" - it is the
+        // station announcing NO title, which is what it sends between tracks. Latching it
+        // anyway let a track that already ended keep ageing past the settle window, and
+        // then a press starred it: precisely the wrong-star this whole path exists to
+        // prevent, five minutes after the track was over.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("A - One".into()));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2 renamed".into()), None);
+        {
+            let st = h.state.lock().unwrap();
+            let (_, meta) = st.stream_meta.as_ref().expect("the slot survives");
+            assert_eq!(meta.title, None, "an absent icy-title retracts the line");
+            assert_eq!(meta.name.as_deref(), Some("NTS 2 renamed"), "the name still updates");
+            // Retired, not lost: the press that lands right after a retraction can still
+            // name what just ended, which is the whole reason prev_icy exists.
+            let (_, prev) = st.prev_icy.as_ref().expect("the outgoing line is retired");
+            assert_eq!(prev.raw, "A - One");
+            assert!(st.stream_title_since.is_none(), "nothing is standing to age");
+        }
+
+        // Well past the settle window: the dead line must NOT come back as a subject.
+        tokio::time::advance(Duration::from_secs(crate::heard::MARK_SETTLE_SECS * 10)).await;
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(pair_of(&p, "mark_kind").as_deref(), Some("moment"), "{p:?}");
+        assert_eq!(pair_of(&p, "mark_starred").as_deref(), Some("0"), "{p:?}");
+        assert!(
+            !pair_of(&p, "mark_result").unwrap().contains("A - One"),
+            "a retracted line must never be named as what is playing: {p:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_absent_icy_title_never_touches_a_line_we_recognized_ourselves() {
+        // The other half of the retraction rule, and the one that keeps it safe on the
+        // streams auto-identify actually serves: a mixtape sends `icy-name` and NEVER an
+        // `icy-title`, so a blanket clear would wipe every recognition the moment the
+        // station name arrived. The station cannot retract a line it never announced.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_surface(
+            QueueId(qid),
+            StreamMeta {
+                title: Some("Takuya Nakamura - Ancient Reflection".into()),
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        tokio::time::advance(Duration::from_secs(10)).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), None);
+
+        let st = h.state.lock().unwrap();
+        let (_, meta) = st.stream_meta.as_ref().expect("the slot survives");
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("Takuya Nakamura - Ancient Reflection"),
+            "an icy-name dispatch has no standing over a recognized line"
+        );
+        assert_eq!(meta.name.as_deref(), Some("NTS 2"), "the station name still lands");
+        assert!(st.prev_icy.is_none(), "nothing was retired");
+        let (_, stamp) = st.stream_title_since.expect("the recognized stamp survives");
+        assert_eq!(stamp.source, TitleSource::Recognized);
+        assert_eq!(stamp.since.elapsed().as_secs(), 10, "and its age keeps running");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mark_refuses_to_guess_inside_the_settle_window_and_names_both() {
+        // THE claim of the whole design, driven through the real verb: a press landing
+        // moments after a flip records BOTH candidates, stars NEITHER, and says which
+        // two words resolve it. Exactly at the boundary the subject is settled again.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("Modular Station".into()), Some("A - One".into()));
+        tokio::time::advance(Duration::from_secs(120)).await;
+        h.set_stream_meta(QueueId(qid), None, Some("B - Two".into()));
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(pair_of(&p, "mark_ambiguous").as_deref(), Some("1"), "{p:?}");
+        assert_eq!(pair_of(&p, "mark_starred").as_deref(), Some("0"), "nothing is starred");
+        let sentence = pair_of(&p, "mark_result").unwrap();
+        assert!(sentence.contains("B - Two"), "{sentence}");
+        assert!(sentence.contains("A - One"), "{sentence}");
+        assert!(sentence.contains("mark this"), "{sentence}");
+        assert!(sentence.contains("mark previous"), "{sentence}");
+
+        // At EXACTLY the settle window the subject is unambiguous again.
+        tokio::time::advance(Duration::from_secs(crate::heard::MARK_SETTLE_SECS - 6)).await;
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(pair_of(&p, "mark_ambiguous").as_deref(), Some("0"), "{p:?}");
+        assert_eq!(
+            pair_of(&p, "mark_subject_age").as_deref(),
+            Some(crate::heard::MARK_SETTLE_SECS.to_string().as_str()),
+            "the press latency is recorded, which is what lets the window be tightened later"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mark_previous_names_the_retired_title_and_refuses_when_there_is_none() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("Modular Station".into()), Some("A - One".into()));
+
+        // Nothing retired yet: an honest refusal, NEVER a fallback to the current title
+        // (which would be the wrong subject on purpose).
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Previous).await;
+        assert!(
+            pair_of(&p, "mark_result").unwrap().contains("nothing has been playing before"),
+            "{p:?}"
+        );
+
+        tokio::time::advance(Duration::from_secs(200)).await;
+        h.set_stream_meta(QueueId(qid), None, Some("B - Two".into()));
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Previous).await;
+        assert!(pair_of(&p, "mark_result").unwrap().contains("A - One"), "{p:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mark_on_a_placeholder_line_records_a_show_and_never_fabricates_a_track() {
+        // Fabricating a track row from "Airtime - offline" is the precise failure the
+        // whole honest-subject rule exists to prevent.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("NTS 2".into()), Some("Airtime - offline".into()));
+        tokio::time::advance(Duration::from_secs(300)).await;
+
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(pair_of(&p, "mark_kind").as_deref(), Some("junk"), "{p:?}");
+        assert_eq!(pair_of(&p, "mark_starred").as_deref(), Some("0"));
+        let sentence = pair_of(&p, "mark_result").unwrap();
+        assert!(sentence.contains("names no track"), "a placeholder names nothing: {sentence}");
+        assert!(sentence.contains("Airtime - offline"), "{sentence}");
+
+        // A real SHOW heading is different, and reads as one: with a timestamp and a
+        // station this reconstructs a tracklist tomorrow.
+        h.set_stream_meta(QueueId(qid), None, Some("NTS 2 - KIM LANA (R)".into()));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(pair_of(&p, "mark_kind").as_deref(), Some("show"), "{p:?}");
+        assert!(
+            pair_of(&p, "mark_result").unwrap().starts_with("marked the show"),
+            "{p:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mark_with_no_ledger_says_it_was_not_recorded_rather_than_claiming_success() {
+        // A missing ledger degrades the RECORD, never anything else, and the reply must
+        // never report a success it did not achieve.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("Modular Station".into()), Some("A - One".into()));
+        tokio::time::advance(Duration::from_secs(120)).await;
+
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(pair_of(&p, "mark_recorded").as_deref(), Some("0"), "{p:?}");
+        assert!(
+            pair_of(&p, "mark_result").unwrap().contains("not recorded"),
+            "{p:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_mark_and_the_icy_titles_around_it_all_reach_the_real_ledger() {
+        // End to end through the REAL append path: two ICY rows from the spine entry
+        // point plus one mark row, in order, in one session file.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let (ledger, dir) = ledger_rig("rows");
+        h.set_heard_ledger(ledger, dir.clone(), 1800);
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("Modular Station".into()), Some("A - One".into()));
+        h.set_stream_meta(QueueId(qid), None, Some("B - Two".into()));
+        // An identical repeat must add NOTHING (mpv re-fires `metadata` on any map
+        // change, so the same line really does arrive twice).
+        h.set_stream_meta(QueueId(qid), Some("Modular Station".into()), Some("B - Two".into()));
+        let p = mark_pairs(&h, crate::heard::MarkTarget::This).await;
+        assert_eq!(pair_of(&p, "mark_recorded").as_deref(), Some("1"), "{p:?}");
+
+        // session + 2 icy + 1 mark.
+        let rows = settle_rows(&dir, 4).await;
+        assert_eq!(rows.len(), 4, "no row for an identical repeat: {rows:?}");
+        assert_eq!(rows[0].ev, "session");
+        assert_eq!(rows[1].raw.as_deref(), Some("A - One"));
+        assert_eq!(rows[1].station.as_deref(), Some("Modular Station"));
+        assert_eq!(rows[1].url.as_deref(), Some(NTS));
+        assert_eq!(rows[1].kind.as_deref(), Some("track"));
+        assert!(!rows[1].starred, "an automatic row never stars");
+        assert_eq!(rows[2].raw.as_deref(), Some("B - Two"));
+        assert_eq!(rows[3].ev, "mark");
+        assert_eq!(rows[3].raw.as_deref(), Some("B - Two"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_heard_verb_reads_the_session_back_with_its_coverage_line() {
+        // The read-back is daemon-side because the state dir is 0700 and the clients
+        // have no knowledge of it. Drive the whole loop: write through the real ledger,
+        // then read it back through the real verb.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let (ledger, dir) = ledger_rig("readback");
+        h.set_heard_ledger(ledger, dir.clone(), 1800);
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("Modular Station".into()), Some("A - One".into()));
+        h.set_stream_meta(QueueId(qid), None, Some("B - Two".into()));
+        let _ = settle_rows(&dir, 3).await;
+
+        let lines: Vec<String> = match h
+            .handle(MpdCommand::Heard(crate::heard::HeardQuery::default()))
+            .await
+        {
+            MpdResponse::Pairs(p) => {
+                assert!(p.iter().all(|(k, _)| k == "heard"), "one key, many lines: {p:?}");
+                p.into_iter().map(|(_, v)| v).collect()
+            }
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        // THE COVERAGE LINE IS MANDATORY and comes first, so a thin file can never read
+        // as a quiet evening.
+        assert!(lines[0].starts_with("coverage:"), "{lines:?}");
+        assert!(
+            lines[0].contains("ICY named this station directly"),
+            "an ICY-only session must not render as a recognizer failure: {lines:?}"
+        );
+        let body = lines.join("\n");
+        assert!(body.contains("A - One"), "{body}");
+        assert!(body.contains("B - Two"), "{body}");
+        assert!(body.contains("Modular Station"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_heard_verb_says_so_when_no_ledger_is_configured() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        match h.handle(MpdCommand::Heard(crate::heard::HeardQuery::default())).await {
+            MpdResponse::Pairs(p) => {
+                let v = pair_of(&p, "heard").expect("an honest answer, never an ACK");
+                assert!(v.contains("no heard ledger configured"), "{p:?}");
+            }
+            other => panic!("expected Pairs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_stream_meta_never_blocks_when_the_ledger_cannot_write_anything() {
+        // THE SPINE BAR. `set_stream_meta` is called SYNCHRONOUSLY by the director on the
+        // task that drives EOF and queue advance, so it must stay a memory move plus a
+        // lock-free send no matter what the filesystem is doing. Here the ledger's
+        // directory is a FILE, so it can never open a handle at all - and 2000 title
+        // changes must still complete, with the state left correct.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let broken = std::env::temp_dir().join(format!("hypodj-heard-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&broken);
+        std::fs::write(&broken, b"not a directory").unwrap();
+        let ledger = crate::heard::spawn_heard_ledger(broken.clone(), 5, 300);
+        h.set_heard_ledger(ledger, broken.clone(), 1800);
+
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        // Let the ledger task finish FAILING to open before hammering it, so this
+        // exercises the steady state of a dead ledger rather than the race before it
+        // notices. Harness slack (a `spawn_blocking` completion is a real-thread event),
+        // not time-based logic.
+        for _ in 0..500 {
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        for i in 0..2000u32 {
+            h.set_stream_meta(QueueId(qid), Some("S".into()), Some(format!("A - {i}")));
+        }
+        let st = h.state.lock().unwrap();
+        assert_eq!(
+            st.stream_meta.as_ref().unwrap().1.title.as_deref(),
+            Some("A - 1999"),
+            "the overlay is still correct with a dead ledger"
+        );
+        assert_eq!(st.prev_icy.as_ref().unwrap().1.raw, "A - 1998");
+        drop(st);
+        let _ = std::fs::remove_file(&broken);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_library_match_stops_riding_currentsong_once_its_subject_is_gone() {
+        // The freshness bound itself, over a slot resolved with NO subject title at all.
+        // The slot used to be retired only on a qid change, so it rode currentsong for
+        // the rest of the entry. NOTE this seeds `names: None`, which is the ONE shape a
+        // production writer does not produce - the mixtape case the bug actually bit is
+        // `a_library_match_cannot_stay_live_by_pointing_at_the_title_it_wrote_itself`.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().library_match =
+            Some(test_match_slot(QueueId(qid), test_library_match("s7", "al-3")));
+
+        async fn has_match(h: &HypodjHandler) -> bool {
+            match h.handle(MpdCommand::CurrentSong).await {
+                MpdResponse::Pairs(p) => p.iter().any(|(k, _)| k == "X-MatchUri"),
+                other => panic!("expected Pairs, got {other:?}"),
+            }
+        }
+        // Just below the freshness bound it still stands.
+        tokio::time::advance(Duration::from_secs(crate::heard::MATCH_SUBJECT_FRESH_SECS - 1)).await;
+        assert!(has_match(&h).await, "a fresh match still rides currentsong");
+        // Past it, it is gone - no more silent hour-old star.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!has_match(&h).await, "a stale match must stop being starrable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recognized_line_is_never_read_as_a_settled_station_announcement() {
+        // THE WRONG STAR, on the exact shape the gesture was written for. A no-ICY
+        // mixtape has ONE writer of the now-playing line: our own recognizer. Reading
+        // that line back as an ICY announcement inverts what its age means - an old
+        // station line has SETTLED (the station is still saying it), an old recognized
+        // line has DECAYED (nothing has re-confirmed it since) - so a press an hour
+        // later took the "unambiguous" door, starred an hour-old track, and wrote a
+        // ledger row dated now. Worse than before the gesture existed, because on these
+        // streams it previously refused.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        // Exactly what an identify HIT publishes: the recognized line plus the library
+        // counterpart it resolved, in one write.
+        h.set_stream_surface(
+            QueueId(qid),
+            StreamMeta {
+                title: Some("Takuya Nakamura - Ancient Reflection".into()),
+                ..Default::default()
+            },
+            None,
+            Some(test_library_match("s7", "al-3")),
+        );
+
+        // While it is young it IS the subject, and the reply says how old it is rather
+        // than pretending it is live.
+        tokio::time::advance(Duration::from_secs(crate::heard::MATCH_SUBJECT_FRESH_SECS - 1)).await;
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(pair_of(&p, "mark_kind").as_deref(), Some("track"), "{p:?}");
+        assert_eq!(
+            pair_of(&p, "mark_subject_age").as_deref(),
+            Some((crate::heard::MATCH_SUBJECT_FRESH_SECS - 1).to_string().as_str()),
+            "{p:?}"
+        );
+
+        // An hour on, well past MARK_SETTLE_SECS: the settled-ICY door must stay SHUT.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        let p = mark_pairs(&h, crate::heard::MarkTarget::Auto).await;
+        assert_eq!(
+            pair_of(&p, "mark_kind").as_deref(),
+            Some("moment"),
+            "an hour-old recognition is not a settled subject: {p:?}"
+        );
+        assert_eq!(pair_of(&p, "mark_starred").as_deref(), Some("0"), "{p:?}");
+        assert!(
+            !pair_of(&p, "mark_result").unwrap().contains("Takuya Nakamura"),
+            "the reply must not name an hour-old track as what is playing: {p:?}"
+        );
+
+        // `mark this` is an ambiguity resolver between the live line and the retired one.
+        // It cannot make a decayed recognition current, so it must not open that door
+        // either - the human is reading a stale display, not a live announcement.
+        let p = mark_pairs(&h, crate::heard::MarkTarget::This).await;
+        assert_eq!(pair_of(&p, "mark_kind").as_deref(), Some("moment"), "{p:?}");
+        assert_eq!(pair_of(&p, "mark_starred").as_deref(), Some("0"), "{p:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_library_match_cannot_stay_live_by_pointing_at_the_title_it_wrote_itself() {
+        // The provenance gate's "the live title still names the subject" branch is
+        // SELF-SATISFYING on the identify path: ONE write publishes both the live title
+        // and the provenance `names` from the same string, so on a no-ICY mixtape the
+        // equality holds forever and X-MatchUri kept pointing at the 20:00 track all
+        // evening - the very bug the gate was added to close. A line WE wrote is no
+        // evidence that the match still stands; only freshness is.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_surface(
+            QueueId(qid),
+            StreamMeta { title: Some("Takuya Nakamura - Ancient Reflection".into()), ..Default::default() },
+            None,
+            Some(test_library_match("s7", "al-3")),
+        );
+
+        async fn has_match(h: &HypodjHandler) -> bool {
+            match h.handle(MpdCommand::CurrentSong).await {
+                MpdResponse::Pairs(p) => p.iter().any(|(k, _)| k == "X-MatchUri"),
+                other => panic!("expected Pairs, got {other:?}"),
+            }
+        }
+        tokio::time::advance(Duration::from_secs(crate::heard::MATCH_SUBJECT_FRESH_SECS - 1)).await;
+        assert!(has_match(&h).await, "a fresh recognition still rides currentsong");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            !has_match(&h).await,
+            "the recognized line cannot vouch for its own match past the freshness bound"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_icy_title_flip_retires_the_library_match_on_the_same_edge() {
+        // The other half of the provenance gate: while the live title still equals what
+        // the match was resolved FOR it holds indefinitely; the instant a new ICY title
+        // lands it is retired, without waiting for the freshness bound.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("Modular Station".into()), Some("A - One".into()));
+        h.set_library_match(
+            QueueId(qid),
+            test_library_match("s7", "al-3"),
+            Some("A - One".into()),
+        );
+
+        async fn has_match(h: &HypodjHandler) -> bool {
+            match h.handle(MpdCommand::CurrentSong).await {
+                MpdResponse::Pairs(p) => p.iter().any(|(k, _)| k == "X-MatchUri"),
+                other => panic!("expected Pairs, got {other:?}"),
+            }
+        }
+        // Well past the freshness bound, but the subject is still on the air.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(has_match(&h).await, "the named subject is still playing");
+
+        h.set_stream_meta(QueueId(qid), None, Some("B - Two".into()));
+        assert!(!has_match(&h).await, "a new ICY title retires the match immediately");
     }
 
     #[tokio::test]
@@ -15524,7 +17210,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         let qid = h.enqueue_stream_for_test(NTS).await;
         h.play_for_test(0).await;
-        h.state.lock().unwrap().library_match = Some((QueueId(qid), test_library_match("s7", "al-3")));
+        h.state.lock().unwrap().library_match = Some(test_match_slot(QueueId(qid), test_library_match("s7", "al-3")));
         h.cover_cache.put("cover/al-3".to_string(), FAKE_PNG.to_vec());
 
         match h.handle(MpdCommand::AlbumArt(NTS.to_string(), 0)).await {
@@ -15900,7 +17586,8 @@ mod tests {
             let st = h.state.lock().unwrap();
             let a = st.pending_auto_identify.as_ref().expect("a grace slot is armed");
             assert_eq!(a.qid, QueueId(qid));
-            assert_eq!(a.misses, 0);
+            assert_eq!(a.content_misses, 0);
+            assert_eq!(a.transport_misses, 0);
             assert!(a.last_recognized.is_none());
         }
         // Before the 8s grace: no fire.
@@ -15993,38 +17680,118 @@ mod tests {
         );
     }
 
-    // The backoff SCHEDULE (pure): one interval on a hit/first miss, doubling per miss,
-    // saturating at interval * 8.
+    // The backoff SCHEDULE (pure), now SPLIT by kind. A TRANSPORT failure keeps the full
+    // exponential up to interval * 8 (the path is broken; hammering it helps nobody). A
+    // CONTENT miss caps at ONE doubling and stays flat at 600s, because a miss says
+    // nothing about whether the NEXT track is recognizable - the fused curve bought only
+    // 40 minutes of deafness on exactly the material where the recognizer is the only
+    // hope.
     #[test]
-    fn auto_identify_delay_schedule() {
-        assert_eq!(auto_identify_delay(300, 0), Duration::from_secs(300));
-        assert_eq!(auto_identify_delay(300, 1), Duration::from_secs(600));
-        assert_eq!(auto_identify_delay(300, 2), Duration::from_secs(1200));
-        assert_eq!(auto_identify_delay(300, 3), Duration::from_secs(2400));
-        assert_eq!(auto_identify_delay(300, 4), Duration::from_secs(2400), "saturated at *8");
-        assert_eq!(auto_identify_delay(300, 99), Duration::from_secs(2400));
+    fn auto_identify_delay_schedule_splits_content_from_transport() {
+        use BackoffKind::{Content, Transport};
+        assert_eq!(auto_identify_delay(300, Transport, 0), Duration::from_secs(300));
+        assert_eq!(auto_identify_delay(300, Transport, 1), Duration::from_secs(600));
+        assert_eq!(auto_identify_delay(300, Transport, 2), Duration::from_secs(1200));
+        assert_eq!(auto_identify_delay(300, Transport, 3), Duration::from_secs(2400));
+        assert_eq!(
+            auto_identify_delay(300, Transport, 4),
+            Duration::from_secs(2400),
+            "transport saturates at *8"
+        );
+        assert_eq!(auto_identify_delay(300, Transport, 99), Duration::from_secs(2400));
+
+        assert_eq!(auto_identify_delay(300, Content, 0), Duration::from_secs(300));
+        assert_eq!(auto_identify_delay(300, Content, 1), Duration::from_secs(600));
+        for n in 2..8u32 {
+            assert_eq!(
+                auto_identify_delay(300, Content, n),
+                Duration::from_secs(600),
+                "content is FLAT at one doubling, never {n} doublings"
+            );
+        }
+        assert_eq!(auto_identify_delay(300, Content, u32::MAX), Duration::from_secs(600));
+        // Saturating multiply: a huge configured interval must never wrap into a tiny
+        // delay that would hammer the endpoint.
+        assert_eq!(
+            auto_identify_delay(u64::MAX, Transport, 3),
+            Duration::from_secs(u64::MAX),
+            "saturating, never wrapping"
+        );
     }
 
-    // Rearm MISS increments misses (saturating at 3); a HIT resets to 0 and records
-    // own-hit provenance.
+    // Rearm advances ONLY the counter for its own kind, each saturating at its own cap;
+    // a HIT resets BOTH and records own-hit provenance. The independence is the point:
+    // a broken network must not decay the content curve, and vice versa.
     #[tokio::test(start_paused = true)]
-    async fn auto_identify_backoff_increments_and_hit_resets() {
+    async fn auto_identify_backoff_counters_are_independent_and_a_hit_resets_both() {
         let Some((h, _rx)) = auto_identify_rig() else { return };
         let qid = h.enqueue_stream_for_test(NTS).await;
         h.play_for_test(0).await;
         h.reschedule_auto_identify(Some(QueueId(qid)));
-        for expect_after in [1u32, 2, 3, 3] {
-            h.rearm_auto_identify_after_attempt(QueueId(qid), false, None);
-            assert_eq!(
-                h.state.lock().unwrap().pending_auto_identify.as_ref().unwrap().misses,
-                expect_after
-            );
+        // Content misses saturate at ONE.
+        for expect_after in [1u32, 1, 1] {
+            h.rearm_auto_identify_after_attempt(QueueId(qid), AttemptOutcome::ContentMiss, None);
+            let st = h.state.lock().unwrap();
+            let a = st.pending_auto_identify.as_ref().unwrap();
+            assert_eq!(a.content_misses, expect_after);
+            assert_eq!(a.transport_misses, 0, "a content miss must not decay the transport curve");
+            assert_eq!(a.last_miss, Some(BackoffKind::Content));
         }
-        h.rearm_auto_identify_after_attempt(QueueId(qid), true, Some("Artist - Track".into()));
+        // Transport failures saturate at THREE, and leave the content count alone.
+        for expect_after in [1u32, 2, 3, 3] {
+            h.rearm_auto_identify_after_attempt(QueueId(qid), AttemptOutcome::TransportMiss, None);
+            let st = h.state.lock().unwrap();
+            let a = st.pending_auto_identify.as_ref().unwrap();
+            assert_eq!(a.transport_misses, expect_after);
+            assert_eq!(a.content_misses, 1, "a transport failure must not decay the content curve");
+            assert_eq!(a.last_miss, Some(BackoffKind::Transport));
+        }
+        h.rearm_auto_identify_after_attempt(
+            QueueId(qid),
+            AttemptOutcome::Hit,
+            Some("Artist - Track".into()),
+        );
         let st = h.state.lock().unwrap();
         let a = st.pending_auto_identify.as_ref().unwrap();
-        assert_eq!(a.misses, 0, "a hit resets misses");
+        assert_eq!(a.content_misses, 0, "a hit resets the content count");
+        assert_eq!(a.transport_misses, 0, "a hit resets the transport count");
+        assert_eq!(a.last_miss, None);
         assert_eq!(a.last_recognized.as_deref(), Some("Artist - Track"), "own-hit provenance recorded");
+    }
+
+    // THE MEASURED PAYOFF, as a schedule rather than a constant: an all-miss mixtape
+    // evening now re-attempts every 600s flat instead of decaying to 2400s. Walks the
+    // REAL rearm path and reads the armed deadline off the fake clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_content_miss_run_reattempts_every_ten_minutes_not_every_forty() {
+        let Some((h, mut fire_rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        // Burn the grace fire so the slot is on the cadence.
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        let _ = fire_rx.try_recv();
+
+        // Four consecutive content misses. From the second onward the gap must be 600s.
+        h.rearm_auto_identify_after_attempt(QueueId(qid), AttemptOutcome::ContentMiss, None);
+        for round in 0..4 {
+            h.rearm_auto_identify_after_attempt(QueueId(qid), AttemptOutcome::ContentMiss, None);
+            // Nothing at 599s.
+            tokio::time::advance(Duration::from_secs(599)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                fire_rx.try_recv().is_err(),
+                "round {round}: the content cadence must not fire early"
+            );
+            // Fires by 600s, NOT at 1200 or 2400 as the fused exponential would.
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                fire_rx.try_recv().is_ok(),
+                "round {round}: a content miss must re-attempt within ten minutes, flat"
+            );
+        }
     }
 
     // PAUSE PROVENANCE (MEDIUM, task why1cp6): a cadence fire while PAUSED (still our current
@@ -16043,7 +17810,8 @@ mod tests {
             let mut st = h.state.lock().unwrap();
             let slot = st.pending_auto_identify.as_mut().unwrap();
             slot.last_recognized = Some("Artist - Track".into());
-            slot.misses = 2;
+            slot.transport_misses = 2;
+            slot.last_miss = Some(BackoffKind::Transport);
             slot.timer_id
         };
         // Report Paused (pending_pause makes reported_play_state Paused without a real fade).
@@ -16062,7 +17830,11 @@ mod tests {
             Some("Artist - Track"),
             "last_recognized provenance is preserved across the paused fire"
         );
-        assert_eq!(slot.misses, 2, "misses preserved (a paused fire is neither a hit nor a miss)");
+        assert_eq!(
+            slot.transport_misses, 2,
+            "miss counts preserved (a paused fire is neither a hit nor a miss)"
+        );
+        assert_eq!(slot.content_misses, 0);
         assert_ne!(slot.timer_id, first_id, "a FRESH cadence timer is armed (the fired one is spent)");
     }
 
@@ -16125,7 +17897,11 @@ mod tests {
         h.play_for_test(0).await;
         h.reschedule_auto_identify(Some(QueueId(qid)));
         let id0 = h.state.lock().unwrap().pending_auto_identify.as_ref().unwrap().timer_id;
-        h.rearm_auto_identify_after_attempt(QueueId(qid.wrapping_add(999)), true, Some("x".into()));
+        h.rearm_auto_identify_after_attempt(
+            QueueId(qid.wrapping_add(999)),
+            AttemptOutcome::Hit,
+            Some("x".into()),
+        );
         {
             let st = h.state.lock().unwrap();
             let a = st.pending_auto_identify.as_ref().unwrap();
@@ -16134,7 +17910,7 @@ mod tests {
         }
         // Slot gone -> rearm is a no-op (no panic).
         h.clear_stream_meta_except(None);
-        h.rearm_auto_identify_after_attempt(QueueId(qid), true, Some("y".into()));
+        h.rearm_auto_identify_after_attempt(QueueId(qid), AttemptOutcome::Hit, Some("y".into()));
         assert!(h.state.lock().unwrap().pending_auto_identify.is_none());
     }
 

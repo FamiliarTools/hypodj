@@ -3,6 +3,7 @@
 //! runs directly; anything else is sent to the daemon as `nl "<phrase>"`, echoed,
 //! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
 
+mod heard;
 mod pls;
 mod render;
 mod stations;
@@ -24,6 +25,13 @@ USAGE:
   dj play | pause | stop  playback control
   dj next | prev          skip / go back (also \"next song\", \"skip this\")
   dj fav | favorite       favorite the current track (also \"fav current\")
+  dj mark                 mark what is playing: star it if you own it, note it if
+                           not. On a stream whose title JUST changed it records
+                           both candidates and stars neither - resolve it with
+                           \"mark this\" or \"mark previous\"
+  dj heard [all|marks|limit <n>]
+                          read the heard ledger back: last session, marks first,
+                           unowned only. The first line is the coverage line
   dj radio                endless radio from what is playing; it keeps going
                            (\"radio random\" to start cold, \"radio off\" to stop)
   dj vol <0-100>          set volume
@@ -147,6 +155,21 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         return Ok(());
     }
 
+    // `heard` is intercepted BEFORE route() for the same stated reason as `stations`:
+    // route is deliberately a pure verb-vs-NL split and is SHARED with dj-gui, so it
+    // knows only the bare views (`heard`, `heard all`, `heard marks`) - and left to the
+    // fallthrough, `heard limit 5` and `heard --all` would be handed to the NL
+    // translator, which has no heard action at all.
+    if parsed.words.first().is_some_and(|w| w == "heard") {
+        let env = Env { get: &|k| std::env::var(k).ok() };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        if !heard::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let action = route::route(&parsed.words);
     if let Action::Help = action {
         print!("{HELP}");
@@ -164,10 +187,7 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
             let pairs = conn.command("playlistinfo")?;
             println!("{}", render::render_queue(&pairs));
         }
-        Action::Command(line) => {
-            conn.command(&line)?;
-            print_card(&mut conn)?;
-        }
+        Action::Command(line) => run_verb(&mut conn, &line)?,
         Action::ClearConfirm => {
             if confirm("clear the whole queue?") {
                 conn.command("clear")?;
@@ -185,7 +205,14 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
 
 /// Star the currently playing track. The server exposes only
 /// `playlistadd Starred <uri>` (no favorite-current shorthand), so resolve the
-/// current song's uri from `currentsong` first. A raw stream has no star surface.
+/// current song's uri from `currentsong` first.
+///
+/// A raw stream is not a library song and has no star surface of its own, so the
+/// gesture goes to the daemon's `mark` verb, which holds everything the decision needs
+/// (the previous ICY title, the subject ages, the provenance-stamped library match, the
+/// ledger) and answers with the one sentence a human reads: it stars the local copy
+/// when the subject is owned and unambiguous, notes a pointer row when it is not, and
+/// refuses to pick between two plausible subjects rather than guessing one.
 fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
     let current = conn.command("currentsong")?;
     let np = model::now_playing(&[], &current);
@@ -196,17 +223,10 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
             return Ok(());
         }
     };
-    // A stream (http(s) URL) is not a library song, so it has no star surface of its
-    // own - but a RECOGNIZED track that matched the library does, so star the copy the
-    // user actually owns (task g96g064).
-    let uri = if uri.starts_with("song/") {
-        uri.to_string()
-    } else if let Some(matched) = np.match_uri.as_deref() {
-        matched.to_string()
-    } else {
-        println!("the current track is a stream, which can't be favorited");
-        return Ok(());
-    };
+    if !uri.starts_with("song/") {
+        return run_verb(conn, "mark");
+    }
+    let uri = uri.to_string();
     let uri = uri.as_str();
     match conn.command(&format!("playlistadd Starred {uri}")) {
         Ok(_) => {
@@ -218,6 +238,18 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// Run one command line and print the card - plus, first, whatever the verb ANSWERED.
+/// Most MPD verbs answer with a bare OK and the card is the whole feedback, but `mark`
+/// returns `mark_result`, the one sentence a human reads. Dropping it would make
+/// `dj mark` succeed in silence, which is the precise bug the gesture exists to end.
+fn run_verb(conn: &mut MpdConn, line: &str) -> Result<(), MpdError> {
+    let pairs = conn.command(line)?;
+    if let Some((_, sentence)) = pairs.iter().find(|(k, _)| k == "mark_result") {
+        println!("{sentence}");
+    }
+    print_card(conn)
 }
 
 /// Fetch status + currentsong on the SAME connection and print the card.
@@ -455,6 +487,29 @@ mod tests {
             route::route(&p.words),
             Action::Nl("wake me at 7 with jazz".into())
         );
+    }
+
+    #[test]
+    fn heard_must_be_intercepted_because_route_would_send_it_to_the_translator() {
+        // This is WHY `heard` is claimed before route(), exactly as `stations` is:
+        // route is a pure verb-vs-NL split SHARED with dj-gui, so it knows only the
+        // bare views. Every argument-carrying form falls through to NL, where the
+        // question about last night's listening would come back as a phrasing hint.
+        assert_eq!(
+            route::route(&v(&["heard", "limit", "5"])),
+            Action::Nl("heard limit 5".into())
+        );
+        assert_eq!(route::route(&v(&["heard", "--all"])), Action::Nl("heard --all".into()));
+        // And the tokens survive parse_args intact, so the interception sees them.
+        let p = parse_args(v(&["heard", "--all"])).unwrap();
+        assert_eq!(p.words, v(&["heard", "--all"]));
+        assert_eq!(p.words.first().map(String::as_str), Some("heard"));
+        let p = parse_args(v(&["--port", "6699", "heard", "limit", "5"])).unwrap();
+        assert_eq!(p.port, Some(6699));
+        assert_eq!(p.words, v(&["heard", "limit", "5"]));
+        // The bare views DO route, which is what makes `:heard` work in the TUI.
+        assert_eq!(route::route(&v(&["heard"])), Action::Command("heard".into()));
+        assert_eq!(route::route(&v(&["heard", "all"])), Action::Command("heard all".into()));
     }
 
     #[test]

@@ -122,6 +122,11 @@ async fn main() -> anyhow::Result<()> {
     // stream names itself; ICY still wins when present, and the backoff + single-flight
     // keep the Shazam endpoint safe. The plan-timer wheel it arms on is wired below.
     handler.set_recognize_config(cfg.recognize.auto, cfg.recognize.interval_secs);
+    // The handler's own Arc, WEAKLY: the `mark` gesture's no-ICY branch spawns a
+    // one-shot recognition, and `tokio::spawn` needs an owned 'static handle the &self
+    // MPD dispatch does not have. Weak so it can never keep the handler alive (the same
+    // posture the store's server-back hook takes below).
+    handler.set_self_ref(Arc::downgrade(&handler));
 
     // The background scrobbler (feature 1) shares the SAME client. The director
     // spine feeds it every player event alongside the inline queue-advance.
@@ -283,6 +288,36 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         tracing::info!("offline store disabled by config");
+    }
+
+    // THE HEARD LEDGER. Root: an explicit [heard].dir wins, else <state_dir>/heard -
+    // the same shape the store root uses, and deliberately NOT inside `store/`, whose
+    // reconciler owns its directory exclusively and deletes everything in it that is not
+    // a valid cached song. With neither, the ledger is disabled with a warn (resume's
+    // posture: never fatal). Spawned BEFORE the MPD bind so the very first ICY title of
+    // the session is already recorded.
+    if cfg.heard.enable {
+        let heard_root = cfg
+            .heard
+            .dir
+            .clone()
+            .or_else(|| state_dir.as_ref().map(|d| d.join("heard")));
+        match heard_root {
+            None => tracing::warn!(
+                "heard ledger enabled but no directory resolves (set [heard].dir or [restart].state_dir); listening will not be recorded"
+            ),
+            Some(root) => {
+                let ledger = hypodj_core::heard::spawn_heard_ledger(
+                    root.clone(),
+                    cfg.heard.keep_sessions,
+                    cfg.recognize.interval_secs,
+                );
+                handler.set_heard_ledger(ledger, root.clone(), cfg.heard.dedupe_window_secs);
+                tracing::info!(dir = %root.display(), "heard ledger open");
+            }
+        }
+    } else {
+        tracing::info!("heard ledger disabled by config");
     }
 
     if let Some(dir) = &state_dir {

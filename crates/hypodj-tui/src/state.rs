@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use hypodj_client::model::{NowPlaying, QueueItem};
 use hypodj_client::nl::not_understood_hint;
@@ -995,32 +995,103 @@ impl TuiState {
         }
     }
 
-    /// Favorite (star) the SELECTED row from its uri (`song/<id>`); mirrors Enter
-    /// in acting on the cursor, so any track can be starred without playing it. A
-    /// stream row (URL uri) is a friendly status; an empty queue is a silent
-    /// no-op.
+    /// `s`: favorite (star) the SELECTED row - the thing under the cursor, mirroring
+    /// Enter, so any track can be starred without playing it.
+    ///
+    /// EVERY screen answers, and the row it acts on is always the one the EYE is on.
+    /// It used to fall through to `self.queue[self.selected]` on every non-Find screen,
+    /// which is the QUEUE cursor: pressing `s` on an Albums row starred whatever library
+    /// song happened to sit at that queue index - invisible, wrong, and a write into the
+    /// user's library. That is the exact failure the mark work exists to prevent, so the
+    /// dispatch is now per-screen like `radio_selected`, and an unstarrable row says WHY.
     fn favorite_selected(&mut self) -> Option<Intent> {
+        // The Find HIT list is not a `Browse`, so it must be claimed BEFORE any
+        // `active_browse()` consultation (which returns None off-drill and would fall
+        // through to the QUEUE row while the visible list sat still).
         if self.screen == Screen::Find && !self.find.drilling {
-            // song/ and album/ are both starrable (Favorite::from_uri handles both);
-            // an artist row is not, and stage one never produces one.
-            let uri = self.find.current_row()?.uri.clone();
-            return if uri.starts_with("song/") || uri.starts_with("album/") {
-                Some(Intent::Command(format!("playlistadd Starred {uri}")))
-            } else {
-                self.status_msg = Some("that row can't be favorited".into());
-                None
+            let Some(row) = self.find.current_row() else {
+                self.status_msg = Some("nothing here to star".into());
+                return None;
             };
+            let (uri, label) = (row.uri.clone(), row.label.clone());
+            return self.favorite_from_uri(&uri, &label);
         }
-        match self.queue.get(self.selected).and_then(|it| it.uri.as_deref()) {
-            Some(uri) if uri.starts_with("song/") => {
-                Some(Intent::Command(format!("playlistadd Starred {uri}")))
-            }
-            Some(_) => {
-                self.status_msg = Some("that row is a stream, can't favorite".into());
+        match self.screen {
+            // The DJ ask line owns every printable key, so `s` is text there and never
+            // reaches dispatch; unreachable rather than meaningful.
+            Screen::Dj => None,
+            // A Playlists row is a NAME, not a uri (see `BrowseRow::uri`), so there is
+            // no id to star - the same reason `r` cannot seed a radio from one.
+            Screen::Playlists => {
+                self.status_msg = Some("a playlist is a name, not a track - can't star it".into());
                 None
             }
-            None => None,
+            // Albums, and a Find drill, are real browse lists keyed by uri.
+            Screen::Albums | Screen::Find => {
+                let Some(b) = self.active_browse() else { return None };
+                let Some(row) = b.rows.get(b.selected) else {
+                    self.status_msg = Some("nothing here to star".into());
+                    return None;
+                };
+                let (uri, label) = (row.uri.clone(), row.label.clone());
+                self.favorite_from_uri(&uri, &label)
+            }
+            Screen::Queue => {
+                let Some(it) = self.queue.get(self.selected) else {
+                    self.status_msg = Some("nothing here to star".into());
+                    return None;
+                };
+                let (uri, label, is_current) = (
+                    it.uri.clone(),
+                    it.title.clone(),
+                    self.now.song == Some(it.pos),
+                );
+                match uri {
+                    Some(uri) if uri.starts_with("song/") => {
+                        Some(Intent::Command(format!("playlistadd Starred {uri}")))
+                    }
+                    // A stream row: "can't favorite" became FALSE the moment `mark`
+                    // shipped, and a false reason is worse than a dead key. The subject
+                    // of a mark is what is ON AIR, though, not what the cursor is on, so
+                    // only the PLAYING stream row marks; another one says what to do.
+                    Some(_) if is_current => Some(Intent::Command("mark".into())),
+                    Some(_) => {
+                        self.status_msg =
+                            Some("that row is a stream - play it, then s marks what is on".into());
+                        None
+                    }
+                    None => {
+                        self.status_msg = Some(format!("{label} has no track to star"));
+                        None
+                    }
+                }
+            }
         }
+    }
+
+    /// The ONE uri gate behind `s`: `playlistadd Starred` accepts a library `song/<id>`
+    /// or `album/<id>` (`Favorite::from_uri` handles exactly those two), so the client
+    /// whitelists the same two shapes and turns every other row into a REASON rather
+    /// than an ACK banner. Mirrors [`radio_from_uri`].
+    fn favorite_from_uri(&mut self, uri: &str, label: &str) -> Option<Intent> {
+        if uri.starts_with("song/") || uri.starts_with("album/") {
+            return Some(Intent::Command(format!("playlistadd Starred {uri}")));
+        }
+        self.status_msg = Some(if uri.starts_with("artist/") {
+            "can't star an artist - open it and star an album".into()
+        } else if uri.starts_with("list/") {
+            "can't star a smart list".into()
+        } else if uri.starts_with("station/") {
+            // Subsonic has no star endpoint for internet radio at all, but the thing
+            // PLAYING on it is markable - so the refusal points at the verb that works
+            // instead of stopping at "can't".
+            "a saved station is a stream - play it, then C-s marks what is on".into()
+        } else if uri.contains("://") {
+            "that row is a stream - play it, then C-s marks what is on".into()
+        } else {
+            format!("can't star {label}")
+        });
+        None
     }
 
     /// `r`: start an ENDLESS radio from the SELECTED row - the thing under the cursor
@@ -1391,26 +1462,26 @@ impl TuiState {
         }
     }
 
-    /// Favorite (star) the current track from a typed `fav`/`favorite` phrase. Needs
-    /// the current song uri (`song/<id>`); a raw stream or nothing playing is a
-    /// friendly status, not a command.
+    /// Favorite (star) the current track - Ctrl-s, and the typed `fav`/`favorite`
+    /// phrase. TOTAL: every playing thing answers, and none of the answers is silence.
+    ///
+    /// A library `song/<id>` stars itself. A raw stream goes to the daemon's `mark`
+    /// verb, which is the only place that holds what the decision needs - the previous
+    /// ICY title, the subject ages, the provenance-stamped library match and the heard
+    /// ledger - so it stars the local copy when the subject is owned and unambiguous,
+    /// records a pointer row when it is not, refuses to pick between two plausible
+    /// subjects, and ALWAYS answers with a sentence the worker turns into a banner.
+    ///
+    /// Deliberately NOT the client-side `match_uri` shortcut this replaced: that starred
+    /// silently (nothing on screen changed at all), recorded nothing, and read a match
+    /// the client cannot age-check. Nothing playing is still answered here rather than
+    /// on a round trip, because the client already knows.
     fn favorite_current(&mut self) -> Option<Intent> {
         match self.now.file.as_deref() {
             Some(uri) if uri.starts_with("song/") => {
                 Some(Intent::Command(format!("playlistadd Starred {uri}")))
             }
-            // A raw stream has no star surface of its own, but a RECOGNIZED track that
-            // matched the library does: star the copy the user actually owns (task
-            // g96g064). Only reachable when songrec named the track AND the matcher was
-            // confident, so it can never star a guess.
-            Some(_) => match self.now.match_uri.as_deref() {
-                Some(uri) => Some(Intent::Command(format!("playlistadd Starred {uri}"))),
-                None => {
-                    self.status_msg =
-                        Some("the current track is a stream, can't favorite".into());
-                    None
-                }
-            },
+            Some(_) => Some(Intent::Command("mark".into())),
             None => {
                 self.status_msg = Some("nothing is playing to favorite".into());
                 None
@@ -1475,6 +1546,15 @@ impl TuiState {
                 }
                 _ => None,
             };
+        }
+        // A Ctrl chord is NEVER query text. crossterm delivers Ctrl-s as
+        // `Char('s') + CONTROL`, and the `KeyCode::Char(c)` arm below inspects only the
+        // code - so without this the mark gesture silently TYPED an `s` into the query
+        // the user was in the middle of writing. A key that corrupts input is worse than
+        // a dead one, and the gesture cannot be called total while a screen eats it.
+        // Resolved through the SINGLE-SOURCE keymap, so this can never drift from KEYMAP.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return keymap::match_key(key, self.screen).and_then(|act| self.apply_act(act));
         }
         match key.code {
             // The Esc ladder: out of a drill, then off the query line to the results,
@@ -1556,6 +1636,13 @@ impl TuiState {
                 }
                 _ => {}
             }
+        }
+        // A Ctrl chord is NEVER ask-line text - same reason as the Find query line:
+        // crossterm delivers Ctrl-s as `Char('s') + CONTROL` and the `KeyCode::Char(c)`
+        // arm below inspects only the code, so the mark gesture silently typed an `s`
+        // into the phrase being written. Resolved through the SINGLE-SOURCE keymap.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return keymap::match_key(key, self.screen).and_then(|act| self.apply_act(act));
         }
         match key.code {
             KeyCode::Esc => {
@@ -1645,26 +1732,27 @@ mod tests {
     }
 
     #[test]
-    fn favorite_current_stars_the_library_match_for_a_stream() {
-        // Phase 2 (task g96g064): starring what the radio is playing. A stream has no
-        // star surface of its own, but a confidently matched library counterpart does.
+    fn favorite_current_marks_a_stream_and_never_goes_silent() {
+        // THE gesture. A stream has no star surface of its own, and the client holds
+        // none of what the subject decision needs (the previous ICY title, the ages, the
+        // provenance-stamped match, the ledger) - so every stream shape goes to the
+        // daemon's `mark`, which always answers with a sentence.
+        let mut s = TuiState::default();
+        s.now.file = Some("https://stream.example/live".into());
+        assert_eq!(
+            s.favorite_current(),
+            Some(Intent::Command("mark".into())),
+            "a stream marks rather than refusing - this WAS the silent no-op"
+        );
+        assert!(s.status_msg.is_none(), "no client-side refusal is invented");
+
+        // A stream with a recognized library match goes the SAME way. The old
+        // client-side `match_uri` shortcut starred it silently, recorded nothing, and
+        // could not age-check the match; `mark` stars the owned copy AND says so.
         let mut s = TuiState::default();
         s.now.file = Some("https://stream.example/live".into());
         s.now.match_uri = Some("song/s7".into());
-        assert_eq!(
-            s.favorite_current(),
-            Some(Intent::Command("playlistadd Starred song/s7".into())),
-            "the library copy is starred, not the stream"
-        );
-
-        // Without a match the refusal is unchanged - never star a guess.
-        let mut s = TuiState::default();
-        s.now.file = Some("https://stream.example/live".into());
-        assert_eq!(s.favorite_current(), None);
-        assert_eq!(
-            s.status_msg.as_deref(),
-            Some("the current track is a stream, can't favorite")
-        );
+        assert_eq!(s.favorite_current(), Some(Intent::Command("mark".into())));
 
         // A library song still stars itself, ignoring any match uri.
         let mut s = TuiState::default();
@@ -1674,6 +1762,12 @@ mod tests {
             s.favorite_current(),
             Some(Intent::Command("playlistadd Starred song/lib1".into()))
         );
+
+        // Nothing playing is answered HERE rather than on a round trip - the client
+        // already knows - but it is still answered, never silence.
+        let mut s = TuiState::default();
+        assert_eq!(s.favorite_current(), None);
+        assert_eq!(s.status_msg.as_deref(), Some("nothing is playing to favorite"));
     }
 
     fn item(pos: usize) -> QueueItem {
@@ -2086,10 +2180,14 @@ mod tests {
         assert_eq!(s.selected, 0, "and the queue cursor did not");
 
         // `s`: Subsonic has no star endpoint for internet radio at all, so this is a
-        // refusal with a reason, never a silent no-op.
+        // refusal with a reason, never a silent no-op - and now the reason points at the
+        // verb that DOES work on a station, which is marking what it is playing.
         let mut s = fresh();
         assert_eq!(s.handle_key(ch('s')), None);
-        assert_eq!(s.status_msg.as_deref(), Some("that row can't be favorited"));
+        assert_eq!(
+            s.status_msg.as_deref(),
+            Some("a saved station is a stream - play it, then C-s marks what is on")
+        );
 
         // `o`: a station is a leaf. Drilling would paint an empty bordered box over the
         // hits, so it says so instead.
@@ -2535,14 +2633,43 @@ mod tests {
             s.handle_key(ctrl('s')),
             Some(Intent::Command("playlistadd Starred song/3".into()))
         );
-        // A stream -> friendly status, no command.
+        // A stream -> the mark gesture, NOT a refusal. This key was a silent no-op on
+        // 92% of his listening; the whole point is that it now always does something.
         s.now.file = Some("http://stream.example/live".into());
-        assert_eq!(s.handle_key(ctrl('s')), None);
-        assert!(s.status_msg.is_some());
+        assert_eq!(s.handle_key(ctrl('s')), Some(Intent::Command("mark".into())));
         // Nothing playing -> friendly status.
         s.now.file = None;
         assert_eq!(s.handle_key(ctrl('s')), None);
         assert!(s.status_msg.is_some());
+    }
+
+    #[test]
+    fn ctrl_s_on_the_find_query_line_marks_and_never_types_an_s() {
+        // crossterm delivers Ctrl-s as `Char('s') + CONTROL`, and key_find's Char arm
+        // inspected only the CODE - so the gesture silently TYPED an `s` into the query
+        // the user was writing. A key that corrupts input is worse than a dead one.
+        let mut s = TuiState::new();
+        s.screen = Screen::Find;
+        s.find.query = "takuya".into();
+        s.now.file = Some("http://stream.example/live".into());
+        assert_eq!(s.handle_key(ctrl('s')), Some(Intent::Command("mark".into())));
+        assert_eq!(s.find.query, "takuya", "the query is UNCHANGED");
+        // A plain `s` is still ordinary query text on this line.
+        assert_eq!(s.handle_key(ch('s')), None);
+        assert_eq!(s.find.query, "takuyas");
+    }
+
+    #[test]
+    fn ctrl_s_on_the_dj_ask_line_marks_and_never_types_an_s() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Dj;
+        s.dj_input = "something like".into();
+        s.now.file = Some("http://stream.example/live".into());
+        assert_eq!(s.handle_key(ctrl('s')), Some(Intent::Command("mark".into())));
+        assert_eq!(s.dj_input, "something like", "the ask line is UNCHANGED");
+        // A plain `s` is still ordinary ask-line text.
+        assert_eq!(s.handle_key(ch('s')), None);
+        assert_eq!(s.dj_input, "something likes");
     }
 
     #[test]
@@ -2583,16 +2710,91 @@ mod tests {
             s.handle_key(ch('s')),
             Some(Intent::Command("playlistadd Starred song/7".into()))
         );
-        // A stream row (URL uri) is a friendly status, not a command.
+        // A stream row that is NOT the one playing: the subject of a mark is what is on
+        // AIR, not what the cursor is on, so it says what to do instead of guessing.
         s.queue[1].uri = Some("http://stream.example/live".into());
         assert_eq!(s.handle_key(ch('s')), None);
-        assert!(s.status_msg.is_some());
-        // No uri at all -> silent no-op.
+        assert_eq!(
+            s.status_msg.as_deref(),
+            Some("that row is a stream - play it, then s marks what is on")
+        );
+        // No uri at all -> a reason, not the old silent no-op.
         s.queue[1].uri = None;
         assert_eq!(s.handle_key(ch('s')), None);
-        // Empty queue -> no-op.
+        assert!(s.status_msg.is_some(), "a row the cursor can land on always answers");
+        // Empty queue -> no command, and it says there is nothing here.
         s.apply_snapshot(NowPlaying::default(), vec![]);
         assert_eq!(s.handle_key(ch('s')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("nothing here to star"));
+    }
+
+    #[test]
+    fn s_on_the_playing_stream_row_marks_it() {
+        // "that row is a stream, can't favorite" became FALSE the moment `mark` shipped,
+        // and a false reason is worse than a dead key.
+        let mut s = TuiState::new();
+        let mut now = NowPlaying::default();
+        now.song = Some(1);
+        let mut stream = item(1);
+        stream.uri = Some("http://stream.example/live".into());
+        s.apply_snapshot(now, vec![item(0), stream]);
+        s.selected = 1;
+        assert_eq!(s.handle_key(ch('s')), Some(Intent::Command("mark".into())));
+    }
+
+    #[test]
+    fn s_stars_the_visible_album_row_not_the_queue_cursor() {
+        // THE wrong-target star. `favorite_selected` fell through to
+        // `self.queue[self.selected]` on every non-Find screen, which is the QUEUE
+        // cursor - so `s` on an Albums row starred whatever library song happened to sit
+        // at that queue index. Invisible, wrong, and a WRITE into his library.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(11), item(22), item(33)]);
+        s.selected = 2; // the queue cursor sits on song/33 and must not be touched
+        s.screen = Screen::Albums;
+        s.albums.rows = vec![
+            BrowseRow { label: "Sun Ra".into(), uri: "album/a1".into(), is_dir: true, song_count: None },
+            BrowseRow { label: "Takuya Nakamura".into(), uri: "album/a2".into(), is_dir: true, song_count: None },
+        ];
+        s.albums.selected = 1;
+        assert_eq!(
+            s.handle_key(ch('s')),
+            Some(Intent::Command("playlistadd Starred album/a2".into())),
+            "the VISIBLE album is starred, never queue[selected]"
+        );
+        assert_eq!(s.selected, 2, "the queue cursor never moved");
+
+        // A smart-list row on the same screen is not starrable, and says so rather than
+        // reaching for the queue.
+        s.albums.rows.push(BrowseRow {
+            label: "Recently Added".into(),
+            uri: "list/recent".into(),
+            is_dir: true,
+            song_count: None,
+        });
+        s.albums.selected = 2;
+        assert_eq!(s.handle_key(ch('s')), None);
+        assert_eq!(s.status_msg.as_deref(), Some("can't star a smart list"));
+    }
+
+    #[test]
+    fn s_on_a_playlist_row_says_why_instead_of_starring_a_queue_song() {
+        // A Playlists row is a NAME, not a uri - the same reason `r` cannot seed a radio
+        // from one. Before the per-screen dispatch this starred queue[selected].
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(5)]);
+        s.screen = Screen::Playlists;
+        s.playlists.rows = vec![BrowseRow {
+            label: "Starred".into(),
+            uri: "Starred".into(),
+            is_dir: false,
+            song_count: None,
+        }];
+        assert_eq!(s.handle_key(ch('s')), None);
+        assert_eq!(
+            s.status_msg.as_deref(),
+            Some("a playlist is a name, not a track - can't star it")
+        );
     }
 
     #[test]

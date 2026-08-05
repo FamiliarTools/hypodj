@@ -12,7 +12,10 @@
 //! never blocks the reactor and a timeout can actually KILL the child):
 //! 1. `ffmpeg` captures ~11s of the stream URL to a temp mono 16 kHz wav.
 //! 2. `songrec recognize --json <wav>` fingerprints the wav, queries Shazam, and
-//!    prints ONE line of JSON to stdout (empty stdout + exit 0 = no match).
+//!    prints ONE line of JSON to stdout, with its OUTCOME on stderr. Both are
+//!    captured and classified by [`classify_songrec`], which is what splits a content
+//!    miss ("No match for this song") from a transport failure ("Network unreachable")
+//!    AT THE SOURCE, so nothing downstream has to infer it from timing.
 //!
 //! Both tools are put on `PATH` by the nix wrapper (see `nix/package.nix`), so the
 //! feature is self-contained. The temp wav is removed in EVERY branch (RAII guard),
@@ -75,6 +78,15 @@ pub struct RecognizedTrack {
 /// Why a recognition attempt failed at the SUBPROCESS layer (as opposed to a clean
 /// no-match, which is `Ok(None)`). Kept distinct so the handler can ACK an honest
 /// error versus a plain "no match".
+///
+/// THE SPLIT THAT MATTERS: a CONTENT miss (`Ok(None)` - Shazam simply does not know
+/// this music) and a TRANSPORT failure (this variant - the network, the endpoint, or a
+/// stalled capture) are different facts about the world and must back off differently.
+/// Before the stderr taxonomy below existed they were indistinguishable, so both decayed
+/// on the same exponential and an all-miss mixtape evening produced 40 minutes of
+/// deafness. Every variant here is a TRANSPORT failure; nothing content-shaped reaches
+/// it. CORE-INTERNAL: `RecognizeError` appears nowhere outside this module (the handler
+/// consumes it via `Display`), so adding a variant is not a cross-crate break.
 #[derive(Debug)]
 pub enum RecognizeError {
     /// A tool could not be spawned or exec'd (e.g. missing from `PATH`). Carries the
@@ -83,9 +95,34 @@ pub enum RecognizeError {
     /// `ffmpeg` ran but exited non-zero (the stream URL was unreachable / not
     /// capturable, or its `-rw_timeout` fired on a stalled read).
     Capture,
+    /// `songrec` ran but could not REACH Shazam, as it said on its own stderr. Carries
+    /// whether the message was specifically a rate-limit ("Your IP has been
+    /// rate-limited"), which songrec 0.7.4 prints with no retry and whose limiter is
+    /// IP-keyed - so it is worth naming in a log even though the backoff treats it as
+    /// any other transport failure.
+    Transport { rate_limited: bool },
+    /// `songrec` produced something this module cannot classify (an unparseable stdout
+    /// with a silent stderr, an unrecognized stderr message). Counted as a transport
+    /// failure for backoff, because an UNKNOWN outcome must not be optimistically
+    /// treated as "Shazam does not know this music".
+    Unknown,
     /// The whole capture+recognition exceeded [`RECOGNIZE_TIMEOUT`]; the child was
-    /// killed on the way out.
+    /// killed on the way out. Note that a timeout with an EMPTY stderr is the ONLY
+    /// remaining 429 SUSPICION (songrec prints nothing and hangs on a genuine 429), and
+    /// it is logged as suspicion, never as certainty - there is no timing inference
+    /// anywhere in this module.
     Timeout,
+}
+
+impl RecognizeError {
+    /// A short, stable word for the ledger `outcome` field.
+    pub fn outcome_word(&self) -> &'static str {
+        match self {
+            RecognizeError::Transport { rate_limited: true } => "rate_limited",
+            RecognizeError::Timeout => "timeout",
+            _ => "transport",
+        }
+    }
 }
 
 impl std::fmt::Display for RecognizeError {
@@ -93,12 +130,94 @@ impl std::fmt::Display for RecognizeError {
         match self {
             RecognizeError::Spawn(tool, e) => write!(f, "could not run {tool}: {e}"),
             RecognizeError::Capture => write!(f, "stream capture failed"),
+            RecognizeError::Transport { rate_limited: true } => {
+                write!(f, "shazam rate-limited this address")
+            }
+            RecognizeError::Transport { rate_limited: false } => {
+                write!(f, "could not reach shazam")
+            }
+            RecognizeError::Unknown => write!(f, "recognition failed for an unknown reason"),
             RecognizeError::Timeout => write!(f, "recognition timed out"),
         }
     }
 }
 
 impl std::error::Error for RecognizeError {}
+
+/// What one `songrec recognize --json` run actually said, read from its exit status,
+/// its stdout AND its stderr.
+///
+/// The stderr was previously thrown away (`Stdio::null()`), which collapsed three
+/// genuinely different outcomes into one indistinguishable "empty or unparseable
+/// stdout". songrec ALREADY prints the taxonomy; capturing it removes every need for
+/// timing inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SongrecOutcome {
+    /// A parseable track came back on stdout.
+    Hit(String),
+    /// A CONTENT miss: songrec reached Shazam and Shazam did not know this audio.
+    NoMatch,
+    /// A TRANSPORT failure: songrec could not reach Shazam.
+    Transport { rate_limited: bool },
+    /// Unclassifiable. Treated as transport, never as a content miss.
+    Unknown,
+}
+
+/// stderr substrings that mean a clean CONTENT miss.
+const NO_MATCH_MARKERS: &[&str] = &["no match for this song", "no match found", "no match"];
+
+/// stderr substrings that mean songrec was RATE-LIMITED (songrec 0.7.4's own wording,
+/// plus the raw status).
+const RATE_LIMIT_MARKERS: &[&str] = &["rate-limited", "rate limited", "429", "too many requests"];
+
+/// stderr substrings that mean a TRANSPORT failure of any other shape.
+const TRANSPORT_MARKERS: &[&str] = &[
+    "network unreachable",
+    "network is unreachable",
+    "error sending request",
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "dns error",
+    "failed to lookup address",
+    "temporary failure in name resolution",
+    "operation timed out",
+    "timed out",
+    "certificate",
+    "tls",
+    "no route to host",
+];
+
+/// Classify one songrec run. PURE, so the whole taxonomy is unit-testable against real
+/// songrec strings with no subprocess, no network and no clock.
+///
+/// STDOUT FIRST: a parseable track is a Hit regardless of any stderr noise. Only then is
+/// stderr consulted, no-match before the failure markers, because a clean miss is the
+/// common case and must never be mistaken for a network problem (that mistake is what
+/// would put a content miss on the full exponential again).
+pub fn classify_songrec(status: Option<i32>, stdout: &str, stderr: &str) -> SongrecOutcome {
+    let out = stdout.trim();
+    if !out.is_empty() && parse_recognize_json(out).is_some() {
+        return SongrecOutcome::Hit(out.to_string());
+    }
+    let err = stderr.to_lowercase();
+    if NO_MATCH_MARKERS.iter().any(|m| err.contains(m)) {
+        return SongrecOutcome::NoMatch;
+    }
+    if RATE_LIMIT_MARKERS.iter().any(|m| err.contains(m)) {
+        return SongrecOutcome::Transport { rate_limited: true };
+    }
+    if TRANSPORT_MARKERS.iter().any(|m| err.contains(m)) {
+        return SongrecOutcome::Transport { rate_limited: false };
+    }
+    // The LEGACY clean-no-match shape: exit 0, empty stdout, silent stderr. Kept as a
+    // content miss because that is what it has always meant and inflating it into a
+    // transport failure would put the gentler backoff on the wrong arm.
+    if status == Some(0) && out.is_empty() && err.trim().is_empty() {
+        return SongrecOutcome::NoMatch;
+    }
+    SongrecOutcome::Unknown
+}
 
 /// Removes its temp wav on drop, in EVERY branch (ok / err / panic / timeout), so a
 /// recognition never leaves litter in the temp dir. Removal is best-effort (`let _`)
@@ -126,11 +245,12 @@ fn temp_wav_path() -> PathBuf {
 /// SIGKILLed rather than orphaned. Every subprocess uses `Stdio::null()` for stdin
 /// so it can never block waiting on input.
 ///
-/// On a clean no-match, `songrec` exits 0 with EMPTY stdout (it prints "No match"
-/// to stderr), so this returns `Ok("")` and the parser maps empty -> `None`. A
-/// non-zero songrec exit is NOT treated as a hard error here (an empty/garbage
-/// stdout still parses to `None`); only a spawn/exec failure is.
-async fn capture_and_recognize(url: &str, wav: &Path) -> Result<String, RecognizeError> {
+/// songrec's OWN stderr carries the outcome taxonomy - "No match for this song" versus
+/// "Network unreachable" - so it is PIPED and classified by [`classify_songrec`]
+/// rather than discarded. ffmpeg's stderr stays null (it is decode noise, and a failed
+/// capture is already an unambiguous non-zero exit). The exit status is passed to the
+/// classifier but is never on its own a hard error.
+async fn capture_and_recognize(url: &str, wav: &Path) -> Result<SongrecOutcome, RecognizeError> {
     use std::process::Stdio;
     use tokio::process::Command;
 
@@ -154,19 +274,22 @@ async fn capture_and_recognize(url: &str, wav: &Path) -> Result<String, Recogniz
         return Err(RecognizeError::Capture);
     }
 
-    // 2. Headless recognition: songrec prints ONE line of JSON on a match, empty on
-    // no-match. Capture stdout; stderr is discarded (the no-match message lives
-    // there). Null stdin so it never blocks.
+    // 2. Headless recognition: songrec prints ONE line of JSON on a match, and its
+    // OUTCOME on stderr. Both are captured, because the stderr IS the taxonomy that
+    // splits a content miss from a transport failure at the source. Null stdin so it
+    // never blocks.
     let out = Command::new("songrec")
         .args(["recognize", "--json"])
         .arg(wav)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| RecognizeError::Spawn("songrec", e))?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Ok(classify_songrec(out.status.code(), &stdout, &stderr))
 }
 
 /// Recognize the currently-playing audio at `url` via the side-band capture +
@@ -192,17 +315,29 @@ pub async fn recognize_stream_url(url: String) -> Result<Option<RecognizedTrack>
 async fn run_bounded(
     wav: PathBuf,
     timeout: Duration,
-    work: impl std::future::Future<Output = Result<String, RecognizeError>>,
+    work: impl std::future::Future<Output = Result<SongrecOutcome, RecognizeError>>,
 ) -> Result<Option<RecognizedTrack>, RecognizeError> {
     // RAII: removes the wav on EVERY exit path below (including the timeout branch,
     // where `work` is dropped - killing its child - but this guard still unlinks it).
     let _guard = TempFileGuard(wav);
-    let stdout = match tokio::time::timeout(timeout, work).await {
-        Ok(Ok(stdout)) => stdout,
+    let outcome = match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(outcome)) => outcome,
         Ok(Err(e)) => return Err(e),
         Err(_elapsed) => return Err(RecognizeError::Timeout),
     };
-    Ok(parse_recognize_json(&stdout))
+    // The classified outcome maps onto the caller's contract: `Ok(None)` is and stays
+    // the CONTENT miss, every failure shape is an `Err` the backoff reads as transport.
+    match outcome {
+        // A classified Hit already parsed once; the second parse is the same pure call
+        // and cannot disagree, so an unparseable value here is impossible by
+        // construction and degrades to a content miss rather than a panic.
+        SongrecOutcome::Hit(stdout) => Ok(parse_recognize_json(&stdout)),
+        SongrecOutcome::NoMatch => Ok(None),
+        SongrecOutcome::Transport { rate_limited } => {
+            Err(RecognizeError::Transport { rate_limited })
+        }
+        SongrecOutcome::Unknown => Err(RecognizeError::Unknown),
+    }
 }
 
 // ── the songrec JSON shape (only the fields the mapper needs) ────────────────
@@ -489,7 +624,7 @@ mod tests {
         assert!(path.exists());
         let work = async {
             tokio::time::sleep(Duration::from_secs(3600)).await;
-            Ok(String::new())
+            Ok(SongrecOutcome::NoMatch)
         };
         let res = run_bounded(path.clone(), Duration::from_secs(40), work).await;
         assert!(matches!(res, Err(RecognizeError::Timeout)));
@@ -502,12 +637,124 @@ mod tests {
         // temp wav is still cleaned afterward.
         let path = temp_wav_path();
         std::fs::write(&path, b"wav").unwrap();
-        let hit = REAL_HIT.to_string();
+        let hit = SongrecOutcome::Hit(REAL_HIT.to_string());
         let work = async move { Ok(hit) };
         let res = run_bounded(path.clone(), Duration::from_secs(40), work).await;
         let track = res.expect("no error").expect("a hit");
         assert_eq!(track.title.as_deref(), Some("Blessings"));
         assert!(!path.exists(), "temp wav must be cleaned on the success path");
+    }
+
+    #[tokio::test]
+    async fn run_bounded_splits_content_miss_from_transport_failure() {
+        // THE residual: a content miss stays `Ok(None)` while every transport shape
+        // becomes an `Err`, so the two can back off differently. Before this split both
+        // arrived as an indistinguishable empty stdout.
+        let path = temp_wav_path();
+        let miss = run_bounded(path.clone(), Duration::from_secs(40), async {
+            Ok(SongrecOutcome::NoMatch)
+        })
+        .await;
+        assert!(matches!(miss, Ok(None)), "a content miss is Ok(None)");
+
+        let net = run_bounded(path.clone(), Duration::from_secs(40), async {
+            Ok(SongrecOutcome::Transport { rate_limited: false })
+        })
+        .await;
+        assert!(matches!(net, Err(RecognizeError::Transport { rate_limited: false })));
+
+        let limited = run_bounded(path.clone(), Duration::from_secs(40), async {
+            Ok(SongrecOutcome::Transport { rate_limited: true })
+        })
+        .await;
+        assert!(matches!(limited, Err(RecognizeError::Transport { rate_limited: true })));
+
+        let unknown =
+            run_bounded(path.clone(), Duration::from_secs(40), async { Ok(SongrecOutcome::Unknown) })
+                .await;
+        assert!(matches!(unknown, Err(RecognizeError::Unknown)));
+    }
+
+    #[test]
+    fn classify_songrec_reads_songrecs_own_stderr_taxonomy() {
+        // songrec 0.7.4's REAL strings. The whole point of piping stderr is that these
+        // three are different facts about the world.
+        assert_eq!(
+            classify_songrec(Some(0), "", "No match for this song\n"),
+            SongrecOutcome::NoMatch
+        );
+        assert_eq!(
+            classify_songrec(Some(1), "", "Error: Network unreachable (os error 101)\n"),
+            SongrecOutcome::Transport { rate_limited: false }
+        );
+        assert_eq!(
+            classify_songrec(Some(1), "", "Your IP has been rate-limited\n"),
+            SongrecOutcome::Transport { rate_limited: true }
+        );
+        // A reqwest transport failure, as songrec surfaces it.
+        assert_eq!(
+            classify_songrec(Some(1), "", "error sending request for url (https://amp.shazam.com)"),
+            SongrecOutcome::Transport { rate_limited: false }
+        );
+    }
+
+    #[test]
+    fn classify_songrec_is_stdout_first_and_never_guesses_a_content_miss() {
+        // A parseable track is a Hit regardless of stderr noise.
+        let out = classify_songrec(Some(0), REAL_HIT, "warning: something on stderr\n");
+        assert!(matches!(out, SongrecOutcome::Hit(_)));
+        // The LEGACY clean shape (exit 0, empty stdout, silent stderr) stays a content
+        // miss - inflating it would put the gentle backoff on the wrong arm.
+        assert_eq!(classify_songrec(Some(0), "", ""), SongrecOutcome::NoMatch);
+        assert_eq!(classify_songrec(Some(0), "  \n", "   "), SongrecOutcome::NoMatch);
+        // An UNCLASSIFIABLE outcome must NOT be optimistically read as "Shazam does not
+        // know this music": a non-zero exit with a silent stderr, and garbage stdout,
+        // are both Unknown (which the backoff treats as transport).
+        assert_eq!(classify_songrec(Some(1), "", ""), SongrecOutcome::Unknown);
+        assert_eq!(classify_songrec(None, "", ""), SongrecOutcome::Unknown);
+        assert_eq!(classify_songrec(Some(0), "not json at all", ""), SongrecOutcome::Unknown);
+    }
+
+    #[test]
+    fn the_songrec_child_really_pipes_its_stderr() {
+        // The classifier is pure and fully tested above, but it is only USEFUL if the
+        // child's stderr actually reaches it - and that is one literal in a builder
+        // chain that no unit test can otherwise observe (spawning songrec would cost a
+        // real call against an IP-keyed limiter). A structural guard on the source is
+        // the honest floor: it catches a revert to `Stdio::null()`, which is exactly how
+        // this residual existed for a year.
+        let whole = include_str!("recognize.rs");
+        let src = whole.split("#[cfg(test)]").next().expect("a production half");
+        let songrec = src
+            .split("Command::new(\"songrec\")")
+            .nth(1)
+            .expect("the songrec child");
+        let chain = &songrec[..songrec.find(".output()").expect("the output call")];
+        assert!(
+            chain.contains(".stderr(Stdio::piped())"),
+            "songrec's stderr must be PIPED; its outcome taxonomy lives there"
+        );
+        assert!(
+            !chain.contains(".stderr(Stdio::null())"),
+            "nulling songrec's stderr fuses content misses with transport failures again"
+        );
+        // stdin stays null, so the child can never block waiting on input.
+        assert!(chain.contains(".stdin(Stdio::null())"));
+    }
+
+    #[test]
+    fn recognize_error_outcome_words_are_stable() {
+        assert_eq!(RecognizeError::Timeout.outcome_word(), "timeout");
+        assert_eq!(
+            RecognizeError::Transport { rate_limited: true }.outcome_word(),
+            "rate_limited"
+        );
+        assert_eq!(
+            RecognizeError::Transport { rate_limited: false }.outcome_word(),
+            "transport"
+        );
+        assert_eq!(RecognizeError::Unknown.outcome_word(), "transport");
+        assert_eq!(RecognizeError::Capture.outcome_word(), "transport");
     }
 
     #[test]

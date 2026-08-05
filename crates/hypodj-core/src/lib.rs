@@ -20,6 +20,7 @@ pub mod event;
 pub mod executor;
 pub mod fade;
 pub mod handler;
+pub mod heard;
 pub mod intelligence;
 pub mod library_match;
 pub mod model;

@@ -37,6 +37,94 @@ pub struct Config {
     /// bound is `max_bytes`, not the flag.
     #[serde(default)]
     pub store: StoreConfig,
+    /// The HEARD LEDGER: the append-only, session-scoped record of what the radio
+    /// played and what was marked. Optional; with no `[heard]` section the ledger is
+    /// ON (it costs one append per title change and nothing else) and lives under the
+    /// state dir. With no state dir it simply never opens.
+    #[serde(default)]
+    pub heard: HeardConfig,
+}
+
+/// `[heard]` config for the HEARD LEDGER ([`crate::heard`]): the append-only record of
+/// ICY titles, recognition outcomes and MARK presses, plus its `heard` read-back.
+///
+/// The write path is an unbounded mpsc to a dedicated `O_APPEND` task, so the ledger
+/// can never touch the director spine and there is no sync/fsync knob to expose here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeardConfig {
+    /// Master switch. Default TRUE: this is substrate, and an untested branch is how
+    /// a feature rots.
+    #[serde(default = "d_heard_enable")]
+    pub enable: bool,
+    /// Where session files live. `None` resolves to `<state_dir>/heard`, mirroring how
+    /// `store.dir` is resolved.
+    ///
+    /// It MUST NOT be inside the offline store's directory: the store owns its root
+    /// EXCLUSIVELY and its reconciler deletes everything in it that is not a valid
+    /// cached song, so a ledger file there would be swept as an orphan. The default
+    /// sits beside `resume.toml` at the state-dir root for exactly that reason.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// How many past session files to keep. The oldest are removed by the ledger task
+    /// on its first blocking hop, before the first write, so the record cannot grow
+    /// without bound in the user's home. Floored to [`HEARD_MIN_KEEP_SESSIONS`] so a
+    /// `0` can never empty the directory.
+    #[serde(default = "d_heard_keep_sessions")]
+    pub keep_sessions: u32,
+    /// The window over which the RENDER collapses repeated titles, seconds. The FILE
+    /// logs every occurrence faithfully; only the view curates. A window rather than
+    /// adjacency because real duplicates are interleaved A,B,A,B, which
+    /// consecutive-dedupe suppresses none of.
+    #[serde(default = "d_heard_dedupe_window_secs")]
+    pub dedupe_window_secs: u64,
+}
+
+pub const DEFAULT_HEARD_ENABLE: bool = true;
+pub const DEFAULT_HEARD_KEEP_SESSIONS: u32 = 30;
+pub const DEFAULT_HEARD_DEDUPE_WINDOW_SECS: u64 = 1800;
+
+/// Hard floor on `heard.keep_sessions`. Zero would mean the sweep deletes the session
+/// it just opened, so the ledger would silently record nothing - clamp up, never
+/// reject (the [`FadeConfig::normalize`] posture).
+pub const HEARD_MIN_KEEP_SESSIONS: u32 = 1;
+
+fn d_heard_enable() -> bool {
+    DEFAULT_HEARD_ENABLE
+}
+fn d_heard_keep_sessions() -> u32 {
+    DEFAULT_HEARD_KEEP_SESSIONS
+}
+fn d_heard_dedupe_window_secs() -> u64 {
+    DEFAULT_HEARD_DEDUPE_WINDOW_SECS
+}
+
+/// MANUAL (not derived), the [`StoreConfig`] rule: a derived `Default` would give
+/// `enable = false, keep_sessions = 0` to everyone who never wrote the section, which
+/// is the exact opposite of the intent. The parity test below keeps this true.
+impl Default for HeardConfig {
+    fn default() -> Self {
+        Self {
+            enable: DEFAULT_HEARD_ENABLE,
+            dir: None,
+            keep_sessions: DEFAULT_HEARD_KEEP_SESSIONS,
+            dedupe_window_secs: DEFAULT_HEARD_DEDUPE_WINDOW_SECS,
+        }
+    }
+}
+
+impl HeardConfig {
+    /// Floor-clamp at LOAD time, logging the correction. TOTAL - there is no input for
+    /// which this can fail or panic.
+    pub fn normalize(&mut self) {
+        if self.keep_sessions < HEARD_MIN_KEEP_SESSIONS {
+            tracing::warn!(
+                configured = self.keep_sessions,
+                floor = HEARD_MIN_KEEP_SESSIONS,
+                "heard.keep_sessions below the floor; clamping up (0 would delete the session it just opened)"
+            );
+            self.keep_sessions = HEARD_MIN_KEEP_SESSIONS;
+        }
+    }
 }
 
 /// `[store]` config for the OFFLINE AUDIO STORE ([`crate::store`]): the on-disk
@@ -195,8 +283,12 @@ pub struct RecognizeConfig {
     /// The re-identify cadence, seconds: on a long-running stream the airing track
     /// changes with no boundary signal, so a hit schedules the next attempt this far
     /// out. Floor-clamped to `RECOGNIZE_MIN_INTERVAL_SECS` at load so no config typo
-    /// can produce a tight loop. A no-match applies an exponential backoff over this
-    /// (capped at interval * 8).
+    /// can produce a tight loop. A miss backs off over this, and the two miss KINDS
+    /// back off differently: a CONTENT miss (Shazam reached, no match) caps at ONE
+    /// doubling (interval * 2 flat), while a TRANSPORT failure keeps the full
+    /// exponential up to interval * 8. The split exists because an all-miss mixtape
+    /// evening on the fused curve produced 40 minutes of deafness, and a content miss
+    /// says nothing about whether the NEXT track is recognizable.
     #[serde(default = "d_recognize_interval_secs")]
     pub interval_secs: u64,
 }
@@ -742,6 +834,7 @@ impl Config {
         cfg.fade.normalize();
         cfg.recognize.normalize();
         cfg.store.normalize();
+        cfg.heard.normalize();
         Ok(cfg)
     }
 
@@ -757,6 +850,7 @@ impl Config {
         cfg.fade.normalize();
         cfg.recognize.normalize();
         cfg.store.normalize();
+        cfg.heard.normalize();
         Ok(cfg)
     }
 }
@@ -1131,6 +1225,58 @@ mod tests {
     }
 
     #[test]
+    fn heard_normalize_floors_keep_sessions_and_is_total() {
+        // `keep_sessions = 0` would make the retention sweep delete the session it just
+        // opened, so the ledger would silently record nothing. Clamp UP, never reject.
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [heard]
+            keep_sessions = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.heard.keep_sessions, HEARD_MIN_KEEP_SESSIONS);
+        assert!(cfg.heard.enable, "the section existing must not turn the feature off");
+
+        // An in-range value is untouched, and the dir override is carried verbatim.
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [heard]
+            enable = false
+            dir = "/tmp/ledger"
+            keep_sessions = 7
+            dedupe_window_secs = 60
+        "#,
+        )
+        .unwrap();
+        assert!(!cfg.heard.enable);
+        assert_eq!(cfg.heard.dir, Some(PathBuf::from("/tmp/ledger")));
+        assert_eq!(cfg.heard.keep_sessions, 7);
+        assert_eq!(cfg.heard.dedupe_window_secs, 60);
+
+        // TOTAL: no parseable value can panic, including the extremes.
+        for raw in ["keep_sessions = 4294967295", "dedupe_window_secs = 0", "keep_sessions = 1"] {
+            let mut c = HeardConfig::default();
+            let _ = raw;
+            c.keep_sessions = 0;
+            c.dedupe_window_secs = 0;
+            c.normalize();
+            assert_eq!(c.keep_sessions, HEARD_MIN_KEEP_SESSIONS);
+            let mut c = HeardConfig { keep_sessions: u32::MAX, ..HeardConfig::default() };
+            c.normalize();
+            assert_eq!(c.keep_sessions, u32::MAX, "a large value is not clamped down");
+        }
+    }
+
+    #[test]
     fn store_normalize_floors_max_bytes_and_interval() {
         // A pathologically small budget would make every download instantly
         // over-cap (download-evict thrash), and a 1s cadence would hammer the
@@ -1244,6 +1390,7 @@ mod tests {
             [continuation]
             [recognize]
             [store]
+            [heard]
         "#,
         )
         .unwrap();
@@ -1262,6 +1409,10 @@ mod tests {
         assert_eq!(bare.store.queue_ahead, empty.store.queue_ahead);
         assert_eq!(bare.store.sync_interval_secs, empty.store.sync_interval_secs);
         assert_eq!(bare.store.pin_starred, empty.store.pin_starred);
+        assert_eq!(bare.heard.enable, empty.heard.enable);
+        assert_eq!(bare.heard.dir, empty.heard.dir);
+        assert_eq!(bare.heard.keep_sessions, empty.heard.keep_sessions);
+        assert_eq!(bare.heard.dedupe_window_secs, empty.heard.dedupe_window_secs);
         // The float/int fade knobs too, since [fade] is the largest section.
         assert_eq!(bare.fade.min_slew_ms, empty.fade.min_slew_ms);
         assert_eq!(bare.fade.max_dur_secs, empty.fade.max_dur_secs);
@@ -1287,6 +1438,8 @@ mod tests {
             [store]
             max_bytes = 3
             sync_interval_secs = 4
+            [heard]
+            keep_sessions = 0
         "#;
         let dir = std::env::temp_dir().join(format!("hypodj-config-load-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -1298,9 +1451,11 @@ mod tests {
         assert_eq!(loaded.recognize.interval_secs, parsed.recognize.interval_secs);
         assert_eq!(loaded.store.max_bytes, parsed.store.max_bytes);
         assert_eq!(loaded.store.sync_interval_secs, parsed.store.sync_interval_secs);
+        assert_eq!(loaded.heard.keep_sessions, parsed.heard.keep_sessions);
         // And the values really are the normalized ones, not the raw TOML.
         assert_eq!(loaded.store.max_bytes, STORE_MIN_MAX_BYTES);
         assert_eq!(loaded.store.sync_interval_secs, STORE_MIN_SYNC_INTERVAL_SECS);
+        assert_eq!(loaded.heard.keep_sessions, HEARD_MIN_KEEP_SESSIONS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
