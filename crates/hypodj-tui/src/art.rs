@@ -168,6 +168,14 @@ fn fetch_albumart(host: &str, port: u16, uri: &str) -> Option<Vec<u8>> {
 }
 
 impl AlbumArt {
+    /// A solid-colour cover, for tests that need a real AlbumArt without a daemon.
+    #[cfg(test)]
+    pub fn for_test_solid(c: [u8; 3]) -> AlbumArt {
+        let img = RgbImage::from_fn(THUMB, THUMB, |_, _| image::Rgb(c));
+        let palette = crate::album_color::extract_palette(&img);
+        AlbumArt { img, palette, sixel: std::cell::RefCell::new(None) }
+    }
+
     /// The sixel payload for this cover at exactly `px_w x px_h` pixels.
     ///
     /// Cached by geometry. Returning the SAME `Arc<str>` for an unchanged cover and
