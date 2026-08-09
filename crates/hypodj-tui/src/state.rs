@@ -574,6 +574,24 @@ pub struct TuiState {
     /// renderer without any special casing. It is also why the existing TestBackend
     /// tests still exercise the cell path unchanged.
     pub sixel_cell_px: Option<(u16, u16)>,
+    /// Whether an overlay (menu, help, heard, confirm) was painted on the PREVIOUS
+    /// frame. A sixel image is cell-anchored: a popup drawn over the cover prints text
+    /// into cells the terminal was showing image pixels in, and those pixels are gone.
+    /// Closing the popup does not bring them back on its own - the cells revert to the
+    /// blank-and-skipped state the image painter left them in, and the backend never
+    /// draws a skipped cell, so the cover keeps the popup's silhouette punched out of
+    /// it until the track changes. See [`sixel_gen`].
+    pub sixel_covered: Cell<bool>,
+    /// Flips whenever a covered image needs to be re-sent, and is mixed into the payload
+    /// cell's symbol so it DIFFERS from the one already on screen.
+    ///
+    /// This is the whole repair: ratatui re-sends a cell only when it changes, and the
+    /// image painter writes a byte-identical payload every frame, so the diff would
+    /// otherwise conclude there is nothing to do and leave the holes. Flipping the
+    /// symbol makes the diff re-send the image, and a sixel payload paints its ENTIRE
+    /// pixel rect, so one re-send fills every hole at once. A single frame, with no
+    /// blank flash in between, which a clear-then-repaint would cost.
+    pub sixel_gen: Cell<bool>,
     /// Whether the terminal advertises truecolor (else colors quantize to xterm-256).
     pub truecolor: bool,
     /// The cached album sigil, rebuilt only when the album identity changes (static -
@@ -647,6 +665,8 @@ impl Default for TuiState {
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             sixel_cell_px: None,
+            sixel_covered: Cell::new(false),
+            sixel_gen: Cell::new(false),
             truecolor: false,
             sigil: None,
         }

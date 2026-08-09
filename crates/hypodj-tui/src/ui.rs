@@ -35,6 +35,25 @@ fn now_playing_h(total: u16) -> u16 {
 }
 
 pub fn render(f: &mut Frame, state: &TuiState) {
+    // Decided BEFORE anything is drawn, because the art is painted early in this
+    // function and the generation has to be right by the time it is: an overlay that
+    // closed since the last frame must re-send the image on THIS frame, not on the one
+    // after it. See `TuiState::sixel_gen`.
+    //
+    // Deliberately keyed on "an overlay was open" rather than on the popup rect actually
+    // intersecting the art: the popups are centered and the art sits in the now-playing
+    // pane, so they overlap in the ordinary layout, and the cost of being wrong is one
+    // extra image re-send on close - against a cover that stays punched full of holes
+    // until the track changes if the test is ever wrong the other way.
+    let overlay_drawn = state.menu.is_some()
+        || state.help_open
+        || state.heard_open
+        || (state.mode == Mode::Confirm && state.screen != Screen::Dj);
+    if overlay_drawn {
+        state.sixel_covered.set(true);
+    } else if state.sixel_covered.replace(false) {
+        state.sixel_gen.set(!state.sixel_gen.get());
+    }
     // A blank top and bottom margin row give the frame breathing room; the bottom
     // bar is a single borderless row (thin + less prominent than the old 3-row
     // bordered box), living as a dim ambient wave when idle.
@@ -633,7 +652,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         match &state.art {
             // A real cover is always preferred. Sixel when the terminal can draw it,
             // else the cell renderers.
-            Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px) => {}
+            Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px, state.sixel_gen.get()) => {}
             Some(a) => f.render_widget(Paragraph::new(a.lines(art_cols, art_rows)), art_area),
             // No cover: draw the deterministic album sigil when no inline-image
             // protocol is available (the image-less fallback for the art slot); else a
@@ -2855,6 +2874,7 @@ fn render_sixel_art(
     rect: Rect,
     art: &crate::art::AlbumArt,
     cell_px: Option<(u16, u16)>,
+    gen: bool,
 ) -> bool {
     use crate::art::{art_mode, ArtMode};
 
@@ -2884,6 +2904,11 @@ fn render_sixel_art(
         return false;
     }
 
+    // A trailing SGR reset when the generation is flipped: it renders as nothing at all,
+    // and its only job is to make this frame's symbol differ from the one the diff
+    // already sent, which is what forces a covered image to be re-sent (see
+    // `TuiState::sixel_gen`).
+    let payload = if gen { format!("{payload}\x1b[0m") } else { payload.to_string() };
     let buf = f.buffer_mut();
     for y in rect.y..rect.y + rect.height {
         for x in rect.x..rect.x + rect.width {
@@ -2911,6 +2936,71 @@ mod sixel_render_tests {
         crate::art::AlbumArt::for_test_solid([200, 60, 60])
     }
 
+    /// An overlay that covers the cover must leave the image REPAINTED, not holed.
+    ///
+    /// A sixel image is cell-anchored: a popup drawn over it prints text into cells the
+    /// terminal is showing pixels in, and those pixels are destroyed. Closing the popup
+    /// restores the buffer to blank-and-skipped, and the backend never draws a skipped
+    /// cell - so unless the PAYLOAD cell changes, ratatui's diff concludes there is
+    /// nothing to send and the cover keeps the popup's silhouette punched out of it
+    /// until the track changes.
+    ///
+    /// This drives three real frames through a real `Terminal`, so it is ratatui's own
+    /// diff answering, not an assertion about our intent. Without the fix the frame-3
+    /// payload is byte-identical to frame 1 and this fails on the last assert.
+    #[test]
+    fn an_overlay_over_the_cover_forces_the_image_to_be_resent_when_it_closes() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut s = TuiState::new();
+        s.sixel_cell_px = Some((8, 17));
+        s.art = Some(art());
+        s.now.title = Some("Future Proof".into());
+        s.now.state = Some("play".into());
+
+        let payload_of = |t: &Terminal<TestBackend>| -> Option<String> {
+            let buf = t.backend().buffer();
+            buf.content()
+                .iter()
+                .map(|c| c.symbol().to_string())
+                .find(|sym| sym.starts_with("\x1bP"))
+        };
+
+        // Frame 1: no overlay. The image is on screen.
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let first = payload_of(&terminal).expect("the cover is drawn as a sixel payload");
+
+        // Frame 2: the menu is open over it, which is what destroys the pixels.
+        s.menu = Some(crate::menu::Menu::new(
+            crate::menu::Target {
+                kind: crate::menu::TargetKind::LibrarySong,
+                origin: crate::menu::Origin::Queue { pos: 0 },
+                label: "Future Proof".into(),
+                uri: Some("song/s1".into()),
+                album_uri: Some("album/a1".into()),
+                artist: Some("Massive Attack".into()),
+                artist_uri: None,
+                match_uri: None,
+            },
+            1,
+        ));
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert!(s.sixel_covered.get(), "the frame recorded that an overlay covered it");
+
+        // Frame 3: the menu closes. The payload must DIFFER from frame 1, because that
+        // difference is the only thing that makes the diff re-send the image.
+        s.menu = None;
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let third = payload_of(&terminal).expect("the cover is still drawn");
+        assert_ne!(
+            first, third,
+            "the payload cell must change on the frame the overlay closes, or the diff \
+             never re-sends the image and the holes stay"
+        );
+        // And the change is invisible: same image, plus an SGR reset that renders as
+        // nothing. Anything else would be a different picture, not a repaint.
+        assert!(third.starts_with(&first) || first.starts_with(&third));
+    }
+
     /// The payload goes in ONE cell and every other cell of the rect is skipped.
     ///
     /// Both halves matter. The payload cell is what the frame diff watches, so it
@@ -2928,7 +3018,7 @@ mod sixel_render_tests {
         // drawn, so a skipped cell never appears there at all.
         terminal
             .draw(|f| {
-                assert!(render_sixel_art(f, rect, &a, Some((8, 17))));
+                assert!(render_sixel_art(f, rect, &a, Some((8, 17)), false));
 
                 let buf = f.buffer_mut();
 
@@ -2994,21 +3084,21 @@ mod sixel_render_tests {
         terminal
             .draw(|f| {
                 // No cell geometry: the terminal never told us how big a cell is.
-                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 8, height: 4 }, &a, None));
+                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 8, height: 4 }, &a, None, false));
 
                 // One column wide: the backend only emits MoveTo when the next cell
                 // is not (x+1, y), so the cell right of the payload has to exist.
-                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 1, height: 4 }, &a, Some((8, 17))));
+                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 1, height: 4 }, &a, Some((8, 17)), false));
 
                 // Past the right edge: this terminal TRUNCATES a too-wide image
                 // rather than scaling it.
                 let w = f.area().width;
-                assert!(!render_sixel_art(f, Rect { x: w - 2, y: 0, width: 8, height: 4 }, &a, Some((8, 17))));
+                assert!(!render_sixel_art(f, Rect { x: w - 2, y: 0, width: 8, height: 4 }, &a, Some((8, 17)), false));
 
                 // Last row: an image whose bottom lands on the bottom row scrolls
                 // the whole alternate screen.
                 let h = f.area().height;
-                assert!(!render_sixel_art(f, Rect { x: 0, y: h - 1, width: 8, height: 1 }, &a, Some((8, 17))));
+                assert!(!render_sixel_art(f, Rect { x: 0, y: h - 1, width: 8, height: 1 }, &a, Some((8, 17)), false));
             })
             .unwrap();
     }
