@@ -211,21 +211,19 @@ fn read_da1_reply(timeout: Duration) -> Option<String> {
             n if n > 0 => {
                 buf.push(byte[0]);
 
-                // Stop when the buffer holds a COMPLETE DA1 reply, not when any
-                // terminator goes past. Another reply can be in front of ours - a late
-                // OSC 11 answer from the background probe is the normal case - and its
-                // terminator says nothing about whether ours has arrived. Stopping
-                // there consumed someone else's reply, burned the deadline, and
-                // reported a sixel terminal as incapable.
-                let complete_da1 = buf
-                    .iter()
-                    .position(|&b| b == b'[')
-                    .map(|i| buf[i..].starts_with(b"[?") && buf[i..].contains(&b'c'))
-                    .unwrap_or(false);
-
-                // `n` is the DSR sentinel: a terminal with no DA1 at all still answers
-                // it, and that is what stops us waiting out the whole deadline there.
-                if complete_da1 || byte[0] == b'n' || buf.len() >= 256 {
+                // Stop ONLY on the DSR sentinel, never on the DA1 terminator.
+                //
+                // We send DA1 and then DSR, so `n` is the last byte the terminal will
+                // send and stopping there leaves nothing behind. Stopping at DA1's own
+                // `c` looks correct and is not: it leaves the DSR answer sitting in
+                // stdin, crossterm reads it as input on the next poll, and the TUI
+                // starts up wedged - the whole snapshot never lands and the panes come
+                // up empty. That cost a bisect to find, because the symptom looks
+                // nothing like a leftover byte.
+                //
+                // A terminal with no DA1 at all still answers DSR, so this is also what
+                // stops us waiting out the full deadline there.
+                if byte[0] == b'n' || buf.len() >= 256 {
                     break;
                 }
             }
