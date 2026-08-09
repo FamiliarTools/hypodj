@@ -171,6 +171,22 @@ const DOWNLOAD_BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// Ceiling on the per-id download backoff.
 const DOWNLOAD_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
+/// Consecutive failures after which an id is GIVEN UP on for this process.
+///
+/// The exponential backoff bounds the RATE of a retry; it does not bound the TOTAL,
+/// so a permanently-invalid download still costs ~24 requests a day forever once it
+/// reaches [`DOWNLOAD_BACKOFF_MAX`]. Observed live: a starred song whose Navidrome
+/// metadata declares 3 MiB while `/rest/download` serves 29.2 MiB can NEVER satisfy
+/// the exact-length check, so waiting longer changes nothing - the condition is a
+/// disagreement between the server and itself, not a transient.
+///
+/// Eight is past any plausible transient (with the doubling that is roughly two and a
+/// half hours of trying) and short of a number that would keep a genuinely flaky
+/// network out of the mirror. Giving up is per-PROCESS and deliberately not
+/// persisted: a restart is exactly when the server may have been fixed or the file
+/// rescanned, so it earns a fresh attempt.
+const DOWNLOAD_GIVE_UP_AFTER: u32 = 8;
+
 /// Process-wide sequence for in-flight temp names, so two writers in one process
 /// can never collide on a temp path.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1951,13 +1967,39 @@ struct Backoff {
     entries: HashMap<SongId, (u32, tokio::time::Instant)>,
 }
 
+/// Why an id is not being attempted right now.
+#[derive(Debug, PartialEq, Eq)]
+enum Attempt {
+    /// Go ahead.
+    Now,
+    /// Still inside its backoff window.
+    Waiting,
+    /// Given up on for this process - see [`DOWNLOAD_GIVE_UP_AFTER`]. Distinct from
+    /// `Waiting` because it is reported ONCE and then stays silent, instead of a warn
+    /// on every pass forever for a thing that will never change.
+    GivenUp,
+}
+
 impl Backoff {
     /// Whether `id` may be attempted now.
     fn ready(&self, id: &SongId, now: tokio::time::Instant) -> bool {
+        matches!(self.attempt(id, now), Attempt::Now)
+    }
+
+    /// Whether `id` may be attempted, and if not, WHY - so the caller can log a
+    /// give-up once rather than a wait every pass.
+    fn attempt(&self, id: &SongId, now: tokio::time::Instant) -> Attempt {
         match self.entries.get(id) {
-            Some((_, not_before)) => now >= *not_before,
-            None => true,
+            Some((failures, _)) if *failures >= DOWNLOAD_GIVE_UP_AFTER => Attempt::GivenUp,
+            Some((_, not_before)) if now < *not_before => Attempt::Waiting,
+            _ => Attempt::Now,
         }
+    }
+
+    /// Has `id` just crossed into given-up on this failure? True exactly once per id,
+    /// which is what keeps the warn from repeating.
+    fn just_gave_up(&self, id: &SongId) -> bool {
+        self.entries.get(id).map(|(n, _)| *n) == Some(DOWNLOAD_GIVE_UP_AFTER)
     }
 
     /// Record a failure and push the next attempt out, doubling per consecutive
@@ -1995,6 +2037,10 @@ const MAX_EVICTION_CHAIN: usize = 8;
 struct PassReport {
     /// Downloads the plan scheduled (before backoff filtering).
     scheduled: usize,
+    /// Downloads skipped because the id is given up on for this process. Counted so a
+    /// pass that "did nothing" is distinguishable from one that did nothing BECAUSE
+    /// something is permanently broken.
+    given_up: usize,
     /// Downloads that committed.
     committed: usize,
     /// Entries whose bytes were ACTUALLY reclaimed - an eviction whose unlink
@@ -2241,9 +2287,22 @@ async fn execute<C: Clock, P: PinSource>(
             }
             StoreAction::Download { id, reason } => {
                 report.scheduled += 1;
-                if !backoff.ready(&id, clock.now()) {
-                    tracing::debug!(id = %id.0, ?reason, "store: download still backing off");
-                    continue;
+                match backoff.attempt(&id, clock.now()) {
+                    Attempt::Waiting => {
+                        tracing::debug!(id = %id.0, ?reason, "store: download still backing off");
+                        continue;
+                    }
+                    // Already reported when it crossed the line. Staying silent here is
+                    // the point: the old behaviour warned on every pass forever about a
+                    // condition that cannot change, which buried everything else.
+                    Attempt::GivenUp => {
+                        tracing::debug!(id = %id.0, ?reason, "store: download given up on");
+                        report.given_up += 1;
+                        continue;
+                    }
+                    Attempt::Now => {}
+                }
+                {
                 }
                 // The fingerprint MUST come from this pass's own server data, never
                 // a cached copy - committing against a stale size is how a wrong
@@ -2272,7 +2331,20 @@ async fn execute<C: Clock, P: PinSource>(
                     }
                     Err(e) => {
                         backoff.fail(&id, clock.now());
-                        tracing::warn!(id = %id.0, ?reason, error = %e, "store: download failed; will retry");
+                        if backoff.just_gave_up(&id) {
+                            // ONCE, loudly, naming the id and the reason - because this
+                            // is the moment a starred song becomes permanently absent
+                            // from the offline mirror, and it must not be discoverable
+                            // only by noticing the mirror is one short.
+                            tracing::warn!(
+                                id = %id.0, ?reason, error = %e,
+                                attempts = DOWNLOAD_GIVE_UP_AFTER,
+                                "store: giving up on this download for now; it will be \
+                                 retried after a restart"
+                            );
+                        } else {
+                            tracing::warn!(id = %id.0, ?reason, error = %e, "store: download failed; will retry");
+                        }
                     }
                 }
             }
@@ -4632,26 +4704,72 @@ title = "Minimal"
         b.fail(&id, t0);
         assert!(!b.ready(&id, t0 + DOWNLOAD_BACKOFF_BASE));
         assert!(b.ready(&id, t0 + DOWNLOAD_BACKOFF_BASE * 2));
-        // The ceiling holds however many times it fails, and never overflows.
+        // The ceiling holds however many times it fails, and never overflows - but
+        // past DOWNLOAD_GIVE_UP_AFTER the id is GIVEN UP on rather than merely slowed,
+        // so no amount of waiting makes it ready again.
         for _ in 0..64 {
             b.fail(&id, t0);
         }
-        assert!(b.ready(&id, t0 + DOWNLOAD_BACKOFF_MAX));
+        assert!(
+            !b.ready(&id, t0 + DOWNLOAD_BACKOFF_MAX),
+            "a permanently-invalid download must stop being attempted, not just slow \
+             down: the backoff bounds the RATE, this bounds the TOTAL"
+        );
+        assert_eq!(b.attempt(&id, t0 + DOWNLOAD_BACKOFF_MAX), Attempt::GivenUp);
         b.succeed(&id);
         assert!(b.ready(&id, t0), "a success forgets the history entirely");
+    }
+
+    // The rate bound and the total bound are different guarantees, and the second is
+    // the one that was missing: observed live, a starred song whose server metadata
+    // declares 3 MiB while the download serves 29.2 MiB retried ~24 times a day
+    // forever, because waiting cannot fix a server disagreeing with itself.
+    #[test]
+    fn an_id_is_given_up_on_only_after_the_full_run_of_failures() {
+        let mut b = Backoff::default();
+        let id = sid("x");
+        let t0 = tokio::time::Instant::now();
+        for i in 1..DOWNLOAD_GIVE_UP_AFTER {
+            b.fail(&id, t0);
+            assert_ne!(
+                b.attempt(&id, t0 + DOWNLOAD_BACKOFF_MAX),
+                Attempt::GivenUp,
+                "failure {i} is still inside the transient budget"
+            );
+            assert!(!b.just_gave_up(&id));
+        }
+        b.fail(&id, t0);
+        assert_eq!(b.attempt(&id, t0 + DOWNLOAD_BACKOFF_MAX), Attempt::GivenUp);
+        assert!(b.just_gave_up(&id), "the warn fires exactly on the crossing");
+        // And exactly once: a further failure must not re-announce it.
+        b.fail(&id, t0);
+        assert!(!b.just_gave_up(&id), "the give-up is reported ONCE, never every pass");
+        assert_eq!(b.attempt(&id, t0 + DOWNLOAD_BACKOFF_MAX), Attempt::GivenUp);
+    }
+
+    #[test]
+    fn a_waiting_id_is_distinguishable_from_a_given_up_one() {
+        // The caller logs them differently - a wait is debug, a give-up is a one-time
+        // warn - so conflating them would either bury the give-up or restore the spam.
+        let mut b = Backoff::default();
+        let id = sid("x");
+        let t0 = tokio::time::Instant::now();
+        b.fail(&id, t0);
+        assert_eq!(b.attempt(&id, t0), Attempt::Waiting);
+        assert_eq!(b.attempt(&id, t0 + DOWNLOAD_BACKOFF_BASE), Attempt::Now);
     }
 
     #[test]
     fn re_enter_requires_progress_not_merely_outstanding_work() {
         // A full batch that landed something: keep draining.
-        assert!(PassReport { scheduled: 4, committed: 1, evicted: 0 }.re_enter(4, 0));
+        assert!(PassReport { scheduled: 4, given_up: 0, committed: 1, evicted: 0 }.re_enter(4, 0));
         // A full batch that landed NOTHING must sleep, or a permanently failing
         // download would spin the reconciler at full speed forever.
-        assert!(!PassReport { scheduled: 4, committed: 0, evicted: 0 }.re_enter(4, 0));
+        assert!(!PassReport { scheduled: 4, given_up: 0, committed: 0, evicted: 0 }.re_enter(4, 0));
         // A partial batch is all there was: nothing more to drain.
-        assert!(!PassReport { scheduled: 2, committed: 2, evicted: 0 }.re_enter(4, 0));
+        assert!(!PassReport { scheduled: 2, given_up: 0, committed: 2, evicted: 0 }.re_enter(4, 0));
         // An eviction re-enters so the reclaimed headroom is usable now.
-        assert!(PassReport { scheduled: 0, committed: 0, evicted: 1 }.re_enter(4, 0));
+        assert!(PassReport { scheduled: 0, given_up: 0, committed: 0, evicted: 1 }.re_enter(4, 0));
     }
 
     #[test]
@@ -4660,7 +4778,7 @@ title = "Minimal"
         // filesystem that reports reclamation it did not perform gets at most
         // MAX_EVICTION_CHAIN passes, not an endless run of directory scans and
         // getStarred2 round trips.
-        let evicting = PassReport { scheduled: 0, committed: 0, evicted: 1 };
+        let evicting = PassReport { scheduled: 0, given_up: 0, committed: 0, evicted: 1 };
         assert!(evicting.re_enter(4, MAX_EVICTION_CHAIN - 1), "the last link is allowed");
         assert!(!evicting.re_enter(4, MAX_EVICTION_CHAIN), "and then the loop must wait");
         assert!(!evicting.re_enter(4, MAX_EVICTION_CHAIN + 9));
@@ -4668,12 +4786,12 @@ title = "Minimal"
         // A chain of COMMITTED downloads is not capped: every link cost a real
         // original, the desired set is finite, and capping it would stall a cold
         // backfill for a whole interval.
-        let draining = PassReport { scheduled: 4, committed: 4, evicted: 0 };
+        let draining = PassReport { scheduled: 4, given_up: 0, committed: 4, evicted: 0 };
         assert!(draining.re_enter(4, MAX_EVICTION_CHAIN * 100));
         assert!(draining.drained_a_full_batch(4), "which is what resets the chain");
         assert!(!evicting.drained_a_full_batch(4));
         // A pass that both drained a batch and evicted still counts as draining.
-        let both = PassReport { scheduled: 4, committed: 1, evicted: 2 };
+        let both = PassReport { scheduled: 4, given_up: 0, committed: 1, evicted: 2 };
         assert!(both.re_enter(4, MAX_EVICTION_CHAIN));
     }
 
