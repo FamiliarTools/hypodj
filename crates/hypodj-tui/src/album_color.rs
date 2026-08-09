@@ -139,6 +139,133 @@ fn read_osc_reply(timeout: Duration) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+/// Does this DA1 reply advertise SIXEL?
+///
+/// The reply is `ESC [ ? Ps ; Ps ; ... c` and parameter 4 means sixel. It must be
+/// matched as a WHOLE parameter: a substring test says yes to 14 (which is "sixel
+/// is not here, but rectangular editing is") and to 24, and the terminal would then
+/// be sent image data it cannot decode.
+pub fn da1_has_sixel(reply: &str) -> bool {
+    // Match on `[?` rather than `ESC [ ?`. The ESC is genuinely not always there: the
+    // background probe runs first and its reader can consume the introducer of a reply
+    // that arrives while it is still draining, which is exactly what happens here in
+    // practice. Requiring the ESC threw away a perfectly good reply.
+    //
+    // Shape is still checked strictly, so an arbitrary line of text cannot pass: every
+    // parameter must be all digits, and one of them must be exactly 4.
+    let Some(start) = reply.find("[?") else {
+        return false;
+    };
+    let rest = &reply[start + 2..];
+    let Some(end) = rest.find('c') else {
+        return false;
+    };
+    let params = &rest[..end];
+    if params.is_empty() || !params.chars().all(|c| c.is_ascii_digit() || c == ';') {
+        return false;
+    }
+    params.split(';').any(|p| p == "4")
+}
+
+/// Read one DA1 reply from stdin, bounded by `timeout`.
+///
+/// Same single-thread contract as [`read_osc_reply`], and for the same reason: a
+/// terminal that never answers must cost us the deadline and nothing else, never a
+/// thread that outlives it and later steals the user's keystrokes.
+///
+/// The read is terminated by the DSR sentinel (`n`) rather than DA1's own `c`, because
+/// [`probe_sixel`] sends `CSI 6n` behind the DA1 query: a terminal that does not
+/// implement DA1 at all still answers DSR, so the sentinel is what stops us waiting
+/// the full deadline on every such terminal. Note the sentinel must be DSR (`CSI 5n`,
+/// answered with `CSI 0n`) and not a cursor position report (`CSI 6n`, answered with
+/// `CSI r;cR`): the reply's FINAL BYTE is what the read stops on.
+fn read_da1_reply(timeout: Duration) -> Option<String> {
+    use std::os::fd::AsRawFd;
+    use std::time::Instant;
+    let fd = std::io::stdin().as_raw_fd();
+    let deadline = Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        // Break rather than return on an expired deadline. Returning here would throw
+        // away a buffer that ALREADY holds the reply, which is exactly what happens
+        // when the sentinel never arrives.
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if !wait_readable(fd, remaining) {
+            break;
+        }
+        // Read the FD directly, never through std::io::Stdin.
+        //
+        // Stdin is buffered: its first read pulls everything available into a
+        // userspace buffer and hands back one byte, after which poll(2) on the fd
+        // correctly reports nothing left to read - while the rest of the reply is
+        // sitting in that buffer. The loop then waits out its deadline holding the
+        // answer it was waiting for. This cost a long debugging session; the symptom
+        // was a sixel-capable terminal being reported as incapable, with the reply
+        // plainly visible in a trace.
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+        match n {
+            0 => break,
+            n if n > 0 => {
+                buf.push(byte[0]);
+
+                // Stop when the buffer holds a COMPLETE DA1 reply, not when any
+                // terminator goes past. Another reply can be in front of ours - a late
+                // OSC 11 answer from the background probe is the normal case - and its
+                // terminator says nothing about whether ours has arrived. Stopping
+                // there consumed someone else's reply, burned the deadline, and
+                // reported a sixel terminal as incapable.
+                let complete_da1 = buf
+                    .iter()
+                    .position(|&b| b == b'[')
+                    .map(|i| buf[i..].starts_with(b"[?") && buf[i..].contains(&b'c'))
+                    .unwrap_or(false);
+
+                // `n` is the DSR sentinel: a terminal with no DA1 at all still answers
+                // it, and that is what stops us waiting out the whole deadline there.
+                if complete_da1 || byte[0] == b'n' || buf.len() >= 256 {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    if buf.is_empty() {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// Ask the terminal whether it can draw SIXEL images.
+///
+/// Sends DA1 followed by a DSR sentinel in ONE write, so a terminal that ignores DA1
+/// still gives us something to stop reading on instead of costing the whole timeout.
+/// Everything received is scanned, because the DA1 reply is not necessarily the first
+/// thing in the buffer.
+pub fn probe_sixel(out: &mut impl Write, timeout: Duration) -> bool {
+    // Clear any LATE reply still in flight before asking anything.
+    //
+    // probe_bg runs first, and a terminal slow enough to miss its deadline delivers
+    // that OSC 11 answer afterwards. Observed: the sixel probe then read
+    // "]11;rgb:ffff/ffff/ffff" plus the ESC of the DA1 reply, spent its whole deadline
+    // doing it, and concluded the terminal could not draw images - on a terminal that
+    // had already said it could.
+    drain_pending_osc(Duration::from_millis(30));
+
+    if out.write_all(b"\x1b[c\x1b[5n").is_err() || out.flush().is_err() {
+        return false;
+    }
+    match read_da1_reply(timeout) {
+        Some(reply) => da1_has_sixel(&reply),
+        None => {
+            drain_pending_osc(Duration::from_millis(20));
+            false
+        }
+    }
+}
+
 /// A pending OSC 11 reply is `ESC ]11;rgb:RRRR/GGGG/BBBB` + terminator - at least ~20
 /// bytes, delivered by the terminal in a single write. Ordinary typeahead trickles one
 /// key (or a 3-byte arrow) at a time. So a burst of at least this many bytes waiting on
@@ -992,6 +1119,56 @@ mod tests {
         drain_pending_osc_fd(rd, Duration::from_millis(200));
         assert!(read_remaining(rd).is_empty(), "BEL-terminated reply fully drained");
         unsafe { libc::close(rd) };
+    }
+
+    /// Parameter 4 means sixel. These are the replies that decide whether dj-gui
+    /// sends image data, so the discriminator has to be exact.
+    #[test]
+    fn da1_sixel_is_matched_as_a_whole_parameter() {
+        // Our forked GNOME Console, with and without sixel.
+        assert!(da1_has_sixel("\x1b[?61;1;4;21;22;28c"));
+        assert!(!da1_has_sixel("\x1b[?61;1;21;22;28c"));
+
+        // The trap: 14 and 24 contain a 4 but are not sixel. A substring test says
+        // yes to both and we would send images to a terminal that cannot draw them.
+        assert!(!da1_has_sixel("\x1b[?64;1;14;24;21c"));
+        assert!(!da1_has_sixel("\x1b[?62;14c"));
+
+        // Sixel as the only parameter, and as the last one.
+        assert!(da1_has_sixel("\x1b[?4c"));
+        assert!(da1_has_sixel("\x1b[?62;1;4c"));
+
+        // Junk, truncation, and a reply that never terminates.
+        assert!(!da1_has_sixel(""));
+        assert!(!da1_has_sixel("\x1b[?61;1;4;21"));
+        assert!(!da1_has_sixel("garbage"));
+    }
+
+    /// The ESC introducer is not guaranteed to survive. probe_bg runs first and its
+    /// reader can eat the ESC of a reply that lands mid-drain - observed, not
+    /// hypothetical: the live probe returned "[?61;1;4;21;22;28c" with no ESC, and
+    /// requiring one made a sixel-capable terminal look incapable.
+    #[test]
+    fn da1_sixel_is_found_without_the_esc_introducer() {
+        assert!(da1_has_sixel("[?61;1;4;21;22;28c"));
+        assert!(!da1_has_sixel("[?61;1;21;22;28c"));
+    }
+
+    /// Being lenient about the ESC must not make it lenient about SHAPE.
+    #[test]
+    fn da1_sixel_rejects_text_that_merely_looks_similar() {
+        assert!(!da1_has_sixel("see [?the 4 in this sentence] of course"));
+        assert!(!da1_has_sixel("[?abc;4c"));
+        assert!(!da1_has_sixel("[?c"));
+    }
+
+    #[test]
+    fn da1_sixel_survives_a_late_osc_burst_in_front_of_it() {
+        // probe_bg runs first, so a slow terminal's OSC 11 reply can still be sitting
+        // in the buffer when the DA1 reply arrives. Scanning, rather than assuming the
+        // reply starts at byte 0, is what makes that harmless.
+        let mixed = "\x1b]11;rgb:1e1e/1e1e/2e2e\x07\x1b[?61;1;4;21;22;28c";
+        assert!(da1_has_sixel(mixed));
     }
 
     #[test]

@@ -20,23 +20,50 @@ use ratatui::text::{Line, Span};
 
 const ART_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Has the user pinned the art pane back to the half-block renderer?
-fn half_block_forced() -> bool {
-    std::env::var("HYPODJ_ART_CELLS").is_ok_and(|v| v.eq_ignore_ascii_case("half"))
+/// How the art pane should be drawn.
+///
+/// `HYPODJ_ART_CELLS` picks one explicitly. The escape hatch predates sixel and its
+/// reason still holds: a renderer can be right on this terminal and wrong on the next
+/// one, and the user must be able to fix that without a rebuild. `sixel` forces images
+/// even if the probe said no, which is what makes a terminal that answers DA1 badly
+/// still usable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArtMode {
+    Auto,
+    Sixel,
+    Sextant,
+    Half,
+}
+
+/// Read the pinned art mode, per call, so it can be changed without a restart.
+pub fn art_mode() -> ArtMode {
+    match std::env::var("HYPODJ_ART_CELLS") {
+        Ok(v) if v.eq_ignore_ascii_case("half") => ArtMode::Half,
+        Ok(v) if v.eq_ignore_ascii_case("sextant") => ArtMode::Sextant,
+        Ok(v) if v.eq_ignore_ascii_case("sixel") => ArtMode::Sixel,
+        _ => ArtMode::Auto,
+    }
 }
 /// Decoded-thumbnail edge (px). Fetch+decode once per track; the per-frame downscale
 /// from this to the cell grid is cheap.
 ///
 /// This is a hard FIDELITY CEILING, so it must stay above what the pane can actually
 /// show: a sextant cell carries 2x3 subcells, so a 30x15 pane already wants 60x45 and a
-/// large pane on a big terminal wants more. 96 was sized for the half-block renderer and
-/// was already below the display resolution of a modest pane.
-const THUMB: u32 = 256;
+/// large pane on a big terminal wants more. It now also has to clear a SIXEL pane at
+/// native pixels, which wants roughly cell_px times the pane's cell size - a few
+/// hundred pixels on an ordinary layout - so 256 was itself becoming the ceiling.
+const THUMB: u32 = 512;
 
 /// A decoded cover thumbnail, cached per track uri. Rendering downscales it to the
 /// current cell area every frame (cheap); the expensive fetch+decode happens once.
 pub struct AlbumArt {
     img: RgbImage,
+    /// The last sixel payload, keyed by the pixel geometry it was encoded for.
+    ///
+    /// Encoding is the expensive part and the pane geometry rarely changes, so this
+    /// turns a per-frame cost into a per-resize one. It also makes the payload STRING
+    /// STABLE, which is what lets the frame diff decide when to re-send it.
+    sixel: std::cell::RefCell<Option<(u32, u32, std::sync::Arc<str>)>>,
     /// The ranked cover palette, extracted once at decode time. Shared by the sigil
     /// (DECORATION) and the waveform (INFO) so the visual system reads from one source.
     pub palette: crate::album_color::Palette,
@@ -52,7 +79,7 @@ impl AlbumArt {
             .resize_exact(THUMB, THUMB, image::imageops::FilterType::Triangle)
             .to_rgb8();
         let palette = crate::album_color::extract_palette(&thumb);
-        Some(AlbumArt { img: thumb, palette })
+        Some(AlbumArt { img: thumb, palette, sixel: std::cell::RefCell::new(None) })
     }
 
     /// Render the art into `cols x rows` cells, using the SEXTANT renderer (2x3 subcells
@@ -63,7 +90,7 @@ impl AlbumArt {
     /// itself (VTE does) or the font covers Symbols for Legacy Computing; a terminal with
     /// neither would show tofu, and the user must be able to fix that without a rebuild.
     pub fn lines(&self, cols: usize, rows: usize) -> Vec<Line<'static>> {
-        if half_block_forced() {
+        if art_mode() == ArtMode::Half {
             render_lines(&self.img, cols, rows)
         } else {
             render_lines_sextant(&self.img, cols, rows)
@@ -137,6 +164,24 @@ fn fetch_albumart(host: &str, port: u16, uri: &str) -> Option<Vec<u8>> {
         None
     } else {
         Some(all)
+    }
+}
+
+impl AlbumArt {
+    /// The sixel payload for this cover at exactly `px_w x px_h` pixels.
+    ///
+    /// Cached by geometry. Returning the SAME `Arc<str>` for an unchanged cover and
+    /// pane is the whole mechanism behind the redraw policy: the payload is the symbol
+    /// of one cell, so an identical string means the frame diff emits nothing at all.
+    pub fn sixel(&self, px_w: u32, px_h: u32) -> std::sync::Arc<str> {
+        if let Some((w, h, payload)) = self.sixel.borrow().as_ref() {
+            if *w == px_w && *h == px_h {
+                return payload.clone();
+            }
+        }
+        let payload: std::sync::Arc<str> = encode_sixel(&self.img, px_w, px_h).into();
+        *self.sixel.borrow_mut() = Some((px_w, px_h, payload.clone()));
+        payload
     }
 }
 
@@ -437,7 +482,7 @@ impl AlbumArt {
     /// image is a 1x1 stub; the palette is read by the waveform styling and the stub
     /// still renders as half-block cells in the art pane.
     pub fn for_test(palette: crate::album_color::Palette) -> AlbumArt {
-        AlbumArt { img: RgbImage::new(1, 1), palette }
+        AlbumArt { img: RgbImage::new(1, 1), palette, sixel: std::cell::RefCell::new(None) }
     }
 }
 

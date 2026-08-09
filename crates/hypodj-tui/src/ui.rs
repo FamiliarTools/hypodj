@@ -420,10 +420,18 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         // Keep the art roughly square: each cell renders 2 vertical pixels, so a
         // square cover is about (rows*2) columns wide. Clamp to the pane width.
         let art_rows = art_h as usize;
-        let art_cols = (art_rows * 2).min(inner.width as usize);
+        // The 2:1 constant encodes the HALF-BLOCK aspect (two vertical pixels per
+        // cell). A sixel image is drawn at native pixels, so its square-ish width comes
+        // from the real cell aspect instead; using 2:1 there would letterbox it.
+        let art_cols = match state.sixel_cell_px {
+            Some((cw, ch)) if cw > 0 => (art_rows * ch as usize / cw as usize).min(inner.width as usize),
+            _ => (art_rows * 2).min(inner.width as usize),
+        };
         let art_area = Rect { x: inner.x, y: inner.y, width: art_cols as u16, height: art_h };
         match &state.art {
-            // A real cover is always preferred (dithered half-block render).
+            // A real cover is always preferred. Sixel when the terminal can draw it,
+            // else the cell renderers.
+            Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px) => {}
             Some(a) => f.render_widget(Paragraph::new(a.lines(art_cols, art_rows)), art_area),
             // No cover: draw the deterministic album sigil when no inline-image
             // protocol is available (the image-less fallback for the art slot); else a
@@ -2318,4 +2326,74 @@ fn find_row_line(
     spans.extend(match_spans(&label, query, style, hit));
     spans.push(Span::styled(format!("{}{trailer}", " ".repeat(pad)), style));
     Line::from(spans)
+}
+
+/// Draw `art` into `rect` as a SIXEL image, or return false to let the caller fall back
+/// to the cell renderers.
+///
+/// THE REDRAW POLICY LIVES HERE. The payload is written as the SYMBOL of the rect's
+/// top-left cell and every other cell of the rect is blank and SKIPPED. Two things fall
+/// out of that, and both are the point:
+///
+///   - It is re-sent exactly when that cell's value changes, which means when the cover
+///     changes or the pane geometry changes, and never otherwise. The draw loop runs at
+///     up to 20 fps with an animated wave, so the frame diff is never empty; writing the
+///     payload out of band would push it every frame at a terminal that deliberately
+///     shortens its processing slice after decoding an image.
+///
+///   - Skipped cells emit NOTHING on the wire, so the rest of the frame cannot print
+///     into the image. That is not an optimisation here: images are cell-anchored in
+///     this terminal, so one printed character permanently takes that cell away from
+///     the image and eats a hole in the cover.
+///
+/// Skip has to be re-applied every frame because the buffer is reset between frames.
+fn render_sixel_art(
+    f: &mut Frame,
+    rect: Rect,
+    art: &crate::art::AlbumArt,
+    cell_px: Option<(u16, u16)>,
+) -> bool {
+    use crate::art::{art_mode, ArtMode};
+
+    let mode = art_mode();
+    if matches!(mode, ArtMode::Sextant | ArtMode::Half) {
+        return false;
+    }
+    let Some((cw, ch)) = cell_px else {
+        return false;
+    };
+    if cw == 0 || ch == 0 || rect.width < 2 || rect.height < 1 {
+        return false;
+    }
+
+    // An image wider than the screen is TRUNCATED by the terminal rather than scaled,
+    // and one whose last row is the bottom row scrolls the whole alternate screen.
+    // Refusing is better than either.
+    let area = f.area();
+    if rect.x + rect.width > area.width || rect.y + rect.height >= area.height {
+        return false;
+    }
+
+    let px_w = rect.width as u32 * cw as u32;
+    let px_h = rect.height as u32 * ch as u32;
+    let payload = art.sixel(px_w, px_h);
+    if payload.is_empty() {
+        return false;
+    }
+
+    let buf = f.buffer_mut();
+    for y in rect.y..rect.y + rect.height {
+        for x in rect.x..rect.x + rect.width {
+            let cell = &mut buf[(x, y)];
+            if x == rect.x && y == rect.y {
+                // The one cell that carries the payload. Not skipped, so the diff sees
+                // it change when the cover or the geometry does.
+                cell.set_symbol(&payload);
+            } else {
+                cell.reset();
+                cell.set_skip(true);
+            }
+        }
+    }
+    true
 }
