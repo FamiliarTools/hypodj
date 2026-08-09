@@ -622,10 +622,18 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         // Keep the art roughly square: each cell renders 2 vertical pixels, so a
         // square cover is about (rows*2) columns wide. Clamp to the pane width.
         let art_rows = art_h as usize;
-        let art_cols = (art_rows * 2).min(inner.width as usize);
+        // The 2:1 constant encodes the HALF-BLOCK aspect (two vertical pixels per
+        // cell). A sixel image is drawn at native pixels, so its square-ish width comes
+        // from the real cell aspect instead; using 2:1 there would letterbox it.
+        let art_cols = match state.sixel_cell_px {
+            Some((cw, ch)) if cw > 0 => (art_rows * ch as usize / cw as usize).min(inner.width as usize),
+            _ => (art_rows * 2).min(inner.width as usize),
+        };
         let art_area = Rect { x: inner.x, y: inner.y, width: art_cols as u16, height: art_h };
         match &state.art {
-            // A real cover is always preferred (dithered half-block render).
+            // A real cover is always preferred. Sixel when the terminal can draw it,
+            // else the cell renderers.
+            Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px) => {}
             Some(a) => f.render_widget(Paragraph::new(a.lines(art_cols, art_rows)), art_area),
             // No cover: draw the deterministic album sigil when no inline-image
             // protocol is available (the image-less fallback for the art slot); else a
@@ -2821,4 +2829,187 @@ fn find_row_line(
     spans.extend(match_spans(&label, query, style, hit));
     spans.push(Span::styled(format!("{}{trailer}", " ".repeat(pad)), style));
     Line::from(spans)
+}
+
+/// Draw `art` into `rect` as a SIXEL image, or return false to let the caller fall back
+/// to the cell renderers.
+///
+/// THE REDRAW POLICY LIVES HERE. The payload is written as the SYMBOL of the rect's
+/// top-left cell and every other cell of the rect is blank and SKIPPED. Two things fall
+/// out of that, and both are the point:
+///
+///   - It is re-sent exactly when that cell's value changes, which means when the cover
+///     changes or the pane geometry changes, and never otherwise. The draw loop runs at
+///     up to 20 fps with an animated wave, so the frame diff is never empty; writing the
+///     payload out of band would push it every frame at a terminal that deliberately
+///     shortens its processing slice after decoding an image.
+///
+///   - Skipped cells emit NOTHING on the wire, so the rest of the frame cannot print
+///     into the image. That is not an optimisation here: images are cell-anchored in
+///     this terminal, so one printed character permanently takes that cell away from
+///     the image and eats a hole in the cover.
+///
+/// Skip has to be re-applied every frame because the buffer is reset between frames.
+fn render_sixel_art(
+    f: &mut Frame,
+    rect: Rect,
+    art: &crate::art::AlbumArt,
+    cell_px: Option<(u16, u16)>,
+) -> bool {
+    use crate::art::{art_mode, ArtMode};
+
+    let mode = art_mode();
+    if matches!(mode, ArtMode::Sextant | ArtMode::Half) {
+        return false;
+    }
+    let Some((cw, ch)) = cell_px else {
+        return false;
+    };
+    if cw == 0 || ch == 0 || rect.width < 2 || rect.height < 1 {
+        return false;
+    }
+
+    // An image wider than the screen is TRUNCATED by the terminal rather than scaled,
+    // and one whose last row is the bottom row scrolls the whole alternate screen.
+    // Refusing is better than either.
+    let area = f.area();
+    if rect.x + rect.width > area.width || rect.y + rect.height >= area.height {
+        return false;
+    }
+
+    let px_w = rect.width as u32 * cw as u32;
+    let px_h = rect.height as u32 * ch as u32;
+    let payload = art.sixel(px_w, px_h);
+    if payload.is_empty() {
+        return false;
+    }
+
+    let buf = f.buffer_mut();
+    for y in rect.y..rect.y + rect.height {
+        for x in rect.x..rect.x + rect.width {
+            let cell = &mut buf[(x, y)];
+            if x == rect.x && y == rect.y {
+                // The one cell that carries the payload. Not skipped, so the diff sees
+                // it change when the cover or the geometry does.
+                cell.set_symbol(&payload);
+            } else {
+                cell.reset();
+                cell.set_skip(true);
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod sixel_render_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn art() -> crate::art::AlbumArt {
+        crate::art::AlbumArt::for_test_solid([200, 60, 60])
+    }
+
+    /// The payload goes in ONE cell and every other cell of the rect is skipped.
+    ///
+    /// Both halves matter. The payload cell is what the frame diff watches, so it
+    /// must not be skipped; the rest must be, because skipped cells emit nothing and
+    /// images are cell-anchored in this terminal - a single character printed into
+    /// the rect permanently takes that cell away from the image.
+    #[test]
+    fn payload_occupies_one_cell_and_the_rest_are_skipped() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let a = art();
+        let rect = Rect { x: 2, y: 1, width: 8, height: 4 };
+
+        // Assert on RATATUI's buffer, inside the closure. The backend's buffer is
+        // what was actually drawn, and `skip` exists precisely to stop a cell being
+        // drawn, so a skipped cell never appears there at all.
+        terminal
+            .draw(|f| {
+                assert!(render_sixel_art(f, rect, &a, Some((8, 17))));
+
+                let buf = f.buffer_mut();
+
+                let payload = buf[(rect.x, rect.y)].symbol().to_string();
+                assert!(payload.starts_with("\x1bP"), "top-left cell must carry the DCS");
+                assert!(!buf[(rect.x, rect.y)].skip, "the payload cell must NOT be skipped");
+
+                for y in rect.y..rect.y + rect.height {
+                    for x in rect.x..rect.x + rect.width {
+                        if x == rect.x && y == rect.y {
+                            continue;
+                        }
+                        assert!(buf[(x, y)].skip, "cell {x},{y} in the art rect must be skipped");
+                    }
+                }
+            })
+            .unwrap();
+
+        // And the consequence that actually matters: the skipped cells emitted
+        // nothing, so the backend never received anything in the art rect beyond
+        // the payload cell.
+        let drawn = terminal.backend().buffer().clone();
+        for y in rect.y..rect.y + rect.height {
+            for x in rect.x..rect.x + rect.width {
+                if x == rect.x && y == rect.y {
+                    continue;
+                }
+                assert_eq!(
+                    drawn[(x, y)].symbol(),
+                    " ",
+                    "cell {x},{y} was drawn into the image and would eat a hole in it"
+                );
+            }
+        }
+    }
+
+    /// The redraw policy: an unchanged cover at an unchanged geometry must produce
+    /// an IDENTICAL payload, so the frame diff has nothing to send.
+    ///
+    /// This is the property the whole design rests on. The draw loop runs
+    /// unconditionally at up to 20 fps with an animated wave, so if the payload
+    /// string varied per frame the terminal would be handed a fresh image twenty
+    /// times a second.
+    #[test]
+    fn an_unchanged_cover_yields_an_identical_payload() {
+        let a = art();
+        let first = a.sixel(64, 68);
+        let second = a.sixel(64, 68);
+        assert_eq!(first, second, "same cover and geometry must give the same bytes");
+        assert!(std::sync::Arc::ptr_eq(&first, &second), "and it must be cached, not re-encoded");
+
+        // A different geometry is a different image and must re-encode.
+        let resized = a.sixel(80, 68);
+        assert_ne!(first, resized);
+    }
+
+    /// Refusals fall back rather than drawing something wrong.
+    #[test]
+    fn refuses_when_it_cannot_draw_safely() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let a = art();
+
+        terminal
+            .draw(|f| {
+                // No cell geometry: the terminal never told us how big a cell is.
+                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 8, height: 4 }, &a, None));
+
+                // One column wide: the backend only emits MoveTo when the next cell
+                // is not (x+1, y), so the cell right of the payload has to exist.
+                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 1, height: 4 }, &a, Some((8, 17))));
+
+                // Past the right edge: this terminal TRUNCATES a too-wide image
+                // rather than scaling it.
+                let w = f.area().width;
+                assert!(!render_sixel_art(f, Rect { x: w - 2, y: 0, width: 8, height: 4 }, &a, Some((8, 17))));
+
+                // Last row: an image whose bottom lands on the bottom row scrolls
+                // the whole alternate screen.
+                let h = f.area().height;
+                assert!(!render_sixel_art(f, Rect { x: 0, y: h - 1, width: 8, height: 1 }, &a, Some((8, 17))));
+            })
+            .unwrap();
+    }
 }

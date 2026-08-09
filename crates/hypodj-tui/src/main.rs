@@ -103,6 +103,11 @@ fn run() -> Result<(), MpdError> {
         &env,
         Duration::from_millis(150),
     );
+    // Ask whether this terminal can draw images, AFTER the background probe and never
+    // batched with it: two outstanding replies could interleave and neither would parse.
+    // A terminal that stays silent costs us the deadline and nothing else.
+    state.sixel_cell_px = sixel_geometry(&mut terminal);
+
     // Prime the panes before the first draw: request the initial snapshot (the
     // response lands within the first few poll cycles).
     request_refresh(&workers.req_tx, &mut state);
@@ -134,6 +139,7 @@ fn event_loop(
     // paused) so the DJ "thinking..." spinner keeps rotating on a paused/stopped deck.
     let mut spin_accum = 0.0f64;
     let mut last_frame = Instant::now();
+    let mut last_size = terminal.size().ok();
     loop {
         let frame_now = Instant::now();
         let dt = frame_now.duration_since(last_frame).as_secs_f64();
@@ -151,6 +157,18 @@ fn event_loop(
         // viz_active and the renderer falls back to the decorative wave. The slot
         // lock is held only for the brief read, never across IO or the draw.
         update_viz(state, workers, dt);
+
+        // A resize changes the cell pixel size AND leaves the old image's cells behind,
+        // so re-query the geometry and clear. Only on the edge: clearing every frame
+        // would throw away the frame diff that keeps the payload from being re-sent.
+        if state.sixel_cell_px.is_some() {
+            let size = terminal.size().ok();
+            if size != last_size {
+                last_size = size;
+                state.sixel_cell_px = cell_px(terminal);
+                let _ = terminal.clear();
+            }
+        }
 
         terminal
             .draw(|f| ui::render(f, state))
@@ -753,6 +771,9 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        // Same reason as restore_terminal: clear the cover before leaving, or a panic
+        // leaves an image sitting on the shell.
+        let _ = std::io::Write::write_all(&mut io::stdout(), b"\x1b[2J");
         let _ = io::stdout().execute(LeaveAlternateScreen);
         // Clear the stale "HypoDJ - ..." title; the shell repaints its own on the
         // next prompt (VTE/kgx has no title stack to restore from).
@@ -762,8 +783,43 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
+/// Cell size in pixels, when the terminal can actually draw sixel at it.
+///
+/// Two independent questions, and BOTH have to answer yes. DA1 says the terminal
+/// decodes sixel; TIOCGWINSZ says how big a cell is, which is what turns a pane in
+/// cells into an image in pixels. A terminal can advertise sixel and report no pixel
+/// geometry (tmux, some multiplexers), and sizing an image from a zero cell would ask
+/// for a zero-pixel image.
+///
+/// `HYPODJ_ART_CELLS=sixel` forces it, so a terminal that draws sixel but answers DA1
+/// badly is still usable without a rebuild.
+fn sixel_geometry(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Option<(u16, u16)> {
+    let forced = crate::art::art_mode() == crate::art::ArtMode::Sixel;
+    if !forced && !album_color::probe_sixel(terminal.backend_mut(), Duration::from_millis(150)) {
+        return None;
+    }
+    cell_px(terminal)
+}
+
+/// Pixel size of one cell, from TIOCGWINSZ. No escape handshake, so this cannot hang.
+fn cell_px(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Option<(u16, u16)> {
+    use ratatui::backend::Backend;
+    let ws = terminal.backend_mut().window_size().ok()?;
+    let (cols, rows) = (ws.columns_rows.width, ws.columns_rows.height);
+    let (pw, ph) = (ws.pixels.width, ws.pixels.height);
+    if cols == 0 || rows == 0 || pw == 0 || ph == 0 {
+        return None;
+    }
+    Some((pw / cols, ph / rows))
+}
+
+
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
+    // Clear BEFORE leaving the alternate screen. An image lives in the cells it
+    // covers, and leaving the alternate screen does not erase those cells, so without
+    // this the last cover stays on the user's shell.
+    terminal.clear().ok();
     // Neutral title on clean exit; the shell reclaims its own on the next prompt.
     terminal.backend_mut().execute(SetTitle("")).ok();
     terminal.backend_mut().execute(LeaveAlternateScreen)?;

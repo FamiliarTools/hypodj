@@ -565,6 +565,15 @@ pub struct TuiState {
     /// The detected inline-image protocol; `None` => the album sigil is drawn in the
     /// album-art slot's image-less path.
     pub image_protocol: crate::album_color::ImageProtocol,
+
+    /// Cell size in pixels, set only when the terminal both ADVERTISED sixel and
+    /// reported a usable pixel geometry.
+    ///
+    /// `None` is the default and the fallback, so every terminal that does not answer,
+    /// answers without parameter 4, or reports a zero-sized cell keeps the sextant
+    /// renderer without any special casing. It is also why the existing TestBackend
+    /// tests still exercise the cell path unchanged.
+    pub sixel_cell_px: Option<(u16, u16)>,
     /// Whether the terminal advertises truecolor (else colors quantize to xterm-256).
     pub truecolor: bool,
     /// The cached album sigil, rebuilt only when the album identity changes (static -
@@ -637,6 +646,7 @@ impl Default for TuiState {
             heard_scroll: 0,
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
+            sixel_cell_px: None,
             truecolor: false,
             sigil: None,
         }

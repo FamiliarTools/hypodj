@@ -20,23 +20,50 @@ use ratatui::text::{Line, Span};
 
 const ART_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Has the user pinned the art pane back to the half-block renderer?
-fn half_block_forced() -> bool {
-    std::env::var("HYPODJ_ART_CELLS").is_ok_and(|v| v.eq_ignore_ascii_case("half"))
+/// How the art pane should be drawn.
+///
+/// `HYPODJ_ART_CELLS` picks one explicitly. The escape hatch predates sixel and its
+/// reason still holds: a renderer can be right on this terminal and wrong on the next
+/// one, and the user must be able to fix that without a rebuild. `sixel` forces images
+/// even if the probe said no, which is what makes a terminal that answers DA1 badly
+/// still usable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArtMode {
+    Auto,
+    Sixel,
+    Sextant,
+    Half,
+}
+
+/// Read the pinned art mode, per call, so it can be changed without a restart.
+pub fn art_mode() -> ArtMode {
+    match std::env::var("HYPODJ_ART_CELLS") {
+        Ok(v) if v.eq_ignore_ascii_case("half") => ArtMode::Half,
+        Ok(v) if v.eq_ignore_ascii_case("sextant") => ArtMode::Sextant,
+        Ok(v) if v.eq_ignore_ascii_case("sixel") => ArtMode::Sixel,
+        _ => ArtMode::Auto,
+    }
 }
 /// Decoded-thumbnail edge (px). Fetch+decode once per track; the per-frame downscale
 /// from this to the cell grid is cheap.
 ///
 /// This is a hard FIDELITY CEILING, so it must stay above what the pane can actually
 /// show: a sextant cell carries 2x3 subcells, so a 30x15 pane already wants 60x45 and a
-/// large pane on a big terminal wants more. 96 was sized for the half-block renderer and
-/// was already below the display resolution of a modest pane.
-const THUMB: u32 = 256;
+/// large pane on a big terminal wants more. It now also has to clear a SIXEL pane at
+/// native pixels, which wants roughly cell_px times the pane's cell size - a few
+/// hundred pixels on an ordinary layout - so 256 was itself becoming the ceiling.
+const THUMB: u32 = 512;
 
 /// A decoded cover thumbnail, cached per track uri. Rendering downscales it to the
 /// current cell area every frame (cheap); the expensive fetch+decode happens once.
 pub struct AlbumArt {
     img: RgbImage,
+    /// The last sixel payload, keyed by the pixel geometry it was encoded for.
+    ///
+    /// Encoding is the expensive part and the pane geometry rarely changes, so this
+    /// turns a per-frame cost into a per-resize one. It also makes the payload STRING
+    /// STABLE, which is what lets the frame diff decide when to re-send it.
+    sixel: std::cell::RefCell<Option<(u32, u32, std::sync::Arc<str>)>>,
     /// The ranked cover palette, extracted once at decode time. Shared by the sigil
     /// (DECORATION) and the waveform (INFO) so the visual system reads from one source.
     pub palette: crate::album_color::Palette,
@@ -52,7 +79,7 @@ impl AlbumArt {
             .resize_exact(THUMB, THUMB, image::imageops::FilterType::Triangle)
             .to_rgb8();
         let palette = crate::album_color::extract_palette(&thumb);
-        Some(AlbumArt { img: thumb, palette })
+        Some(AlbumArt { img: thumb, palette, sixel: std::cell::RefCell::new(None) })
     }
 
     /// Render the art into `cols x rows` cells, using the SEXTANT renderer (2x3 subcells
@@ -63,7 +90,7 @@ impl AlbumArt {
     /// itself (VTE does) or the font covers Symbols for Legacy Computing; a terminal with
     /// neither would show tofu, and the user must be able to fix that without a rebuild.
     pub fn lines(&self, cols: usize, rows: usize) -> Vec<Line<'static>> {
-        if half_block_forced() {
+        if art_mode() == ArtMode::Half {
             render_lines(&self.img, cols, rows)
         } else {
             render_lines_sextant(&self.img, cols, rows)
@@ -138,6 +165,177 @@ fn fetch_albumart(host: &str, port: u16, uri: &str) -> Option<Vec<u8>> {
     } else {
         Some(all)
     }
+}
+
+impl AlbumArt {
+    /// A solid-colour cover, for tests that need a real AlbumArt without a daemon.
+    #[cfg(test)]
+    pub fn for_test_solid(c: [u8; 3]) -> AlbumArt {
+        let img = RgbImage::from_fn(THUMB, THUMB, |_, _| image::Rgb(c));
+        let palette = crate::album_color::extract_palette(&img);
+        AlbumArt { img, palette, sixel: std::cell::RefCell::new(None) }
+    }
+
+    /// The sixel payload for this cover at exactly `px_w x px_h` pixels.
+    ///
+    /// Cached by geometry. Returning the SAME `Arc<str>` for an unchanged cover and
+    /// pane is the whole mechanism behind the redraw policy: the payload is the symbol
+    /// of one cell, so an identical string means the frame diff emits nothing at all.
+    pub fn sixel(&self, px_w: u32, px_h: u32) -> std::sync::Arc<str> {
+        if let Some((w, h, payload)) = self.sixel.borrow().as_ref() {
+            if *w == px_w && *h == px_h {
+                return payload.clone();
+            }
+        }
+        let payload: std::sync::Arc<str> = encode_sixel(&self.img, px_w, px_h).into();
+        *self.sixel.borrow_mut() = Some((px_w, px_h, payload.clone()));
+        payload
+    }
+}
+
+/// Encode `img` as a SIXEL payload sized exactly `px_w x px_h`.
+///
+/// Sixel is PALETTE INDEXED and carries colour components as percentages, so the wire
+/// format has roughly 101 levels per channel however many registers we use. Both limits
+/// band a photographic cover, so the image is dithered with the same Bayer matrix the
+/// cell renderers use BEFORE it is quantized - dithering after quantizing would do
+/// nothing, since the damage is already done by then.
+///
+/// 64 registers rather than the 1024 the terminal offers: the payload is re-sent
+/// whenever the cover or the pane geometry changes, so its size is a bandwidth cost we
+/// pay repeatedly, and 64 keeps a 300 px cover near 70 KB against roughly 130 KB at 256
+/// without banding that shows on real covers.
+fn encode_sixel(img: &RgbImage, px_w: u32, px_h: u32) -> String {
+    if px_w == 0 || px_h == 0 {
+        return String::new();
+    }
+
+    let scaled = image::imageops::resize(img, px_w, px_h, image::imageops::FilterType::Triangle);
+
+    // The palette is built from the REAL pixels, undithered. Dithering first would
+    // spend the register budget on the dither noise: median_cut would cluster around
+    // the bias values, adjacent pixels in a flat region would land on different
+    // registers, and the result is both a worse palette and a payload with no runs
+    // left to compress.
+    let pixels: Vec<crate::album_color::Rgb> = scaled.pixels().map(|p| p.0).collect();
+
+    let palette = crate::album_color::median_cut(pixels.clone(), SIXEL_REGISTERS);
+    if palette.is_empty() {
+        return String::new();
+    }
+
+    // Dither at MATCH time instead: the bias nudges each pixel before it picks a
+    // register, so a gradient crosses register boundaries at different points per
+    // pixel (which is what breaks banding) while a flat region still maps every pixel
+    // to the same register (which is what keeps the runs).
+    let mut indexed: Vec<u8> = Vec::with_capacity(pixels.len());
+    for y in 0..px_h {
+        for x in 0..px_w {
+            let px = pixels[(y * px_w + x) as usize];
+            let bias = BAYER4[(y % 4) as usize][(x % 4) as usize] - 8;
+            let biased = [
+                (px[0] as i16 + bias).clamp(0, 255) as u8,
+                (px[1] as i16 + bias).clamp(0, 255) as u8,
+                (px[2] as i16 + bias).clamp(0, 255) as u8,
+            ];
+            indexed.push(nearest_register(&palette, biased));
+        }
+    }
+
+    let mut out = String::with_capacity((px_w as usize * px_h as usize) / 4 + 1024);
+
+    // Three parameters, never a fourth: P1 aspect, P2 background select, P3 grid.
+    // P2 = 0 means unset pixels take the background rather than staying transparent,
+    // which is what pins the image's extent to the raster attribute below.
+    out.push_str("\x1bP0;0;0q");
+    out.push_str(&format!("\"1;1;{px_w};{px_h}"));
+
+    for (i, c) in palette.iter().enumerate() {
+        // Components are percentages, not 0..255.
+        let pc = |v: u8| (v as u32 * 100 + 127) / 255;
+        out.push_str(&format!("#{};2;{};{};{}", i, pc(c[0]), pc(c[1]), pc(c[2])));
+    }
+
+    let bands = px_h.div_ceil(6);
+    let mut row_bits = vec![0u8; px_w as usize];
+
+    for band in 0..bands {
+        let top = band * 6;
+
+        for (reg, _) in palette.iter().enumerate() {
+            row_bits.iter_mut().for_each(|b| *b = 0);
+            let mut any = false;
+
+            for sub in 0..6u32 {
+                let y = top + sub;
+                if y >= px_h {
+                    break;
+                }
+                let row = (y * px_w) as usize;
+                for x in 0..px_w as usize {
+                    if indexed[row + x] as usize == reg {
+                        row_bits[x] |= 1 << sub;
+                        any = true;
+                    }
+                }
+            }
+
+            if !any {
+                continue;
+            }
+
+            out.push_str(&format!("#{reg}"));
+
+            // Run-length encode: DECGRI pays for itself from four repeats up, and a
+            // flat-coloured cover is mostly long runs.
+            let mut x = 0usize;
+            while x < row_bits.len() {
+                let bits = row_bits[x];
+                let mut run = 1usize;
+                while x + run < row_bits.len() && row_bits[x + run] == bits {
+                    run += 1;
+                }
+                let ch = (0x3f + bits) as char;
+                if run >= 4 {
+                    out.push_str(&format!("!{run}{ch}"));
+                } else {
+                    for _ in 0..run {
+                        out.push(ch);
+                    }
+                }
+                x += run;
+            }
+
+            out.push('$');
+        }
+
+        if band + 1 < bands {
+            out.push('-');
+        }
+    }
+
+    out.push_str("\x1b\\");
+    out
+}
+
+/// Colour registers used by the sixel encoder. See [`encode_sixel`].
+const SIXEL_REGISTERS: usize = 64;
+
+/// Index of the palette entry nearest `px`, by squared distance.
+fn nearest_register(palette: &[crate::album_color::Rgb], px: crate::album_color::Rgb) -> u8 {
+    let mut best = 0usize;
+    let mut best_d = u32::MAX;
+    for (i, c) in palette.iter().enumerate() {
+        let dr = c[0] as i32 - px[0] as i32;
+        let dg = c[1] as i32 - px[1] as i32;
+        let db = c[2] as i32 - px[2] as i32;
+        let d = (dr * dr + dg * dg + db * db) as u32;
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best as u8
 }
 
 /// Bayer 4x4 ordered-dither matrix, centered to roughly [-8, +7].
@@ -292,7 +490,7 @@ impl AlbumArt {
     /// image is a 1x1 stub; the palette is read by the waveform styling and the stub
     /// still renders as half-block cells in the art pane.
     pub fn for_test(palette: crate::album_color::Palette) -> AlbumArt {
-        AlbumArt { img: RgbImage::new(1, 1), palette }
+        AlbumArt { img: RgbImage::new(1, 1), palette, sixel: std::cell::RefCell::new(None) }
     }
 }
 
@@ -401,5 +599,89 @@ mod tests {
     fn quote_escapes() {
         assert_eq!(quote("song/1"), "\"song/1\"");
         assert_eq!(quote(r#"a"b\c"#), "\"a\\\"b\\\\c\"");
+    }
+}
+
+#[cfg(test)]
+mod sixel_tests {
+    use super::*;
+
+    /// A flat image of one colour, plus a checkerboard, are the two shapes that pin
+    /// the wire format: one exercises run-length coding, the other multiple registers.
+    fn flat(w: u32, h: u32, c: [u8; 3]) -> RgbImage {
+        RgbImage::from_fn(w, h, |_, _| image::Rgb(c))
+    }
+
+    #[test]
+    fn payload_is_a_well_formed_dcs() {
+        let out = encode_sixel(&flat(12, 12, [200, 40, 40]), 12, 12);
+
+        assert!(out.starts_with("\x1bP"), "must open with a DCS introducer");
+        assert!(out.ends_with("\x1b\\"), "must close with ST, ESC + ONE backslash");
+
+        // Exactly three parameters before the q, never a fourth: a fourth parameter
+        // is a different command shape and terminals disagree about it.
+        let head = &out[2..out.find('q').expect("DCS needs a q")];
+        assert_eq!(head.split(';').count(), 3, "header was {head:?}");
+    }
+
+    #[test]
+    fn raster_attribute_pins_the_extent() {
+        // Without this the image's height is whatever the data happens to fill, and a
+        // dark cover would silently occupy fewer rows than the pane reserved.
+        let out = encode_sixel(&flat(12, 18, [10, 10, 10]), 12, 18);
+        assert!(out.contains("\"1;1;12;18"), "missing raster attributes");
+    }
+
+    #[test]
+    fn data_bytes_stay_in_the_printable_range() {
+        let img = RgbImage::from_fn(16, 12, |x, y| {
+            image::Rgb(if (x / 2 + y / 2) % 2 == 0 { [250, 250, 250] } else { [5, 5, 5] })
+        });
+        let out = encode_sixel(&img, 16, 12);
+
+        // Everything after the header must be either a command byte or a sixel data
+        // byte in 0x3f..=0x7e. Anything outside that range is a corrupt payload that
+        // some terminals render as garbage rather than refusing.
+        let body = &out[out.find('q').unwrap() + 1..out.len() - 2];
+        for ch in body.chars() {
+            let ok = matches!(ch, '#' | '$' | '-' | '!' | '"' | ';' | '0'..='9')
+                || ('\u{3f}'..='\u{7e}').contains(&ch);
+            assert!(ok, "byte {ch:?} is outside the sixel alphabet");
+        }
+    }
+
+    #[test]
+    fn a_two_colour_image_defines_at_least_two_registers() {
+        let img = RgbImage::from_fn(16, 12, |x, _| {
+            image::Rgb(if x < 8 { [250, 10, 10] } else { [10, 10, 250] })
+        });
+        let out = encode_sixel(&img, 16, 12);
+        assert!(out.matches("#").count() >= 2, "expected several palette writes");
+    }
+
+    #[test]
+    fn band_count_covers_every_row() {
+        // 18 rows is exactly 3 bands; 20 rows needs 4, and the partial band must still
+        // be emitted or the bottom of the cover is cut off.
+        let three = encode_sixel(&flat(6, 18, [90, 90, 90]), 6, 18);
+        let four = encode_sixel(&flat(6, 20, [90, 90, 90]), 6, 20);
+        assert_eq!(three.matches('-').count(), 2, "3 bands means 2 separators");
+        assert_eq!(four.matches('-').count(), 3, "4 bands means 3 separators");
+    }
+
+    #[test]
+    fn run_length_coding_keeps_a_cover_affordable() {
+        // The payload is re-sent on every cover or geometry change, so its size is a
+        // recurring cost. A flat 300x300 must compress hard.
+        let out = encode_sixel(&flat(300, 300, [123, 45, 67]), 300, 300);
+        assert!(out.contains('!'), "expected DECGRI runs");
+        assert!(out.len() < 120_000, "payload was {} bytes", out.len());
+    }
+
+    #[test]
+    fn degenerate_geometry_yields_nothing_rather_than_a_broken_dcs() {
+        assert!(encode_sixel(&flat(4, 4, [1, 2, 3]), 0, 10).is_empty());
+        assert!(encode_sixel(&flat(4, 4, [1, 2, 3]), 10, 0).is_empty());
     }
 }
