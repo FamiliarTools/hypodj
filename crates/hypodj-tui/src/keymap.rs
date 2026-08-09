@@ -53,7 +53,16 @@ pub enum Act {
     Heard,
     PlaySel,
     Enqueue,
-    Open,
+    /// Open the row CONTEXT MENU for the thing under the cursor. Renamed from `Open`
+    /// when `o` stopped meaning "drill": drilling moved to its own key so `o` can be
+    /// unconditional on every screen and every row kind, and an album row can reach its
+    /// own menu (which is where "go to artist" lives).
+    Menu,
+    /// Open the context menu for the NOW PLAYING track, screen-independent.
+    MenuCurrent,
+    /// Drill into a directory - the body `o` used to run, on its own key so the vim
+    /// symmetry with the existing `h` / Left / Esc back-out is restored.
+    BrowseIn,
     BrowseBack,
     HelpToggle,
     Quit,
@@ -180,7 +189,9 @@ pub const KEYMAP: &[Binding] = &[
     // Browse.
     Binding { matchers: &[Code(KeyCode::Enter)], keys: "enter", group: Browse, scope: Scope::Global, act: PlaySel, help: "play the selection" },
     Binding { matchers: &[Char(' ')], keys: "space", group: Browse, scope: Scope::Browse, act: Enqueue, help: "enqueue the selected row" },
-    Binding { matchers: &[Char('o')], keys: "o", group: Browse, scope: Scope::Browse, act: Open, help: "open (drill into) a directory" },
+    Binding { matchers: &[Char('l'), Code(KeyCode::Right)], keys: "l / right", group: Browse, scope: Scope::Browse, act: BrowseIn, help: "drill into a directory" },
+    Binding { matchers: &[Char('o')], keys: "o", group: Browse, scope: Scope::Global, act: Menu, help: "context menu for this row (open is item 1)" },
+    Binding { matchers: &[Char('O')], keys: "O", group: Browse, scope: Scope::Global, act: MenuCurrent, help: "context menu for the playing track" },
     Binding { matchers: &[Char('h'), Code(KeyCode::Left), Code(KeyCode::Esc)], keys: "h / left / esc", group: Browse, scope: Scope::Browse, act: BrowseBack, help: "back out one browse level" },
     // Favorites.
     Binding { matchers: &[Char('s')], keys: "s", group: Favorites, scope: Scope::Global, act: FavSelected, help: "star the selected row" },
@@ -305,7 +316,7 @@ mod tests {
     #[test]
     fn documented_bindings_all_present() {
         // The set the task calls out must each have a row.
-        let want_chars = ['j', 'k', 'g', 'G', 'P', '/', 'n', 'N', ':', 'p', '<', '>', 'r', 's', 'o', 'h', 'q', '?', '0', '9', ' '];
+        let want_chars = ['j', 'k', 'g', 'G', 'P', '/', 'n', 'N', ':', 'p', '<', '>', 'r', 's', 'o', 'O', 'l', 'h', 'q', '?', '0', '9', ' '];
         for c in want_chars {
             assert!(
                 KEYMAP.iter().any(|b| b.matchers.iter().any(|m| matches!(m, KeyMatch::Char(k) if *k == c))),
