@@ -62,6 +62,83 @@ pub enum PlayerError {
     Gone,
 }
 
+/// What a BOUNDED cache dump actually produced. EVIDENCE, never a status.
+///
+/// `Ok(())` would be a lie here and that is measured, not theoretical.
+/// `libmpv2::Mpv::command` is `mpv_err((), mpv_command_string(...))` - the success path
+/// discards everything and yields `()`. The `"error":"success"` the design study saw is
+/// the JSON IPC envelope, invisible through this API, and it was WRONG anyway: it
+/// accompanied a zero-byte file after a warm switch destroyed 110 s of history. mpv's own
+/// manual says the same prospectively - "If no data is cached at the given time range,
+/// nothing may be dumped (creating a file with no packets)". So the reply carries what
+/// can be checked instead of what mpv claims.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DumpOutcome {
+    /// Bytes on disk, from a `metadata()` stat taken ON the actor thread immediately
+    /// after the command returned - before any queue advance can land between the two.
+    pub bytes: u64,
+    /// The window actually requested (entry-relative seconds), echoed back so the sidecar
+    /// records what was ASKED FOR rather than what a caller believed.
+    pub start: f64,
+    pub end: f64,
+    /// `time-pos` as the actor read it in the same instant it resolved the window. The
+    /// only position reading taken on the same thread as the dump itself, which is what a
+    /// later ffmpeg re-cut needs to anchor against.
+    pub pos_at_dump: f64,
+    /// `time-pos` read immediately AFTER the dump, so a caller can see how far the
+    /// playhead moved while the actor was blocked.
+    pub pos_after: Option<f64>,
+    /// Whether mpv still held the beginning of the entry.
+    pub bof_cached: bool,
+    /// WHOSE audio this is: the queue entry the ACTOR was holding at the instant it ran
+    /// the dump, read on the actor thread from the same latch that stamps `TimePos`.
+    ///
+    /// Load-bearing, and the reason a caller must not trust its own snapshot: MPD `next`
+    /// advances the handler's reported current IMMEDIATELY while the warm switch lands
+    /// one to two seconds later, so a press inside that window snapshots the NEW entry
+    /// and dumps the OLD entry's audio. Observed live, twice, in both directions, with
+    /// the codec proving it - a sidecar naming an mp3 station over aac bytes. The
+    /// caller compares this against what it snapshotted and refuses to label a segment
+    /// it cannot attribute.
+    pub entry: Option<QueueId>,
+}
+
+/// Why a cache dump produced nothing usable.
+///
+/// Deliberately NOT a new [`PlayerError`] variant: `PlayerError` is `pub`, flows through
+/// `fade::FadeError::SinkError` and eleven handler signatures, and widening it would be a
+/// blast radius for no gain. `TooThin` carrying `available` is load-bearing - it is what
+/// lets a caller WAIT the deficit instead of refetching anything over the network.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DumpFailure {
+    /// Nothing is loaded, or the backend has no cache at all (the headless actor).
+    NoEntry,
+    /// The cache holds less than the caller's floor. No mpv command was spent.
+    TooThin { available: f64 },
+    /// mpv returned success and wrote a ZERO-BYTE file. The measured case.
+    Empty,
+    /// mpv refused the command.
+    Backend(String),
+    /// The actor is gone.
+    Gone,
+}
+
+impl std::fmt::Display for DumpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DumpFailure::NoEntry => write!(f, "nothing is loaded to capture from"),
+            DumpFailure::TooThin { available } => {
+                write!(f, "only {available:.0}s is buffered so far")
+            }
+            DumpFailure::Empty => write!(f, "the cache was emptied before the dump landed"),
+            DumpFailure::Backend(e) => write!(f, "player backend: {e}"),
+            DumpFailure::Gone => write!(f, "player actor is gone"),
+        }
+    }
+}
+
+impl std::error::Error for DumpFailure {}
+
 /// Events pushed OUT of the player actor. In the mpv impl these originate from
 /// mpv's `time-pos` / `end-file` observations. The MPD server + a scrobble
 /// driver subscribe to this stream.
@@ -250,6 +327,38 @@ enum PlayerCommand {
         url: String,
         queue_id: QueueId,
         reply: oneshot::Sender<Result<(), PlayerError>>,
+    },
+    /// Dump a BOUNDED PAST window of the current entry's demuxer cache to `path` as a
+    /// bitstream copy. The end is ALWAYS a finite number.
+    ///
+    /// THE ONE FAILURE WITH NO RUNTIME RECOVERY, stated here because this is where a
+    /// future edit would introduce it: the continuous-append form of the mpv command
+    /// (a literal `no` where the end bound goes) returns only when playback STOPS, and
+    /// libmpv2 4.1.0 re-exports neither `mpv_command_async` nor `mpv_abort_async_command`
+    /// (both exist in libmpv2-sys and neither is wrapped). Issuing it would permanently
+    /// wedge the thread that drives EOF and queue advance, with no way back short of
+    /// restarting the daemon. It is made UNREPRESENTABLE here - `back` and `fwd` are
+    /// plain `f64` with no `Option` and no sentinel, and the arm formats both resolved
+    /// bounds with `{:.3}` - and a source-text guard test pins that shut.
+    ///
+    /// The window is resolved ON THE ACTOR from a `time-pos` and a `demuxer-cache-state`
+    /// it reads itself, rather than passed in absolute: the only position a caller can
+    /// see is `HypodjHandler::last_elapsed_secs`, a lossy ~1 Hz copy off a droppable
+    /// broadcast, which is good enough to choose a generous window and not good enough to
+    /// be a cut anchor.
+    DumpCache {
+        /// Seconds of PAST to ask for, relative to the actor's own `time-pos`.
+        back: f64,
+        /// Seconds of FUTURE, clamped on the actor to what the forward cache holds.
+        fwd: f64,
+        /// The span cap, seconds. Applied AFTER the cache-state read so neither a config
+        /// typo nor a caller can widen the actor's blocking budget.
+        max_secs: f64,
+        /// The floor below which the dump is refused without spending an mpv command.
+        min_secs: f64,
+        /// Where mpv writes. mpv writes it from its OWN thread; the caller renames.
+        path: std::path::PathBuf,
+        reply: oneshot::Sender<Result<DumpOutcome, DumpFailure>>,
     },
     /// TEST-ONLY: make the actor emit a natural `Eof` for the latched entry
     /// (mirrors an mpv `EndFile(Eof)`), so a director test can drive a queue
@@ -475,6 +584,45 @@ impl PlayerHandle {
         self.state_rx.clone()
     }
 
+    /// Dump the last `back` seconds (plus up to `fwd` seconds of whatever the forward
+    /// cache already holds) of the current entry to `path`, bounded by `max_secs` and
+    /// refused below `min_secs`.
+    ///
+    /// The FIRST value-returning player command in the tree, which is why it is a
+    /// separate helper rather than a change to [`Self::request`]: that helper's reply is
+    /// hard-pinned to `Result<(), PlayerError>` and widening it would touch all eleven
+    /// call sites.
+    ///
+    /// COST: one synchronous `mpv_command_string` on the actor thread, so `wait_event` is
+    /// not called for its duration - measured at ~45 ms for an 8-minute mp3 window at
+    /// ~350 MB/s, and bounded by `max_secs`. Affordable against the fade driver's 250 ms
+    /// `min_slew` and the ~20 Hz property cadence. What is NOT affordable is a QUEUE of
+    /// these: the actor's command arm `continue`s without pumping events, so a burst
+    /// starves EOF for the sum of its dumps. Callers must single-flight (the handler's
+    /// `taping` flag), never loop.
+    pub async fn dump_cache(
+        &self,
+        back: f64,
+        fwd: f64,
+        max_secs: f64,
+        min_secs: f64,
+        path: &std::path::Path,
+    ) -> Result<DumpOutcome, DumpFailure> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(PlayerCommand::DumpCache {
+                back,
+                fwd,
+                max_secs,
+                min_secs,
+                path: path.to_path_buf(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| DumpFailure::Gone)?;
+        rx.await.map_err(|_| DumpFailure::Gone)?
+    }
+
     async fn request<F>(&self, make: F) -> Result<(), PlayerError>
     where
         F: FnOnce(oneshot::Sender<Result<(), PlayerError>>) -> PlayerCommand,
@@ -509,7 +657,18 @@ pub(crate) struct WarmProbe {
     /// Counts `PrefetchContinuation` commands so a fake-clock handler test can assert
     /// the continuation warm actually reached the actor at fire time.
     pub prefetch_continuation: std::sync::atomic::AtomicUsize,
+    /// Counts `DumpCache` commands, and SCRIPTS the headless reply so the thin-cache
+    /// retry is drivable without a real mpv: the FIRST dump answers
+    /// [`DumpFailure::TooThin`] (a cache that has not filled yet), every later one answers
+    /// [`DumpFailure::NoEntry`]. It never answers `Ok` - a headless actor has no cache, and
+    /// fabricating a byte count would let a test go green about a file that does not exist.
+    pub dump: std::sync::atomic::AtomicUsize,
 }
+
+/// How much audio the scripted first headless dump claims to hold. Below every caller's
+/// floor, so it exercises exactly the deficit-and-retry path.
+#[cfg(test)]
+pub(crate) const PROBE_THIN_AVAILABLE: f64 = 5.0;
 
 impl NullPlayer {
     /// Spawn the actor; returns the handle plus the event stream receiver.
@@ -690,6 +849,28 @@ impl NullPlayer {
                     PlayerCommand::SetVolumeF64 { vol: _, reply } => {
                         let _ = reply.send(Ok(()));
                     }
+                    PlayerCommand::DumpCache { reply, .. } => {
+                        // A headless actor has NO demuxer cache, so the honest answer is
+                        // an error. It must NEVER reply `Ok(DumpOutcome { bytes: 0, .. })`:
+                        // fabricating success would let a test - and the certless nix
+                        // sandbox, where `handler_with_null_player()` returns `None` - go
+                        // green about a filename for a file that does not exist, which is
+                        // the exact lie this whole feature exists to prevent.
+                        #[cfg(test)]
+                        if let Some(p) = &probe {
+                            // Scripted, and still never an Ok: the FIRST dump reports a
+                            // cache too thin to fingerprint, which is the only way a
+                            // headless test can drive the wait-then-retry path.
+                            let n = p.dump.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = reply.send(Err(if n == 0 {
+                                DumpFailure::TooThin { available: PROBE_THIN_AVAILABLE }
+                            } else {
+                                DumpFailure::NoEntry
+                            }));
+                            continue;
+                        }
+                        let _ = reply.send(Err(DumpFailure::NoEntry));
+                    }
                     #[cfg(test)]
                     PlayerCommand::TestEof => {
                         // Mirror the mpv EndFile(Eof) shape: emit Eof for the
@@ -806,6 +987,24 @@ impl MpvPlayer {
             //       phantom queue advance ever escapes, and SwitchWarmed's index re-check
             //       still lands the intended target.
             init.set_property("prefetch-playlist", "yes")?;
+            // PIN THE RAM CEILING the tape reads from. This block previously set NO cache
+            // options at all, so mpv's defaults were in force and the retained history had
+            // no explicit bound. `demuxer-max-back-bytes` was measured NOT to govern what
+            // the cache dump can read (the stream-level byte cache serves it), so the
+            // ceiling that plausibly bites is this one - pinned at mpv's own 150 MiB
+            // default, made explicit so it is a stated choice rather than an inherited
+            // one, and so a future change to it is visible in this file.
+            //
+            // Stated honestly: the BITE of this knob was measured once and never
+            // confirmed, and the relationship between the packet cache and the
+            // stream-level byte cache is unestablished (a local probe read
+            // `file-cache-bytes = 988082` with `cache-on-disk` off alongside
+            // `total-bytes = 627104`, which the mpv 0.41.0 manual says is impossible).
+            // Nobody should call the ring free about MEMORY until RSS has been watched
+            // across a real multi-hour evening. `cache-on-disk=yes` stays rejected: it
+            // writes continuously, forever, on a 91-percent-full disk and on battery, to
+            // buy a bound obtainable by capping bytes.
+            init.set_property("demuxer-max-bytes", "150MiB")?;
             match &out {
                 AudioOut::Null => {
                     init.set_property("ao", "null")?;
@@ -1625,6 +1824,77 @@ fn handle_cmd(
             }
             let _ = reply.send(res);
         }
+        PlayerCommand::DumpCache { back, fwd, max_secs, min_secs, path, reply } => {
+            // Everything below runs in ONE uninterrupted stretch on this thread, which is
+            // the point: the position, the cache state, the dump and the byte count are
+            // all sampled in the same instant, so no queue advance can interleave between
+            // the command and the check that it produced anything.
+            let pos = match mpv.get_property::<f64>("time-pos") {
+                Ok(p) if p.is_finite() => p,
+                _ => {
+                    let _ = reply.send(Err(DumpFailure::NoEntry));
+                    return false;
+                }
+            };
+            let state = mpv
+                .get_property::<libmpv2::mpv_node::MpvNode>("demuxer-cache-state")
+                .map(parse_cache_state)
+                .unwrap_or_default();
+            let (start, end) = match crate::tape::plan_window(
+                pos,
+                back,
+                fwd,
+                &state.ranges,
+                max_secs,
+                min_secs,
+            ) {
+                Ok(w) => w,
+                // Refused BEFORE any command is issued, so a press three seconds after a
+                // load costs nothing at all.
+                Err(crate::tape::WindowError::NoPosition) => {
+                    let _ = reply.send(Err(DumpFailure::NoEntry));
+                    return false;
+                }
+                Err(crate::tape::WindowError::TooThin { available }) => {
+                    let _ = reply.send(Err(DumpFailure::TooThin { available }));
+                    return false;
+                }
+            };
+            // BOTH bounds are finite numbers formatted here. There is no code path that
+            // can produce the continuous-append sentinel (see the variant's doc), and the
+            // `raw` prefix disables mpv's property expansion, which otherwise runs on all
+            // string arguments regardless of quoting.
+            let (start_s, end_s) = (format!("{start:.3}"), format!("{end:.3}"));
+            let res = mpv.command(
+                "raw",
+                &["dump-cache", &start_s, &end_s, &quote(&path.to_string_lossy())],
+            );
+            if let Err(e) = res {
+                let _ = reply.send(Err(DumpFailure::Backend(e.to_string())));
+                return false;
+            }
+            // LAYER 1 of the verify, and it belongs HERE rather than at the caller: one
+            // stat costs microseconds, neither writes nor fsyncs, and it closes the window
+            // in which a warm switch could land between the dump and the check.
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if bytes == 0 {
+                // The measured case. Remove the empty file rather than leaving litter the
+                // caller has to reason about.
+                let _ = std::fs::remove_file(&path);
+                let _ = reply.send(Err(DumpFailure::Empty));
+                return false;
+            }
+            let pos_after = mpv.get_property::<f64>("time-pos").ok().filter(|p| p.is_finite());
+            let _ = reply.send(Ok(DumpOutcome {
+                bytes,
+                start,
+                end,
+                pos_at_dump: pos,
+                pos_after,
+                bof_cached: state.bof_cached,
+                entry: *current_qid,
+            }));
+        }
         // The mpv actor never receives TestEof (only NullPlayer does), but the
         // command enum carries it in test builds so this arm keeps the match total.
         #[cfg(test)]
@@ -1694,6 +1964,90 @@ where
         (None, None) => None,
         (r, p) => Some((r.or(p).unwrap(), p.or(r).unwrap())),
     }
+}
+
+/// What the tape needs out of mpv's `demuxer-cache-state` node.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct CacheState {
+    /// Seekable ranges on the entry's own timeline, `(start, end)` seconds. A range start
+    /// can be NEGATIVE on a live stream (measured: `-0.025057`), so nothing floors at 0.
+    pub ranges: Vec<(f64, f64)>,
+    /// Whether mpv still holds the beginning of the entry.
+    pub bof_cached: bool,
+}
+
+/// One decoded field of a `demuxer-cache-state` map, flattened so the pure selector below
+/// is testable offline (an `MpvNodeMapIter` cannot be constructed without a live mpv).
+/// Same split as [`parse_astats_levels`] / [`select_astats_levels`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CacheField {
+    /// One entry of `seekable-ranges`, its `start`/`end` as decoded (either may be
+    /// missing or unparseable).
+    Range(Option<f64>, Option<f64>),
+    /// `bof-cached`.
+    BofCached(bool),
+}
+
+/// Read the seekable ranges + `bof-cached` off a `demuxer-cache-state` node.
+pub(crate) fn parse_cache_state(node: libmpv2::mpv_node::MpvNode) -> CacheState {
+    let Some(map) = node.map() else {
+        return CacheState::default();
+    };
+    let mut fields: Vec<CacheField> = Vec::new();
+    for (key, value) in map {
+        match key.as_str() {
+            "seekable-ranges" => {
+                if let Some(arr) = value.array() {
+                    for item in arr {
+                        let Some(entry) = item.map() else { continue };
+                        let (mut start, mut end) = (None, None);
+                        for (k, v) in entry {
+                            match k.as_str() {
+                                "start" => start = node_f64(&v),
+                                "end" => end = node_f64(&v),
+                                _ => {}
+                            }
+                        }
+                        fields.push(CacheField::Range(start, end));
+                    }
+                }
+            }
+            "bof-cached" => fields.push(CacheField::BofCached(value.bool().unwrap_or(false))),
+            _ => {}
+        }
+    }
+    select_cache_state(fields)
+}
+
+/// Decode one numeric node tolerantly: mpv reports these as doubles, but an integral
+/// value arriving as an int (or, defensively, a string) must not silently drop a range.
+fn node_f64(node: &libmpv2::mpv_node::MpvNode) -> Option<f64> {
+    match node {
+        libmpv2::mpv_node::MpvNode::Double(d) => Some(*d),
+        libmpv2::mpv_node::MpvNode::Int64(i) => Some(*i as f64),
+        libmpv2::mpv_node::MpvNode::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Pure selection over decoded cache fields: keep only ranges with BOTH bounds finite and
+/// ordered, because a half-decoded range handed to the window planner would silently
+/// widen or void a cut.
+pub(crate) fn select_cache_state<I>(fields: I) -> CacheState
+where
+    I: IntoIterator<Item = CacheField>,
+{
+    let mut out = CacheState::default();
+    for field in fields {
+        match field {
+            CacheField::Range(Some(s), Some(e)) if s.is_finite() && e.is_finite() && e >= s => {
+                out.ranges.push((s, e))
+            }
+            CacheField::Range(..) => {}
+            CacheField::BofCached(b) => out.bof_cached = b,
+        }
+    }
+    out
 }
 
 /// Extract the live ICY station / now-playing from mpv's `metadata` node (a string
@@ -1773,6 +2127,96 @@ mod tests {
         let (rms, peak) = select_astats_levels(pairs).expect("overall levels present");
         assert_eq!(rms, -20.0, "RMS must be the Overall value, not a per-channel one");
         assert_eq!(peak, -12.0, "Peak must be the Overall value, not a per-channel one");
+    }
+
+    #[tokio::test]
+    async fn the_headless_actor_never_fabricates_a_successful_dump() {
+        // A headless actor has no demuxer cache, so `Ok` would be a lie - and a
+        // particularly dangerous one, because the certless nix sandbox runs
+        // `-p hypodj-core` where `handler_with_null_player()` returns `None` and every
+        // handler test skips. A fabricated `Ok(DumpOutcome { bytes: 0, .. })` would let a
+        // caller mint a filename for a file that does not exist, which is the exact class
+        // this feature exists to prevent. Asserted DIRECTLY at the actor rather than
+        // through a handler test, because a handler test would still pass on a fabricated
+        // Ok (the ffprobe layer would catch it later and record an honest outcome).
+        let (player, _events) = NullPlayer::spawn();
+        let path = std::env::temp_dir()
+            .join(format!("hypodj-nulldump-{}.mkv", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let res = player.dump_cache(300.0, 0.0, 1200.0, 12.0, &path).await;
+        assert!(
+            matches!(res, Err(DumpFailure::NoEntry)),
+            "the headless actor must answer an honest error, got {res:?}"
+        );
+        assert!(!path.exists(), "and it must write no file at all");
+    }
+
+    #[test]
+    fn select_cache_state_keeps_only_whole_ordered_ranges() {
+        // A half-decoded range handed to the window planner would silently widen or void a
+        // cut, so a range missing a bound, carrying a non-finite one, or inverted is
+        // DROPPED rather than repaired. A negative start is real and must survive
+        // (measured on a live stream: `-0.025057`).
+        let state = select_cache_state(vec![
+            CacheField::Range(Some(-0.025_057), Some(97.31)),
+            CacheField::Range(Some(100.0), None),
+            CacheField::Range(None, Some(200.0)),
+            CacheField::Range(Some(f64::NAN), Some(300.0)),
+            CacheField::Range(Some(400.0), Some(390.0)),
+            CacheField::BofCached(true),
+        ]);
+        assert_eq!(state.ranges, vec![(-0.025_057, 97.31)]);
+        assert!(state.bof_cached);
+    }
+
+    #[test]
+    fn select_cache_state_defaults_to_nothing_dumpable() {
+        // An empty or unreadable node must mean "no cache", which the window planner
+        // turns into a refusal - never an unbounded or fabricated window.
+        let state = select_cache_state(Vec::new());
+        assert!(state.ranges.is_empty());
+        assert!(!state.bof_cached);
+        assert_eq!(
+            crate::tape::plan_window(10.0, 300.0, 0.0, &state.ranges, 1200.0, 12.0),
+            Err(crate::tape::WindowError::TooThin { available: 0.0 })
+        );
+    }
+
+    #[test]
+    fn the_unbounded_cache_dump_is_structurally_unreachable() {
+        // THE one failure with no runtime recovery: the continuous-append form of the mpv
+        // command returns only when playback stops, and libmpv2 4.1.0 wraps neither
+        // mpv_command_async nor mpv_abort_async_command - so it would permanently wedge
+        // the thread that drives EOF and queue advance. Made unrepresentable by the
+        // variant's two plain f64, and pinned HERE because a guard that depends on the
+        // next author remembering is not a guard.
+        // Split at the tests MODULE rather than the first `#[cfg(test)]` attribute: this
+        // file carries cfg(test) items (the TestEof command, the WarmProbe) well above the
+        // module, and splitting on the attribute would silently truncate the production
+        // half to almost nothing - a guard that passes by looking at no code at all.
+        let whole = include_str!("player.rs");
+        let src = whole
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("a production half");
+        assert!(src.contains("fn handle_cmd"), "the guard must actually see the actor body");
+        let issued: Vec<&str> = src.match_indices("\"dump-cache\"").map(|(_, s)| s).collect();
+        assert_eq!(issued.len(), 1, "exactly one site may issue the cache dump");
+        let call = src
+            .split("\"dump-cache\"")
+            .nth(1)
+            .expect("the argument list")
+            .split(')')
+            .next()
+            .expect("the end of the call");
+        assert!(
+            !call.contains("\"no\""),
+            "a literal `no` end bound is the continuous-append form; it wedges the actor forever"
+        );
+        assert!(
+            call.contains("&start_s") && call.contains("&end_s"),
+            "both bounds must be the finite formatted numbers, never a sentinel"
+        );
     }
 
     #[test]
@@ -2499,6 +2943,200 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.state(), PlayState::Playing);
+    }
+
+    // ── LIVE cache-dump proofs, #[ignore] (need real libmpv) ────────────────
+
+    /// Resolve `ffprobe` / `ffmpeg`, which come from the DAEMON's own nix wrapper
+    /// (`nix/package.nix`) and are deliberately NOT on the devshell PATH. `None` means the
+    /// binary-dependent half of a live proof cannot run here; the caller says so out loud
+    /// and skips that half rather than passing silently.
+    fn find_ffbin(name: &str) -> Option<std::path::PathBuf> {
+        if std::process::Command::new(name)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Some(std::path::PathBuf::from(name));
+        }
+        let rd = std::fs::read_dir("/nix/store").ok()?;
+        let mut hits: Vec<std::path::PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().contains("ffmpeg"))
+                    .unwrap_or(false)
+            })
+            .map(|p| p.join("bin").join(name))
+            .filter(|p| p.exists())
+            .collect();
+        hits.sort();
+        hits.pop()
+    }
+
+    /// A minimal HTTP/1.0 server that streams one WAV body. Returns the url; the listener
+    /// thread exits when the process does. Local socket only - no network anywhere.
+    fn serve_wav(secs: f64) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind wav server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let sr = 44100u32;
+                let n = (sr as f64 * secs) as usize;
+                let mut pcm: Vec<u8> = Vec::with_capacity(n * 2);
+                for i in 0..n {
+                    let t = i as f64 / sr as f64;
+                    let s = (2.0 * std::f64::consts::PI * 440.0 * t).sin() * 0.4;
+                    pcm.extend_from_slice(&((s * i16::MAX as f64) as i16).to_le_bytes());
+                }
+                let data_len = pcm.len() as u32;
+                let mut body: Vec<u8> = Vec::new();
+                body.extend_from_slice(b"RIFF");
+                body.extend_from_slice(&(36 + data_len).to_le_bytes());
+                body.extend_from_slice(b"WAVE");
+                body.extend_from_slice(b"fmt ");
+                body.extend_from_slice(&16u32.to_le_bytes());
+                body.extend_from_slice(&1u16.to_le_bytes());
+                body.extend_from_slice(&1u16.to_le_bytes());
+                body.extend_from_slice(&sr.to_le_bytes());
+                body.extend_from_slice(&(sr * 2).to_le_bytes());
+                body.extend_from_slice(&2u16.to_le_bytes());
+                body.extend_from_slice(&16u16.to_le_bytes());
+                body.extend_from_slice(b"data");
+                body.extend_from_slice(&data_len.to_le_bytes());
+                body.extend_from_slice(&pcm);
+                let header = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/stream")
+    }
+
+    /// THE proof no headless test can reach, and the one the whole design is built around:
+    /// a real bounded dump returns real audio, and the instant a warm switch lands the same
+    /// call must FAIL rather than hand back a named zero-byte file.
+    ///
+    /// A `let Some(..) = handler_with_null_player()` test provably cannot prove an mpv path
+    /// - that class shipped a live-broken favorite route and an audible skip-EOF bleed - so
+    /// this exists and the integrate gate runs it:
+    ///   cargo test -p hypodj-core -- --ignored live_bounded_dump
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a real libmpv runtime + a local socket; run from the devshell"]
+    async fn live_bounded_dump_returns_audio_and_refuses_after_a_warm_switch() {
+        let url = serve_wav(120.0);
+        let dir = std::env::temp_dir().join(format!("hypodj-livedump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the live dump dir");
+
+        // AudioOut::Null, always: a live proof must leave no sound in the human's room.
+        let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+        player.play_url(None, Some(QueueId(1)), &url, false).await.expect("load");
+
+        // Wait for real playback to pass the window we intend to ask for. Wall clock here
+        // is not a scheduling decision, it is waiting for a physical process; the
+        // fake-clock rule governs LOGIC, and there is none in this loop.
+        let mut pos = 0.0f64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while pos < 20.0 && std::time::Instant::now() < deadline {
+            if let Some(PlayerEvent::TimePos { pos: p, .. }) = events.recv().await {
+                pos = p;
+            }
+        }
+        assert!(pos >= 20.0, "the live stream never reached 20s (got {pos})");
+
+        let first = dir.join("first.mkv");
+        let out = player
+            .dump_cache(15.0, 0.0, 1200.0, crate::tape::TAPE_MIN_SECS, &first)
+            .await
+            .expect("a bounded dump off a filled cache must succeed");
+        assert!(out.bytes > 0, "a dump that returns Ok must have written bytes");
+        assert_eq!(std::fs::metadata(&first).unwrap().len(), out.bytes);
+        assert!(out.end - out.start >= crate::tape::TAPE_MIN_SECS);
+        assert!(out.pos_at_dump.is_finite());
+
+        // LAYER 2, and the exact-12 constraint, when the daemon's own ffmpeg is reachable.
+        // NOTE the binaries are invoked BY RESOLVED PATH here, not through
+        // `tape::probe_secs`: in the daemon they arrive on the wrapper's PATH, but the
+        // devshell has no ffmpeg at all, so a test calling the bare name would fail for an
+        // environmental reason and look like a defect.
+        match (find_ffbin("ffprobe"), find_ffbin("ffmpeg")) {
+            (Some(ffprobe), Some(ffmpeg)) => {
+                let probe_out = std::process::Command::new(&ffprobe)
+                    .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
+                    .arg(&first)
+                    .output()
+                    .expect("run ffprobe");
+                assert!(probe_out.status.success(), "the dump must probe as real audio");
+                let probed: f64 = String::from_utf8_lossy(&probe_out.stdout)
+                    .trim()
+                    .parse()
+                    .expect("a parseable duration");
+                assert!(
+                    (probed - (out.end - out.start)).abs() < 2.0,
+                    "probed {probed} vs requested {}",
+                    out.end - out.start
+                );
+                // EXACTLY 12.000s, enforced as a byte count. Anything else silently
+                // re-anchors every future Shazam offset by (duration - 12) / 2.
+                let wav = dir.join("exact.wav");
+                let off = crate::recognize::sample_offset(probed);
+                let ok = std::process::Command::new(&ffmpeg)
+                    .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
+                    .arg(&first)
+                    .args([
+                        "-ss", &format!("{off:.3}"), "-t", "12.000", "-ac", "1", "-ar", "16000",
+                        "-fflags", "+bitexact", "-flags", "+bitexact", "-f", "wav",
+                    ])
+                    .arg(&wav)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "the exact cut must succeed on a local dump");
+                assert_eq!(
+                    std::fs::metadata(&wav).unwrap().len(),
+                    crate::recognize::SONGREC_WAV_BYTES,
+                    "the sample must be byte-exactly 12.000s of mono 16k PCM"
+                );
+            }
+            _ => eprintln!(
+                "SKIPPING the ffprobe/ffmpeg half: they come from the daemon's nix wrapper and are not reachable here"
+            ),
+        }
+
+        // THE MEASURED VOLATILITY. A warm switch is `playlist-play-index 1` +
+        // `playlist-remove 0`, which destroyed 110s of history while the dump still
+        // returned success and wrote a zero-byte file. The shipped path must FAIL here.
+        let url2 = serve_wav(120.0);
+        player.prefetch_warm(&url2).await.expect("warm");
+        player.switch_warmed(None, Some(QueueId(2)), &url2, false).await.expect("switch");
+        let second = dir.join("second.mkv");
+        let after = player
+            .dump_cache(15.0, 0.0, 1200.0, crate::tape::TAPE_MIN_SECS, &second)
+            .await;
+        assert!(
+            after.is_err(),
+            "a dump straight after a warm switch must refuse, never hand back a named empty file: {after:?}"
+        );
+        assert!(
+            !second.exists() || std::fs::metadata(&second).unwrap().len() > 0,
+            "no zero-byte file may survive with a name"
+        );
+
+        let _ = player.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── LIVE continuation-warm proofs (slice 2), #[ignore] (need real libmpv) ──

@@ -50,6 +50,7 @@ pub enum Act {
     Radio,
     FavSelected,
     FavCurrent,
+    Heard,
     PlaySel,
     Enqueue,
     /// Open the row CONTEXT MENU for the thing under the cursor. Renamed from `Open`
@@ -195,6 +196,10 @@ pub const KEYMAP: &[Binding] = &[
     // Favorites.
     Binding { matchers: &[Char('s')], keys: "s", group: Favorites, scope: Scope::Global, act: FavSelected, help: "star the selected row" },
     Binding { matchers: &[Ctrl('s')], keys: "C-s", group: Favorites, scope: Scope::Global, act: FavCurrent, help: "star the playing track" },
+    // `t` for TAPE. C-s on a stream keeps the audio of what it marked, and the segment
+    // outlives the one-line banner that announced it - so the gesture needs a read-back
+    // that is not "go run another program". The daemon renders it; this key asks for it.
+    Binding { matchers: &[Char('t')], keys: "t", group: Favorites, scope: Scope::Global, act: Heard, help: "what you marked, and the audio kept" },
     // General.
     Binding { matchers: &[Char('?')], keys: "?", group: General, scope: Scope::Global, act: HelpToggle, help: "toggle this help" },
     Binding { matchers: &[Char('q')], keys: "q", group: General, scope: Scope::Global, act: Quit, help: "quit" },

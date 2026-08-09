@@ -43,6 +43,154 @@ pub struct Config {
     /// state dir. With no state dir it simply never opens.
     #[serde(default)]
     pub heard: HeardConfig,
+    /// THE TAPE: retroactive audio capture off mpv's own demuxer cache ([`crate::tape`]),
+    /// taken by the `mark` gesture. Optional; with no `[tape]` section it is ON with a
+    /// 2 GiB rolling budget and lives beside `heard/` under the state dir. With no state
+    /// dir it simply never opens and `mark` behaves exactly as it did without it.
+    #[serde(default)]
+    pub tape: TapeConfig,
+}
+
+/// `[tape]` config for THE TAPE ([`crate::tape`]): the rolling cache of retroactively
+/// captured stream audio a `mark` press keeps when audio is the only thing that can still
+/// help.
+///
+/// A ROLLING CACHE, NOT AN ARCHIVE, and that framing is what makes the budget honest: he
+/// acts on a segment the next morning or he does not, and if he has not acted in ten
+/// weeks the ledger row is still there and the sound is gone. A row outliving its audio is
+/// designed for, not a defect.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TapeConfig {
+    /// Master switch. Default TRUE: this is substrate, and an untested branch is how a
+    /// feature rots. The safety bound is `max_bytes`, not the flag.
+    #[serde(default = "d_tape_enable")]
+    pub enable: bool,
+    /// Where segments live. `None` resolves to `<state_dir>/tape`, the same shape
+    /// `[heard].dir` uses.
+    ///
+    /// It must be a DEDICATED directory, and the tape enforces that rather than trusting
+    /// it: `tape::sweep` deletes every `.mkv` without a matching `.toml` and every `.toml`
+    /// without a matching `.mkv`, because that is what an interrupted commit looks like.
+    /// Pointed at, say, a videos folder it would take the lot on the first press. So the
+    /// daemon claims the root with a `.hypodj-tape` marker at startup and REFUSES a
+    /// non-empty directory that carries none, running without the tape instead - the same
+    /// guard `[store].dir` has.
+    ///
+    /// It MUST NOT be inside the offline store's directory, for the reason `[heard].dir`
+    /// records: the store owns its root EXCLUSIVELY and its reconciler deletes everything
+    /// in it that is not a valid cached song. Its `scan_dir` is also non-recursive and
+    /// skips subdirectories, so a nested tape directory would be invisible to the index
+    /// while sitting in a root that deletes strangers. A SIBLING, always.
+    ///
+    /// It must additionally contain no `"`, `\` or newline: mpv's flat command syntax
+    /// C-unescapes inside double quotes, so such a path is mangled rather than merely
+    /// risky. `main.rs` validates that once at resolution and disables the tape rather
+    /// than handing mpv an ambiguous string.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Hard byte budget for captured AUDIO. Oldest-first eviction by press time runs
+    /// BEFORE each dump as well as after each commit, so the budget is enforced by making
+    /// room rather than by observing the disk. Pinned segments (`heard keep <n>`) still
+    /// COUNT against it - a budget that excludes pins lies - but are never deleted; if
+    /// pins alone exceed it, the sweep warns and the next press is refused honestly.
+    ///
+    /// The default arithmetic, stated so it can be checked rather than trusted: at NTS
+    /// mp3's 32.2 KB/s a 300 s window is 9.66 MB, so 2 GiB is about 222 segments. At five
+    /// presses an evening with roughly two discarded on a successful star, that is about
+    /// seventy evenings - call it ten weeks, NOT four months. It is also 2.3% of the
+    /// ~85 GiB free on a 91%-full disk the offline store still intends to eat 5.77 GiB of.
+    #[serde(default = "d_tape_max_bytes")]
+    pub max_bytes: u64,
+    /// How many seconds of PAST a press asks for. Generous on purpose (Rule 0: dump wide,
+    /// refine on disk); the actual span is clamped to what mpv's cache really holds.
+    #[serde(default = "d_tape_back_secs")]
+    pub back_secs: u64,
+    /// The hard span cap per dump, seconds. Bounds BOTH disk per press and the actor's
+    /// blocking time per dump: 1200 s of NTS mp3 is about 47 MB, roughly 135 ms of
+    /// non-pumped event loop at the measured ~350 MB/s. Applied ON the actor after the
+    /// cache-state read, so neither a config typo nor a caller can widen it.
+    #[serde(default = "d_tape_max_secs")]
+    pub max_secs: u64,
+}
+
+pub const DEFAULT_TAPE_ENABLE: bool = true;
+/// 2 GiB - about 222 segments at NTS mp3's 300 s window, roughly ten weeks of use.
+pub const DEFAULT_TAPE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_TAPE_BACK_SECS: u64 = 300;
+pub const DEFAULT_TAPE_MAX_SECS: u64 = 1200;
+
+/// Hard floor on `tape.max_bytes`, 64 MiB (mirroring [`STORE_MIN_MAX_BYTES`]). Below one
+/// segment plus slack the sweep would evict every press immediately after taking it, so
+/// the feature could not function at all. Clamp up, never reject.
+pub const TAPE_MIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Hard floor on `tape.back_secs`, 30 s. Shorter than this and a press would routinely
+/// resolve below `tape::TAPE_MIN_SECS` and be refused for a reason the human did not
+/// choose.
+pub const TAPE_MIN_BACK_SECS: u64 = 30;
+
+/// Hard floor on `tape.max_secs`, 60 s. It must never sit BELOW `back_secs`' own floor,
+/// or the cap would silently void every window the back-ask produced.
+pub const TAPE_MIN_MAX_SECS: u64 = 60;
+
+fn d_tape_enable() -> bool {
+    DEFAULT_TAPE_ENABLE
+}
+fn d_tape_max_bytes() -> u64 {
+    DEFAULT_TAPE_MAX_BYTES
+}
+fn d_tape_back_secs() -> u64 {
+    DEFAULT_TAPE_BACK_SECS
+}
+fn d_tape_max_secs() -> u64 {
+    DEFAULT_TAPE_MAX_SECS
+}
+
+/// MANUAL (not derived), the [`StoreConfig`] / [`HeardConfig`] rule: a derived `Default`
+/// would give `enable = false, max_bytes = 0, back_secs = 0` to everyone who never wrote
+/// the section - the tape silently off and, worse, silently zero-budget. The parity test
+/// below is what keeps this true.
+impl Default for TapeConfig {
+    fn default() -> Self {
+        Self {
+            enable: DEFAULT_TAPE_ENABLE,
+            dir: None,
+            max_bytes: DEFAULT_TAPE_MAX_BYTES,
+            back_secs: DEFAULT_TAPE_BACK_SECS,
+            max_secs: DEFAULT_TAPE_MAX_SECS,
+        }
+    }
+}
+
+impl TapeConfig {
+    /// Floor-clamp at LOAD time, logging every correction. TOTAL - there is no input for
+    /// which this can fail or panic, including `0` and `u64::MAX` on every knob.
+    pub fn normalize(&mut self) {
+        if self.max_bytes < TAPE_MIN_MAX_BYTES {
+            tracing::warn!(
+                configured = self.max_bytes,
+                floor = TAPE_MIN_MAX_BYTES,
+                "tape.max_bytes below the 64 MiB floor; clamping up (below one segment the sweep would evict every press)"
+            );
+            self.max_bytes = TAPE_MIN_MAX_BYTES;
+        }
+        if self.back_secs < TAPE_MIN_BACK_SECS {
+            tracing::warn!(
+                configured = self.back_secs,
+                floor = TAPE_MIN_BACK_SECS,
+                "tape.back_secs below the floor; clamping up"
+            );
+            self.back_secs = TAPE_MIN_BACK_SECS;
+        }
+        if self.max_secs < TAPE_MIN_MAX_SECS {
+            tracing::warn!(
+                configured = self.max_secs,
+                floor = TAPE_MIN_MAX_SECS,
+                "tape.max_secs below the floor; clamping up (a cap under the back-ask would void every window)"
+            );
+            self.max_secs = TAPE_MIN_MAX_SECS;
+        }
+    }
 }
 
 /// `[heard]` config for the HEARD LEDGER ([`crate::heard`]): the append-only record of
@@ -835,6 +983,7 @@ impl Config {
         cfg.recognize.normalize();
         cfg.store.normalize();
         cfg.heard.normalize();
+        cfg.tape.normalize();
         Ok(cfg)
     }
 
@@ -851,6 +1000,7 @@ impl Config {
         cfg.recognize.normalize();
         cfg.store.normalize();
         cfg.heard.normalize();
+        cfg.tape.normalize();
         Ok(cfg)
     }
 }
@@ -1391,6 +1541,7 @@ mod tests {
             [recognize]
             [store]
             [heard]
+            [tape]
         "#,
         )
         .unwrap();
@@ -1413,6 +1564,11 @@ mod tests {
         assert_eq!(bare.heard.dir, empty.heard.dir);
         assert_eq!(bare.heard.keep_sessions, empty.heard.keep_sessions);
         assert_eq!(bare.heard.dedupe_window_secs, empty.heard.dedupe_window_secs);
+        assert_eq!(bare.tape.enable, empty.tape.enable);
+        assert_eq!(bare.tape.dir, empty.tape.dir);
+        assert_eq!(bare.tape.max_bytes, empty.tape.max_bytes);
+        assert_eq!(bare.tape.back_secs, empty.tape.back_secs);
+        assert_eq!(bare.tape.max_secs, empty.tape.max_secs);
         // The float/int fade knobs too, since [fade] is the largest section.
         assert_eq!(bare.fade.min_slew_ms, empty.fade.min_slew_ms);
         assert_eq!(bare.fade.max_dur_secs, empty.fade.max_dur_secs);
@@ -1440,6 +1596,10 @@ mod tests {
             sync_interval_secs = 4
             [heard]
             keep_sessions = 0
+            [tape]
+            max_bytes = 5
+            back_secs = 1
+            max_secs = 2
         "#;
         let dir = std::env::temp_dir().join(format!("hypodj-config-load-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -1452,11 +1612,79 @@ mod tests {
         assert_eq!(loaded.store.max_bytes, parsed.store.max_bytes);
         assert_eq!(loaded.store.sync_interval_secs, parsed.store.sync_interval_secs);
         assert_eq!(loaded.heard.keep_sessions, parsed.heard.keep_sessions);
+        assert_eq!(loaded.tape.max_bytes, parsed.tape.max_bytes);
+        assert_eq!(loaded.tape.back_secs, parsed.tape.back_secs);
+        assert_eq!(loaded.tape.max_secs, parsed.tape.max_secs);
         // And the values really are the normalized ones, not the raw TOML.
         assert_eq!(loaded.store.max_bytes, STORE_MIN_MAX_BYTES);
         assert_eq!(loaded.store.sync_interval_secs, STORE_MIN_SYNC_INTERVAL_SECS);
         assert_eq!(loaded.heard.keep_sessions, HEARD_MIN_KEEP_SESSIONS);
+        assert_eq!(loaded.tape.max_bytes, TAPE_MIN_MAX_BYTES);
+        assert_eq!(loaded.tape.back_secs, TAPE_MIN_BACK_SECS);
+        assert_eq!(loaded.tape.max_secs, TAPE_MIN_MAX_SECS);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tape_normalize_floors_its_three_knobs_and_never_panics() {
+        // Clamp UP from a parsed TOML, in-range untouched, dir carried verbatim, and both
+        // extremes total - the `heard_normalize_floors_keep_sessions` shape.
+        let low = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [tape]
+            dir = "/var/tmp/mine"
+            max_bytes = 1
+            back_secs = 0
+            max_secs = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(low.tape.max_bytes, TAPE_MIN_MAX_BYTES);
+        assert_eq!(low.tape.back_secs, TAPE_MIN_BACK_SECS);
+        assert_eq!(low.tape.max_secs, TAPE_MIN_MAX_SECS);
+        assert_eq!(low.tape.dir, Some(PathBuf::from("/var/tmp/mine")));
+        assert!(low.tape.enable);
+
+        let in_range = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [tape]
+            enable = false
+            max_bytes = 1073741824
+            back_secs = 600
+            max_secs = 900
+        "#,
+        )
+        .unwrap();
+        assert_eq!(in_range.tape.max_bytes, 1_073_741_824);
+        assert_eq!(in_range.tape.back_secs, 600);
+        assert_eq!(in_range.tape.max_secs, 900);
+        assert!(!in_range.tape.enable);
+
+        // TOTAL at the extremes: nothing overflows, nothing panics.
+        let mut huge = TapeConfig {
+            max_bytes: u64::MAX,
+            back_secs: u64::MAX,
+            max_secs: u64::MAX,
+            ..TapeConfig::default()
+        };
+        huge.normalize();
+        assert_eq!(huge.max_bytes, u64::MAX);
+        let mut zero = TapeConfig {
+            max_bytes: 0,
+            back_secs: 0,
+            max_secs: 0,
+            ..TapeConfig::default()
+        };
+        zero.normalize();
+        assert_eq!(zero.max_bytes, TAPE_MIN_MAX_BYTES);
     }
 
     #[test]

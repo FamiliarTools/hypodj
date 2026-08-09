@@ -3,14 +3,20 @@
 //! Sibling jmrwr99 surfaces a stream's ICY `icy-name`/`icy-title` into MPD
 //! `Name`/`Title`. But some real radio streams (the NTS mixtapes) carry NO ICY at
 //! all, so the now-playing text must come from OUTSIDE the stream. This module
-//! fingerprints a short SIDE-BAND capture of the SAME stream URL with `songrec`
-//! (open-source Shazam) and returns the recognized artist / title / album / cover
-//! art, station-agnostic and with ZERO interference to the playing libmpv
-//! instance.
+//! fingerprints a short sample with `songrec` (open-source Shazam) and returns the
+//! recognized artist / title / album / cover art.
+//!
+//! THE SAMPLE IS NO LONGER DOWNLOADED. It used to be: `ffmpeg -i <stream url> -t 11`
+//! re-fetched a stream the daemon was ALREADY downloading, at 0.17 s CPU / 9.73 s wall /
+//! 401 KB per call, roughly 65 bytes pulled per byte of fingerprint sent. mpv is holding
+//! that audio in RAM, so the caller now hands this module a LOCAL file dumped off the
+//! demuxer cache in ~6 ms with zero network (see [`crate::tape`]), and the timing inverts:
+//! identify now names the 12 s BEFORE the press rather than the 11 s after it.
 //!
 //! Two honest subprocess steps, both async (`tokio::process`, so the child I/O
 //! never blocks the reactor and a timeout can actually KILL the child):
-//! 1. `ffmpeg` captures ~11s of the stream URL to a temp mono 16 kHz wav.
+//! 1. `ffmpeg` cuts EXACTLY [`SONGREC_EXACT_SECS`] out of the local dump to a temp mono
+//!    16 kHz wav - see that constant for why the exactness is load-bearing.
 //! 2. `songrec recognize --json <wav>` fingerprints the wav, queries Shazam, and
 //!    prints ONE line of JSON to stdout, with its OUTCOME on stderr. Both are
 //!    captured and classified by [`classify_songrec`], which is what splits a content
@@ -25,23 +31,77 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Total wall-clock ceiling for one capture + recognition. Three nested guards keep
-/// a hung endpoint from ever WEDGING the `identify` trigger: `ffmpeg -t 11`
-/// self-terminates a healthy capture, the `ffmpeg -rw_timeout` (see
-/// [`FFMPEG_RW_TIMEOUT_US`]) self-aborts a STALLED stream read well before this
-/// bound, and this outer `tokio::time::timeout` is the last resort. On elapse the
-/// in-flight child future is dropped, which `kill_on_drop` turns into a real
-/// SIGKILL of the `ffmpeg`/`songrec` child (no orphan survives), and the temp wav is
-/// cleaned by the RAII guard - only THEN does the async call return and release the
+/// Total wall-clock ceiling for one capture + recognition.
+///
+/// Since the sample stopped being downloaded this is very nearly a PURE SHAZAM BUDGET:
+/// the local ffprobe + ffmpeg cut costs milliseconds, so a slow attempt is a slow
+/// endpoint. On elapse the in-flight child future is dropped, which `kill_on_drop` turns
+/// into a real SIGKILL of the `ffmpeg`/`songrec` child (no orphan survives), and the temp
+/// wav is cleaned by the RAII guard - only THEN does the async call return and release the
 /// caller's in-flight guard, so a later `identify` still runs on a clean slate.
-const RECOGNIZE_TIMEOUT: Duration = Duration::from_secs(40);
+pub const RECOGNIZE_TIMEOUT: Duration = Duration::from_secs(40);
 
-/// Per-operation I/O ceiling handed to `ffmpeg` as `-rw_timeout` (microseconds): a
-/// stream whose socket read/connect stalls for this long self-aborts the capture,
-/// so the common "endpoint went silent" case never has to wait for the outer
-/// [`RECOGNIZE_TIMEOUT`]. Well under that bound (15s vs 40s) and comfortably above
-/// the ~11s a healthy realtime capture takes.
-const FFMPEG_RW_TIMEOUT_US: &str = "15000000";
+/// The EXACT slice length songrec must be handed, seconds. Get this wrong and every
+/// reported offset is silently, permanently wrong.
+///
+/// songrec's `SignatureGenerator` PADS anything under 12 s and CENTRE-CROPS anything over
+/// it. Verified locally, byte-exactly, on a time-varying 20 s mono/16k source with the
+/// network-free `audio-file-to-fingerprint` subcommand: the 20 s file and its centre 12 s
+/// fingerprint IDENTICALLY, while its first 12 s and its first 13 s each differ. And in
+/// the other direction an 11 s file fingerprints identically to itself plus 1 s of
+/// appended silence, but differs from the same silence PREPENDED - so sub-12 s input is
+/// TAIL-padded.
+///
+/// The precise rule: any slice at or below 12.000 s anchors at FILE START, exactly
+/// 12.000 s maximises the fingerprint, and anything above 12.000 s re-anchors to the
+/// MIDPOINT with an error of `(duration - 12) / 2` seconds. The old code sat on the safe
+/// side of that line only by accident of a bare `-t 11` literal that was named nowhere.
+pub const SONGREC_EXACT_SECS: f64 = 12.0;
+
+/// The EXACT byte size of a correct sample wav: a 44-byte canonical RIFF header plus
+/// `12 x 16000 x 2` bytes of mono 16-bit 16 kHz PCM.
+///
+/// ENFORCEMENT IS A BYTE COUNT, NOT A COMMENT. The wav is stat'd against this BEFORE
+/// songrec is spawned, so a slice that would silently re-anchor every future offset
+/// becomes a loud local failure costing zero calls against an IP-keyed limiter.
+///
+/// Both `-fflags +bitexact` and `-flags +bitexact` are required to hit it: verified
+/// locally that without them ffmpeg writes an extra 34-byte LIST/INFO chunk and the file
+/// is 384,078. The flags are load-bearing for the assertion, not cosmetic.
+pub const SONGREC_WAV_BYTES: u64 = 44 + 2 * 16_000 * 12;
+
+/// Slack the cut leaves at the END of the dump, seconds - the difference between a
+/// container's DECLARED duration and the audio a decoder actually emits from it.
+///
+/// MEASURED, and it is why this constant exists rather than a comment. A cut taken flush
+/// against `ffprobe`'s `format=duration` on an mp3-in-matroska window - the exact shape
+/// `dump-cache` produces on his Icecast mp3 stations - comes back SHORT every time:
+/// 383,220 B of the required 384,044 on a 25 s window, 383,724 on a 13 s one, 383,436 on a
+/// 90 s one. mp3 carries encoder delay plus whole-frame granularity (26.12 ms per frame at
+/// 44.1 kHz), so the declared duration over-reports the decodable audio by tens of
+/// milliseconds, and [`SONGREC_WAV_BYTES`] (correctly) rejects the result. Backing the cut
+/// off by a quarter second - ten times the largest shortfall observed - lands it INSIDE the
+/// stream, where the same command is byte-exact, and costs 0.25 s of freshness on a window
+/// the design already calls generous.
+pub const SONGREC_TAIL_MARGIN_SECS: f64 = 0.25;
+
+/// The minimum LOCAL DUMP length the cut needs, seconds. Deliberately above
+/// [`SONGREC_EXACT_SECS`] so a container's own rounding can never leave the cut a few
+/// milliseconds short of an exact slice, which the byte check would (correctly, but
+/// uselessly) reject.
+///
+/// The margin is on BOTH sides, which is what sets this number. The tail needs
+/// [`SONGREC_TAIL_MARGIN_SECS`]; the head needs its own slack because an output-side `-ss`
+/// within roughly the first 0.7 s of an mp3-in-matroska window measured 384,046 B - two
+/// samples LONG, the priming region reading back as one extra frame. 12.0 + 0.25 + 1.25
+/// keeps the smallest admissible dump's cut clear of both edges, and the extra half second
+/// of waiting on a cache that has not filled yet is invisible beside the 9.73 s refetch
+/// this path replaced.
+pub const RECOGNIZE_MIN_DUMP_SECS: f64 = 13.5;
+
+/// How much PAST to ask the cache for when sampling. Wider than needed, per Rule 0:
+/// deciding the exact slice happens afterwards on a local file, never in the moment.
+pub const RECOGNIZE_BACK_SECS: f64 = 20.0;
 
 /// A monotonic per-process counter mixed into the temp-file name alongside the pid,
 /// so two captures can never collide on the same path (the in-flight guard already
@@ -92,8 +152,15 @@ pub enum RecognizeError {
     /// A tool could not be spawned or exec'd (e.g. missing from `PATH`). Carries the
     /// tool name and the underlying io error.
     Spawn(&'static str, std::io::Error),
-    /// `ffmpeg` ran but exited non-zero (the stream URL was unreachable / not
-    /// capturable, or its `-rw_timeout` fired on a stalled read).
+    /// The SAMPLE could not be turned into a fingerprintable wav: the local cache dump was
+    /// missing, unprobeable, or `ffmpeg` exited non-zero cutting it - or the cut came back
+    /// at the wrong size, which means the slice is not exactly [`SONGREC_EXACT_SECS`] and
+    /// must never be fingerprinted.
+    ///
+    /// Its MEANING changed with the source: it used to be "the stream URL was
+    /// unreachable", and it is now "nothing usable came out of the cache". That is the
+    /// class the design study's zero-byte-file-with-success lands in, and catching it here
+    /// is mandatory rather than defensive.
     Capture,
     /// `songrec` ran but could not REACH Shazam, as it said on its own stderr. Carries
     /// whether the message was specifically a rate-limit ("Your IP has been
@@ -129,7 +196,7 @@ impl std::fmt::Display for RecognizeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecognizeError::Spawn(tool, e) => write!(f, "could not run {tool}: {e}"),
-            RecognizeError::Capture => write!(f, "stream capture failed"),
+            RecognizeError::Capture => write!(f, "no usable audio in the buffer"),
             RecognizeError::Transport { rate_limited: true } => {
                 write!(f, "shazam rate-limited this address")
             }
@@ -237,31 +304,106 @@ fn temp_wav_path() -> PathBuf {
     std::env::temp_dir().join(format!("hypodj-songrec-{}-{}.wav", std::process::id(), n))
 }
 
-/// The subprocess half: capture the stream with `ffmpeg`, then fingerprint the wav
-/// with `songrec recognize --json`, returning songrec's raw stdout. Uses
-/// `tokio::process` so the child I/O rides the reactor (never blocks it) and both
-/// children carry `kill_on_drop(true)` - so if the awaiting future is dropped (the
-/// [`RECOGNIZE_TIMEOUT`] path in [`recognize_stream_url`]) the in-flight child is
-/// SIGKILLed rather than orphaned. Every subprocess uses `Stdio::null()` for stdin
-/// so it can never block waiting on input.
+/// A unique temp path for one cache DUMP: `hypodj-dump-<pid>-<counter>.mkv`.
 ///
-/// songrec's OWN stderr carries the outcome taxonomy - "No match for this song" versus
-/// "Network unreachable" - so it is PIPED and classified by [`classify_songrec`]
-/// rather than discarded. ffmpeg's stderr stays null (it is decode noise, and a failed
-/// capture is already an unambiguous non-zero exit). The exit status is passed to the
-/// classifier but is never on its own a hard error.
-async fn capture_and_recognize(url: &str, wav: &Path) -> Result<SongrecOutcome, RecognizeError> {
+/// ASCII by construction and in the system temp dir, because mpv writes this path itself
+/// from its own thread: mpv's flat command syntax C-unescapes inside double quotes and
+/// runs property expansion on every string argument, so the only safe leaf is one the
+/// daemon minted. Matroska for the reason `tape::SEGMENT_EXT` records - it takes mp3, AAC
+/// and the HLS elementary streams, and it removes the bare-mpegts class that makes songrec
+/// emit `symphonia_codec_aac` noise no marker in this file can classify.
+pub fn temp_dump_path() -> PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "hypodj-dump-{}-{}.{}",
+        std::process::id(),
+        n,
+        crate::tape::SEGMENT_EXT
+    ))
+}
+
+/// Where in a local dump the exact slice starts: the freshest
+/// [`SONGREC_EXACT_SECS`] that still ends [`SONGREC_TAIL_MARGIN_SECS`] INSIDE the file.
+///
+/// NOT flush against the end, and that is the whole point of the margin - a container's
+/// declared duration is not its decodable duration, so a flush cut on any compressed
+/// stream comes back short of [`SONGREC_WAV_BYTES`] and the enforcement below rejects every
+/// attempt. See [`SONGREC_TAIL_MARGIN_SECS`] for the measurements.
+///
+/// TOTAL by construction, and the property that matters is that the resulting slice is
+/// never LONGER than [`SONGREC_EXACT_SECS`] in either direction - above it songrec
+/// centre-crops and re-anchors every reported offset by `(duration - 12) / 2`.
+pub fn sample_offset(dump_secs: f64) -> f64 {
+    if !dump_secs.is_finite() {
+        return 0.0;
+    }
+    (dump_secs - SONGREC_EXACT_SECS - SONGREC_TAIL_MARGIN_SECS).max(0.0)
+}
+
+/// Probe a local file's duration with `ffprobe`, asynchronously.
+///
+/// Async rather than the sync `tape::probe_secs` because this one sits INSIDE the
+/// [`RECOGNIZE_TIMEOUT`] bound: its child must ride the reactor and be reapable by
+/// `kill_on_drop` if the whole attempt is abandoned.
+async fn probe_secs(path: &Path) -> Option<f64> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let secs: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    (secs.is_finite() && secs > 0.0).then_some(secs)
+}
+
+/// Cut EXACTLY [`SONGREC_EXACT_SECS`] out of the LOCAL `sample` into `wav`, and PROVE it
+/// by byte count before returning.
+///
+/// Split out of [`capture_and_recognize`] deliberately: this is the half that can be
+/// exercised end to end against a real container with real ffmpeg and ZERO Shazam calls,
+/// which is the only way the exactness contract can be regression-tested at all. The
+/// failure it exists to catch is silent and format-dependent - a flush-to-the-end cut is
+/// byte-exact on PCM and short on mp3 - so a test whose source is lossless proves nothing
+/// about the streams he listens to.
+async fn cut_exact_sample(sample: &Path, wav: &Path) -> Result<(), RecognizeError> {
     use std::process::Stdio;
     use tokio::process::Command;
 
-    // 1. SIDE-BAND capture: re-fetch the SAME stream URL to a bounded temp wav. 11s
-    // mono 16 kHz is plenty for a Shazam fingerprint and does not touch the playing
-    // libmpv instance. `-nostdin` + null stdin so ffmpeg never waits on the tty;
-    // `-rw_timeout` self-aborts a stalled read (see FFMPEG_RW_TIMEOUT_US).
+    // 0. How long the local dump actually is, so the cut can site its 12.000 s. An
+    // unprobeable dump is a Capture failure here and not a guess: mpv's cache dump returns
+    // success even when it wrote nothing at all.
+    let dump_secs = probe_secs(sample).await.ok_or(RecognizeError::Capture)?;
+    let offset = sample_offset(dump_secs);
+
+    // 1. The cut itself. Output-side `-ss` (after `-i`) plus `-t`, and both bitexact flags
+    // so the wav is byte-predictable - see SONGREC_WAV_BYTES.
     let capture = Command::new("ffmpeg")
-        .args(["-nostdin", "-loglevel", "error", "-rw_timeout", FFMPEG_RW_TIMEOUT_US, "-y", "-i"])
-        .arg(url)
-        .args(["-t", "11", "-ac", "1", "-ar", "16000", "-f", "wav"])
+        .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
+        .arg(sample)
+        .args([
+            "-ss",
+            &format!("{offset:.3}"),
+            "-t",
+            &format!("{SONGREC_EXACT_SECS:.3}"),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-fflags",
+            "+bitexact",
+            "-flags",
+            "+bitexact",
+            "-f",
+            "wav",
+        ])
         .arg(wav)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -273,6 +415,57 @@ async fn capture_and_recognize(url: &str, wav: &Path) -> Result<SongrecOutcome, 
     if !capture.success() {
         return Err(RecognizeError::Capture);
     }
+
+    // 2. THE ENFORCEMENT. Any other size means the slice is not 12.000 s, which would
+    // silently re-anchor every offset from here on.
+    let bytes = tokio::fs::metadata(wav).await.map(|m| m.len()).unwrap_or(0);
+    if bytes != SONGREC_WAV_BYTES {
+        tracing::warn!(
+            bytes,
+            expected = SONGREC_WAV_BYTES,
+            dump_secs,
+            offset,
+            "the recognition sample is not exactly 12.000s; refusing to fingerprint it"
+        );
+        return Err(RecognizeError::Capture);
+    }
+    Ok(())
+}
+
+/// The subprocess half: cut EXACTLY [`SONGREC_EXACT_SECS`] out of the LOCAL `sample`
+/// (already dumped off mpv's cache by the caller - no network, no second fetch), then
+/// fingerprint that wav with `songrec recognize --json`, returning songrec's raw stdout.
+///
+/// Uses `tokio::process` so the child I/O rides the reactor (never blocks it) and every
+/// child carries `kill_on_drop(true)` - so if the awaiting future is dropped (the
+/// [`RECOGNIZE_TIMEOUT`] path) the in-flight child is SIGKILLed rather than orphaned.
+/// Every subprocess uses `Stdio::null()` for stdin so it can never block waiting on input.
+///
+/// WHY FFMPEG SURVIVES, given songrec eats wav, mp3 and bare ADTS directly and needs no
+/// resampling or downmix. Three reasons, none of them fetching:
+/// 1. CUTTING EXACTLY 12.000 s. This is the load-bearing one, and it is why the step is a
+///    `-f wav -ar 16000` RE-ENCODE rather than a `-c copy`: a copy lands on frame
+///    boundaries (an mp3 frame at 44.1 kHz is 26.12 ms), so 12.0 plus or minus a frame -
+///    and "plus" silently crosses the centre-crop line.
+/// 2. NORMALISING a container songrec decodes noisily. A bare mpegts/AAC slice makes it
+///    emit seven `symphonia_codec_aac` ERROR lines that match NONE of
+///    [`classify_songrec`]'s twenty markers, which would convert content misses into
+///    transport misses on the full exponential.
+/// 3. BEING THE STEP THAT CAN FAIL LOUDLY on a corrupt or empty dump - the design study's
+///    zero-byte-file-with-success is exactly the class this catches.
+///
+/// songrec's OWN stderr carries the outcome taxonomy - "No match for this song" versus
+/// "Network unreachable" - so it is PIPED and classified by [`classify_songrec`]
+/// rather than discarded. ffmpeg's stderr stays null (it is decode noise, and a failed
+/// cut is already an unambiguous non-zero exit). The exit status is passed to the
+/// classifier but is never on its own a hard error.
+async fn capture_and_recognize(sample: &Path, wav: &Path) -> Result<SongrecOutcome, RecognizeError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    // 1. The EXACT cut, from bytes already on disk, verified before a single call is
+    // spent against an IP-keyed limiter.
+    cut_exact_sample(sample, wav).await?;
 
     // 2. Headless recognition: songrec prints ONE line of JSON on a match, and its
     // OUTCOME on stderr. Both are captured, because the stderr IS the taxonomy that
@@ -292,31 +485,33 @@ async fn capture_and_recognize(url: &str, wav: &Path) -> Result<SongrecOutcome, 
     Ok(classify_songrec(out.status.code(), &stdout, &stderr))
 }
 
-/// Recognize the currently-playing audio at `url` via the side-band capture +
-/// `songrec` pipeline. `Ok(None)` is a clean NO MATCH (the honest common case for a
+/// Recognize the audio in a LOCAL `sample` (a bounded window the caller already dumped
+/// off mpv's demuxer cache). `Ok(None)` is a clean NO MATCH (the honest common case for a
 /// niche stream); `Ok(Some(_))` is a hit; `Err(_)` is a subprocess/timeout failure.
 ///
-/// ASYNC/LOCK DISCIPLINE: the caller reads the stream URL under the std state lock
-/// and DROPS the lock before calling this (no lock is held across the await here).
-/// The heavy work is one async subprocess pair bounded by [`RECOGNIZE_TIMEOUT`] so a
-/// hung Shazam call cannot wedge the trigger; on elapse the child future is dropped
-/// and `kill_on_drop` reaps the child (no orphan). The temp wav is cleaned in every
-/// branch by [`TempFileGuard`].
-pub async fn recognize_stream_url(url: String) -> Result<Option<RecognizedTrack>, RecognizeError> {
+/// ASYNC/LOCK DISCIPLINE unchanged from the URL-fetching version it replaces: the caller
+/// reads the stream URL under the std state lock and DROPS the lock before calling this.
+/// The heavy work is bounded by [`RECOGNIZE_TIMEOUT`] so a hung Shazam call cannot wedge
+/// the trigger; on elapse the child future is dropped and `kill_on_drop` reaps the child.
+/// The temp wav is cleaned in every branch by [`TempFileGuard`]; the SAMPLE belongs to the
+/// caller, who owns its own guard.
+pub async fn recognize_local_sample(
+    sample: &Path,
+) -> Result<Option<Recognition>, RecognizeError> {
     let wav = temp_wav_path();
-    run_bounded(wav.clone(), RECOGNIZE_TIMEOUT, capture_and_recognize(&url, &wav)).await
+    run_bounded(wav.clone(), RECOGNIZE_TIMEOUT, capture_and_recognize(sample, &wav)).await
 }
 
 /// Bound `work` (the capture+recognize future) by `timeout`, cleaning `wav` on EVERY
 /// exit via [`TempFileGuard`] - including the timeout branch, where dropping `work`
 /// also `kill_on_drop`-reaps the in-flight child. Split out from
-/// [`recognize_stream_url`] so the timeout + cleanup wiring is unit-testable with a
+/// [`recognize_local_sample`] so the timeout + cleanup wiring is unit-testable with a
 /// synthetic `work` future (no real hung stream needed).
 async fn run_bounded(
     wav: PathBuf,
     timeout: Duration,
     work: impl std::future::Future<Output = Result<SongrecOutcome, RecognizeError>>,
-) -> Result<Option<RecognizedTrack>, RecognizeError> {
+) -> Result<Option<Recognition>, RecognizeError> {
     // RAII: removes the wav on EVERY exit path below (including the timeout branch,
     // where `work` is dropped - killing its child - but this guard still unlinks it).
     let _guard = TempFileGuard(wav);
@@ -331,7 +526,10 @@ async fn run_bounded(
         // A classified Hit already parsed once; the second parse is the same pure call
         // and cannot disagree, so an unparseable value here is impossible by
         // construction and degrades to a content miss rather than a panic.
-        SongrecOutcome::Hit(stdout) => Ok(parse_recognize_json(&stdout)),
+        SongrecOutcome::Hit(stdout) => Ok(parse_recognize_json(&stdout).map(|track| Recognition {
+            track,
+            offset_secs: parse_recognize_offset(&stdout),
+        })),
         SongrecOutcome::NoMatch => Ok(None),
         SongrecOutcome::Transport { rate_limited } => {
             Err(RecognizeError::Transport { rate_limited })
@@ -347,6 +545,18 @@ async fn run_bounded(
 #[derive(serde::Deserialize)]
 struct RecognizeResponse {
     track: Option<TrackJson>,
+    /// Shazam's match array. It has been arriving on stdout all along and serde was
+    /// silently dropping it, because this struct declared only `track`. Only `offset` is
+    /// read; `id`, `timeskew` and `frequencyskew` stay dropped deliberately.
+    #[serde(default)]
+    matches: Vec<MatchJson>,
+}
+
+#[derive(serde::Deserialize)]
+struct MatchJson {
+    /// Position of the sample within the STUDIO recording, seconds. Can be NEGATIVE,
+    /// which is the strong case: the track began INSIDE our own capture.
+    offset: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -446,6 +656,36 @@ pub fn parse_recognize_json(stdout: &str) -> Option<RecognizedTrack> {
         return None;
     }
     Some(RecognizedTrack { artist, title, album, released, label, genre, isrc, cover_url })
+}
+
+/// Shazam's reported `matches[0].offset`, when one came back.
+///
+/// A SEARCH WINDOW, NEVER A CUT POINT, and nothing downstream may promote it. There is no
+/// confidence field anywhere in the envelope; the offset reports position in the STUDIO
+/// recording, so a DJ's +4% pitch fader costs `0.04 x elapsed` (9.6 s at 240 s in); and a
+/// track dropped in at its second chorus makes `now - offset` land in the PREVIOUS
+/// track's tail. It narrows an unbounded search to a seconds-to-tens-of-seconds window.
+/// It is recorded as a labelled guess and it never touches a filename.
+///
+/// It is also only meaningful because the slice handed to songrec is exactly
+/// [`SONGREC_EXACT_SECS`] - see that constant.
+pub fn parse_recognize_offset(stdout: &str) -> Option<f64> {
+    let resp: RecognizeResponse = serde_json::from_str(stdout.trim()).ok()?;
+    resp.matches
+        .into_iter()
+        .find_map(|m| m.offset)
+        .filter(|o| o.is_finite())
+}
+
+/// A hit: the track, plus Shazam's own position reading if it sent one.
+///
+/// Two fields rather than one struct field on [`RecognizedTrack`], because that type
+/// derives `Eq` and an `f64` cannot live on it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Recognition {
+    pub track: RecognizedTrack,
+    /// See [`parse_recognize_offset`]. Never authorises a cut and never earns a name.
+    pub offset_secs: Option<f64>,
 }
 
 /// The now-playing `Title` line for a recognized track, mirroring the ICY
@@ -640,8 +880,8 @@ mod tests {
         let hit = SongrecOutcome::Hit(REAL_HIT.to_string());
         let work = async move { Ok(hit) };
         let res = run_bounded(path.clone(), Duration::from_secs(40), work).await;
-        let track = res.expect("no error").expect("a hit");
-        assert_eq!(track.title.as_deref(), Some("Blessings"));
+        let hit = res.expect("no error").expect("a hit");
+        assert_eq!(hit.track.title.as_deref(), Some("Blessings"));
         assert!(!path.exists(), "temp wav must be cleaned on the success path");
     }
 
@@ -713,6 +953,229 @@ mod tests {
         assert_eq!(classify_songrec(Some(1), "", ""), SongrecOutcome::Unknown);
         assert_eq!(classify_songrec(None, "", ""), SongrecOutcome::Unknown);
         assert_eq!(classify_songrec(Some(0), "not json at all", ""), SongrecOutcome::Unknown);
+    }
+
+    #[test]
+    fn the_songrec_wav_size_is_the_arithmetic_it_claims_to_be() {
+        // 44-byte canonical RIFF header + 12 s of mono 16-bit 16 kHz PCM. If someone
+        // changes the sample rate, the channel count or the slice length, this is what
+        // says so out loud instead of letting the byte check silently reject every sample.
+        assert_eq!(SONGREC_WAV_BYTES, 44 + 2 * 16_000 * 12);
+        assert_eq!(SONGREC_WAV_BYTES, 384_044);
+        assert_eq!(SONGREC_EXACT_SECS, 12.0);
+        // The dump floor must leave room for an exact cut plus BOTH container margins.
+        assert!(RECOGNIZE_MIN_DUMP_SECS > SONGREC_EXACT_SECS + SONGREC_TAIL_MARGIN_SECS);
+    }
+
+    #[test]
+    fn the_sample_slice_is_never_longer_than_twelve_seconds_in_either_direction() {
+        // THE trap: anything ABOVE 12.000 s re-anchors to the file midpoint with an error
+        // of (duration - 12) / 2, silently and forever. Anything at or below anchors at
+        // file start. So the resulting slice length must never exceed 12.000 s, whatever
+        // the dump turned out to be. A property sweep, plus the degenerate inputs.
+        let mut d = 0.0f64;
+        while d <= 600.0 {
+            let off = sample_offset(d);
+            assert!(off >= 0.0, "offset must never be negative at {d}");
+            assert!(off <= d.max(0.0) + f64::EPSILON, "offset must sit inside the dump at {d}");
+            let slice = (d - off).min(SONGREC_EXACT_SECS);
+            assert!(
+                slice <= SONGREC_EXACT_SECS + 1e-9,
+                "a {d}s dump would hand songrec {slice}s and re-anchor every offset"
+            );
+            // Above the exact length the cut takes the freshest audio that still ENDS
+            // inside the file - never flush against a declared duration a decoder does
+            // not reach (see SONGREC_TAIL_MARGIN_SECS).
+            if d > SONGREC_EXACT_SECS + SONGREC_TAIL_MARGIN_SECS {
+                assert!((off - (d - SONGREC_EXACT_SECS - SONGREC_TAIL_MARGIN_SECS)).abs() < 1e-9);
+                assert!(
+                    d - (off + SONGREC_EXACT_SECS) >= SONGREC_TAIL_MARGIN_SECS - 1e-9,
+                    "a {d}s dump leaves no tail margin, so a compressed stream cuts short"
+                );
+            } else {
+                assert_eq!(off, 0.0, "a short dump anchors at file start (songrec tail-pads)");
+            }
+            d += 0.25;
+        }
+        // AND the floor the dump path enforces must leave room for both margins at once,
+        // which is the arithmetic that keeps the smallest admissible dump cuttable.
+        assert!(
+            sample_offset(RECOGNIZE_MIN_DUMP_SECS) >= 1.0,
+            "the smallest admissible dump must still cut clear of the container's head"
+        );
+        // TOTAL over garbage.
+        assert_eq!(sample_offset(f64::NAN), 0.0);
+        assert_eq!(sample_offset(f64::INFINITY), 0.0);
+        assert_eq!(sample_offset(-5.0), 0.0);
+    }
+
+    /// Is a real ffmpeg toolchain reachable? Both bins come from the daemon's own nix
+    /// wrapper in production and from the devshell / check inputs here; a machine without
+    /// them skips rather than failing, the same posture `handler_with_null_player` takes.
+    fn ffmpeg_available() -> bool {
+        ["ffmpeg", "ffprobe"].iter().all(|tool| {
+            std::process::Command::new(tool)
+                .arg("-version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// A fresh temp dir, removed FIRST and LAST, with no `tempfile` dependency.
+    fn media_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("hypodj-cut-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// `secs` of tone encoded with `codec`, then muxed into matroska with `-c copy` -
+    /// exactly the container shape `dump-cache` writes, and exactly the reason the codec
+    /// matters: the copy preserves the encoder delay and frame granularity that make a
+    /// declared duration over-report the decodable audio.
+    fn tone_in_mkv(dir: &Path, name: &str, codec: &str, ext: &str, secs: f64) -> PathBuf {
+        let raw = dir.join(format!("{name}.{ext}"));
+        let mkv = dir.join(format!("{name}.mkv"));
+        let run = |args: Vec<String>| {
+            let ok = std::process::Command::new("ffmpeg")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "ffmpeg failed for {args:?}");
+        };
+        run(vec![
+            "-nostdin".into(), "-loglevel".into(), "error".into(), "-y".into(),
+            "-f".into(), "lavfi".into(),
+            "-i".into(), format!("sine=frequency=440:sample_rate=44100:duration={secs}"),
+            "-c:a".into(), codec.into(),
+            raw.display().to_string(),
+        ]);
+        run(vec![
+            "-nostdin".into(), "-loglevel".into(), "error".into(), "-y".into(),
+            "-i".into(), raw.display().to_string(),
+            "-c".into(), "copy".into(),
+            mkv.display().to_string(),
+        ]);
+        mkv
+    }
+
+    #[tokio::test]
+    async fn the_exact_cut_is_byte_exact_on_a_real_compressed_dump() {
+        // THE REGRESSION, and it is only visible against a real compressed container. A
+        // cut taken flush against ffprobe's declared duration is byte-exact on PCM and
+        // SHORT on mp3 - 383,220 B of 384,044 was measured on a 25 s mp3-in-matroska
+        // window - so `SONGREC_WAV_BYTES` rejected every sample and every identify on his
+        // main stations was logged as a transport miss on the full exponential, without a
+        // single Shazam call ever being spent. The live proof used a PCM source, which is
+        // structurally incapable of showing it. This runs the SHIPPED cut over all three.
+        if !ffmpeg_available() {
+            return;
+        }
+        let dir = media_dir("exact");
+        let wav = dir.join("sample.wav");
+        for (codec, ext) in [("libmp3lame", "mp3"), ("aac", "m4a"), ("pcm_s16le", "wav")] {
+            for secs in [RECOGNIZE_MIN_DUMP_SECS, RECOGNIZE_BACK_SECS, 90.0] {
+                let src = tone_in_mkv(&dir, "dump", codec, ext, secs);
+                let got = cut_exact_sample(&src, &wav).await;
+                assert!(
+                    got.is_ok(),
+                    "a {secs}s {codec} dump must yield an exact slice, got {got:?} ({} B)",
+                    std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0)
+                );
+                assert_eq!(
+                    std::fs::metadata(&wav).unwrap().len(),
+                    SONGREC_WAV_BYTES,
+                    "{codec} at {secs}s"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unprobeable_dump_fails_locally_and_never_reaches_songrec() {
+        // The zero-byte-file-with-success class the study measured after a warm switch.
+        if !ffmpeg_available() {
+            return;
+        }
+        let dir = media_dir("garbage");
+        let src = dir.join("dump.mkv");
+        std::fs::write(&src, b"not a container at all").unwrap();
+        let wav = dir.join("sample.wav");
+        assert!(matches!(cut_exact_sample(&src, &wav).await, Err(RecognizeError::Capture)));
+        assert!(!wav.exists(), "nothing usable was written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_shazam_offset_survives_serde_now_and_is_never_promoted() {
+        // It has been arriving on stdout all along and this struct was dropping it.
+        let json = r#"{"matches":[{"id":"1","offset":-6.500591796,"timeskew":0.0001,
+          "frequencyskew":0.0}],"track":{"title":"X","subtitle":"Y"}}"#;
+        assert_eq!(parse_recognize_offset(json), Some(-6.500591796));
+        // A NEGATIVE offset is the strong case (the track began inside our own capture),
+        // so it must NOT be filtered out as nonsense.
+        assert!(parse_recognize_offset(json).unwrap() < 0.0);
+        // No matches block, a null offset, and garbage all degrade to None rather than
+        // fabricating a position.
+        assert_eq!(parse_recognize_offset(REAL_HIT), None);
+        assert_eq!(parse_recognize_offset(r#"{"matches":[{"offset":null}]}"#), None);
+        assert_eq!(parse_recognize_offset("not json"), None);
+        // A non-finite offset is not a position.
+        assert_eq!(parse_recognize_offset(r#"{"matches":[{"offset":1e999}]}"#), None);
+    }
+
+    #[tokio::test]
+    async fn a_hit_carries_its_offset_through_run_bounded() {
+        let path = temp_wav_path();
+        let json = r#"{"matches":[{"offset":42.5}],"track":{"title":"X","subtitle":"Y"}}"#;
+        let work = async move { Ok(SongrecOutcome::Hit(json.to_string())) };
+        let hit = run_bounded(path.clone(), Duration::from_secs(40), work)
+            .await
+            .expect("no error")
+            .expect("a hit");
+        assert_eq!(hit.track.title.as_deref(), Some("X"));
+        assert_eq!(hit.offset_secs, Some(42.5));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn this_module_can_no_longer_download_the_stream_it_is_already_playing() {
+        // The second HTTP fetch is DELETED, not merely unused. A future edit that
+        // reintroduces `-rw_timeout` or feeds a URL to ffmpeg would restore a 9.73 s /
+        // 401 KB side-band download of a stream the daemon already has in RAM, and would
+        // do it on the least-exercised path in the module. A structural guard is the
+        // honest floor, exactly as it is for songrec's stderr below.
+        let whole = include_str!("recognize.rs");
+        let src = whole.split("#[cfg(test)]").next().expect("a production half");
+        assert!(
+            !src.contains("rw_timeout"),
+            "nothing here reads a socket any more; an rw_timeout means a fetch came back"
+        );
+        assert!(
+            !src.contains("recognize_stream_url"),
+            "the URL-fetching entry point is gone; the sample comes from the local cache dump"
+        );
+        // The ffmpeg child's input is a local sample path, never a url.
+        let ffmpeg = src
+            .split("Command::new(\"ffmpeg\")")
+            .nth(1)
+            .expect("the ffmpeg child");
+        let chain = &ffmpeg[..ffmpeg.find(".status()").expect("the status call")];
+        assert!(chain.contains(".arg(sample)"), "ffmpeg reads the LOCAL dump");
+        assert!(!chain.contains("url"), "ffmpeg must never be handed a url again");
+        // And both bitexact flags stay, because SONGREC_WAV_BYTES depends on them.
+        assert!(chain.contains("\"-fflags\"") && chain.contains("\"+bitexact\""));
+        assert!(chain.contains("\"-flags\""));
     }
 
     #[test]

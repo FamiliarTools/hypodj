@@ -26,12 +26,18 @@ USAGE:
   dj next | prev          skip / go back (also \"next song\", \"skip this\")
   dj fav | favorite       favorite the current track (also \"fav current\")
   dj mark                 mark what is playing: star it if you own it, note it if
-                           not. On a stream whose title JUST changed it records
-                           both candidates and stars neither - resolve it with
+                           not, and KEEP THE AUDIO when audio is the only thing
+                           that can still help (a radio window off what mpv is
+                           already holding - never on a track you own). On a
+                           stream whose title JUST changed it records both
+                           candidates and stars neither - resolve it with
                            \"mark this\" or \"mark previous\"
   dj heard [all|marks|limit <n>]
                           read the heard ledger back: last session, marks first,
-                           unowned only. The first line is the coverage line
+                           unowned only. The first line is the coverage line; a
+                           marked row that kept audio carries [tape <n>: ...]
+  dj heard keep <n> | drop <n>
+                          pin that tape segment against the sweep, or release it
   dj radio                endless radio from what is playing; it keeps going
                            (\"radio random\" to start cold, \"radio off\" to stop)
   dj vol <0-100>          set volume
@@ -157,9 +163,9 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
 
     // `heard` is intercepted BEFORE route() for the same stated reason as `stations`:
     // route is deliberately a pure verb-vs-NL split and is SHARED with dj-gui, so it
-    // knows only the bare views (`heard`, `heard all`, `heard marks`) - and left to the
-    // fallthrough, `heard limit 5` and `heard --all` would be handed to the NL
-    // translator, which has no heard action at all.
+    // knows only the bare views (`heard`, `heard all`, `heard marks`) plus the two tape
+    // pins - and left to the fallthrough, `heard limit 5` and `heard --all` would be
+    // handed to the NL translator, which has no heard action at all.
     if parsed.words.first().is_some_and(|w| w == "heard") {
         let env = Env { get: &|k| std::env::var(k).ok() };
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);

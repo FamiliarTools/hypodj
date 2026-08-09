@@ -447,11 +447,16 @@ fn parse_mark(args: &[String], line: &str) -> MpdCommand {
     }
 }
 
-/// Parse a `heard` request: the bare form, `all`, `marks`, or `limit <n>`. Subcommand
-/// WORDS rather than flags, matching every other hypodj verb here. A bad limit, an
-/// unknown keyword or a stray extra argument is a loud Unsupported ACK.
+/// Parse a `heard` request: the bare form, `all`, `marks`, `limit <n>`, or the two TAPE
+/// tokens `keep <n>` / `drop <n>`. Subcommand WORDS rather than flags, matching every
+/// other hypodj verb here. A bad limit, a bad index, an unknown keyword or a stray extra
+/// argument is a loud Unsupported ACK.
+///
+/// The tape read-back deliberately grows THIS verb rather than adding one: `MpdCommand`
+/// gains zero variants, so [`ADVERTISED_MPD_VERSION`] is untouched by construction and no
+/// other crate's exhaustive match moves.
 fn parse_heard(args: &[String], line: &str) -> MpdCommand {
-    use crate::heard::{HeardQuery, HeardView};
+    use crate::heard::{HeardAction, HeardQuery, HeardView};
     let base = HeardQuery::default();
     match args.first().map(|s| s.as_str()) {
         None => MpdCommand::Heard(base),
@@ -461,6 +466,16 @@ fn parse_heard(args: &[String], line: &str) -> MpdCommand {
         }
         Some("limit") if args.len() == 2 => match args[1].parse::<usize>() {
             Ok(n) if n > 0 => MpdCommand::Heard(HeardQuery { limit: n, ..base }),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        // `keep <n>` pins tape segment n against eviction; `drop <n>` unpins it. The
+        // index is the one the render prints, which is the tape's own chronological
+        // order rather than any session file's.
+        Some(word @ ("keep" | "drop")) if args.len() == 2 => match args[1].parse::<usize>() {
+            Ok(n) if n > 0 => MpdCommand::Heard(HeardQuery {
+                action: HeardAction::Keep { n, on: word == "keep" },
+                ..base
+            }),
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         _ => MpdCommand::Unsupported(line.to_string()),
@@ -1578,6 +1593,25 @@ mod parse_tests {
         assert!(matches!(parse("heard all"), MpdCommand::Heard(q) if q.view == HeardView::All));
         assert!(matches!(parse("heard marks"), MpdCommand::Heard(q) if q.view == HeardView::Marks));
         assert!(matches!(parse("heard limit 5"), MpdCommand::Heard(q) if q.limit == 5));
+        // The two TAPE tokens ride the SAME verb, so MpdCommand gains no variant and the
+        // advertised MPD version cannot drift.
+        use crate::heard::HeardAction;
+        assert!(matches!(
+            parse("heard keep 3"),
+            MpdCommand::Heard(q) if q.action == HeardAction::Keep { n: 3, on: true }
+        ));
+        assert!(matches!(
+            parse("heard drop 3"),
+            MpdCommand::Heard(q) if q.action == HeardAction::Keep { n: 3, on: false }
+        ));
+        // A bare read-back never carries an action.
+        assert!(matches!(parse("heard"), MpdCommand::Heard(q) if q.action == HeardAction::Render));
+        // A zero index, a non-number and a missing index all ACK loud rather than pinning
+        // something arbitrary.
+        assert!(matches!(parse("heard keep 0"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("heard keep x"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("heard keep"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("heard keep 1 2"), MpdCommand::Unsupported(_)));
         // A zero, a non-number, an unknown keyword and a stray argument all ACK loud.
         assert!(matches!(parse("heard limit 0"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("heard limit x"), MpdCommand::Unsupported(_)));

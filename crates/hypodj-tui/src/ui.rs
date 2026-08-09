@@ -65,7 +65,23 @@ pub fn render(f: &mut Frame, state: &TuiState) {
         }
     }
     render_now(f, chunks[3], state);
-    render_command(f, chunks[4], state);
+    // A status sentence longer than the bar BORROWS the blank bottom breathing row
+    // rather than growing the layout: the row is already reserved and already empty, so
+    // nothing moves - which is the same reason Confirm renders as a popup instead of a
+    // taller bar. Two rows is what it takes to hold a mark sentence WITH its tape
+    // clause; at 60 columns the clause is the whole tail, and a bar that clipped it
+    // announced a capture the human never learned about.
+    let bar = chunks[4];
+    let status_area = match &state.status_msg {
+        Some(msg)
+            if state.mode == Mode::Normal
+                && status_lines(msg, bar.width as usize, 2).len() > 1 =>
+        {
+            Rect { height: 2, ..bar }.intersection(f.area())
+        }
+        _ => bar,
+    };
+    render_command(f, status_area, state);
     // Confirm is a small centered popup over the list/now region so the thin bottom
     // bar never grows (no layout jump when toggling modes). On the DJ (chat) screen
     // the confirm is rendered INLINE in the chat scrollback (pushed by enter_confirm),
@@ -73,14 +89,20 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     if state.mode == Mode::Confirm && state.screen != Screen::Dj {
         render_confirm_popup(f, list_area, state);
     }
-    // The row context menu sits ABOVE the confirm popup (its keys are intercepted
-    // first, so it must also be the one the eye sees first) and BELOW the help overlay
-    // - which cannot be open at the same time anyway, since `open_menu` closes it. It
-    // gets the FULL frame as its region, like the help overlay and unlike the two-line
-    // confirm: eight rows plus a heading and a border ring do not fit the list band on
-    // a 24-row terminal (`now_playing_h` takes 12 of them), and a menu that silently
-    // truncates its last row - `remove from queue` - is worse than one that overlaps
-    // the pane below.
+    // The heard/tape read-back: a normal-mode modal over the FULL frame, because a
+    // ledger row carries a time, a title, a url and its tape annotation and the list
+    // region cannot hold that. Below the help overlay so `?` still wins.
+    if state.heard_open {
+        render_heard_overlay(f, f.area(), state);
+    }
+    // The row context menu sits ABOVE the confirm popup and the heard panel - its keys
+    // are intercepted FIRST in `key_normal`, so it must also be the one the eye sees
+    // first - and BELOW the help overlay, which cannot be open at the same time anyway
+    // since `open_menu` closes it (and the heard panel with it). It gets the FULL frame
+    // as its region, like the help overlay and unlike the two-line confirm: eight rows
+    // plus a heading and a border ring do not fit the list band on a 24-row terminal
+    // (`now_playing_h` takes 12 of them), and a menu that silently truncates its last
+    // row - `remove from queue` - is worse than one that overlaps the pane below.
     if let Some(menu) = &state.menu {
         render_menu(f, f.area(), menu, state);
     }
@@ -147,6 +169,123 @@ fn render_menu(f: &mut Frame, region: Rect, menu: &crate::menu::Menu, state: &Tu
         .title(Span::styled("Menu", base.add_modifier(Modifier::BOLD)));
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(lines).block(block).style(base), popup);
+}
+
+/// Wrap `msg` to `width` columns, at most `max_rows` rows, marking a truncation IN the
+/// text rather than letting the terminal clip it silently.
+///
+/// The silent clip is the bug this exists to close: the daemon appends what a `mark`
+/// kept - the duration and the cut label - to the END of its sentence, so a single 60
+/// column row drops exactly the part that says audio was captured at all. A sentence cut
+/// short with no marker reads as a complete sentence.
+///
+/// Breaks at the last space that fits; a run with no space in it is hard-split rather
+/// than dropped. It slices the ORIGINAL string rather than rebuilding it from words, so
+/// the daemon's own double-space column separators survive inside a row - they are how a
+/// `heard` line separates its time, its title and its url.
+///
+/// Pure and total: any width, any row count, no panic on a multibyte boundary (every cut
+/// walks `char_indices`).
+fn status_lines(msg: &str, width: usize, max_rows: usize) -> Vec<String> {
+    let width = width.max(1);
+    let max_rows = max_rows.max(1);
+    let flat = msg.replace('\n', " ");
+    let mut rows: Vec<String> = Vec::new();
+    let mut rest: &str = &flat;
+    loop {
+        if rest.chars().count() <= width {
+            rows.push(rest.trim_end().to_string());
+            break;
+        }
+        // The byte offset just past the `width`th char; `rest` is longer, so it exists.
+        let cut = rest.char_indices().nth(width).map(|(i, _)| i).unwrap_or(rest.len());
+        let (take, skip) = match rest[..cut].rfind(' ') {
+            Some(i) if i > 0 => (i, i + 1),
+            // No space to break on (a url, one long word): split on the char boundary
+            // and lose nothing.
+            _ => (cut, cut),
+        };
+        rows.push(rest[..take].trim_end().to_string());
+        rest = rest[skip..].trim_start_matches(' ');
+        if rest.is_empty() {
+            break;
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+        // The marker is only affordable on a row wide enough to hold it; below that a
+        // clip is all there is, and inventing three dots would eat the text instead.
+        if width >= 3 {
+            if let Some(last) = rows.last_mut() {
+                while last.chars().count() + 3 > width && !last.is_empty() {
+                    last.pop();
+                }
+                last.push_str("...");
+            }
+        }
+    }
+    rows
+}
+
+/// The heard/tape read-back overlay: the daemon's own `heard` render, whole, in a
+/// scrollable modal.
+///
+/// It shows what the daemon says and interprets NOTHING. The render lives daemon-side
+/// because only the daemon can join a ledger row to the audio still on disk beside it,
+/// and re-phrasing any of it here is how the two surfaces come to disagree about what a
+/// press kept. Every line is WRAPPED rather than clipped: a marked row ends in its
+/// `[tape <n>: ...]` annotation, which is precisely what a horizontal clip removes.
+fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
+    let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
+    let base = Style::default().fg(fg);
+    let head = base.add_modifier(Modifier::BOLD);
+
+    // The WHOLE frame, unlike the help overlay's content-sized box: a heard line carries
+    // a time, a title, a url and its tape annotation, so every column is worth having -
+    // and a margin would leave a ring of the jukebox underneath showing through as
+    // fragments of borders, which reads as damage rather than as depth.
+    let (w, h) = (region.width.max(1), region.height.max(1));
+    let popup = Rect { x: region.x, y: region.y, width: w, height: h };
+    // Two columns are reserved for the continuation indent so an indented wrap can never
+    // push its own tail off the right edge - which would clip exactly the `[tape ...]`
+    // annotation this panel exists to show.
+    let inner_w = w.saturating_sub(4).max(1) as usize;
+    let inner_h = h.saturating_sub(2);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for l in &state.heard_lines {
+        // A blank daemon line is a deliberate separator (the render puts one under the
+        // marks block); keep it rather than collapsing the shape it was drawing.
+        if l.trim().is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        for (i, row) in status_lines(l, inner_w, usize::MAX).into_iter().enumerate() {
+            // A continuation is indented so a wrapped row never reads as a new entry.
+            let text = if i == 0 { row } else { format!("  {row}") };
+            lines.push(Line::from(Span::styled(text, base)));
+        }
+    }
+
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    let scroll = state.heard_scroll.min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!("Marked - the tape ({}/{})  j/k scroll  t closes", scroll + 1, max_scroll + 1)
+    } else {
+        "Marked - the tape  t closes".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(base)
+        .title(Span::styled(title, head));
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(block).style(base).scroll((scroll, 0)),
+        popup,
+    );
 }
 
 /// The `?` help overlay: a centered, bordered popup laid out in two columns from the
@@ -1048,6 +1187,21 @@ mod tests {
         out
     }
 
+    /// The rendered screen as ONE whitespace-normalized string, with the box-drawing
+    /// frame dropped. A sentence that wraps across rows (or across a popup border) still
+    /// has every word on screen, and this asserts that without pinning the exact column
+    /// a break lands in.
+    fn render_flat(state: &TuiState) -> String {
+        render_to_lines(state)
+            .join(" ")
+            .chars()
+            .map(|c| if ('\u{2500}'..='\u{257F}').contains(&c) { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn render_to_lines_sized(state: &TuiState, w: u16, h: u16) -> Vec<String> {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1094,6 +1248,8 @@ mod tests {
         // The `quit` binding is off-screen at the top but becomes reachable by scrolling:
         // walk the offsets and assert it appears at some page (proving nothing is lost to
         // truncation). Over-scroll clamps to the last page, never panics.
+        // The range is a probe, not a bound: it must stay comfortably past the real max
+        // scroll, which grows by one row every time the keymap does.
         let reachable = (0..80u16).any(|off| {
             s.help_scroll = off;
             render_to_lines_sized(&s, 60, 12).join("\n").contains("quit")
@@ -1385,6 +1541,139 @@ mod tests {
         s.status_msg = Some("can't star a smart list".into());
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("can't star a smart list"), "the reason is drawn:\n{out}");
+    }
+
+    #[test]
+    fn a_mark_that_kept_audio_says_so_at_60_columns() {
+        // The press KEEPS THE AUDIO, and the daemon appends what it kept to the end of
+        // the sentence. On one 60-column row that tail is exactly what falls off the
+        // edge - so the capture would be announced to nobody, which is the same silent
+        // success the gesture was built to end. The bar borrows the blank breathing row
+        // below it (already reserved, so nothing moves) and the clause lands.
+        let mut s = TuiState::new();
+        s.status_msg = Some(
+            "noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it".into(),
+        );
+        let out = render_flat(&s);
+        assert!(
+            out.contains("noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it"),
+            "the whole sentence is on screen, wrap and all:\n{out}"
+        );
+        // And the tail really is on a SECOND row: the first is full at 60 columns, so
+        // without the borrowed row it does not exist at all.
+        let rows = render_to_lines(&s);
+        let head = rows.iter().position(|r| r.contains("kept 5m of audio")).expect("head row");
+        let tail = rows.iter().position(|r| r.contains("heard` has it")).expect("tail row");
+        assert_eq!(tail, head + 1, "the tail is the row directly under the bar:\n{rows:#?}");
+
+        // The inapplicable case is just as load-bearing: a press that could not keep
+        // audio must say WHY, not fall silent about the half that failed.
+        let mut s = TuiState::new();
+        s.status_msg = Some(
+            "noted: NTS 2 at 23:17 - no audio kept (only 3s is buffered so far)".into(),
+        );
+        let out = render_flat(&s);
+        assert!(
+            out.contains("no audio kept (only 3s is buffered so far)"),
+            "the refusal and its reason are drawn:\n{out}"
+        );
+
+        // The layout does NOT move to make room: the now-playing pane and the tab strip
+        // sit on exactly the rows they sit on with a short banner.
+        let mut short = TuiState::new();
+        short.status_msg = Some("noted".into());
+        let a = render_to_lines(&short);
+        let b = render_to_lines(&s);
+        for row in 0..21 {
+            assert_eq!(a[row], b[row], "row {row} moved when the banner grew");
+        }
+    }
+
+    #[test]
+    fn the_tape_overlay_shows_the_daemon_render_whole_at_60x24() {
+        // `t` asks the daemon for the marks and their audio; this is the panel it lands
+        // in. It used to be one bar line plus "(+N more - run `dj heard`)" - a standing
+        // instruction to leave the program to read an answer the program already had,
+        // and the tape annotations live in precisely the lines that were dropped.
+        let mut s = TuiState::new();
+        s.heard_lines = vec![
+            "3 marks, oldest first".into(),
+            "21:02  * Sun Ra - Space Is The Place  [starred]".into(),
+            "23:17  * NTS 2  https://stream-mixtape-geo.ntslive.net/mixtape5  [tape 2: 5m, window]"
+                .into(),
+            "23:41  * Modular Station  [tape swept]".into(),
+            "2 tape segment(s) on disk; `heard keep <n>` pins one against eviction".into(),
+        ];
+        s.heard_open = true;
+        let out = render_flat(&s);
+        assert!(out.contains("Marked - the tape"), "the panel is titled:\n{out}");
+        assert!(out.contains("t closes"), "and says how to leave it:\n{out}");
+        assert!(out.contains("Sun Ra - Space Is The Place"), "an ordinary mark is listed:\n{out}");
+        // THE POINT: the tape annotation survives at 60 columns. That row is 84 chars, so
+        // without the panel it is a bar line that ends at "https://stream-mix" and the
+        // `[tape 2: 5m, window]` tail is off the right edge of the screen entirely.
+        assert!(out.contains("[tape 2: 5m, window]"), "the segment is named:\n{out}");
+        assert!(
+            out.contains("https://stream-mixtape-geo.ntslive.net/mixtape5"),
+            "and the url it came from survives the wrap:\n{out}"
+        );
+        // A row whose audio has been swept says so - the tape is a rolling cache and a
+        // row outliving its sound is designed for, not a defect to hide.
+        assert!(out.contains("[tape swept]"), "a swept segment is honest:\n{out}");
+        // And the pin surface is reachable from what is on screen.
+        assert!(out.contains("heard keep <n>"), "how to pin one:\n{out}");
+    }
+
+    #[test]
+    fn the_tape_overlay_is_honest_when_there_is_nothing_to_show() {
+        // Every inapplicable case SAYS why. A daemon with no ledger, or an evening with
+        // no presses, answers in one line - which is a banner, not a panel - but if it
+        // ever reaches the panel it must still read as an answer rather than an empty
+        // box.
+        let mut s = TuiState::new();
+        s.heard_lines = vec![
+            "no marks recorded yet".into(),
+            "no tape configured (set [tape].dir or a state directory)".into(),
+        ];
+        s.heard_open = true;
+        let out = render_flat(&s);
+        assert!(out.contains("no marks recorded yet"), "{out}");
+        assert!(
+            out.contains("no tape configured (set [tape].dir or a state directory)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn status_lines_wraps_marks_its_truncation_and_never_panics() {
+        use super::status_lines;
+        // Pure, and the two properties that matter: nothing is dropped silently, and no
+        // input shape panics the whole render.
+        assert_eq!(status_lines("short", 20, 2), vec!["short".to_string()]);
+        assert_eq!(
+            status_lines("one two three four", 9, 4),
+            vec!["one two".to_string(), "three".to_string(), "four".to_string()]
+        );
+        // The daemon's own double-space column separators survive INSIDE a row: they are
+        // how a heard line separates its time, its title and its url.
+        assert_eq!(
+            status_lines("23:17  * NTS 2  x", 30, 2),
+            vec!["23:17  * NTS 2  x".to_string()]
+        );
+        // Overflow past the last row is MARKED: a sentence cut short with no marker
+        // reads as a complete sentence.
+        let out = status_lines("aaa bbb ccc ddd eee fff", 7, 2);
+        assert_eq!(out.len(), 2);
+        assert!(out[1].ends_with("..."), "{out:?}");
+        assert!(out.iter().all(|r| r.chars().count() <= 7), "{out:?}");
+        // A run with no space in it (a url) is SPLIT, never dropped.
+        let out = status_lines("supercalifragilistic", 6, 4);
+        assert_eq!(out.concat(), "supercalifragilistic");
+        // Totality: zero width, zero rows, empty input, multibyte.
+        assert_eq!(status_lines("", 10, 1), vec![String::new()]);
+        assert!(!status_lines("hello", 0, 0).is_empty());
+        let multi = status_lines("Ale\u{0301}m Ame\u{0301}rica cora\u{e7}\u{e3}o", 4, 3);
+        assert!(multi.iter().all(|r| r.chars().count() <= 4), "{multi:?}");
     }
 
     #[test]
@@ -2302,7 +2591,15 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
         // Confirm's detail lives in the popup; keep the bar blank so it never grows.
         Mode::Confirm => Line::from(""),
         Mode::Normal => match &state.status_msg {
-            Some(msg) => Line::from(msg.replace('\n', " ")),
+            // WRAPPED to the rows this area actually has (one, or two when the caller
+            // lent it the blank breathing row), with any remaining truncation marked in
+            // the text. `render` sizes the area; this only ever fills what it was given.
+            Some(msg) => {
+                let rows = status_lines(msg, area.width as usize, area.height as usize);
+                let lines: Vec<Line> = rows.into_iter().map(Line::from).collect();
+                f.render_widget(Paragraph::new(lines), area);
+                return;
+            }
             None => {
                 // Truly idle: the bottom-bar wave. When the viz socket is live
                 // (viz_active) draw the REAL post-gain level field; otherwise fall

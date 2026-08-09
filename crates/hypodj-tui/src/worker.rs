@@ -118,6 +118,10 @@ pub enum RespKind {
     Snapshot { now: NowPlaying, queue: Option<Vec<QueueItem>>, version: Option<u64> },
     Confirm(Pending),
     Banner(String),
+    /// The daemon's `heard` render, one entry per line, for the scrollable overlay.
+    /// Multi-line by construction (a one-line reply is a Banner), so it always has
+    /// something the bottom bar could not have carried.
+    Heard(Vec<String>),
     /// An old daemon ACKed `unknown command "knob"`; render computes a setvol
     /// fallback from the last-known volume.
     KnobUnknown(String),
@@ -399,28 +403,52 @@ fn command_worker(
     }
 }
 
-/// The banner a SUCCESSFUL command reply deserves, or None when the verb had nothing
-/// to say (which is almost all of them - `play`, `next`, `setvol` answer with a bare
-/// OK and the queue itself is the feedback).
+/// What a SUCCESSFUL command reply is worth saying, and on which surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reply {
+    /// One line for the bottom bar - transient, dismissed by the next keypress.
+    Banner(String),
+    /// The daemon's whole `heard` render, one entry per line, for the scrollable
+    /// overlay. A ledger takes longer to read than the next keypress.
+    Heard(Vec<String>),
+}
+
+/// The reply a SUCCESSFUL command deserves, or None when the verb had nothing to say
+/// (which is almost all of them - `play`, `next`, `setvol` answer with a bare OK and the
+/// queue itself is the feedback).
 ///
 /// Two hypodj verbs exist precisely to answer in words:
-/// - `mark` returns `mark_result`, the one sentence the human reads. Without this the
-///   press would be exactly as silent as the bug it replaces.
-/// - `heard` returns one `heard` pair per rendered line, the FIRST of which is the
-///   mandatory coverage line. The bottom bar is one line, so that is the one shown,
-///   with a count pointing at `dj heard` for the rest rather than pretending there is
-///   no more.
+/// - `mark` returns `mark_result`, the one sentence the human reads - including, when
+///   the press kept audio, what was kept and how honest its boundaries are. Without this
+///   the press would be exactly as silent as the bug it replaces.
+/// - `heard` returns one `heard` pair per rendered line. A SINGLE line (a pin
+///   confirmation, "no marks recorded yet", a daemon with no ledger) is a banner; more
+///   than one is the ledger itself and goes to the overlay, because collapsing it to
+///   "the first line, +N more - run `dj heard`" was a running instruction to leave this
+///   program to read an answer this program asked for.
 ///
-/// Pure over the pairs, so the whole rule is testable without a socket.
-pub fn success_banner(pairs: &[(String, String)]) -> Option<String> {
+/// `line` is the request, and it is what makes an EMPTY reply speakable: only the caller
+/// knows a bare OK came back from a verb that was supposed to answer. That case is an
+/// older daemon, and saying so is the difference between a key that failed and a key
+/// that did nothing.
+///
+/// Pure over the request and the pairs, so the whole rule is testable without a socket.
+pub fn command_reply(line: &str, pairs: &[(String, String)]) -> Option<Reply> {
     if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "mark_result") {
-        return Some(v.clone());
+        return Some(Reply::Banner(v.clone()));
     }
-    let mut heard = pairs.iter().filter(|(k, _)| k == "heard").map(|(_, v)| v.as_str());
-    let first = heard.next()?;
-    match heard.count() {
-        0 => Some(first.to_string()),
-        n => Some(format!("{first}  (+{n} more - run `dj heard`)")),
+    let heard: Vec<String> = pairs
+        .iter()
+        .filter(|(k, _)| k == "heard")
+        .map(|(_, v)| v.clone())
+        .collect();
+    match heard.len() {
+        0 if line.split_whitespace().next() == Some("heard") => Some(Reply::Banner(
+            "nothing to read back (is the daemon new enough to keep a heard ledger?)".into(),
+        )),
+        0 => None,
+        1 => Some(Reply::Banner(heard.into_iter().next().unwrap_or_default())),
+        _ => Some(Reply::Heard(heard)),
     }
 }
 
@@ -449,8 +477,14 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 // exist to tell the human something, and dropping their pairs on the
                 // floor is the silent-success hole a radio star shipped with: it worked,
                 // and nothing on screen changed at all.
-                if let Some(b) = success_banner(&pairs) {
-                    send(RespKind::Banner(b));
+                match command_reply(&line, &pairs) {
+                    Some(Reply::Banner(b)) => {
+                        send(RespKind::Banner(b));
+                    }
+                    Some(Reply::Heard(lines)) => {
+                        send(RespKind::Heard(lines));
+                    }
+                    None => {}
                 }
                 false
             }
@@ -890,54 +924,122 @@ mod tests {
 
     #[test]
     fn a_mark_reply_becomes_a_banner_so_success_is_never_silent() {
-        use super::success_banner;
+        use super::{command_reply, Reply};
         // THE silent-success hole: starring a radio track's library match succeeded and
         // nothing on screen changed at all. `mark_result` IS the sentence the human
         // reads, so it must reach the bottom bar.
         assert_eq!(
-            success_banner(&pairs(&[
-                ("mark_result", "starred your copy: Takuya Nakamura - Cosmos"),
-                ("mark_kind", "track"),
-                ("mark_starred", "1"),
-            ])),
-            Some("starred your copy: Takuya Nakamura - Cosmos".to_string())
+            command_reply(
+                "mark",
+                &pairs(&[
+                    ("mark_result", "starred your copy: Takuya Nakamura - Cosmos"),
+                    ("mark_kind", "track"),
+                    ("mark_starred", "1"),
+                ])
+            ),
+            Some(Reply::Banner("starred your copy: Takuya Nakamura - Cosmos".to_string()))
         );
         // The ambiguous reply - the one that stars NOTHING - must be just as visible,
         // because it is the one asking the human for the two explicit words.
         let ambiguous = "marked, but which one: \"A - One\" started 6s ago, or \"B - Two\" \
                          which just ended - say `mark this` or `mark previous`";
         assert_eq!(
-            success_banner(&pairs(&[("mark_result", ambiguous), ("mark_ambiguous", "1")])),
-            Some(ambiguous.to_string())
+            command_reply("mark", &pairs(&[("mark_result", ambiguous), ("mark_ambiguous", "1")])),
+            Some(Reply::Banner(ambiguous.to_string()))
         );
     }
 
     #[test]
-    fn a_heard_reply_banners_the_coverage_line_and_counts_the_rest() {
-        use super::success_banner;
-        // The bottom bar is ONE line, and the coverage line is the mandated first one -
-        // so it is the one shown, with the rest counted rather than pretended away.
+    fn a_mark_that_kept_audio_carries_the_tape_clause_verbatim_to_the_bar() {
+        use super::{command_reply, Reply};
+        // The press now keeps the AUDIO of what it marked, and the daemon appends what
+        // it kept and how honest the boundaries are to the same sentence. The client
+        // interprets none of it - `mark_tape`/`mark_tape_secs`/`mark_cut` ride along as
+        // machine pairs and are deliberately NOT re-rendered here, because two places
+        // phrasing the same outcome is how they come to disagree.
+        let kept = "noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it";
+        assert_eq!(
+            command_reply(
+                "mark",
+                &pairs(&[
+                    ("mark_result", kept),
+                    ("mark_tape", "20260805-2317-nts-2-w312s"),
+                    ("mark_tape_secs", "312"),
+                    ("mark_cut", "window"),
+                ])
+            ),
+            Some(Reply::Banner(kept.to_string()))
+        );
+        // And the refusal, which is the case this whole gesture must never swallow: the
+        // press could not keep audio and SAYS why.
+        let refused = "noted: NTS 2 at 23:17 - no audio kept (only 3s is buffered so far)";
+        assert_eq!(
+            command_reply("mark", &pairs(&[("mark_result", refused)])),
+            Some(Reply::Banner(refused.to_string()))
+        );
+    }
+
+    #[test]
+    fn a_multi_line_heard_reply_goes_to_the_overlay_whole() {
+        use super::{command_reply, Reply};
+        // It used to show the first line plus "(+2 more - run `dj heard`)": a standing
+        // instruction to leave this program to read an answer this program had already
+        // been given. The tape lives in those later lines - which segment, how long, how
+        // it was cut - so they are exactly the ones that were being dropped.
         let coverage = "sampled 9 times over 4h12m on NTS 2 - 1 named, 6 no-match";
+        let taped = "23:17  * NTS 2  [tape 2: 5m, window]";
         assert_eq!(
-            success_banner(&pairs(&[("heard", coverage)])),
-            Some(coverage.to_string())
+            command_reply(
+                "heard marks",
+                &pairs(&[
+                    ("heard", coverage),
+                    ("heard", taped),
+                    ("heard", "21:02  * Sun Ra - Space Is The Place  [tape swept]"),
+                ])
+            ),
+            Some(Reply::Heard(vec![
+                coverage.to_string(),
+                taped.to_string(),
+                "21:02  * Sun Ra - Space Is The Place  [tape swept]".to_string(),
+            ]))
+        );
+        // ONE line is a whole answer on its own (a pin confirmation, an empty ledger, a
+        // daemon with no tape) and belongs on the bar - opening a modal for it would
+        // make the human dismiss a box to get back to a sentence.
+        assert_eq!(
+            command_reply("heard keep 2", &pairs(&[("heard", "kept: 20260805-2317-nts-2-w312s will not be evicted")])),
+            Some(Reply::Banner("kept: 20260805-2317-nts-2-w312s will not be evicted".to_string()))
         );
         assert_eq!(
-            success_banner(&pairs(&[
-                ("heard", coverage),
-                ("heard", "21:14  Takuya Nakamura - Cosmos"),
-                ("heard", "21:02  Sun Ra - Space Is The Place"),
-            ])),
-            Some(format!("{coverage}  (+2 more - run `dj heard`)"))
+            command_reply("heard marks", &pairs(&[("heard", "no marks recorded yet")])),
+            Some(Reply::Banner("no marks recorded yet".to_string()))
         );
+    }
+
+    #[test]
+    fn a_heard_that_answers_nothing_says_so_instead_of_going_silent() {
+        use super::{command_reply, Reply};
+        // An OLD daemon has no `heard` verb behind an OK, so the reply is bare. A key
+        // that asked a question and then showed nothing at all is the defect this whole
+        // surface exists to end - and only the REQUEST can tell that case apart from an
+        // ordinary silent verb.
+        assert_eq!(
+            command_reply("heard marks", &[]),
+            Some(Reply::Banner(
+                "nothing to read back (is the daemon new enough to keep a heard ledger?)".into()
+            ))
+        );
+        assert!(matches!(command_reply("heard keep 2", &[]), Some(Reply::Banner(_))));
     }
 
     #[test]
     fn an_ordinary_verb_stays_silent() {
-        use super::success_banner;
+        use super::command_reply;
         // `play`, `next`, `setvol` answer with a bare OK and the queue is the feedback -
         // banners there would be noise, so the rule keys off the pairs, not the verb.
-        assert_eq!(success_banner(&[]), None);
-        assert_eq!(success_banner(&pairs(&[("volume", "42"), ("state", "play")])), None);
+        assert_eq!(command_reply("play", &[]), None);
+        assert_eq!(command_reply("setvol 42", &pairs(&[("volume", "42"), ("state", "play")])), None);
+        // And a verb whose NAME merely starts with the same letters is not `heard`.
+        assert_eq!(command_reply("heardsomething", &[]), None);
     }
 }

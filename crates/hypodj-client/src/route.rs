@@ -142,6 +142,7 @@ pub fn route(args: &[String]) -> Action {
         0 => Action::NowPlaying,
         1 => route_one(&args[0], args),
         2 => route_two(&args[0], &args[1], args),
+        3 => route_three(&args[0], &args[1], &args[2], args),
         _ => Action::Nl(args.join(" ")),
     }
 }
@@ -176,10 +177,11 @@ fn route_one(verb: &str, args: &[String]) -> Action {
         // on the TUI command line means exactly what Ctrl-s means, instead of being
         // handed to a translator that has no mark action at all.
         "mark" => Action::Command("mark".into()),
-        // Reading the heard ledger back. Rendered DAEMON-side (the state directory is
-        // mode 0700, so no client can read the file), so the client only forwards the
-        // verb. `dj heard` is intercepted BEFORE route() for its flag forms; this arm
-        // is what makes `:heard` work on the TUI command line.
+        // Reading the heard ledger back. Rendered DAEMON-side because only the daemon
+        // knows the state dir AND can join a ledger row to the tape segment still on
+        // disk beside it, so the client only forwards the verb. `dj heard` is
+        // intercepted BEFORE route() for its flag forms; this arm is what makes
+        // `:heard` work on the TUI command line.
         "heard" => Action::Command("heard".into()),
         "clear" => Action::ClearConfirm,
         "help" => Action::Help,
@@ -237,6 +239,26 @@ fn route_two(verb: &str, arg: &str, args: &[String]) -> Action {
         // The heard views the daemon's parser accepts, passed through verbatim.
         "heard" if matches!(arg, "all" | "marks") => Action::Command(format!("heard {arg}")),
         // Any other two-token phrase (including "play something") is NL.
+        _ => Action::Nl(args.join(" ")),
+    }
+}
+
+/// The ONLY three-token verb shape: the tape's two pins, `heard keep <n>` and
+/// `heard drop <n>`.
+///
+/// They ride the `heard` verb rather than a new one (the daemon's parser grew two arms
+/// and `MpdCommand` gained no variant), so the client grows one arm here rather than a
+/// new Action. `<n>` is the number the daemon's own render prints beside a taped row.
+///
+/// A bad index stays NL rather than being forwarded blind: a zero would ACK, and
+/// forwarding `heard keep x` would spend a round trip to be told what this can see for
+/// free. Everything else three tokens long is unchanged - still NL.
+fn route_three(verb: &str, word: &str, arg: &str, args: &[String]) -> Action {
+    match (verb, word) {
+        ("heard", "keep" | "drop") => match arg.parse::<usize>() {
+            Ok(n) if n > 0 => Action::Command(format!("heard {word} {n}")),
+            _ => Action::Nl(args.join(" ")),
+        },
         _ => Action::Nl(args.join(" ")),
     }
 }
@@ -457,6 +479,26 @@ mod tests {
         assert_eq!(r("heard marks"), Action::Command("heard marks".into()));
         // An unknown view is NOT forwarded blind - it stays NL.
         assert_eq!(r("heard everything"), Action::Nl("heard everything".into()));
+    }
+
+    #[test]
+    fn route_heard_keep_and_drop_reach_the_tape_pins() {
+        // The tape's ONLY mutation surface. Without this arm `:heard keep 3` on the TUI
+        // command line is three tokens, falls to the default, and is handed to the NL
+        // translator - which has no heard action at all, so a pin the daemon fully
+        // supports would answer with a hint and pin nothing.
+        assert_eq!(r("heard keep 3"), Action::Command("heard keep 3".into()));
+        assert_eq!(r("heard drop 3"), Action::Command("heard drop 3".into()));
+        assert_eq!(r("heard keep 12"), Action::Command("heard keep 12".into()));
+        // A bad index is seen HERE rather than spending a round trip to be ACKed: the
+        // numbering is 1-based, so a zero names nothing.
+        assert_eq!(r("heard keep 0"), Action::Nl("heard keep 0".into()));
+        assert_eq!(r("heard keep x"), Action::Nl("heard keep x".into()));
+        assert_eq!(r("heard drop -1"), Action::Nl("heard drop -1".into()));
+        // An unknown third-token verb is untouched: still NL, exactly as before.
+        assert_eq!(r("heard pin 3"), Action::Nl("heard pin 3".into()));
+        assert_eq!(r("play something calmer"), Action::Nl("play something calmer".into()));
+        assert_eq!(r("wake me at 7"), Action::Nl("wake me at 7".into()));
     }
 
     #[test]
