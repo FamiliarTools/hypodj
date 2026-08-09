@@ -549,7 +549,7 @@ pub fn extract_palette(img: &image::RgbImage) -> Palette {
 
 /// Median-cut `pixels` into at most `k` buckets, returning each bucket's average
 /// color. Splits the bucket with the widest single-channel range at its median.
-fn median_cut(pixels: Vec<Rgb>, k: usize) -> Vec<Rgb> {
+pub(crate) fn median_cut(pixels: Vec<Rgb>, k: usize) -> Vec<Rgb> {
     let mut buckets: Vec<Vec<Rgb>> = vec![pixels];
     while buckets.len() < k {
         // Pick the bucket with the greatest channel range.
