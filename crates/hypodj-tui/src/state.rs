@@ -708,7 +708,7 @@ impl TuiState {
     /// dead. The confirm takes the screen: close it, exactly as `open_menu` closes
     /// help in the other direction.
     pub fn enter_confirm(&mut self, pending: Pending) {
-        self.menu = None;
+        self.take_screen();
         if self.screen == Screen::Dj {
             if let Some(trust) = &pending.trust {
                 self.push_dj_log(trust.clone());
@@ -770,16 +770,31 @@ impl TuiState {
     /// has not arrived. An empty reply cannot open it: the daemon always renders at
     /// least a coverage line or a reason, so nothing at all means an older daemon, and
     /// the worker turns that into a sentence on the bar rather than an empty box.
+    /// Close every normal-mode overlay, so the caller can take the screen alone.
+    ///
+    /// The ONE place the "at most one overlay is live" invariant is enforced. It exists
+    /// because the pairwise version of this rule kept being incomplete: `open_menu`
+    /// closed help, then the heard panel arrived and closed the menu, and a confirm
+    /// landing over help or over the panel still stranded them - a full-frame overlay
+    /// drawn with every key dead, because `handle_key` dispatches on MODE first and
+    /// `Mode::Confirm` never reaches an overlay intercept at all. Each new overlay
+    /// multiplied the pairs someone had to remember.
+    ///
+    /// So openers call this and then set their own flag, and the invariant holds by
+    /// construction for an overlay nobody has written yet.
+    fn take_screen(&mut self) {
+        self.menu = None;
+        self.help_open = false;
+        self.help_scroll = 0;
+        self.heard_open = false;
+        self.heard_scroll = 0;
+    }
+
     pub fn open_heard(&mut self, lines: Vec<String>) {
         if lines.is_empty() {
             return;
         }
-        // The reply lands ASYNCHRONOUSLY, so the row menu may have been opened in the
-        // window since `t` was pressed. The heard intercept sits BELOW the menu's in
-        // `key_normal`, so leaving both open would strand the panel behind a modal that
-        // swallows every key it needs - the same shape `enter_confirm` closes, in the
-        // same way.
-        self.menu = None;
+        self.take_screen();
         self.heard_lines = lines;
         self.heard_open = true;
         self.heard_scroll = 0;
@@ -1020,8 +1035,8 @@ impl TuiState {
             // `?` opens the help overlay (a normal-mode modal); the modal intercept at
             // the top of key_normal then handles every key until it is toggled closed.
             Act::HelpToggle => {
+                self.take_screen();
                 self.help_open = true;
-                self.help_scroll = 0;
                 None
             }
             Act::Quit => Some(Intent::Quit),
@@ -1533,10 +1548,7 @@ impl TuiState {
     /// the modals are mutually exclusive by construction rather than by an ordering the
     /// intercepts have to agree on.
     fn open_menu(&mut self, target: Target) {
-        self.help_open = false;
-        self.help_scroll = 0;
-        self.heard_open = false;
-        self.heard_scroll = 0;
+        self.take_screen();
         self.menu = Some(Menu::new(target, self.queue.len()));
     }
 
@@ -4440,6 +4452,68 @@ mod tests {
         // And the prompt answers for itself, on the FIRST press - not after an Esc
         // spent closing a popup the user could not act on anyway.
         assert_eq!(s.handle_key(key(KeyCode::Esc)), Some(Intent::ConfirmCancel));
+    }
+
+    #[test]
+    fn at_most_one_overlay_is_ever_live_whatever_lands_over_whatever() {
+        // The pairwise version of this rule kept shipping incomplete: the menu axis was
+        // closed while a confirm landing over help or over the heard panel still left a
+        // full-frame overlay with every key dead, because `handle_key` dispatches on
+        // MODE first and `Mode::Confirm` never reaches an overlay intercept. This asserts
+        // the invariant itself over the whole cross product, so the next overlay someone
+        // adds cannot quietly reintroduce one arm of it.
+        fn live(s: &TuiState) -> Vec<&'static str> {
+            let mut v = Vec::new();
+            if s.menu.is_some() { v.push("menu"); }
+            if s.help_open { v.push("help"); }
+            if s.heard_open { v.push("heard"); }
+            if s.mode == Mode::Confirm { v.push("confirm"); }
+            v
+        }
+        let openers: Vec<(&str, fn(&mut TuiState))> = vec![
+            ("menu", |s: &mut TuiState| {
+                let t = s.cursor_target().expect("a queue row resolves");
+                s.open_menu(t);
+            }),
+            ("help", |s: &mut TuiState| { s.apply_act(keymap::Act::HelpToggle); }),
+            ("heard", |s: &mut TuiState| s.open_heard(vec!["12:04  a mark".to_string()])),
+            ("confirm", |s: &mut TuiState| {
+                s.enter_confirm(Pending { steps: vec!["[1] fade out".into()], ..Default::default() })
+            }),
+        ];
+        // Every ORDERED pair and triple: whatever is already up, the next thing to land
+        // must take the screen alone.
+        for (na, a) in &openers {
+            for (nb, b) in &openers {
+                for (nc, c) in &openers {
+                    let mut s = TuiState::new();
+                    s.apply_snapshot(NowPlaying::default(), vec![item(0)]);
+                    let mut last = "";
+                    for (name, open) in [(na, a), (nb, b), (nc, c)] {
+                        // The three OVERLAYS are opened from normal-mode dispatch, which
+                        // `Mode::Confirm` never reaches - so an overlay landing on a live
+                        // confirm is not a state the app can be driven into, and forcing
+                        // it here would be testing fiction. The confirm itself DOES land
+                        // asynchronously over anything, which is the arm that shipped
+                        // broken, so it is never skipped.
+                        if s.mode == Mode::Confirm && *name != "confirm" {
+                            continue;
+                        }
+                        open(&mut s);
+                        last = name;
+                        let l = live(&s);
+                        assert_eq!(
+                            l.len(),
+                            1,
+                            "{na} then {nb} then {nc}: after {name} the live set was {l:?}; \
+                             exactly one thing must own the screen"
+                        );
+                        assert_eq!(l[0], *name, "the LAST thing to land owns the screen");
+                    }
+                    assert!(!last.is_empty(), "every sequence lands at least one overlay");
+                }
+            }
+        }
     }
 
     #[test]
