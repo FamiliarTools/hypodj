@@ -27,6 +27,9 @@ pub fn render_card(np: &NowPlaying) -> String {
         if let Some(station) = &np.continuation {
             lines.push(format!("then: {station}"));
         }
+        if let Some(store) = &np.store {
+            lines.push(format!("store: {store}"));
+        }
         return lines.join("\n");
     }
     let mut lines = Vec::new();
@@ -82,6 +85,14 @@ pub fn render_card(np: &NowPlaying) -> String {
     // flow into when the queue drains. Present only when continuation is armed.
     if let Some(station) = &np.continuation {
         lines.push(format!("then: {station}"));
+    }
+    // THE OFFLINE MIRROR, last line, already worded by the daemon. It is the only
+    // passive answer to "is the backfill running, held, or done?" a client tool has -
+    // `store` is not in the `commands` advertisement, so nothing else surfaces it.
+    // Absent (no store, or no full pass yet) renders nothing, exactly like the armed
+    // and field HUDs.
+    if let Some(store) = &np.store {
+        lines.push(format!("store: {store}"));
     }
     lines.join("\n")
 }
@@ -389,5 +400,35 @@ mod tests {
     #[test]
     fn queue_empty() {
         assert_eq!(render_queue(&[]), "queue is empty");
+    }
+
+    #[test]
+    fn card_carries_the_offline_store_line_playing_or_stopped() {
+        // "How do I know the backfill is running?" has to be answerable from `dj status`,
+        // because `store` is not in the `commands` advertisement and nothing else in the
+        // toolchain surfaces it. Both branches of the card render it - a stopped deck is
+        // exactly when a multi-day mirror is most likely to be filling.
+        let status = p(&[
+            ("volume", "70"),
+            ("playlistlength", "12"),
+            ("state", "play"),
+            ("song", "2"),
+            ("X-Store", "318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)"),
+        ]);
+        let current = p(&[("file", "song/42"), ("Title", "Blue in Green")]);
+        let card = render_card(&now_playing(&status, &current));
+        assert!(
+            card.contains("store: 318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)"),
+            "card: {card}"
+        );
+
+        let stopped = p(&[("state", "stop"), ("X-Store", "complete, 347 tracks, 9.8 GiB")]);
+        let card = render_card(&now_playing(&stopped, &[]));
+        assert!(card.contains("nothing playing"));
+        assert!(card.contains("store: complete, 347 tracks, 9.8 GiB"), "card: {card}");
+
+        // No store (or no full pass yet): no line at all, exactly like the armed HUD.
+        let lean = p(&[("state", "stop")]);
+        assert!(!render_card(&now_playing(&lean, &[])).contains("store:"));
     }
 }

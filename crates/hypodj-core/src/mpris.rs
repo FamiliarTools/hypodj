@@ -196,13 +196,28 @@ fn stream_metadata(
     // so the GNOME widget stops reading "Unknown artist" next to a hyphenated title.
     let recognized_title = non_blank(meta.and_then(|mm| mm.track_title.as_deref()));
     let now_playing = non_blank(meta.and_then(|mm| mm.title.as_deref()));
+    let station = non_blank(meta.and_then(|mm| mm.name.as_deref()));
+    let queued = if title.is_empty() { url } else { title };
+    // THE STATION NAME IS THE LAST RUNG BEFORE THE URL, and it exists so MPD and MPRIS
+    // AGREE (task 4i3s3ry). `currentsong` has walked this ladder since
+    // `fill_stream_title_from_name`: recognized track title -> ICY / identity now-playing
+    // -> the station name already resolved for `Name:` -> the raw url. MPRIS stopped one
+    // rung short, so an ICY-NAME-ONLY stream - a station that announces `icy-name:
+    // MODULAR STATION` and never a StreamTitle, which is the common shape for a mixtape
+    // channel - showed the station name in ncmpcpp and 50 characters of url in the GNOME
+    // widget, off the same state, at the same instant.
+    //
+    // Gated on the queued title being a PLACEHOLDER (equal to the url), which is exactly
+    // the predicate `fill_stream_title_from_name` uses. So `add station/<name>`, whose
+    // queued title IS the saved station name, keeps that name and is not overwritten by a
+    // live icy-name - one ladder, applied identically on both surfaces.
     let shown = recognized_title
         .or(now_playing)
-        .unwrap_or(if title.is_empty() { url } else { title });
+        .or(if queued == url { station } else { None })
+        .unwrap_or(queued);
     m.set_title(Some(shown.to_string()));
     // xesam:artist is the recognized performer when known, else the station identity
     // (icy-name), which is the best "who is playing this" a bare stream can offer.
-    let station = non_blank(meta.and_then(|mm| mm.name.as_deref()));
     if let Some(artist) = non_blank(meta.and_then(|mm| mm.artist.as_deref())).or(station) {
         m.set_artist(Some([artist.to_string()]));
     }
@@ -732,6 +747,63 @@ mod tests {
         );
         assert_eq!(m.album().as_deref(), Some("Prescription Classics"));
         assert_eq!(m.genre(), Some(vec!["House".to_string()]));
+    }
+
+    // THE DISAGREEMENT (task 4i3s3ry). An icy-name-only stream - a station that announces
+    // `icy-name: MODULAR STATION` and never a StreamTitle, the common shape for a mixtape
+    // channel - showed the station name on MPD `currentsong` (via
+    // `fill_stream_title_from_name`) and 50 characters of raw url in the GNOME widget, off
+    // the SAME state at the SAME instant. This is the case none of the tests above cover:
+    // every one of them carries a `title` or a `track_title`.
+    #[test]
+    fn an_icy_name_only_stream_titles_the_station_instead_of_the_url() {
+        let Some(client) = test_client() else { return };
+        let url = "https://stream.example/modular";
+        let item = CurrentItem {
+            mpd_id: 6,
+            // The queued title IS the url: a bare `add <url>` of a stream nothing named.
+            entry: QueueEntry::Stream { url: url.to_string(), title: url.to_string() },
+            stream_meta: Some(StreamMeta {
+                name: Some("MODULAR STATION".to_string()),
+                title: None,
+                track_title: None,
+                ..Default::default()
+            }),
+            cover_url: None,
+        };
+        let m = item_metadata(&item, &client);
+        assert_eq!(
+            m.title(),
+            Some("MODULAR STATION"),
+            "the icy-name is the last rung before the url, exactly as currentsong's Title is"
+        );
+        assert_eq!(m.artist(), Some(vec!["MODULAR STATION".to_string()]));
+        assert_eq!(m.url().as_deref(), Some(url), "xesam:url stays the raw stream url");
+    }
+
+    #[test]
+    fn a_saved_station_name_outranks_the_live_icy_name_on_mpris_too() {
+        // `add station/<name>` carries the saved name as the queued title, and
+        // `fill_stream_title_from_name` leaves a non-placeholder Title alone. The MPRIS
+        // ladder must be gated identically or the two surfaces disagree in the OTHER
+        // direction: one ladder, not two.
+        let Some(client) = test_client() else { return };
+        let url = "https://stream.example/modular";
+        let item = CurrentItem {
+            mpd_id: 6,
+            entry: QueueEntry::Stream {
+                url: url.to_string(),
+                title: "Modular Station".to_string(),
+            },
+            stream_meta: Some(StreamMeta {
+                name: Some("MODULAR STATION".to_string()),
+                title: None,
+                ..Default::default()
+            }),
+            cover_url: None,
+        };
+        let m = item_metadata(&item, &client);
+        assert_eq!(m.title(), Some("Modular Station"), "the saved name is not a placeholder");
     }
 
     #[test]

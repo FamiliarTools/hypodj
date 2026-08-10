@@ -84,12 +84,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::clock::Clock;
 use crate::config::StoreConfig;
-use crate::model::{Song, SongId};
+use crate::model::{Album, AlbumId, ArtistId, Song, SongId};
 use crate::resume::atomic_write_bytes;
-use crate::subsonic::SubsonicClient;
+use crate::subsonic::{Starred, SubsonicClient, SubsonicError};
 
 /// On-disk sidecar schema version. A sidecar whose `schema_version` differs is
 /// treated as CORRUPT (see [`sidecar_from_toml`]), which invalidates exactly one
@@ -717,6 +718,313 @@ pub enum DownloadReason {
     Backfill,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The PIN SET: what starring actually asks the store to keep
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Which starred GESTURE claimed a track, and - in declaration order - how much
+/// that gesture is worth when the budget runs out.
+///
+/// The order is the whole priority model, and it is defensible one clause at a
+/// time. A starred SONG is a per-track act: the most specific statement of intent
+/// and the smallest, so it is the last thing to go. A starred ALBUM is a statement
+/// about a work, so the way to respect it is to hold it WHOLE or not at all. A
+/// starred ARTIST is a standing subscription - the weakest per-track evidence and
+/// the only UNBOUNDED one (it means everything they have and everything they
+/// release from now on) - so it yields first.
+///
+/// Concretely: starring two hundred more albums can never evict one starred song.
+/// It can only fail to download.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PinTier {
+    Song,
+    Album,
+    Artist,
+}
+
+impl PinTier {
+    /// Stable label for the status surface and the logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            PinTier::Song => "song",
+            PinTier::Album => "album",
+            PinTier::Artist => "artist",
+        }
+    }
+}
+
+/// What kind of entity a [`PinGroup`] came from, for the browse uri the status
+/// surface prints (`song/<id>`, `album/<id>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PinKind {
+    Song,
+    Album,
+}
+
+impl PinKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PinKind::Song => "song",
+            PinKind::Album => "album",
+        }
+    }
+}
+
+/// ONE indivisible unit of wanting: a starred song (a group of one), or the tracks
+/// of one album.
+///
+/// A starred ARTIST does NOT become one group - it becomes one group PER ALBUM, at
+/// [`PinTier::Artist`]. That is what lets a huge catalogue degrade album by album
+/// at the frontier instead of being refused whole, and it is why an unbounded
+/// gesture is safe here: unboundedness is a BYTE problem, and the frontier bounds
+/// bytes structurally.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PinGroup {
+    pub kind: PinKind,
+    /// The entity id (song id or album id), for the `<kind>/<id>` uri.
+    pub id: String,
+    /// Human name, for the deferred list the user reads.
+    pub name: String,
+    pub tier: PinTier,
+    /// The tracks this group wants, with server-reported sizes so the group's cost
+    /// is known BEFORE a byte moves.
+    pub songs: Vec<Song>,
+}
+
+/// The authoritative desired set for one pass: every starred song, every track of
+/// every starred album, and every track of every album of every starred artist -
+/// as groups, in newest-starred-first order within each tier.
+///
+/// A `PinSet` is ALL OR NOTHING by policy (see [`PinSource::pins`]): a partially
+/// expanded set would look authoritative and demote a whole album over one flaky
+/// `getAlbum`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PinSet {
+    pub groups: Vec<PinGroup>,
+}
+
+impl PinSet {
+    /// The pre-expansion shape: one [`PinTier::Song`] group per song. This is what
+    /// a songs-only pin set looks like, and what most planner tests want.
+    pub fn of_songs(songs: Vec<Song>) -> Self {
+        Self {
+            groups: songs
+                .into_iter()
+                .map(|s| PinGroup {
+                    kind: PinKind::Song,
+                    id: s.id.0.clone(),
+                    name: s.title.clone(),
+                    tier: PinTier::Song,
+                    songs: vec![s],
+                })
+                .collect(),
+        }
+    }
+
+    /// Every song in every group, groups in order. Duplicates are possible (a track
+    /// can be a starred song AND an album track); the frontier resolves them by
+    /// first claim.
+    pub fn songs(&self) -> impl Iterator<Item = &Song> {
+        self.groups.iter().flat_map(|g| g.songs.iter())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.iter().all(|g| g.songs.is_empty())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The BUDGET: why hypodj cannot fill the disk
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Percent of the store filesystem's TOTAL size held back from hypodj, no matter
+/// what `store.max_bytes` says.
+///
+/// Not a number anyone invented: 5 % is the fraction `mke2fs` reserves by default
+/// against filesystem exhaustion. hypodj applies the same setback a second time,
+/// as its own. A fraction also scales with the disk without ever needing retuning.
+pub const STORE_RESERVE_FRACTION_PCT: u64 = 5;
+
+/// Absolute floor on the reserve, 20 GiB. On a small disk 5 % is less than a
+/// single NixOS system closure, so the fraction alone would not be a brake.
+///
+/// This is the ONE constant here not derived from a measurement: it is roughly
+/// twice the 11 GB that had to be deleted to rescue this laptop's disk once. That
+/// is one step better than arbitrary, not several. What survives being wrong about
+/// it is the SHAPE - a ceiling that is a function of observed free space, and a
+/// breach regime that writes nothing.
+pub const STORE_RESERVE_FLOOR: u64 = 20 * 1024 * 1024 * 1024;
+
+/// Setback below the effective budget that PINS may not touch, so a full pin
+/// frontier can never starve the queue window and stale replacements.
+///
+/// Sized from real data: p90 per stored original is 62 MiB and the tail holds a
+/// 415 MiB track, so the window slice must fit one worst-case original plus a few
+/// ordinary ones.
+pub const STORE_PIN_CEILING_SETBACK: u64 = 512 * 1024 * 1024;
+
+/// Where a pass's effective budget came from. Reported verbatim by the `store`
+/// verb, because "the budget is 16 GiB" and "the budget is 16 GiB because the disk
+/// is roomy" are different facts and only the second one is falsifiable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BudgetSource {
+    /// `statvfs` answered: the budget is `min(config, (avail + own) - reserve)`.
+    FreeSpace,
+    /// `statvfs` failed or reported nonsense: fall back to the configured cap.
+    /// NEVER to unlimited - an unmeasured disk is not an empty one.
+    #[default]
+    Config,
+}
+
+impl BudgetSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            BudgetSource::FreeSpace => "free-space",
+            BudgetSource::Config => "config",
+        }
+    }
+}
+
+/// THE CEILING. Pure, total, and table-testable - which is the point: the one rule
+/// that makes overfilling the disk impossible must be provable without a disk.
+///
+/// ```text
+/// reserve       = max(STORE_RESERVE_FLOOR, total * 5%)
+/// effective_max = min(configured, (avail + own) - reserve)
+/// ```
+///
+/// Four properties, each checkable:
+///
+/// 1. The ceiling is a function of OBSERVED free space, re-measured every full
+///    pass. If another process eats the disk, hypodj's ceiling FALLS and eviction
+///    hands space back.
+/// 2. `(avail + own)` is INVARIANT to hypodj's own eviction, so hypodj's own
+///    actions cannot move hypodj's own ceiling. That is what kills the oscillation
+///    a naive fraction-of-free rule has: after evicting to meet a tight budget the
+///    recomputed budget is identical, so the state settles instead of looping.
+/// 3. Eviction is planned LAST and download admission budgets against bytes on
+///    disk RIGHT NOW, so the store never transiently exceeds the ceiling.
+/// 4. A zero here means the reserve is breached, and a zero budget writes NOTHING
+///    - not even the queue window - and only deletes.
+///
+/// `avail` larger than `total` is nonsense from the mount; the caller treats a
+/// `None` as a `statvfs` failure and falls back to the configured cap.
+pub fn derive_budget(avail: u64, total: u64, own: u64, configured: u64) -> Option<u64> {
+    if avail > total {
+        return None;
+    }
+    // `total / 100 * pct` rather than `total * pct / 100`: the division first
+    // cannot overflow for any u64 total, and the lost sub-percent is noise against
+    // a 20 GiB floor.
+    let reserve = STORE_RESERVE_FLOOR.max(total / 100 * STORE_RESERVE_FRACTION_PCT);
+    let pool = avail.saturating_add(own);
+    Some(configured.min(pool.saturating_sub(reserve)))
+}
+
+/// The reserve `derive_budget` would apply to a filesystem of this total size.
+/// Split out so the status surface can report it without recomputing the rule.
+/// The floor an EVICTION will not cut below while the disk is merely tight rather
+/// than genuinely critical.
+///
+/// Admission and deletion are different questions and the design conflated them.
+/// Admission must be strict - refusing to GROW when the reserve is breached is what
+/// makes "hypodj cannot fill the disk" structural, and that is untouched. But the
+/// budget is derived from FREE SPACE, so it shrinks whenever anything else on the
+/// machine grows, and tying deletion to it means an ordinary `cargo build` deletes
+/// the offline mirror. Measured on this machine: `target/` alone swings 11 GiB, which
+/// on the real numbers (54.6 GiB free, 46.4 GiB reserve) takes the budget from
+/// 10.5 GiB to under 1 - so a build would evict almost the whole mirror and cleaning
+/// it would re-download ten gigabytes. That is a thrash loop, not a safety measure.
+///
+/// So a pass will not evict below this while `avail` is above
+/// [`STORE_CRITICAL_AVAIL`]. Keeping bytes we ALREADY hold cannot fill a disk; only
+/// admission can, and admission stays gated. Below the critical mark the floor is
+/// abandoned and the mirror is reclaimed in full, because at that point the disk
+/// genuinely needs the space more than the music does.
+pub const STORE_EVICT_FLOOR: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The point at which free space stops being "tight" and starts being a problem the
+/// mirror should get out of the way of.
+pub const STORE_CRITICAL_AVAIL: u64 = 5 * 1024 * 1024 * 1024;
+
+/// The byte total an eviction may reclaim down to: the pass budget normally, but
+/// never below [`STORE_EVICT_FLOOR`] unless free space is critical.
+///
+/// Pure and total so the hysteresis is table-testable without a filesystem.
+pub fn evict_target(max_bytes: u64, configured: u64, avail: u64) -> u64 {
+    if avail <= STORE_CRITICAL_AVAIL {
+        return max_bytes;
+    }
+    // The floor is CAPPED BY THE CONFIGURED CAP, and that clamp is load-bearing: a
+    // flat floor would override a deliberately small `store.max_bytes` and disable
+    // LRU eviction entirely for any store below it. The floor exists to absorb the
+    // FREE-SPACE clamp pulling the effective budget under what was configured - it is
+    // not a licence to ignore what the user asked for.
+    max_bytes.max(STORE_EVICT_FLOOR.min(configured))
+}
+
+pub fn budget_reserve(total: u64) -> u64 {
+    STORE_RESERVE_FLOOR.max(total / 100 * STORE_RESERVE_FRACTION_PCT)
+}
+
+/// How much of an effective budget the PIN FRONTIER may fill, leaving the rest for
+/// the queue window and stale replacements.
+///
+/// The setback is capped at a QUARTER of the budget so this stays total: a 64 MiB
+/// store (the config floor) would otherwise have a zero pin ceiling and mirror
+/// nothing starred at all, which is not what a small budget asks for.
+pub fn pin_ceiling(effective_max: u64) -> u64 {
+    effective_max.saturating_sub(STORE_PIN_CEILING_SETBACK.min(effective_max / 4))
+}
+
+/// Read `(avail, total)` bytes for the filesystem holding `path`, via one
+/// `statvfs`.
+///
+/// `f_bavail` (blocks free to an UNPRIVILEGED writer) is the honest number: it
+/// already excludes the filesystem's own reserve, so hypodj's reserve stacks on
+/// top of it rather than pretending to own it.
+///
+/// This is the reversal of a stated project judgement - the tape declined a `libc`
+/// dependency for exactly this call. The footprint half of that judgement no
+/// longer holds: `libc` is already resolved in `Cargo.lock`, already a direct
+/// dependency of `hypodj-tui`, and already pulled by tokio and mio, so naming it
+/// here adds ZERO nodes to the build graph. The other half is a difference in
+/// kind: the tape is a budget the user presses a key to grow, while this feature
+/// downloads gigabytes because he starred an album, so observing the disk IS the
+/// safety property.
+#[cfg(unix)]
+pub fn statvfs_space(path: &Path) -> Option<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `buf` is a valid, correctly sized, writable `statvfs`; `c` is a
+    // NUL-terminated path that outlives the call. The return code is checked
+    // before any field is read.
+    let stat = unsafe {
+        let mut buf = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        if libc::statvfs(c.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return None;
+        }
+        buf.assume_init()
+    };
+    let frsize = if stat.f_frsize > 0 { stat.f_frsize as u64 } else { stat.f_bsize as u64 };
+    if frsize == 0 {
+        return None;
+    }
+    let avail = (stat.f_bavail as u64).saturating_mul(frsize);
+    let total = (stat.f_blocks as u64).saturating_mul(frsize);
+    if total == 0 {
+        return None;
+    }
+    Some((avail, total))
+}
+
+#[cfg(not(unix))]
+pub fn statvfs_space(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 /// One thing the reconciler should do. [`plan_pass`] returns these in EXECUTION
 /// ORDER; the executor walks the list front to back.
 #[derive(Clone, Debug, PartialEq)]
@@ -735,18 +1043,122 @@ pub enum StoreAction {
     /// that is now starred, `false` DEMOTES one that is not - to evictable, with its
     /// bytes kept, so an accidental unstar and re-star costs zero bytes.
     SetPinned { id: SongId, pinned: bool },
-    /// The pinned mirror alone exceeds the budget. Warn naming the shortfall and
-    /// halt new pin downloads at the cap: never silently evict a pin, never exceed
-    /// the budget, no download-evict thrash.
-    WarnPinOverflow { pinned_bytes: u64, max_bytes: u64 },
     /// Fetch this song's original and commit it.
     Download { id: SongId, reason: DownloadReason },
     /// Persist a resolve-time recency bump, so LRU eviction does not degenerate
     /// into FIFO-by-download-date across a restart.
     FlushRecency { id: SongId, last_played_unix: u64 },
-    /// Reclaim an unpinned, unprotected entry, oldest `last_played` first. Never an
-    /// id the same pass is downloading - see [`plan_pass`] on download-evict thrash.
+    /// Reclaim an unprotected entry. Opportunistic bytes go by oldest
+    /// `last_played`; pin-group members go whole groups at a time, from BELOW the
+    /// frontier first and its tail last. Never an id the same pass is downloading -
+    /// see [`plan_pass`] on download-evict thrash.
     Evict(SongId),
+}
+
+/// One pin group the frontier could not fit, named so the shortfall is a LIST OF
+/// ALBUMS rather than an integer in a log line nobody reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredGroup {
+    pub kind: PinKind,
+    pub id: String,
+    pub name: String,
+    pub tier: PinTier,
+    pub tracks: usize,
+    pub bytes: u64,
+}
+
+/// Why bulk store work is not moving right now. `None` is the answer that means
+/// "it is moving"; the other two exist so a CORRECT deferral is distinguishable
+/// from a stuck reconciler, which is otherwise impossible from outside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StoreWaiting {
+    #[default]
+    None,
+    /// The deck is playing off the network, so a bulk backfill would fight the
+    /// very playback it exists to protect.
+    PlaybackRemote,
+    /// `store pause` (per process, never persisted).
+    Paused,
+    /// The free-space reserve is breached: the store writes NOTHING and only
+    /// deletes until the disk recovers.
+    ReserveBreached,
+}
+
+impl StoreWaiting {
+    pub fn label(self) -> &'static str {
+        match self {
+            StoreWaiting::None => "none",
+            StoreWaiting::PlaybackRemote => "playback-remote",
+            StoreWaiting::Paused => "paused",
+            StoreWaiting::ReserveBreached => "reserve-breached",
+        }
+    }
+}
+
+/// What the store knows about itself right now, recomputed by every full pass and
+/// published for anyone to read.
+///
+/// This REPLACES the old per-pass `warn!` about pin overflow, which fired every
+/// fifteen minutes forever, named only an integer shortfall, halted the backfill
+/// entirely so it could never converge, and appeared in no surface the user looks
+/// at. The shortfall is now a named list of albums in `store` and a moving number
+/// in `status`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StoreStatus {
+    /// Whether a full pass has ever published: `false` means every number below is
+    /// a placeholder.
+    pub known: bool,
+    /// Bytes of stored audio, and how many entries that is.
+    pub bytes: u64,
+    pub entries: usize,
+    /// `store.max_bytes` as configured, and the budget actually in force.
+    pub configured_max: u64,
+    pub effective_max: u64,
+    pub budget_source: BudgetSource,
+    /// The free-space observation the budget came from (zero when the source is
+    /// `Config`).
+    pub reserve: u64,
+    pub avail: u64,
+    pub fs_total: u64,
+    /// Tracks the frontier decided to KEEP, their total byte cost, and how many of
+    /// those are on disk.
+    pub resident_tracks: usize,
+    pub resident_bytes: u64,
+    pub cached_tracks: usize,
+    /// Resident tracks still to fetch, and their exact byte cost.
+    pub pending_tracks: usize,
+    pub pending_bytes: u64,
+    /// Resident tracks per tier, in [`PinTier`] order (song, album, artist).
+    pub tier_tracks: [usize; 3],
+    pub tier_bytes: [u64; 3],
+    /// Groups below the frontier: never downloaded, evicted first.
+    pub deferred: Vec<DeferredGroup>,
+    /// Ids this process has given up downloading. LOAD-BEARING: without it a
+    /// pending count that will NEVER reach zero is indistinguishable from one that
+    /// is merely slow.
+    pub given_up: usize,
+    pub waiting: StoreWaiting,
+}
+
+impl StoreStatus {
+    /// The mirror holds everything it decided to hold. A real predicate the pass
+    /// computes, not a guess - which is what makes "it is done" answerable.
+    pub fn complete(&self) -> bool {
+        self.known && self.pending_tracks == 0
+    }
+
+    /// The fields a one-line badge is built from. Compared between passes so the
+    /// log speaks only when something actually moved.
+    fn digest(&self) -> (usize, usize, usize, usize, u64, StoreWaiting) {
+        (
+            self.resident_tracks,
+            self.cached_tracks,
+            self.pending_tracks,
+            self.deferred.len(),
+            self.effective_max,
+            self.waiting,
+        )
+    }
 }
 
 /// Everything one pass gets to look at. A plain data struct so [`plan_pass`] is a
@@ -754,13 +1166,14 @@ pub enum StoreAction {
 #[derive(Clone, Debug)]
 pub struct PassInput {
     pub mode: PassMode,
-    /// The pin set from THIS pass's `getStarred2`, newest-starred-first.
+    /// The pin set from THIS pass's `getStarred2` and its expansions, as GROUPS,
+    /// newest-starred-first within each tier.
     ///
     /// `None` means NO AUTHORITATIVE PIN SET this pass - either a light pass (which
-    /// never calls the server) or a full pass whose `getStarred2` failed. Every pin
-    /// verdict is then skipped: nothing is deleted, demoted, or marked stale
-    /// because the server flapped. Transient-keeps-the-claim IS offline mode.
-    pub pins: Option<Vec<Song>>,
+    /// never calls the server) or a full pass whose expansion failed anywhere.
+    /// Every pin verdict is then skipped: nothing is deleted, demoted, or marked
+    /// stale because the server flapped. Transient-keeps-the-claim IS offline mode.
+    pub pins: Option<PinSet>,
     /// Current song plus the next `queue_ahead` upcoming Song ids, in play order.
     /// Protected from eviction and the source of `Window` downloads.
     pub window: Vec<SongId>,
@@ -775,13 +1188,28 @@ pub struct PassInput {
     pub orphan_audio: Vec<PathBuf>,
     pub orphan_sidecars: Vec<(SongId, DeleteReason)>,
     pub stale_tmps: Vec<PathBuf>,
+    /// The EFFECTIVE budget for this pass: `min(store.max_bytes, (free + own) -
+    /// reserve)`, already clamped by [`derive_budget`] so this function stays pure.
+    /// ZERO means the free-space reserve is breached and the pass writes NOTHING.
     pub max_bytes: u64,
+    /// `store.max_bytes` as configured, for the status surface only.
+    pub configured_max: u64,
+    /// How the effective budget was arrived at, and the free-space observation
+    /// behind it. Reported, never used to decide anything.
+    pub budget_source: BudgetSource,
+    pub reserve: u64,
+    pub avail: u64,
+    pub fs_total: u64,
     /// Cap on downloads this pass ([`DOWNLOAD_BATCH`] in production).
     pub download_batch: usize,
     /// True while the current track is a remote stream or a remotely resolved song:
     /// bulk work (stale replacements and backfill) waits so initial sync cannot
     /// stall live playback on a thin link. Window and suspect work never waits.
     pub defer_bulk: bool,
+    /// `store pause`: the same suspension `defer_bulk` applies, asked for by hand.
+    /// Per process and deliberately NOT persisted, so a restart resumes mirroring
+    /// and pausing can never become a forgotten config.
+    pub paused: bool,
 }
 
 impl PassInput {
@@ -798,8 +1226,14 @@ impl PassInput {
             orphan_sidecars: Vec::new(),
             stale_tmps: Vec::new(),
             max_bytes,
+            configured_max: max_bytes,
+            budget_source: BudgetSource::Config,
+            reserve: 0,
+            avail: 0,
+            fs_total: 0,
             download_batch: DOWNLOAD_BATCH,
             defer_bulk: false,
+            paused: false,
         }
     }
 }
@@ -833,6 +1267,214 @@ fn fingerprint_verdict(entry: &IndexEntry, server: &Song) -> Verdict {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE FRONTIER: one ordering decides what is kept, what is fetched, and what is
+// refused by name
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Where a cached entry sits relative to the frontier. Declaration order IS the
+/// eviction order: opportunistic bytes go first, then everything below the line,
+/// then - only under real pressure - the line's own tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Standing {
+    /// Not in the pin set at all: opportunistic queue-window bytes.
+    Opportunistic,
+    /// In a pin group the frontier could not fit. Never downloaded; reclaimed
+    /// first if it is somehow already on disk.
+    Deferred,
+    /// In a pin group above the line: downloaded and kept.
+    Resident,
+}
+
+/// The total ordering over pin groups, walked once per pass, with the line drawn
+/// where the pin ceiling runs out.
+///
+/// THE POINT: admission and eviction both read THIS, so they cannot contradict
+/// each other. Two separate rules - a tiered victim filter plus a tiered admission
+/// loop - would disagree the moment a big album is evicted to reclaim a little
+/// space, because next pass that album is the newest-starred backfill candidate
+/// with fresh headroom: it downloads, overruns, and is evicted again, forever.
+/// That is a download loop against the server and the disk, and it is exactly the
+/// shape of bug that fills a disk slowly. Here a group below the line is still
+/// below the line next pass over identical input, so it is never re-admitted.
+struct Frontier<'a> {
+    /// Groups in frontier order: `(tier, position within the pin set, id)`.
+    order: Vec<&'a PinGroup>,
+    /// Parallel to `order`: whether the group fitted under the ceiling.
+    resident: Vec<bool>,
+    /// Storable song id -> slot in `order` for the RESIDENT group that claimed it.
+    /// First claim wins in frontier order, so a track that is both a starred song
+    /// and an album track is claimed at the SONG tier and cannot be dragged out by
+    /// an album-level decision.
+    claim: HashMap<&'a str, usize>,
+    /// Storable song id -> slot in `order` for the DEFERRED group that holds it,
+    /// for ids no resident group claimed.
+    below: HashMap<&'a str, usize>,
+    /// Every storable id anywhere in the pin set. This - not the resident set - is
+    /// what the `pinned` sidecar flag mirrors, so the flag keeps meaning "starred"
+    /// and an unstar still demotes.
+    all_ids: HashSet<&'a str>,
+    /// Byte cost per storable id, first occurrence in frontier order wins. The
+    /// server's reported size, else what is on disk, else zero.
+    size_by_id: HashMap<&'a str, u64>,
+    /// Bytes and tracks above the line.
+    resident_bytes: u64,
+    resident_tracks: usize,
+}
+
+impl<'a> Frontier<'a> {
+    /// Build the frontier. `size_of` gives a song's byte cost - the server's
+    /// reported size, falling back to what is on disk, and zero when neither knows
+    /// (rare, bounded by the pin set, and settled by the commit's exact-length
+    /// gate).
+    fn build(
+        pins: &'a PinSet,
+        by_id: &HashMap<&str, &IndexEntry>,
+        ceiling: u64,
+    ) -> Frontier<'a> {
+        let mut order: Vec<(usize, &'a PinGroup)> = pins.groups.iter().enumerate().collect();
+        // (tier, position, id). Position is already unique so the id only ever
+        // breaks a tie a caller manufactured, but a total, explicit comparator is
+        // what makes "two passes over identical state draw the identical line" a
+        // property rather than a hope.
+        order.sort_by(|(ia, a), (ib, b)| {
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| ia.cmp(ib))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let order: Vec<&'a PinGroup> = order.into_iter().map(|(_, g)| g).collect();
+
+        let size_of = |s: &Song| -> u64 {
+            s.size
+                .or_else(|| by_id.get(s.id.0.as_str()).map(|e| e.size))
+                .unwrap_or(0)
+        };
+
+        let mut all_ids: HashSet<&'a str> = HashSet::new();
+        let mut size_by_id: HashMap<&'a str, u64> = HashMap::new();
+        for g in &order {
+            for s in &g.songs {
+                if is_storable_id(&s.id.0) {
+                    all_ids.insert(s.id.0.as_str());
+                    size_by_id.entry(s.id.0.as_str()).or_insert_with(|| size_of(s));
+                }
+            }
+        }
+
+        let mut claim: HashMap<&'a str, usize> = HashMap::new();
+        let mut resident = vec![false; order.len()];
+        let mut resident_bytes = 0u64;
+        let mut resident_tracks = 0usize;
+        for (slot, g) in order.iter().enumerate() {
+            // A group's cost counts only the tracks no earlier group already holds:
+            // 20 of one real user's 47 starred songs are also starred-album tracks,
+            // and charging for them twice would defer albums that actually fit.
+            let mut fresh: Vec<&'a str> = Vec::new();
+            let mut cost = 0u64;
+            for s in &g.songs {
+                let id = s.id.0.as_str();
+                if !is_storable_id(id) || claim.contains_key(id) || fresh.contains(&id) {
+                    continue;
+                }
+                fresh.push(id);
+                cost = cost.saturating_add(size_by_id.get(id).copied().unwrap_or(0));
+            }
+            // WHOLE OR ABSENT. A group that does not fit is refused entire and the
+            // walk CONTINUES, so a smaller later album still lands - best-effort
+            // fill, order-stable, no bin-packing cleverness. On real data this is
+            // not theoretical: three albums are 4 GiB of a 12.3 GiB want, and
+            // per-track admission would let those three eat the budget in arrival
+            // order while the frontier refuses them BY NAME and fits the other 33.
+            if resident_bytes.saturating_add(cost) <= ceiling {
+                resident[slot] = true;
+                resident_bytes = resident_bytes.saturating_add(cost);
+                resident_tracks += fresh.len();
+                for id in fresh {
+                    claim.insert(id, slot);
+                }
+            }
+        }
+
+        // Below the line, resolved AFTER the walk: a track in a deferred album that
+        // a later resident group claimed is RESIDENT, not deferred.
+        let mut below: HashMap<&'a str, usize> = HashMap::new();
+        for (slot, g) in order.iter().enumerate() {
+            if resident[slot] {
+                continue;
+            }
+            for s in &g.songs {
+                let id = s.id.0.as_str();
+                if is_storable_id(id) && !claim.contains_key(id) {
+                    below.entry(id).or_insert(slot);
+                }
+            }
+        }
+
+        Frontier {
+            order,
+            resident,
+            claim,
+            below,
+            all_ids,
+            size_by_id,
+            resident_bytes,
+            resident_tracks,
+        }
+    }
+
+    /// Where a cached entry stands, plus the group slot when it is in one.
+    fn standing(&self, id: &str) -> (Standing, usize) {
+        if let Some(slot) = self.claim.get(id) {
+            (Standing::Resident, *slot)
+        } else if let Some(slot) = self.below.get(id) {
+            (Standing::Deferred, *slot)
+        } else {
+            (Standing::Opportunistic, usize::MAX)
+        }
+    }
+
+    /// A storable id's byte cost as the frontier accounted for it.
+    fn size(&self, id: &str) -> u64 {
+        self.size_by_id.get(id).copied().unwrap_or(0)
+    }
+
+    /// The groups below the line, in frontier order, named for the user.
+    fn deferred_groups(&self) -> Vec<DeferredGroup> {
+        let mut out = Vec::new();
+        for (slot, g) in self.order.iter().enumerate() {
+            if self.resident[slot] {
+                continue;
+            }
+            let mut tracks = 0usize;
+            let mut bytes = 0u64;
+            let mut counted: HashSet<&str> = HashSet::new();
+            for s in &g.songs {
+                let id = s.id.0.as_str();
+                if is_storable_id(id) && self.below.get(id) == Some(&slot) && !counted.contains(id) {
+                    counted.insert(id);
+                    tracks += 1;
+                    bytes = bytes.saturating_add(self.size(id));
+                }
+            }
+            if tracks == 0 {
+                // Every track of it is held by a resident group - nothing is
+                // actually missing, so naming it would be a lie.
+                continue;
+            }
+            out.push(DeferredGroup {
+                kind: g.kind,
+                id: g.id.clone(),
+                name: g.name.clone(),
+                tier: g.tier,
+                tracks,
+                bytes,
+            });
+        }
+        out
+    }
+}
+
 /// Plan one reconcile pass. PURE: same input, same output, no side effects.
 ///
 /// The returned actions are in EXECUTION ORDER, and that order is load-bearing:
@@ -840,10 +1482,10 @@ fn fingerprint_verdict(entry: &IndexEntry, server: &Song) -> Verdict {
 /// 1. sweep temps, then loose orphans, then invalid entries - so the byte
 ///    accounting below is against what will actually be on disk;
 /// 2. fingerprint verdicts (stale / pin marks) - marks only, never deletes;
-/// 3. the pin-overflow warning, if the pinned mirror alone will not fit;
-/// 4. downloads, in [`DownloadReason`] priority order;
-/// 5. recency flushes;
-/// 6. evictions, LAST - and never of an id step 4 admitted, so no plan ever tells
+/// 3. downloads, in [`DownloadReason`] priority order and, within backfill, in
+///    FRONTIER order by whole group;
+/// 4. recency flushes;
+/// 5. evictions, LAST - and never of an id step 3 admitted, so no plan ever tells
 ///    the executor to download bytes and then delete them.
 ///
 /// Because evictions come last, download admission is budgeted against the bytes
@@ -851,7 +1493,25 @@ fn fingerprint_verdict(entry: &IndexEntry, server: &Song) -> Verdict {
 /// never transiently exceeds `max_bytes`: space a pass reclaims becomes the NEXT
 /// pass's headroom, and the reconciler re-enters immediately while work remains, so
 /// the cost is one extra pass, not a stall.
+///
+/// `input.max_bytes` is the EFFECTIVE budget - already clamped against free space
+/// by [`derive_budget`] before it gets here, which is what keeps this function
+/// pure and the one rule that bounds the disk table-testable. A ZERO effective
+/// budget means the free-space reserve is breached, and this plan then contains no
+/// `Download` of ANY reason - not even `Window` or `Suspect` - and evicts
+/// everything unprotected. A suppressed window download costs a track that streams
+/// instead of playing from disk, which nobody notices; 415 MiB written onto a disk
+/// at 99 % is a machine he cannot use.
 pub fn plan_pass(input: &PassInput) -> Vec<StoreAction> {
+    plan_pass_with_status(input).0
+}
+
+/// [`plan_pass`], plus the self-description a full pass publishes.
+///
+/// The status is `Some` exactly when the pass had an AUTHORITATIVE pin set (a full
+/// pass whose `getStarred2` succeeded). A light pass and a flapping server publish
+/// nothing rather than a set of zeros that would read as "the mirror is empty".
+pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<StoreStatus>) {
     let full = input.mode == PassMode::Full;
     let mut out: Vec<StoreAction> = Vec::new();
 
@@ -879,7 +1539,13 @@ pub fn plan_pass(input: &PassInput) -> Vec<StoreAction> {
     // ── 2. Fingerprint verdicts. Only on a full pass WITH an authoritative pin
     // set; otherwise every verdict is skipped and every claim is kept.
     let verdicts = full && input.pins.is_some();
-    let mut pin_ids: HashSet<&str> = HashSet::new();
+    // The frontier: built once, read by BOTH admission and eviction, which is the
+    // whole design. Absent without an authoritative pin set.
+    let frontier = input
+        .pins
+        .as_ref()
+        .filter(|_| verdicts)
+        .map(|pins| Frontier::build(pins, &by_id, pin_ceiling(input.max_bytes)));
     // Ids whose fingerprint drifted in THIS pass's verdicts. Collected as the
     // verdicts are formed rather than recomputed afterwards, so the pass stays
     // linear in (entries + pins) instead of quadratic.
@@ -887,17 +1553,21 @@ pub fn plan_pass(input: &PassInput) -> Vec<StoreAction> {
     // Entries needing a replacement download: freshly drifted this pass, or still
     // carrying a stale mark from an earlier one.
     let mut needs_replacement: Vec<&IndexEntry> = Vec::new();
-    if verdicts {
-        let pins = input.pins.as_ref().expect("verdicts implies pins");
-        for p in pins {
+    // The freshest server copy of every pinned song, first occurrence wins.
+    let mut pin_song: HashMap<&str, &Song> = HashMap::new();
+    if let Some(pins) = input.pins.as_ref().filter(|_| verdicts) {
+        for p in pins.songs() {
             if is_storable_id(&p.id.0) {
-                pin_ids.insert(p.id.0.as_str());
+                pin_song.entry(p.id.0.as_str()).or_insert(p);
             }
         }
-        for p in pins {
-            let Some(e) = by_id.get(p.id.0.as_str()) else {
-                continue;
-            };
+        // Verdicts are formed per UNIQUE id, not per group membership: a track that
+        // is both a starred song and an album track must not be marked stale twice.
+        let mut judged: Vec<&str> = pin_song.keys().copied().collect();
+        judged.sort_unstable();
+        for id in judged {
+            let p = pin_song[id];
+            let Some(e) = by_id.get(id) else { continue };
             match fingerprint_verdict(e, p) {
                 // Marked stale, and it KEEPS SERVING - the replacement below is
                 // what eventually retires these bytes, by renaming over them.
@@ -921,8 +1591,17 @@ pub fn plan_pass(input: &PassInput) -> Vec<StoreAction> {
                 out.push(StoreAction::SetPinned { id: e.id.clone(), pinned: true });
             }
         }
+        // THE DEMOTE PATH, and it is key-agnostic on purpose: it diffs the entries
+        // against whatever ids the pin set carried, never against why they were in
+        // it. So unstarring an ALBUM demotes its tracks here for free, because the
+        // expansion happens inside `pins()` and the returned set is a COMPLETE
+        // desired set every pass. Bytes are kept - an accidental unstar and re-star
+        // costs zero downloads - and the entry is evictable in THIS same pass,
+        // because eviction reads the frontier, not the pre-pass sidecar flag.
+        let all_pinned = frontier.as_ref().map(|f| &f.all_ids);
         for e in &input.entries {
-            if e.pinned && !pin_ids.contains(e.id.0.as_str()) {
+            let still = all_pinned.is_some_and(|s| s.contains(e.id.0.as_str()));
+            if e.pinned && !still {
                 out.push(StoreAction::SetPinned { id: e.id.clone(), pinned: false });
             }
         }
@@ -936,45 +1615,86 @@ pub fn plan_pass(input: &PassInput) -> Vec<StoreAction> {
         }
     }
 
-    // Whether an entry is pinned AFTER this pass's verdicts. With no authoritative
-    // pin set the sidecar's own flag stands.
-    let pinned_now = |e: &IndexEntry| -> bool {
-        if verdicts {
-            pin_ids.contains(e.id.0.as_str())
-        } else {
-            e.pinned
-        }
-    };
-
     let total_bytes = input
         .entries
         .iter()
         .fold(0u64, |acc, e| acc.saturating_add(e.size));
-    let pinned_bytes = input
-        .entries
-        .iter()
-        .filter(|e| pinned_now(e))
-        .fold(0u64, |acc, e| acc.saturating_add(e.size));
 
-    // ── 3. Pin overflow. Reported before the downloads so the log reads in the
-    // order the decisions were made.
-    let pin_overflow = pinned_bytes > input.max_bytes;
-    if full && pin_overflow {
-        out.push(StoreAction::WarnPinOverflow {
-            pinned_bytes,
-            max_bytes: input.max_bytes,
-        });
+    // ── THE EVICTION ORDER, computed ONCE and consumed twice: first by the
+    // reclaim-for-pins step inside admission (step 3d), then by the over-budget
+    // eviction (step 5). One definition, so "what goes first" cannot disagree
+    // between the two halves that both remove bytes.
+    //
+    // Absolutely excluded, whatever the pressure: the queue window plus whatever
+    // the handler pinned explicitly (the pending-skip target) - evicting what he is
+    // about to hear is never right. Ids this pass is DOWNLOADING are excluded at
+    // use time rather than here, because `seen` is still being filled below.
+    //
+    // Ranked by `Standing` (declaration order IS the eviction order): opportunistic
+    // bytes by oldest `last_played` (real LRU, thanks to the resolve-time bump),
+    // then whole groups from BELOW the line, then the line's TAIL backwards.
+    // Without an authoritative pin set there is no frontier, so this degrades to
+    // exactly the old rule: unpinned entries only, LRU. A server flap must never
+    // cost a starred file.
+    //
+    // Both consumers are full-pass only, so a light pass does not pay for the sort.
+    let mut victims: Vec<((Standing, usize, u64, &str), &IndexEntry)> = Vec::new();
+    if full {
+        let mut protected: HashSet<&str> =
+            input.protected.iter().map(|i| i.0.as_str()).collect();
+        for id in &input.window {
+            protected.insert(id.0.as_str());
+        }
+        // (standing, group order key, last_played, id). The group key is the
+        // frontier slot INVERTED, so the tail of the frontier is taken first.
+        victims = input
+            .entries
+            .iter()
+            .filter(|e| !protected.contains(e.id.0.as_str()))
+            .filter_map(|e| {
+                let id = e.id.0.as_str();
+                match frontier.as_ref() {
+                    Some(f) => {
+                        let (st, slot) = f.standing(id);
+                        let key = match st {
+                            Standing::Opportunistic => 0,
+                            _ => usize::MAX - slot,
+                        };
+                        let lru =
+                            if st == Standing::Opportunistic { e.last_played_unix } else { 0 };
+                        Some(((st, key, lru, id), e))
+                    }
+                    // No verdicts: the sidecar's own flag stands and pins are
+                    // untouchable, exactly as before the frontier existed.
+                    None if !e.pinned => {
+                        Some(((Standing::Opportunistic, 0, e.last_played_unix, id), e))
+                    }
+                    None => None,
+                }
+            })
+            .collect();
+        victims.sort_by(|a, b| a.0.cmp(&b.0));
     }
+    // Ids this pass has already scheduled for eviction, so the reclaim step and
+    // the over-budget eviction can never emit two `Evict`s for one id.
+    let mut evicted: HashSet<&str> = HashSet::new();
+    // What will actually be on disk once this pass's evictions have run. Starts at
+    // the observed total and falls as bytes are reclaimed, so the over-budget
+    // eviction below measures against the post-reclaim store rather than
+    // double-counting bytes the reclaim already took.
+    let mut on_disk = total_bytes;
 
-    // ── 4. Downloads, in priority order, deduped by id keeping the highest
+    // ── 3. Downloads, in priority order, deduped by id keeping the highest
     // priority reason.
     //
-    // Budget admission applies to the BULK categories only (`Stale`, `Backfill`) -
-    // which is exactly where "halt pin downloads at the cap" lives. `Suspect` and
-    // `Window` are NOT budget-gated: they are bounded in count (the suspect set;
-    // queue_ahead + 1), they are precisely what the user is about to hear, and
-    // refusing them because the store is full of pins would defeat the feature.
-    // Their bytes are reclaimed by the next pass's eviction like any others.
+    // Budget admission applies to the BULK categories (`Stale`, `Backfill`).
+    // `Suspect` and `Window` are not budget-gated in the ordinary regime: they are
+    // bounded in count (the suspect set; queue_ahead + 1), they are precisely what
+    // the user is about to hear, and refusing them because the store is full of
+    // pins would defeat the feature. Their bytes are reclaimed by the next pass's
+    // eviction like any others. The ONE exception is a breached free-space reserve
+    // (`max_bytes == 0`), where nothing at all is written.
+    let writes_allowed = input.max_bytes > 0;
     let mut headroom = input.max_bytes.saturating_sub(total_bytes);
     let mut seen: HashSet<String> = HashSet::new();
     let mut downloads: Vec<StoreAction> = Vec::new();
@@ -996,33 +1716,106 @@ pub fn plan_pass(input: &PassInput) -> Vec<StoreAction> {
         downloads.push(StoreAction::Download { id: id.clone(), reason });
         true
     }
-    let batch = input.download_batch;
 
-    // (a) Suspect replacements. A de-offered song is silent until this lands.
-    for e in &input.entries {
-        if e.suspect {
-            push(&mut downloads, &mut seen, batch, &e.id, DownloadReason::Suspect);
+    /// Reclaim `want` bytes FOR a resident pin group, returning what was reclaimed.
+    ///
+    /// WHY IT HAS TO EXIST. Admission spends `max_bytes - total_bytes`, and
+    /// `total_bytes` counts the opportunistic cache the queue window leaves behind -
+    /// bytes that are never budget-gated on the way in. Eviction alone cannot hand
+    /// them back, because it only fires ABOVE the budget and stops the instant it is
+    /// at or under. So ordinary listening walks the store up to `max_bytes` and
+    /// parks there, headroom settles at roughly zero, and every starred group is
+    /// refused for want of space that is being held by a cache with no claim on it.
+    /// Permanently, and silently: the group is above the line, so it is not in the
+    /// deferred list either. "Star an album and it is simply there later" would just
+    /// stop being true once the store filled up. Bytes he asked for outrank bytes
+    /// hypodj kept on spec, and this is where that is enforced on the way IN, not
+    /// only on the way out.
+    ///
+    /// Takes victims in the ONE eviction order: opportunistic entries LRU-first,
+    /// then whole groups from below the line. NEVER a resident group - spending one
+    /// pin's bytes on another is precisely the download-evict thrash the frontier
+    /// exists to forbid - and never anything protected or already being downloaded.
+    ///
+    /// ALL OR NOTHING, like group admission itself: if the cold bytes do not cover
+    /// `want` it evicts NOTHING and returns 0, because a partial reclaim would
+    /// delete cache for a group that is still refused afterwards - a deletion that
+    /// bought nothing and a re-download of the cache next time he plays it.
+    fn reclaim_for_pin<'a>(
+        out: &mut Vec<StoreAction>,
+        victims: &[((Standing, usize, u64, &'a str), &'a IndexEntry)],
+        evicted: &mut HashSet<&'a str>,
+        seen: &HashSet<String>,
+        want: u64,
+    ) -> u64 {
+        let mut take: Vec<usize> = Vec::new();
+        let mut got = 0u64;
+        let mut i = 0usize;
+        while i < victims.len() && got < want {
+            let ((st, key, _, id), e) = victims[i];
+            if st == Standing::Resident {
+                // Ranked last, so everything from here on is a pin above the line.
+                break;
+            }
+            if evicted.contains(id) || seen.contains(id) {
+                i += 1;
+                continue;
+            }
+            if st == Standing::Opportunistic {
+                take.push(i);
+                got = got.saturating_add(e.size);
+                i += 1;
+                continue;
+            }
+            // WHOLE GROUP for anything below the line, exactly as the eviction at
+            // step 5 does: half an album is not a state this planner leaves behind.
+            let mut j = i;
+            while j < victims.len() && victims[j].0 .0 == st && victims[j].0 .1 == key {
+                let ((_, _, _, vid), ve) = victims[j];
+                if !evicted.contains(vid) && !seen.contains(vid) {
+                    take.push(j);
+                    got = got.saturating_add(ve.size);
+                }
+                j += 1;
+            }
+            i = j;
         }
+        if got < want {
+            return 0;
+        }
+        for idx in take {
+            let ((_, _, _, id), e) = victims[idx];
+            evicted.insert(id);
+            out.push(StoreAction::Evict(e.id.clone()));
+        }
+        got
     }
-    // (b) Window ids with nothing cached at all. An id whose entry exists but is
-    // stale keeps serving, so it is bulk work, not window work.
-    for id in &input.window {
-        if !by_id.contains_key(id.0.as_str()) {
-            push(&mut downloads, &mut seen, batch, id, DownloadReason::Window);
+
+    let batch = input.download_batch;
+    if writes_allowed {
+        // (a) Suspect replacements. A de-offered song is silent until this lands.
+        for e in &input.entries {
+            if e.suspect {
+                push(&mut downloads, &mut seen, batch, &e.id, DownloadReason::Suspect);
+            }
+        }
+        // (b) Window ids with nothing cached at all. An id whose entry exists but is
+        // stale keeps serving, so it is bulk work, not window work.
+        for id in &input.window {
+            if !by_id.contains_key(id.0.as_str()) {
+                push(&mut downloads, &mut seen, batch, id, DownloadReason::Window);
+            }
         }
     }
     // (c) and (d) are BULK work: full passes only (a light kick executes only what
-    // the user is about to hear), and deferred while playback is remote.
-    if full && !input.defer_bulk {
+    // the user is about to hear), deferred while playback is remote, and suspended
+    // by `store pause`.
+    if full && writes_allowed && !input.defer_bulk && !input.paused {
         // (c) Stale replacements. A same-suffix replacement renames OVER the old
-        // file, so it grows the store only by the size difference - which is why
-        // the pin-overflow halt does not apply to it: keeping the mirror correct
-        // costs (almost) nothing.
+        // file, so it grows the store only by the size difference.
         for e in &needs_replacement {
-            let grow = input
-                .pins
-                .as_ref()
-                .and_then(|pins| pins.iter().find(|p| p.id == e.id))
+            let grow = pin_song
+                .get(e.id.0.as_str())
                 .and_then(|p| p.size)
                 .map(|new| new.saturating_sub(e.size))
                 .unwrap_or(0);
@@ -1033,31 +1826,84 @@ pub fn plan_pass(input: &PassInput) -> Vec<StoreAction> {
                 headroom = headroom.saturating_sub(grow);
             }
         }
-        // (d) Starred backfill, newest-starred-first (the `getStarred2` order).
-        // Halted entirely while the pinned mirror alone overflows the budget.
-        if !pin_overflow {
-            if let Some(pins) = &input.pins {
-                for p in pins {
-                    if by_id.contains_key(p.id.0.as_str()) {
+        // (d) Starred backfill, in FRONTIER order, by WHOLE GROUP, and only from
+        // groups above the line. Nothing below the line is ever downloaded - that
+        // is the half of the anti-thrash property admission owns.
+        //
+        // ATOMIC ADMISSION: a group's entire outstanding cost is reserved out of
+        // headroom the moment its first track is admitted, so a later group cannot
+        // steal the space mid-fill, and a group that does not fit is skipped ENTIRE
+        // (the walk continues, so a smaller later group still lands). That is also
+        // what makes a resident-tail eviction safe: after eviction the pass is at
+        // or under budget, so either the whole group fits again - in which case
+        // re-downloading it does NOT put the store back over - or it does not fit
+        // and is not re-admitted. Neither branch loops.
+        //
+        // AND WHEN IT DOES NOT FIT, the group first asks the cache for the space
+        // ([`reclaim_for_pin`]): opportunistic bytes are what hypodj kept on spec,
+        // a starred group is what he asked for, so the cache yields. Only then is
+        // the group skipped.
+        if let Some(front) = frontier.as_ref() {
+            for (slot, g) in front.order.iter().enumerate() {
+                if downloads.len() >= batch {
+                    // The batch is full, so nothing further can be admitted this
+                    // pass. Stopping HERE rather than walking on is what keeps the
+                    // reclaim honest: it must never delete cache for a group whose
+                    // downloads the cap would refuse anyway.
+                    break;
+                }
+                if !front.resident[slot] {
+                    continue;
+                }
+                let mut missing: Vec<&Song> = Vec::new();
+                let mut outstanding = 0u64;
+                let mut counted: HashSet<&str> = HashSet::new();
+                for s in &g.songs {
+                    let id = s.id.0.as_str();
+                    if front.claim.get(id) != Some(&slot) || by_id.contains_key(id) {
                         continue;
                     }
-                    // An unknown size cannot be budgeted; admit it and let the
-                    // commit's exact-length gate be the authority. A pin the
-                    // server will not size is rare and bounded by the pin set.
-                    let grow = p.size.unwrap_or(0);
-                    if grow > headroom {
+                    if !counted.insert(id) {
                         continue;
                     }
-                    if push(&mut downloads, &mut seen, batch, &p.id, DownloadReason::Backfill) {
-                        headroom = headroom.saturating_sub(grow);
+                    missing.push(s);
+                    outstanding = outstanding.saturating_add(front.size(id));
+                }
+                if missing.is_empty() {
+                    continue;
+                }
+                if outstanding > headroom {
+                    let want = outstanding - headroom;
+                    let freed =
+                        reclaim_for_pin(&mut out, &victims, &mut evicted, &seen, want);
+                    if freed == 0 {
+                        continue;
                     }
+                    on_disk = on_disk.saturating_sub(freed);
+                    // Credited, then RE-DERIVED against the budget: `headroom + freed`
+                    // is the same number as `max_bytes - on_disk` minus what this pass
+                    // already spent, except when a nonsense entry size has saturated
+                    // the totals - and there the ceiling is the honest answer, never
+                    // the saturated credit.
+                    headroom = headroom
+                        .saturating_add(freed)
+                        .min(input.max_bytes.saturating_sub(on_disk));
+                }
+                let mut admitted = false;
+                for s in missing {
+                    if push(&mut downloads, &mut seen, batch, &s.id, DownloadReason::Backfill) {
+                        admitted = true;
+                    }
+                }
+                if admitted {
+                    headroom = headroom.saturating_sub(outstanding);
                 }
             }
         }
     }
     out.append(&mut downloads);
 
-    // ── 5. Recency flushes, full passes only: a light kick fires at every track
+    // ── 4. Recency flushes, full passes only: a light kick fires at every track
     // boundary, and one sidecar rewrite per boundary is a write storm for a value
     // whose whole job is coarse LRU ordering.
     if full {
@@ -1071,56 +1917,114 @@ pub fn plan_pass(input: &PassInput) -> Vec<StoreAction> {
         }
     }
 
-    // ── 6. Eviction, last. Protected: pins, the queue window (current plus
-    // `queue_ahead`), whatever the handler pinned explicitly (the pending-skip
-    // target), and any id THIS pass is downloading. Everything else is fair game,
-    // oldest `last_played` first - real LRU, thanks to the resolve-time recency bump.
+    // ── 5. Eviction, LAST, and over the SAME ranked victim list admission read
+    // (built above, so the two removers cannot disagree about what goes first).
+    //
+    // Skipped here on top of the ranking's own exclusions: any id THIS pass is
+    // downloading, and anything the reclaim-for-pins step already took.
     //
     // The download exclusion is what forbids DOWNLOAD-EVICT THRASH. Suspect and
-    // stale replacements are scheduled for entries that already exist on disk, and
-    // neither reason is protected by pinning or the window - so without it an
-    // over-budget pass could emit `Download` and `Evict` for the same id and the
-    // executor, walking the list front to back, would fetch a whole original and
-    // then unlink it, leaving a de-offered song permanently gone. The exclusion only
-    // DELAYS such an eviction: the commit clears `stale` and `suspect`, so the next
-    // pass sees an ordinary entry and reclaims it if it is still the coldest. It is
-    // also bounded - at most `download_batch` ids are excluded - so even a
-    // replacement that keeps failing holds back a few entries' worth of bytes, not
-    // the budget, and evicting them instead would delete bytes that are still
-    // serving (stale) or still wanted (suspect) to buy nothing back.
-    if full && total_bytes > input.max_bytes {
-        let mut protected: HashSet<&str> =
-            input.protected.iter().map(|i| i.0.as_str()).collect();
-        for id in &input.window {
-            protected.insert(id.0.as_str());
-        }
-        let mut victims: Vec<&IndexEntry> = input
-            .entries
-            .iter()
-            .filter(|e| {
-                !pinned_now(e)
-                    && !protected.contains(e.id.0.as_str())
-                    && !seen.contains(e.id.0.as_str())
-            })
-            .collect();
-        // The id is the tie-break, so two passes over identical state pick
-        // identical victims - a plan that reshuffles under ties is untestable.
-        victims.sort_by(|a, b| {
-            a.last_played_unix
-                .cmp(&b.last_played_unix)
-                .then_with(|| a.id.0.cmp(&b.id.0))
-        });
-        let mut remaining = total_bytes;
-        for v in victims {
-            if remaining <= input.max_bytes {
-                break;
+    // stale replacements are scheduled for entries that already exist on disk, so
+    // without it an over-budget pass could emit `Download` and `Evict` for the same
+    // id and the executor, walking the list front to back, would fetch a whole
+    // original and then unlink it. The exclusion only DELAYS such an eviction: the
+    // commit clears `stale` and `suspect`, so the next pass sees an ordinary entry
+    // and reclaims it if it is still the coldest.
+    //
+    // The measure is `on_disk` - the observed total MINUS whatever the reclaim
+    // already scheduled away - so the two steps cannot double-count the same bytes
+    // and evict twice over for one overflow.
+    // HYSTERESIS. Reclaim toward the pass budget, but not below STORE_EVICT_FLOOR
+    // while free space is merely tight - see `evict_target`. Deleting music we
+    // already hold never frees the disk from a growth we did not cause, and the
+    // budget shrinks with every unrelated byte the machine writes, so tying deletion
+    // to it makes an ordinary build evict the mirror and cleaning up re-download it.
+    let evict_to = evict_target(input.max_bytes, input.configured_max, input.avail);
+    if full && on_disk > evict_to {
+        let mut remaining = on_disk;
+        let mut i = 0usize;
+        while i < victims.len() && remaining > evict_to {
+            let ((st, key, _, id), e) = victims[i];
+            if evicted.contains(id) || seen.contains(id) {
+                i += 1;
+                continue;
             }
-            out.push(StoreAction::Evict(v.id.clone()));
-            remaining = remaining.saturating_sub(v.size);
+            if st == Standing::Opportunistic {
+                evicted.insert(id);
+                out.push(StoreAction::Evict(e.id.clone()));
+                remaining = remaining.saturating_sub(e.size);
+                i += 1;
+                continue;
+            }
+            // WHOLE GROUP, even if that overshoots the reclaim: half an album is not
+            // a state this planner is willing to leave behind. Members claimed at a
+            // higher tier are not in this run at all - dropping an artist album can
+            // never take a starred song with it.
+            let mut j = i;
+            while j < victims.len() && victims[j].0 .0 == st && victims[j].0 .1 == key {
+                let ((_, _, _, vid), e) = victims[j];
+                if !evicted.contains(vid) && !seen.contains(vid) {
+                    evicted.insert(vid);
+                    out.push(StoreAction::Evict(e.id.clone()));
+                    remaining = remaining.saturating_sub(e.size);
+                }
+                j += 1;
+            }
+            i = j;
         }
     }
 
-    out
+    // ── The self-description, published only when the pin set was authoritative.
+    let status = frontier.as_ref().map(|front| {
+        let mut cached_tracks = 0usize;
+        let mut pending_tracks = 0usize;
+        let mut pending_bytes = 0u64;
+        let mut tier_tracks = [0usize; 3];
+        let mut tier_bytes = [0u64; 3];
+        for (id, slot) in &front.claim {
+            let size = front.size(id);
+            let ti = front.order[*slot].tier as usize;
+            tier_tracks[ti] += 1;
+            tier_bytes[ti] = tier_bytes[ti].saturating_add(size);
+            if by_id.contains_key(*id) {
+                cached_tracks += 1;
+            } else {
+                pending_tracks += 1;
+                pending_bytes = pending_bytes.saturating_add(size);
+            }
+        }
+        StoreStatus {
+            known: true,
+            bytes: total_bytes,
+            entries: input.entries.len(),
+            configured_max: input.configured_max,
+            effective_max: input.max_bytes,
+            budget_source: input.budget_source,
+            reserve: input.reserve,
+            avail: input.avail,
+            fs_total: input.fs_total,
+            resident_tracks: front.resident_tracks,
+            resident_bytes: front.resident_bytes,
+            cached_tracks,
+            pending_tracks,
+            pending_bytes,
+            tier_tracks,
+            tier_bytes,
+            deferred: front.deferred_groups(),
+            given_up: 0,
+            waiting: if !writes_allowed {
+                StoreWaiting::ReserveBreached
+            } else if input.paused {
+                StoreWaiting::Paused
+            } else if input.defer_bulk {
+                StoreWaiting::PlaybackRemote
+            } else {
+                StoreWaiting::None
+            },
+        }
+    });
+
+    (out, status)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1166,6 +2070,20 @@ pub struct AudioStore {
     /// clearing it would suspend the pin mirror for the rest of the process - the
     /// idle hours are exactly when it is supposed to fill.
     playback_remote: AtomicBool,
+    /// `store pause`: bulk work suspended BY HAND. Read once per pass exactly like
+    /// [`playback_remote`](Self::playback_remote), and deliberately not persisted -
+    /// a restart resumes mirroring, so the safe state is the default and a pause
+    /// cannot become a forgotten config.
+    paused: AtomicBool,
+    /// WHAT THE STORE KNOWS ABOUT ITSELF, overwritten at the end of every full pass
+    /// that had an authoritative pin set. Short-locked and clone-out; read-only for
+    /// everyone but the reconciler.
+    ///
+    /// This is the surface the old per-pass overflow `warn!` should have been: the
+    /// shortfall is a NAMED LIST OF ALBUMS the `store` verb prints and a moving
+    /// number on `status`, not an integer in a log line every fifteen minutes
+    /// forever.
+    status: Mutex<StoreStatus>,
     /// Fired by the reconciler after any pass whose `getStarred2` SUCCEEDED - the
     /// "the server is back" edge, which the daemon uses to refresh the id-only
     /// placeholders an OFFLINE restore installed.
@@ -1246,6 +2164,8 @@ impl AudioStore {
             // Nothing is loaded yet, so nothing is streaming: the first pass is free
             // to backfill.
             playback_remote: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            status: Mutex::new(StoreStatus::default()),
             server_back_hook: Mutex::new(None),
         })
     }
@@ -1670,6 +2590,41 @@ impl AudioStore {
         self.playback_remote.load(Ordering::Relaxed)
     }
 
+    /// Suspend or resume BULK store work by hand (`store pause` / `store resume`).
+    /// Returns the new state. Window and suspect downloads are unaffected: pausing
+    /// the mirror must never make the next track stream.
+    pub fn set_paused(&self, paused: bool) -> bool {
+        self.paused.store(paused, Ordering::Relaxed);
+        if !paused {
+            self.kick_full();
+        }
+        paused
+    }
+
+    /// Whether bulk work is suspended by hand.
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// The last published self-description, CLONED OUT under a short lock.
+    /// `known == false` until the first full pass with an authoritative pin set.
+    pub fn status(&self) -> StoreStatus {
+        self.status.lock().expect("store status lock").clone()
+    }
+
+    /// Publish a fresh self-description. The reconciler is the only caller.
+    fn publish_status(&self, status: StoreStatus) {
+        *self.status.lock().expect("store status lock") = status;
+    }
+
+    /// TEST-ONLY: publish a self-description without running a pass, so a HANDLER
+    /// test can prove that the badge on `status` and the detail behind the `store`
+    /// verb read the SAME published status and cannot drift apart.
+    #[cfg(test)]
+    pub fn publish_status_for_test(&self, status: StoreStatus) {
+        self.publish_status(status);
+    }
+
     /// Register the "the server answered" callback (see
     /// [`server_back_hook`](Self::server_back_hook)). Last writer wins; the daemon
     /// registers exactly one, holding only a `Weak` to the handler so this can never
@@ -1812,12 +2767,27 @@ fn remove_audio(root: &Path, id: &SongId, suffix: Option<&str>) -> bool {
 /// failure is the same - keep the claim, back off, retry next pass - so a richer
 /// error taxonomy here would buy nothing it could act on.
 pub trait PinSource: Send + Sync + 'static {
-    /// The authoritative pin set, newest-starred-first.
+    /// The authoritative pin set: starred songs, the tracks of starred albums, and
+    /// the tracks of every album of every starred artist, as GROUPS.
     ///
-    /// An `Err` is TRANSIENT BY POLICY: the pass then skips ALL verdicts (nothing
-    /// deleted, demoted, or marked stale because the server flapped), which is what
-    /// "transient keeps the claim" means and is the whole of offline mode.
-    fn pins(&self) -> impl Future<Output = Result<Vec<Song>, String>> + Send;
+    /// ALL OR NOTHING. An `Err` is TRANSIENT BY POLICY: the pass then skips ALL
+    /// verdicts (nothing deleted, demoted, or marked stale because the server
+    /// flapped), which is what "transient keeps the claim" means and is the whole of
+    /// offline mode. That is exactly why a partial expansion must not be returned -
+    /// 33 of 36 albums would look authoritative and demote the other three over one
+    /// flaky `getAlbum`, then evict them next pass. A DEFINITIVE `NotFound` is
+    /// different: that album is gone, so it expands to nothing and its tracks demote
+    /// correctly.
+    fn pins(&self) -> impl Future<Output = Result<PinSet, String>> + Send;
+
+    /// Drop any memoised expansion, because the PIN SET ITSELF just changed.
+    ///
+    /// Sync and default-no-op: the memos exist only in the production source. The
+    /// reconciler calls this on a full pass that a KICK asked for (a star or unstar
+    /// is the only thing that kicks one), never on the interval tick and never on a
+    /// re-entry - which is what keeps a 290-track backfill's ~73 chained passes at
+    /// ONE expansion instead of 73.
+    fn invalidate(&self) {}
 
     /// Fresh metadata for ONE id - the fingerprint a window or suspect download
     /// commits against, since those ids need not be in the pin set.
@@ -1838,23 +2808,278 @@ pub trait PinSource: Send + Sync + 'static {
 /// thin link; the audio client below has a connect timeout and NO total timeout,
 /// bounded instead by per-chunk inactivity. Audio never rides the metadata client
 /// and metadata never rides this one.
-pub struct SubsonicPinSource {
+pub struct SubsonicPinSource<C: Clock> {
     client: Arc<SubsonicClient>,
     http: reqwest::Client,
     /// Mirrors `store.pin_starred`. When false the pin set is authoritatively
     /// EMPTY (not unknown): entries demote to evictable and only the queue window
     /// is mirrored, which is exactly what the knob promises.
     pin_starred: bool,
+    /// The starred-buckets-to-groups EXPANSION and its two memos, behind the
+    /// [`PinCatalog`] seam so all of it is testable with no server.
+    expansion: PinExpansion<C, Arc<SubsonicClient>>,
 }
 
-impl SubsonicPinSource {
-    pub fn new(client: Arc<SubsonicClient>, pin_starred: bool) -> Self {
+/// The three CATALOGUE reads the pin expansion makes, behind one small seam.
+///
+/// [`PinSource`] is the wrong place to fake this: a test double THERE replaces the
+/// expansion wholesale instead of exercising it, which left tier assignment, the
+/// artist per-album fan-out, newest-first ordering, [`ARTIST_ALBUM_CAP`]
+/// truncation, `NotFound`-as-a-definitive-empty, the all-or-nothing `Err` policy
+/// the entire demote-safety argument rests on, and both memos with no test at all.
+/// This seam is one level lower, so those are all provable without a network.
+///
+/// It speaks only hypodj's own model types, so `subsonic.rs` keeps its monopoly on
+/// the wire.
+pub(crate) trait PinCatalog: Send + Sync {
+    /// `getStarred2`, decomposed into the three buckets.
+    fn starred(&self) -> impl Future<Output = Result<Starred, SubsonicError>> + Send;
+    /// One album's track list (`getAlbum`).
+    fn album_songs(
+        &self,
+        id: &AlbumId,
+    ) -> impl Future<Output = Result<Vec<Song>, SubsonicError>> + Send;
+    /// One artist's albums (`getArtist`), in whatever order the server gave them.
+    fn artist_albums(
+        &self,
+        id: &ArtistId,
+    ) -> impl Future<Output = Result<Vec<Album>, SubsonicError>> + Send;
+}
+
+impl PinCatalog for Arc<SubsonicClient> {
+    fn starred(&self) -> impl Future<Output = Result<Starred, SubsonicError>> + Send {
+        SubsonicClient::starred(self)
+    }
+
+    fn album_songs(
+        &self,
+        id: &AlbumId,
+    ) -> impl Future<Output = Result<Vec<Song>, SubsonicError>> + Send {
+        SubsonicClient::album_songs(self, id)
+    }
+
+    fn artist_albums(
+        &self,
+        id: &ArtistId,
+    ) -> impl Future<Output = Result<Vec<Album>, SubsonicError>> + Send {
+        SubsonicClient::artist_albums(self, id)
+    }
+}
+
+/// The pin EXPANSION: three starred buckets to an ordered [`PinSet`], plus the two
+/// memos that make it affordable to ask for on every pass.
+struct PinExpansion<C: Clock, K: PinCatalog> {
+    catalog: K,
+    /// The scheduling clock, so both memos below expire under
+    /// `#[tokio::test(start_paused = true)]` and never against the wall clock.
+    clock: C,
+    /// THE CHAIN MEMO. A whole expanded pin set, good for
+    /// [`PIN_SET_MEMO_TTL`].
+    ///
+    /// Without it a cold backfill is unaffordable: `PassReport::re_enter` repeats
+    /// the same mode after every drained batch of four, so 290 tracks is ~73
+    /// chained FULL passes, and a naive expansion is 43 round trips (~25-90 s) each
+    /// time. Thirty seconds is far shorter than the 900 s full cadence, so it
+    /// changes nothing about freshness on the interval - it only collapses the
+    /// chain. Freshness on the GESTURE path is exact, because a star or unstar
+    /// kicks a full pass and the reconciler calls [`PinSource::invalidate`] first.
+    pin_set_memo: Mutex<Option<(Instant, PinSet)>>,
+    /// THE EXPANSION MEMO, keyed by album id, good for [`ALBUM_MEMO_TTL`].
+    ///
+    /// Re-expanding every starred album on every full pass is 36 `getAlbum` calls
+    /// against a server that answers in ~0.6 s each. The memo is invalidated early
+    /// when the album's `song_count` from the current `getStarred2` disagrees with
+    /// what was cached, and dropped for any album that left the starred set, so it
+    /// cannot grow.
+    album_memo: Mutex<HashMap<String, AlbumMemo>>,
+}
+
+/// One memoised album expansion.
+struct AlbumMemo {
+    at: Instant,
+    /// The `song_count` the starred listing reported when this was cached. A
+    /// disagreement forces a refetch before the TTL.
+    song_count: u32,
+    songs: Vec<Song>,
+}
+
+/// How long a whole expanded [`PinSet`] may be reused. Short on purpose: its only
+/// job is to collapse the re-entry chain, not to cache anything.
+pub const PIN_SET_MEMO_TTL: Duration = Duration::from_secs(30);
+
+/// How long one album's track list may be reused.
+///
+/// THE HONEST COST: a track ADDED to a starred album is invisible to the mirror
+/// for up to this long. The `song_count` check catches an addition but not a
+/// replacement, `AlbumId3` carries no version field, and re-expanding 36 albums
+/// every pass is 25-90 s of round trips on a pass that chains every four
+/// downloads. This is a chosen bounded staleness, not an oversight.
+pub const ALBUM_MEMO_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Ceiling on how many `getAlbum` calls ONE starred artist may trigger per
+/// expansion.
+///
+/// A RUNAWAY BRAKE ON ROUND TRIPS, not a statement about what "starred" means: a
+/// starred artist still means every album they have, and the frontier - not this -
+/// is what bounds the bytes. No real personal-library artist reaches it.
+pub const ARTIST_ALBUM_CAP: usize = 100;
+
+impl<C: Clock> SubsonicPinSource<C> {
+    pub fn new(client: Arc<SubsonicClient>, pin_starred: bool, clock: C) -> Self {
         Self {
-            client,
             http: build_download_http_client(),
             pin_starred,
+            expansion: PinExpansion::new(client.clone(), clock),
+            client,
         }
     }
+}
+
+impl<C: Clock, K: PinCatalog> PinExpansion<C, K> {
+    fn new(catalog: K, clock: C) -> Self {
+        Self {
+            catalog,
+            clock,
+            pin_set_memo: Mutex::new(None),
+            album_memo: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The memoised expansion: [`PIN_SET_MEMO_TTL`] of reuse, then a fresh walk.
+    async fn pins(&self) -> Result<PinSet, String> {
+        let now = self.clock.now();
+        {
+            let memo = self.pin_set_memo.lock().expect("store pin memo lock");
+            if let Some((at, set)) = memo.as_ref() {
+                if now.saturating_duration_since(*at) < PIN_SET_MEMO_TTL {
+                    return Ok(set.clone());
+                }
+            }
+        }
+        let set = self.expand().await?;
+        *self.pin_set_memo.lock().expect("store pin memo lock") = Some((now, set.clone()));
+        Ok(set)
+    }
+
+    /// Drop BOTH memos, because the pin set itself just changed.
+    fn invalidate(&self) {
+        *self.pin_set_memo.lock().expect("store pin memo lock") = None;
+        self.album_memo.lock().expect("store album memo lock").clear();
+    }
+
+    /// One album's tracks, from the memo when it is fresh and agrees with the
+    /// starred listing's `song_count`, else from `getAlbum`.
+    ///
+    /// A definitive `NotFound` expands to NOTHING (the album is gone, so its tracks
+    /// must demote); every other error propagates, which aborts the whole pin set.
+    async fn album_tracks(&self, album: &Album) -> Result<Vec<Song>, String> {
+        let now = self.clock.now();
+        {
+            let memo = self.album_memo.lock().expect("store album memo lock");
+            if let Some(m) = memo.get(&album.id.0) {
+                let fresh = now.saturating_duration_since(m.at) < ALBUM_MEMO_TTL;
+                if fresh && m.song_count == album.song_count {
+                    return Ok(m.songs.clone());
+                }
+            }
+        }
+        let songs = match self.catalog.album_songs(&album.id).await {
+            Ok(v) => v,
+            Err(SubsonicError::NotFound(_)) => {
+                tracing::info!(album = %album.id.0, "store: starred album is gone; expanding it to nothing");
+                Vec::new()
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        self.album_memo.lock().expect("store album memo lock").insert(
+            album.id.0.clone(),
+            AlbumMemo { at: now, song_count: album.song_count, songs: songs.clone() },
+        );
+        Ok(songs)
+    }
+
+    /// Expand the three starred buckets into groups. Every failure that is not a
+    /// definitive `NotFound` aborts.
+    async fn expand(&self) -> Result<PinSet, String> {
+        let starred = self.catalog.starred().await.map_err(|e| e.to_string())?;
+        let mut groups: Vec<PinGroup> = Vec::new();
+        // Tier SONG: the per-track gesture, most specific and smallest.
+        for s in &starred.songs {
+            groups.push(PinGroup {
+                kind: PinKind::Song,
+                id: s.id.0.clone(),
+                name: s.title.clone(),
+                tier: PinTier::Song,
+                songs: vec![s.clone()],
+            });
+        }
+        // Tier ALBUM: one group per album, so it is held whole or not at all.
+        let mut wanted: HashSet<String> = HashSet::new();
+        for a in &starred.albums {
+            wanted.insert(a.id.0.clone());
+            let songs = self.album_tracks(a).await?;
+            groups.push(PinGroup {
+                kind: PinKind::Album,
+                id: a.id.0.clone(),
+                name: a.name.clone(),
+                tier: PinTier::Album,
+                songs,
+            });
+        }
+        // Tier ARTIST: one group PER ALBUM, newest-first, so a huge catalogue
+        // degrades album by album at the frontier instead of being refused whole.
+        for artist in &starred.artists {
+            let mut albums = match self.catalog.artist_albums(&artist.id).await {
+                Ok(v) => v,
+                Err(SubsonicError::NotFound(_)) => Vec::new(),
+                Err(e) => return Err(e.to_string()),
+            };
+            sort_albums_newest_first(&mut albums);
+            if albums.len() > ARTIST_ALBUM_CAP {
+                tracing::warn!(
+                    artist = %artist.id.0,
+                    albums = albums.len(),
+                    cap = ARTIST_ALBUM_CAP,
+                    "store: starred artist has more albums than the per-expansion cap; taking the newest"
+                );
+                albums.truncate(ARTIST_ALBUM_CAP);
+            }
+            for a in &albums {
+                wanted.insert(a.id.0.clone());
+                let songs = self.album_tracks(a).await?;
+                groups.push(PinGroup {
+                    kind: PinKind::Album,
+                    id: a.id.0.clone(),
+                    name: format!("{} - {}", artist.name, a.name),
+                    tier: PinTier::Artist,
+                    songs,
+                });
+            }
+        }
+        // An album nobody wants any more can never be consulted again, so the memo
+        // drops it here rather than growing for the life of the process.
+        self.album_memo
+            .lock()
+            .expect("store album memo lock")
+            .retain(|id, _| wanted.contains(id));
+        Ok(PinSet { groups })
+    }
+}
+
+/// Order an artist's albums NEWEST FIRST: `created` (the wire timestamp, ISO-8601
+/// so a lexical compare is a chronological one), then `year`, then the id for
+/// determinism. So a partly-resident artist keeps their recent work - the "keep me
+/// current with them" reading - and the truncation is visible in the deferred list
+/// rather than assumed.
+fn sort_albums_newest_first(albums: &mut [Album]) {
+    albums.sort_by(|a, b| {
+        b.created
+            .as_deref()
+            .unwrap_or("")
+            .cmp(a.created.as_deref().unwrap_or(""))
+            .then_with(|| b.year.unwrap_or(0).cmp(&a.year.unwrap_or(0)))
+            .then_with(|| a.id.0.cmp(&b.id.0))
+    });
 }
 
 /// The store's audio HTTP client. Connect-bounded, redirect-bounded, and
@@ -1867,12 +3092,20 @@ fn build_download_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-impl PinSource for SubsonicPinSource {
-    async fn pins(&self) -> Result<Vec<Song>, String> {
+impl<C: Clock> PinSource for SubsonicPinSource<C> {
+    async fn pins(&self) -> Result<PinSet, String> {
+        // AUTHORITATIVELY EMPTY, not unknown. This is the one path where the
+        // Vec -> struct change could have silently started returning "no
+        // information" and stopped demoting anything, so it is an explicit early
+        // return with its own test.
         if !self.pin_starred {
-            return Ok(Vec::new());
+            return Ok(PinSet::default());
         }
-        self.client.starred_songs().await.map_err(|e| e.to_string())
+        self.expansion.pins().await
+    }
+
+    fn invalidate(&self) {
+        self.expansion.invalidate();
     }
 
     async fn song(&self, id: &SongId) -> Result<Song, String> {
@@ -2047,6 +3280,16 @@ struct PassReport {
     /// failed is not counted, because it freed nothing and the next scan will find
     /// the very same entry over budget again.
     evicted: usize,
+    /// WHAT THIS PASS ACTUALLY BUDGETED AGAINST, after the free-space clamp.
+    ///
+    /// Reported because it is the one number that makes "hypodj cannot fill the
+    /// disk" checkable per pass: `0` means the reserve is breached and the pass
+    /// wrote nothing at all, and anything below the configured cap means the clamp
+    /// ran. LIGHT passes carry it too, which is the point - they are the ones that
+    /// fire at every track boundary, and a light pass that skipped the measurement
+    /// would keep downloading window originals onto a disk a full pass had already
+    /// declared unwritable.
+    budget: u64,
 }
 
 impl PassReport {
@@ -2125,7 +3368,18 @@ pub async fn run<C: Clock, P: PinSource>(store: Arc<AudioStore>, source: Arc<P>,
                     _ = store.kicked() => {
                         // A full kick that landed during the previous pass is still
                         // honored here: the flag is sticky until taken.
-                        if store.take_full_request() { PassMode::Full } else { PassMode::Light }
+                        if store.take_full_request() {
+                            // A full KICK means the pin set itself may have changed
+                            // - a star or unstar is the only thing that fires one -
+                            // so the memoised expansion must go. The interval tick
+                            // and the re-entry chain deliberately do NOT invalidate:
+                            // that is what keeps a cold backfill at one expansion
+                            // instead of one per drained batch.
+                            source.invalidate();
+                            PassMode::Full
+                        } else {
+                            PassMode::Light
+                        }
                     }
                 }
             }
@@ -2169,9 +3423,61 @@ async fn run_pass<C: Clock, P: PinSource>(
     batch: usize,
 ) -> PassReport {
     let full = mode == PassMode::Full;
-    let mut input = PassInput::new(mode, store.config().max_bytes);
+    let configured = store.config().max_bytes;
+    let mut input = PassInput::new(mode, configured);
     input.download_batch = batch;
     input.defer_bulk = store.playback_remote();
+    input.paused = store.paused();
+
+    {
+        // THE CEILING, re-measured EVERY pass, light ones included. `own` is the
+        // store's own bytes, so `(avail + own)` is INVARIANT to hypodj's own
+        // eviction: hypodj's actions cannot move hypodj's ceiling, only another
+        // process's can. That is what makes the post-eviction budget identical to
+        // the pre-eviction one and the state settle instead of oscillate.
+        //
+        // LIGHT PASSES MEASURE TOO, and that is the whole of "a breached reserve
+        // writes nothing at all". `plan_pass` gates every write on
+        // `input.max_bytes > 0`, and a light kick fires at EVERY track boundary and
+        // queue edit - so leaving `max_bytes` at the configured cap here would let
+        // the window arm keep writing 31-415 MiB originals onto a disk the full pass
+        // has already declared unwritable, once per track, only for the next full
+        // pass to delete them again. One `statvfs` on a blocking thread is the price
+        // of the guarantee being true on both paths rather than one.
+        let own = store
+            .entries()
+            .iter()
+            .fold(0u64, |a, e| a.saturating_add(e.size));
+        let root = store.root().to_path_buf();
+        let space = tokio::task::spawn_blocking(move || statvfs_space(&root))
+            .await
+            .ok()
+            .flatten();
+        match space.and_then(|(avail, total)| {
+            derive_budget(avail, total, own, configured).map(|max| (avail, total, max))
+        }) {
+            Some((avail, total, max)) => {
+                input.max_bytes = max;
+                input.budget_source = BudgetSource::FreeSpace;
+                input.reserve = budget_reserve(total);
+                input.avail = avail;
+                input.fs_total = total;
+            }
+            // NEVER to unlimited: an unmeasured disk is not an empty one.
+            None => {
+                if full {
+                    // Full only: a light kick lands at every track boundary, so
+                    // warning here would turn one unmeasurable disk into a log storm
+                    // saying the same thing. The fallback is identical either way.
+                    tracing::warn!(
+                        root = %store.root().display(),
+                        "store: could not measure free space; falling back to the configured budget"
+                    );
+                }
+                input.budget_source = BudgetSource::Config;
+            }
+        }
+    }
 
     if full {
         // The directory read is the one genuinely slow observation in a pass (it
@@ -2217,8 +3523,41 @@ async fn run_pass<C: Clock, P: PinSource>(
     input.window = store.window();
     input.protected = store.protected_ids();
 
-    let actions = plan_pass(&input);
-    execute(store, source, &input, actions, clock, backoff).await
+    let (actions, status) = plan_pass_with_status(&input);
+    let mut report = execute(store, source, &input, actions, clock, backoff).await;
+    report.budget = input.max_bytes;
+    if let Some(mut status) = status {
+        // The one number the plan cannot know: ids this PROCESS has stopped
+        // retrying. Without it a pending count that will never reach zero is
+        // indistinguishable from one that is merely slow.
+        status.given_up = report.given_up;
+        let before = store.status();
+        if !before.known || before.digest() != status.digest() {
+            tracing::info!(
+                resident = status.resident_tracks,
+                cached = status.cached_tracks,
+                pending = status.pending_tracks,
+                deferred = status.deferred.len(),
+                bytes = status.bytes,
+                budget = status.effective_max,
+                source = status.budget_source.label(),
+                waiting = status.waiting.label(),
+                "store: mirror frontier"
+            );
+            for d in &status.deferred {
+                tracing::info!(
+                    uri = %format!("{}/{}", d.kind.label(), d.id),
+                    name = %d.name,
+                    tier = d.tier.label(),
+                    tracks = d.tracks,
+                    bytes = d.bytes,
+                    "store: deferred, over the pin ceiling"
+                );
+            }
+        }
+        store.publish_status(status);
+    }
+    report
 }
 
 /// Execute a planned pass front to back. The order is [`plan_pass`]'s, and it is
@@ -2235,7 +3574,13 @@ async fn execute<C: Clock, P: PinSource>(
     // The pin set, for the pinned flag a fresh commit records and for choosing the
     // freshest fingerprint. Absent on a light pass and on a transient failure.
     let pin_by_id: HashMap<&str, &Song> = match &input.pins {
-        Some(pins) => pins.iter().map(|p| (p.id.0.as_str(), p)).collect(),
+        Some(pins) => {
+            let mut m: HashMap<&str, &Song> = HashMap::new();
+            for p in pins.songs() {
+                m.entry(p.id.0.as_str()).or_insert(p);
+            }
+            m
+        }
         None => HashMap::new(),
     };
     let existing_pinned: HashSet<&str> = input
@@ -2277,15 +3622,18 @@ async fn execute<C: Clock, P: PinSource>(
                     Err(e) => tracing::warn!(id = %id.0, error = %e, "store: pin task failed"),
                 }
             }
-            StoreAction::WarnPinOverflow { pinned_bytes, max_bytes } => {
-                tracing::warn!(
-                    pinned_bytes,
-                    max_bytes,
-                    shortfall = pinned_bytes.saturating_sub(max_bytes),
-                    "store: the pinned set alone exceeds store.max_bytes; halting pin downloads at the cap (nothing pinned is ever silently evicted)"
-                );
-            }
             StoreAction::Download { id, reason } => {
+                // PLAYBACK STARTED MID-BATCH. `defer_bulk` is sampled once per pass,
+                // so without this re-check the rest of a four-deep backfill batch
+                // keeps pulling originals while he is listening on a thin link -
+                // which is precisely what the deferral exists to prevent. Suspect
+                // and Window continue: those ARE what he is about to hear.
+                if matches!(reason, DownloadReason::Backfill | DownloadReason::Stale)
+                    && (store.playback_remote() || store.paused())
+                {
+                    tracing::debug!(id = %id.0, ?reason, "store: bulk work yielding mid-pass");
+                    continue;
+                }
                 report.scheduled += 1;
                 match backoff.attempt(&id, clock.now()) {
                     Attempt::Waiting => {
@@ -2327,7 +3675,16 @@ async fn execute<C: Clock, P: PinSource>(
                     Ok(path) => {
                         backoff.succeed(&id);
                         report.committed += 1;
-                        tracing::info!(id = %id.0, ?reason, path = %path.display(), "store: committed");
+                        // Bulk backfill is a 290-track, multi-day background job:
+                        // one info line per track is a wall nobody reads. The
+                        // progress signal is the frontier line and the X-Store
+                        // badge, both of which move. Everything the user is about to
+                        // HEAR still says so at info.
+                        if reason == DownloadReason::Backfill {
+                            tracing::debug!(id = %id.0, ?reason, path = %path.display(), "store: committed");
+                        } else {
+                            tracing::info!(id = %id.0, ?reason, path = %path.display(), "store: committed");
+                        }
                     }
                     Err(e) => {
                         backoff.fail(&id, clock.now());
@@ -2418,6 +3775,56 @@ async fn download_and_commit<P: PinSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADMISSION and DELETION are different questions. Admission stays strict - that is
+    // what makes "cannot fill the disk" structural. Deletion must NOT track the
+    // free-space budget one-for-one, because that budget shrinks with every unrelated
+    // byte the machine writes: measured on this machine, target/ alone swings 11 GiB,
+    // which takes the derived budget from 10.5 GiB to under 1 and would evict almost
+    // the whole mirror - then cleaning the build re-downloads ten gigabytes.
+    #[test]
+    fn a_tight_disk_does_not_delete_the_mirror_but_a_critical_one_does() {
+        let plenty = 40 * 1024 * 1024 * 1024;
+        // Budget squeezed to almost nothing by an unrelated build, disk still fine:
+        // keep what we already hold rather than thrash.
+        let configured = 16 * 1024 * 1024 * 1024;
+        assert_eq!(
+            evict_target(100 * 1024 * 1024, configured, plenty),
+            STORE_EVICT_FLOOR,
+            "a transient squeeze must not reclaim below the floor"
+        );
+        // Budget above the floor: the budget governs, as before.
+        let big = 8 * 1024 * 1024 * 1024;
+        assert_eq!(evict_target(big, configured, plenty), big);
+        // Genuinely critical: the floor is abandoned and the mirror gets out of the way.
+        assert_eq!(
+            evict_target(0, configured, 1024 * 1024 * 1024),
+            0,
+            "below the critical mark the disk needs the space more than the music does"
+        );
+        assert_eq!(evict_target(0, configured, STORE_CRITICAL_AVAIL), 0, "boundary is inclusive");
+    }
+
+    // A flat floor would silently disable LRU for any store smaller than it, which is
+    // how the first version of this fix broke an existing eviction test.
+    #[test]
+    fn the_floor_never_overrides_a_deliberately_small_configured_cap() {
+        let plenty = 40 * 1024 * 1024 * 1024;
+        let small = 64 * 1024 * 1024;
+        assert_eq!(
+            evict_target(small, small, plenty),
+            small,
+            "a 64 MiB store still evicts at 64 MiB, not at the 2 GiB floor"
+        );
+    }
+
+    #[test]
+    fn the_eviction_floor_never_lets_the_store_grow() {
+        // The floor only stops DELETION. Admission is a separate gate, so a zero
+        // budget still writes nothing no matter what the floor says - that is what
+        // keeps the disk guarantee structural rather than a hope.
+        assert_eq!(derive_budget(0, 1_000_000_000_000, 0, u64::MAX), Some(0));
+    }
 
     // Filesystem-and-pure-logic only: no clock, no network, no libmpv. Safe in the
     // certless, network-less Nix sandbox.
@@ -3398,6 +4805,180 @@ title = "Minimal"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── the budget: why hypodj cannot fill the disk ─────────────────────────
+    //
+    // The one rule that bounds the disk is a PURE function, which is the point:
+    // "overfilling is impossible" has to be provable without a disk, without a
+    // server and without a clock. These are that proof.
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn derive_budget_lets_free_space_beat_the_configured_cap_and_never_the_reverse() {
+        // A 2000 GiB filesystem so the 5 % fraction is a round 100 GiB and every
+        // expectation below is a hand-computable number rather than a restatement of
+        // the formula.
+        assert_eq!(budget_reserve(2000 * GIB), 100 * GIB, "5 % beats the floor on a big disk");
+
+        // ROOMY: the configured cap binds. The reserve is a BRAKE, not a governor.
+        assert_eq!(derive_budget(500 * GIB, 2000 * GIB, 10 * GIB, 16 * GIB), Some(16 * GIB));
+        // TIGHTENING: free space binds and the ceiling falls BELOW the cap. Pool is
+        // 105 + 10 = 115 GiB, less the 100 GiB reserve.
+        assert_eq!(derive_budget(105 * GIB, 2000 * GIB, 10 * GIB, 16 * GIB), Some(15 * GIB));
+        // EXACTLY AT THE RESERVE: zero, not a negative wrapped into something huge.
+        assert_eq!(derive_budget(100 * GIB, 2000 * GIB, 0, 16 * GIB), Some(0));
+        // BREACHED: the pool is smaller than the reserve. Zero means the store writes
+        // NOTHING at all and only deletes.
+        assert_eq!(derive_budget(60 * GIB, 2000 * GIB, 10 * GIB, 16 * GIB), Some(0));
+        // A SMALLER CONFIGURED CAP always wins - the knob can only ever lower.
+        assert_eq!(derive_budget(500 * GIB, 2000 * GIB, 10 * GIB, GIB), Some(GIB));
+
+        // THE REAL MACHINE this was sized against: 929 GiB total, 113 GiB free, a
+        // 2 GiB store. The reserve (46 GiB) is not binding, so the 16 GiB cap is.
+        assert_eq!(
+            derive_budget(113 * GIB, 929 * GIB, 2 * GIB, crate::config::DEFAULT_STORE_MAX_BYTES),
+            Some(crate::config::DEFAULT_STORE_MAX_BYTES),
+            "a roomy laptop disk gets the full configured cap"
+        );
+    }
+
+    #[test]
+    fn derive_budget_floors_the_reserve_so_a_small_disk_is_not_cheaply_filled() {
+        // On a small disk 5 % is less than a single NixOS system closure, so the
+        // fraction alone would not be a brake. 5 % of 100 GiB is 5 GiB; the floor
+        // wins.
+        assert_eq!(budget_reserve(100 * GIB), STORE_RESERVE_FLOOR);
+        assert_eq!(derive_budget(50 * GIB, 100 * GIB, 0, 16 * GIB), Some(16 * GIB));
+        assert_eq!(derive_budget(25 * GIB, 100 * GIB, 0, 16 * GIB), Some(5 * GIB));
+
+        // A filesystem SMALLER than the reserve itself - the 6 GiB tmpfs the live
+        // proof points a daemon at - can never be written to at all. This is the
+        // guarantee in its sharpest form: no configuration, on any mount, lets the
+        // store take the last of a small volume.
+        assert_eq!(budget_reserve(6 * GIB), STORE_RESERVE_FLOOR);
+        for own in [0, GIB, 5 * GIB] {
+            assert_eq!(
+                derive_budget(6 * GIB, 6 * GIB, own, 16 * GIB),
+                Some(0),
+                "a filesystem smaller than the reserve yields a zero budget"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_budget_is_invariant_to_the_stores_own_eviction() {
+        // THE ANTI-OSCILLATION PROPERTY, and the reason the ceiling is written
+        // `(avail + own) - reserve` rather than a fraction of free space.
+        //
+        // Evicting moves bytes from `own` into `avail`, and the sum is what the rule
+        // reads - so hypodj's own actions cannot move hypodj's own ceiling. Only
+        // another process can. Without this a tight budget would be met by evicting,
+        // which would RAISE the recomputed budget, which would re-admit, which would
+        // evict again: a download loop against the server and the disk.
+        let cfg = 16 * GIB;
+        let total = 2000 * GIB;
+        let baseline = derive_budget(105 * GIB, total, 10 * GIB, cfg);
+        assert_eq!(baseline, Some(15 * GIB), "the pool binds, so the case is a real test");
+        // Every split of the same pool - including evicting the store to nothing -
+        // yields the IDENTICAL ceiling.
+        for (avail, own) in [
+            (105 * GIB, 10 * GIB),
+            (110 * GIB, 5 * GIB),
+            (114 * GIB, GIB),
+            (115 * GIB, 0),
+        ] {
+            assert_eq!(
+                derive_budget(avail, total, own, cfg),
+                baseline,
+                "freeing {own} of our own bytes must not move our own ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_budget_never_trusts_an_unmeasured_or_nonsense_mount() {
+        // `avail` larger than `total` is nonsense from the mount. `None` sends the
+        // caller to the CONFIGURED cap - never to unlimited, because an unmeasured
+        // disk is not an empty one.
+        assert_eq!(derive_budget(101 * GIB, 100 * GIB, 0, 16 * GIB), None);
+        assert_eq!(derive_budget(1, 0, 0, 16 * GIB), None);
+        // A zero-sized filesystem is measurable and simply yields nothing.
+        assert_eq!(derive_budget(0, 0, 0, 16 * GIB), Some(0));
+        // Degenerate extremes are TOTAL: saturating throughout, no panic, no wrap.
+        assert_eq!(derive_budget(u64::MAX, u64::MAX, u64::MAX, 16 * GIB), Some(16 * GIB));
+        assert_eq!(derive_budget(0, u64::MAX, 0, u64::MAX), Some(0), "a huge disk with nothing free");
+        // Even with no configured cap at all the reserve still holds some back, so
+        // there is no input for which the store may claim the whole filesystem.
+        let unlimited = derive_budget(u64::MAX, u64::MAX, u64::MAX, u64::MAX).expect("total");
+        assert!(unlimited < u64::MAX, "the reserve applies even at the extreme");
+        assert!(
+            u64::MAX - unlimited >= u64::MAX / 100 * STORE_RESERVE_FRACTION_PCT,
+            "and it holds back the full fraction"
+        );
+    }
+
+    #[test]
+    fn the_derived_budget_may_fall_below_the_config_floor_while_the_knob_may_not() {
+        // Deliberate asymmetry. `normalize` clamps the CONFIGURED value up to 64 MiB
+        // because a budget that small would thrash eviction against every download.
+        // The DERIVED value has no such floor: "the disk is nearly full" must beat
+        // "the store would like at least 64 MiB".
+        let derived = derive_budget(
+            STORE_RESERVE_FLOOR + 1024 * 1024,
+            100 * GIB,
+            0,
+            crate::config::DEFAULT_STORE_MAX_BYTES,
+        );
+        assert_eq!(derived, Some(1024 * 1024), "one megabyte of ceiling");
+        assert!(
+            derived.unwrap() < crate::config::STORE_MIN_MAX_BYTES,
+            "and it is allowed below the config floor"
+        );
+
+        let mut cfg = StoreConfig { max_bytes: 1, ..StoreConfig::default() };
+        cfg.normalize();
+        assert_eq!(
+            cfg.max_bytes,
+            crate::config::STORE_MIN_MAX_BYTES,
+            "while the configured knob is still clamped up at load"
+        );
+    }
+
+    #[test]
+    fn pin_ceiling_is_total_and_never_starves_a_small_budget_to_nothing() {
+        // The setback exists so a full pin frontier cannot starve the queue window and
+        // stale replacements. It must not, on a small budget, become the whole budget.
+        assert_eq!(pin_ceiling(0), 0);
+        assert_eq!(pin_ceiling(16 * GIB), 16 * GIB - STORE_PIN_CEILING_SETBACK);
+        // At the 64 MiB config floor the flat setback would leave nothing, so it is
+        // capped at a quarter.
+        assert_eq!(pin_ceiling(64 * 1024 * 1024), 48 * 1024 * 1024);
+        for max in [1u64, 4, 999, 1 << 20, 1 << 30, u64::MAX] {
+            let c = pin_ceiling(max);
+            assert!(c <= max, "the pin ceiling never exceeds the budget ({max})");
+            assert!(c > 0, "a non-zero budget always leaves room for pins ({max})");
+        }
+    }
+
+    #[test]
+    fn statvfs_measures_a_real_filesystem_and_the_ceiling_follows_from_it() {
+        // The one part of the rule that is an OBSERVATION rather than arithmetic. A
+        // real directory on a real mount, so a broken syscall binding is caught here
+        // rather than by a daemon silently falling back to the configured cap.
+        let dir = tmpdir("statvfs");
+        let (avail, total) = statvfs_space(&dir).expect("statvfs answers for a real directory");
+        assert!(total > 0, "a mounted filesystem has a size");
+        assert!(avail <= total, "free space never exceeds the filesystem: {avail} of {total}");
+        // And the measurement feeds the rule without panicking, bounded by the cap.
+        let budget = derive_budget(avail, total, 0, crate::config::DEFAULT_STORE_MAX_BYTES)
+            .expect("a real mount is never nonsense");
+        assert!(budget <= crate::config::DEFAULT_STORE_MAX_BYTES);
+        // A path that does not exist is a failure, not a zero-sized filesystem - the
+        // caller must fall back to the config rather than conclude the disk is full.
+        assert_eq!(statvfs_space(&dir.join("no-such-child")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── plan_pass: the full divergence matrix ───────────────────────────────
 
     /// Just the downloads of a plan, as (id, reason) - the shape most cases assert.
@@ -3450,11 +5031,11 @@ title = "Minimal"
     fn plan_pass_missing_pins_backfill_newest_starred_first() {
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         // getStarred2 order IS newest-first, and the plan preserves it.
-        input.pins = Some(vec![
+        input.pins = Some(PinSet::of_songs(vec![
             song("newest", 10, "flac", None),
             song("middle", 10, "flac", None),
             song("oldest", 10, "flac", None),
-        ]);
+        ]));
         input.download_batch = 2;
         let plan = plan_pass(&input);
         assert_eq!(
@@ -3483,7 +5064,7 @@ title = "Minimal"
             e.pinned = true;
             let mut input = PassInput::new(PassMode::Full, 1 << 30);
             input.entries = vec![e];
-            input.pins = Some(vec![server]);
+            input.pins = Some(PinSet::of_songs(vec![server]));
             let plan = plan_pass(&input);
             assert!(
                 plan.contains(&StoreAction::SetStale { id: sid("a"), stale: true }),
@@ -3513,7 +5094,7 @@ title = "Minimal"
         e.stale = true;
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         input.entries = vec![e];
-        input.pins = Some(vec![song("a", 100, "flac", Some("2024-05-01T12:00:00Z"))]);
+        input.pins = Some(PinSet::of_songs(vec![song("a", 100, "flac", Some("2024-05-01T12:00:00Z"))]));
         let plan = plan_pass(&input);
         assert!(plan.contains(&StoreAction::SetStale { id: sid("a"), stale: false }));
         // It is still scheduled for replacement THIS pass (the mark was live when
@@ -3525,7 +5106,7 @@ title = "Minimal"
         e.pinned = true;
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         input.entries = vec![e];
-        input.pins = Some(vec![song("a", 100, "flac", Some("2024-05-01T14:00:00+02:00"))]);
+        input.pins = Some(PinSet::of_songs(vec![song("a", 100, "flac", Some("2024-05-01T14:00:00+02:00"))]));
         let plan = plan_pass(&input);
         assert_eq!(plan, Vec::new(), "same instant, different rendering => no work");
     }
@@ -3548,7 +5129,7 @@ title = "Minimal"
                 }
                 let mut input = PassInput::new(PassMode::Full, 1 << 30);
                 input.entries = vec![e.clone()];
-                input.pins = Some(vec![server.clone()]);
+                input.pins = Some(PinSet::of_songs(vec![server.clone()]));
                 let plan = plan_pass(&input);
                 assert!(
                     !plan.iter().any(|a| matches!(a, StoreAction::SetStale { stale: true, .. })),
@@ -3565,7 +5146,7 @@ title = "Minimal"
         let unpinned = entry("now-starred", 100, 0);
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         input.entries = vec![pinned, unpinned];
-        input.pins = Some(vec![song("now-starred", 100, "flac", Some("2024-05-01T12:00:00Z"))]);
+        input.pins = Some(PinSet::of_songs(vec![song("now-starred", 100, "flac", Some("2024-05-01T12:00:00Z"))]));
         let plan = plan_pass(&input);
         // Demote to evictable, bytes KEPT - not an eager delete.
         assert!(plan.contains(&StoreAction::SetPinned { id: sid("was-starred"), pinned: false }));
@@ -3622,10 +5203,10 @@ title = "Minimal"
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         input.entries = vec![suspect];
         input.window = vec![sid("window-want")];
-        input.pins = Some(vec![
+        input.pins = Some(PinSet::of_songs(vec![
             song("backfill-want", 100, "flac", None),
             song("suspect", 100, "flac", Some("2024-05-01T12:00:00Z")),
-        ]);
+        ]));
         let plan = plan_pass(&input);
         assert_eq!(
             dls(&plan),
@@ -3658,7 +5239,7 @@ title = "Minimal"
         let mut input = PassInput::new(PassMode::Light, 150);
         input.entries = vec![suspect, stale, dirty];
         input.window = vec![sid("wanted")];
-        input.pins = Some(vec![song("unseen-pin", 100, "flac", None)]);
+        input.pins = Some(PinSet::of_songs(vec![song("unseen-pin", 100, "flac", None)]));
         input.stale_tmps = vec![PathBuf::from("/s/tmp.9.0")];
         input.orphan_audio = vec![PathBuf::from("/s/orphan.flac")];
         input.orphan_sidecars = vec![(sid("bad"), DeleteReason::CorruptSidecar)];
@@ -3685,7 +5266,7 @@ title = "Minimal"
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         input.entries = vec![suspect, stale];
         input.window = vec![sid("wanted")];
-        input.pins = Some(vec![song("backfill", 100, "flac", None)]);
+        input.pins = Some(PinSet::of_songs(vec![song("backfill", 100, "flac", None)]));
         input.defer_bulk = true;
         assert_eq!(
             dls(&plan_pass(&input)),
@@ -3718,7 +5299,7 @@ title = "Minimal"
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         input.entries = vec![e];
         input.window = vec![sid("everything")];
-        input.pins = Some(vec![song("everything", 999, "flac", None)]);
+        input.pins = Some(PinSet::of_songs(vec![song("everything", 999, "flac", None)]));
         assert_eq!(
             dls(&plan_pass(&input)),
             vec![("everything".to_string(), DownloadReason::Suspect)]
@@ -3726,7 +5307,7 @@ title = "Minimal"
         // And a window id that is also an uncached pin is Window, not Backfill.
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         input.window = vec![sid("both")];
-        input.pins = Some(vec![song("both", 100, "flac", None)]);
+        input.pins = Some(PinSet::of_songs(vec![song("both", 100, "flac", None)]));
         assert_eq!(dls(&plan_pass(&input)), vec![("both".to_string(), DownloadReason::Window)]);
     }
 
@@ -3736,7 +5317,7 @@ title = "Minimal"
         // resolution falls through to streaming.
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
         input.window = vec![SongId("../evil".into()), SongId("".into()), sid("ok")];
-        input.pins = Some(vec![song("a/b", 100, "flac", None)]);
+        input.pins = Some(PinSet::of_songs(vec![song("a/b", 100, "flac", None)]));
         assert_eq!(dls(&plan_pass(&input)), vec![("ok".to_string(), DownloadReason::Window)]);
     }
 
@@ -3745,7 +5326,9 @@ title = "Minimal"
         // A cold mirror must drain incrementally rather than pinning the task or
         // saturating the link in one burst.
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
-        input.pins = Some((0..50).map(|i| song(&format!("p{i:02}"), 10, "flac", None)).collect());
+        input.pins = Some(PinSet::of_songs(
+            (0..50).map(|i| song(&format!("p{i:02}"), 10, "flac", None)).collect(),
+        ));
         input.download_batch = 4;
         assert_eq!(dls(&plan_pass(&input)).len(), 4);
         // The bound covers the latency-critical categories too, so no pass is
@@ -3814,12 +5397,13 @@ title = "Minimal"
     }
 
     #[test]
-    fn plan_pass_eviction_never_touches_pins_the_window_or_the_skip_target() {
-        // Every protected class, all with the OLDEST possible recency so plain LRU
-        // would pick them first.
+    fn plan_pass_eviction_never_touches_the_window_or_the_skip_target() {
+        // Every ABSOLUTE protection, all with the OLDEST possible recency so plain
+        // LRU would pick them first. A RESIDENT pin outranks opportunistic bytes but
+        // is no longer categorically exempt - the window and the skip target are.
         let mut pinned = entry("pinned", 100, 0);
         pinned.pinned = true;
-        let mut input = PassInput::new(PassMode::Full, 100);
+        let mut input = PassInput::new(PassMode::Full, 400);
         input.entries = vec![
             pinned,
             entry("current", 100, 0),
@@ -3831,26 +5415,25 @@ title = "Minimal"
         // target is the handler's explicit pin, set when `pending_skip` is armed.
         input.window = vec![sid("current"), sid("upcoming")];
         input.protected = HashSet::from([sid("skip-target")]);
-        input.pins = Some(vec![song("pinned", 100, "flac", Some("2024-05-01T12:00:00Z"))]);
+        input.pins = Some(PinSet::of_songs(vec![song("pinned", 100, "flac", Some("2024-05-01T12:00:00Z"))]));
         let plan = plan_pass(&input);
         assert_eq!(
             evictions(&plan),
             vec!["evictable".to_string()],
-            "only the unprotected entry is reclaimable, despite being the NEWEST"
+            "the opportunistic entry goes first, despite being the NEWEST"
         );
-        // 500 bytes against a 100 cap with only one victim available: the plan
-        // reclaims what it may and STOPS, still over budget, rather than breaking a
-        // protection promise to balance the books.
-        assert!(
-            !plan.iter().any(|a| matches!(a, StoreAction::WarnPinOverflow { .. })),
-            "pinned bytes (100) do not exceed the cap (100); only protection does"
-        );
-        // With the pin alone over the cap, the overflow IS reported - and still no
-        // pin is evicted.
+        // Squeeze the budget until the pin no longer fits under the pin ceiling. It
+        // is then DEFERRED, and a deferred group is reclaimed after opportunistic
+        // bytes and before nothing else - which is the whole point of dropping the
+        // old blanket exemption: the store converges instead of settling forever
+        // over budget while a warn repeats every fifteen minutes.
         input.max_bytes = 50;
         let plan = plan_pass(&input);
-        assert!(plan.contains(&StoreAction::WarnPinOverflow { pinned_bytes: 100, max_bytes: 50 }));
-        assert_eq!(evictions(&plan), vec!["evictable".to_string()]);
+        assert_eq!(
+            evictions(&plan),
+            vec!["evictable".to_string(), "pinned".to_string()],
+            "opportunistic first, then the deferred pin - and never the window"
+        );
     }
 
     #[test]
@@ -3916,7 +5499,7 @@ title = "Minimal"
         still_pinned.pinned = true;
         let mut input = PassInput::new(PassMode::Full, 150);
         input.entries = vec![was_pinned, still_pinned];
-        input.pins = Some(vec![song("still-starred", 100, "flac", Some("2024-05-01T12:00:00Z"))]);
+        input.pins = Some(PinSet::of_songs(vec![song("still-starred", 100, "flac", Some("2024-05-01T12:00:00Z"))]));
         let plan = plan_pass(&input);
         assert!(plan.contains(&StoreAction::SetPinned { id: sid("was-starred"), pinned: false }));
         assert_eq!(evictions(&plan), vec!["was-starred".to_string()]);
@@ -3927,45 +5510,618 @@ title = "Minimal"
     }
 
     #[test]
-    fn plan_pass_pins_exceeding_the_budget_warn_and_halt_pin_downloads() {
+    fn plan_pass_pins_exceeding_the_ceiling_are_deferred_by_name_not_halted() {
+        // THE REPLACEMENT FOR THE OLD OVERFLOW WARN. A pin set larger than the pin
+        // ceiling used to halt the backfill ENTIRELY and warn an integer shortfall
+        // every fifteen minutes forever, so it could never converge and the user
+        // could never see which albums were missing. Now the frontier fits what it
+        // can, refuses the rest BY NAME, and keeps serving the window.
         let mut a = entry("pin-a", 100, 0);
         a.pinned = true;
-        let mut b = entry("pin-b", 100, 0);
-        b.pinned = true;
         let mut input = PassInput::new(PassMode::Full, 150);
-        input.entries = vec![a, b];
-        input.pins = Some(vec![
+        input.entries = vec![a];
+        input.pins = Some(PinSet::of_songs(vec![
             song("pin-a", 100, "flac", Some("2024-05-01T12:00:00Z")),
             song("pin-b", 100, "flac", Some("2024-05-01T12:00:00Z")),
-            song("pin-c", 100, "flac", None),
-        ]);
+        ]));
         input.window = vec![sid("must-have")];
-        let plan = plan_pass(&input);
-        // Warned once, naming the shortfall.
+        let (plan, status) = plan_pass_with_status(&input);
+        let status = status.expect("a full pass with pins publishes a status");
+        // Ceiling is 150 - min(512 MiB, 37) = 113, so exactly one 100-byte group
+        // fits and the second is refused whole.
+        assert_eq!(status.resident_tracks, 1);
         assert_eq!(
-            plan.iter()
-                .filter(|a| matches!(a, StoreAction::WarnPinOverflow { .. }))
-                .collect::<Vec<_>>(),
-            vec![&StoreAction::WarnPinOverflow { pinned_bytes: 200, max_bytes: 150 }]
+            status.deferred.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            vec!["pin-b"],
+            "the shortfall is a NAMED group, not an integer"
         );
-        // No new pin download, and NO pin evicted to make room - the promise holds
-        // and the budget holds; the operator is told to pick one.
+        assert_eq!(status.deferred[0].tracks, 1);
+        assert_eq!(status.deferred[0].bytes, 100);
+        // Nothing below the line is ever downloaded; the queue window still is.
         assert_eq!(
             dls(&plan),
             vec![("must-have".to_string(), DownloadReason::Window)],
-            "backfill halts at the cap, but the queue window still gets served"
+            "a deferred group is never fetched, but the window always is"
         );
-        assert_eq!(evictions(&plan), Vec::<String>::new(), "a pin is never silently evicted");
+        // Not over budget yet (100 on disk against 150), so nothing is reclaimed.
+        assert_eq!(evictions(&plan), Vec::<String>::new());
+    }
+
+    // ── the frontier: ONE ordering decides what is kept and what is fetched ──
+    //
+    // Everything in this block is about the single property the design exists for:
+    // admission and eviction read the SAME ordering, so they cannot contradict each
+    // other and a download-evict loop is structurally impossible rather than merely
+    // unlikely.
+
+    /// One pin group of `tracks` at `tier`. `kind` follows the tier the way the
+    /// expansion produces it: a starred song is a group of one, everything else is
+    /// an album.
+    fn grp(tier: PinTier, id: &str, tracks: &[(&str, u64)]) -> PinGroup {
+        PinGroup {
+            kind: if tier == PinTier::Song { PinKind::Song } else { PinKind::Album },
+            id: id.to_string(),
+            name: format!("name-{id}"),
+            tier,
+            songs: tracks
+                .iter()
+                .map(|(t, size)| song(t, *size, "flac", Some("2024-05-01T12:00:00Z")))
+                .collect(),
+        }
+    }
+
+    /// A pinned, on-disk entry - what a track that has already been mirrored looks
+    /// like to a later pass.
+    fn pinned_entry(id: &str, size: u64, last_played: u64) -> IndexEntry {
+        let mut e = entry(id, size, last_played);
+        e.pinned = true;
+        e
+    }
+
+    /// Just the download ids of a plan, in plan order.
+    fn dl_ids(plan: &[StoreAction]) -> Vec<String> {
+        dls(plan).into_iter().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn the_frontier_walks_song_then_album_then_artist_and_position_within_a_tier() {
+        // Declaration order of PinTier IS the priority model, and the pin set's own
+        // order (newest-starred-first, as getStarred2 returned it) breaks ties within
+        // a tier. The groups are declared here in DELIBERATELY scrambled order, so an
+        // implementation that merely preserved input order would fail.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                grp(PinTier::Artist, "ar-1", &[("art-a", 10)]),
+                grp(PinTier::Album, "al-1", &[("alb-a", 10)]),
+                grp(PinTier::Song, "so-1", &[("sng-a", 10)]),
+                grp(PinTier::Artist, "ar-2", &[("art-b", 10)]),
+                grp(PinTier::Album, "al-2", &[("alb-b", 10)]),
+                grp(PinTier::Song, "so-2", &[("sng-b", 10)]),
+            ],
+        });
+        assert_eq!(
+            dl_ids(&plan_pass(&input)),
+            vec!["sng-a", "sng-b", "alb-a", "alb-b", "art-a", "art-b"],
+            "songs first, then albums, then artists; within a tier, starred order"
+        );
+    }
+
+    #[test]
+    fn the_frontier_refuses_a_group_whole_and_keeps_walking_to_a_smaller_one() {
+        // WHOLE OR ABSENT, and best-effort fill. On real data this is not theoretical:
+        // three albums are 4 GiB of a 12.3 GiB want, and per-track admission would let
+        // those three eat the budget in arrival order. The frontier refuses them BY
+        // NAME and fits the rest.
+        let mut input = PassInput::new(PassMode::Full, 200);
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                // First in line and far too big: 3 tracks of 100 against a ceiling of 150.
+                grp(PinTier::Album, "huge", &[("h1", 100), ("h2", 100), ("h3", 100)]),
+                // Smaller, later, and it still lands.
+                grp(PinTier::Album, "small", &[("s1", 50), ("s2", 50)]),
+            ],
+        });
+        let (plan, status) = plan_pass_with_status(&input);
+        assert_eq!(
+            dl_ids(&plan),
+            vec!["s1", "s2"],
+            "the big group is refused ENTIRE - never a partial album - and the walk continues"
+        );
+        let status = status.expect("a full pass with pins publishes a status");
+        assert_eq!(status.resident_tracks, 2);
+        assert_eq!(
+            status.deferred.iter().map(|d| (d.id.as_str(), d.tracks, d.bytes)).collect::<Vec<_>>(),
+            vec![("huge", 3, 300)],
+            "and the shortfall is one NAMED album, not an integer"
+        );
+    }
+
+    #[test]
+    fn a_track_is_claimed_at_the_highest_tier_that_wants_it() {
+        // 20 of one real user's 47 starred songs are also starred-album tracks.
+        // First claim wins in frontier order, so such a track is tier SONG: it evicts
+        // last, and an album-level decision can never drag it out. Charging for it
+        // twice would also defer albums that actually fit.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                grp(PinTier::Album, "al", &[("shared", 100), ("only-album", 100)]),
+                grp(PinTier::Song, "shared", &[("shared", 100)]),
+            ],
+        });
+        let (plan, status) = plan_pass_with_status(&input);
+        let status = status.expect("status");
+        assert_eq!(status.tier_tracks[PinTier::Song as usize], 1, "the shared track is a SONG pin");
+        assert_eq!(status.tier_tracks[PinTier::Album as usize], 1, "the album keeps only its own");
+        assert_eq!(status.resident_tracks, 2, "and it is counted ONCE, not twice");
+        assert_eq!(status.tier_bytes[PinTier::Album as usize], 100);
+        // Downloaded once, at the song tier's position - not once per claiming group.
+        assert_eq!(dl_ids(&plan), vec!["shared", "only-album"]);
+    }
+
+    #[test]
+    fn a_group_evicted_from_below_the_line_is_never_re_admitted() {
+        // THE ANTI-THRASH PROPERTY, and the reason this design has ONE mechanism
+        // rather than two. With a separate tiered victim filter and a separate tiered
+        // admission loop, evicting a big album to reclaim a little space makes that
+        // album the newest-starred backfill candidate next pass, with fresh headroom:
+        // it downloads, overruns, and is evicted again - forever. A download loop
+        // against the server and the disk, and exactly the shape of bug that fills a
+        // disk slowly.
+        //
+        // Here the deferred group is BELOW THE LINE, so eviction takes it and
+        // admission refuses it, from the same ordering.
+        //
+        // The budget is 400, so the pin ceiling is 400 - min(512 MiB, 100) = 300 and
+        // the 100-byte band between them belongs to the queue window and stale
+        // replacements. `keep` (200) is resident; `doomed` (150) would take the
+        // frontier to 350 and is refused. Those numbers are chosen so the FRONTIER is
+        // the only thing refusing it: there is ample raw headroom for `doomed`, so a
+        // planner that consulted the budget alone would happily fetch it.
+        let mut input = PassInput::new(PassMode::Full, 400);
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                grp(PinTier::Song, "keep", &[("keep", 200)]),
+                grp(PinTier::Album, "doomed", &[("d1", 75), ("d2", 75)]),
+            ],
+        });
+
+        // (1) ADMISSION, from an empty store. 200 bytes of headroom remain after
+        // `keep` and the deferred album needs only 150 - and it is still not fetched.
+        assert_eq!(
+            dl_ids(&plan_pass(&input)),
+            vec!["keep"],
+            "the band below the ceiling is reserved for the window, not for pins that \
+             happen to fit in it"
+        );
+
+        // (2) EVICTION. Everything is on disk now and a protected window entry has
+        // pushed the store over the budget, so the pressure must come out of the pin
+        // groups - and it comes out of the DEFERRED one first, whole.
+        input.entries = vec![
+            pinned_entry("keep", 200, 500),
+            pinned_entry("d1", 75, 900),
+            pinned_entry("d2", 75, 900),
+            entry("window-bytes", 60, 5),
+        ];
+        input.window = vec![sid("window-bytes")];
+        let plan = plan_pass(&input);
+        let mut evicted = evictions(&plan);
+        evicted.sort();
+        assert_eq!(
+            evicted,
+            ["d1", "d2"],
+            "the whole deferred group goes, and the resident song is untouched"
+        );
+        assert_eq!(dl_ids(&plan), Vec::<String>::new(), "nothing below the line is ever fetched");
+
+        // (3) THE NEXT PASS over exactly the state eviction produced. The group is
+        // still below the line, so it is still not admitted - the state has SETTLED
+        // rather than begun a download-evict cycle.
+        input.entries = vec![pinned_entry("keep", 200, 500), entry("window-bytes", 60, 5)];
+        let plan = plan_pass(&input);
+        assert_eq!(
+            dl_ids(&plan),
+            Vec::<String>::new(),
+            "the loop is structurally impossible, not merely unlikely"
+        );
+        assert_eq!(evictions(&plan), Vec::<String>::new(), "and nothing further is reclaimed");
+    }
+
+    #[test]
+    fn eviction_takes_a_whole_group_and_never_a_member_a_higher_tier_claimed() {
+        // An album is held whole or not at all in BOTH directions: half an album is
+        // not a state this planner is willing to leave behind. And dropping an
+        // artist's album can never take a starred SONG with it, because that track was
+        // claimed at the song tier and is not in the artist group's run at all.
+        let mut input = PassInput::new(PassMode::Full, 200);
+        input.pins = Some(PinSet {
+            groups: vec![
+                grp(PinTier::Song, "loved", &[("loved", 50)]),
+                grp(PinTier::Artist, "ar", &[("loved", 50), ("a1", 50), ("a2", 50)]),
+            ],
+        });
+        input.entries = vec![
+            pinned_entry("loved", 50, 100),
+            pinned_entry("a1", 50, 900),
+            pinned_entry("a2", 50, 900),
+        ];
+        // 150 on disk against a 200 budget is not over, so nothing moves yet.
+        assert_eq!(evictions(&plan_pass(&input)), Vec::<String>::new());
+
+        // Now push over the line with an opportunistic entry the window is holding
+        // onto, so the pressure has to come out of the pin groups. The overshoot is
+        // 50 bytes - ONE member's worth - so a per-track rule would stop after `a1`
+        // and leave half an album behind. Whole-group eviction takes both anyway.
+        input.entries.push(entry("window-bytes", 100, 5));
+        input.window = vec![sid("window-bytes")];
+        let evicted = evictions(&plan_pass(&input));
+        assert_eq!(
+            evicted,
+            vec!["a1".to_string(), "a2".to_string()],
+            "the artist album goes WHOLE even though half of it would have sufficed, \
+             and the starred song it shares is untouched"
+        );
+    }
+
+    #[test]
+    fn a_starred_song_is_the_last_thing_the_store_will_give_up() {
+        // The priority model, end to end: opportunistic bytes go first by real LRU,
+        // then the weakest gesture (a standing artist subscription), then an album,
+        // and a per-track act survives all of it. Concretely: starring two hundred
+        // more albums can never evict one of his starred songs - it can only fail to
+        // download.
+        let mut input = PassInput::new(PassMode::Full, 100);
+        input.pins = Some(PinSet {
+            groups: vec![
+                grp(PinTier::Song, "sng", &[("sng", 100)]),
+                grp(PinTier::Album, "al", &[("alb", 100)]),
+                grp(PinTier::Artist, "ar", &[("art", 100)]),
+            ],
+        });
+        input.entries = vec![
+            // The opportunistic one is the MOST recently played, so a pure LRU rule
+            // would keep it and take a pin instead. Standing beats recency.
+            entry("cold-but-recent", 100, 10_000),
+            pinned_entry("sng", 100, 1),
+            pinned_entry("alb", 100, 1),
+            pinned_entry("art", 100, 1),
+        ];
+        assert_eq!(
+            evictions(&plan_pass(&input)),
+            vec![
+                "cold-but-recent".to_string(),
+                "art".to_string(),
+                "alb".to_string(),
+            ],
+            "opportunistic, then artist, then album - and the starred song survives"
+        );
+    }
+
+    #[test]
+    fn store_pause_stops_the_planner_from_scheduling_bulk_work() {
+        // The planner half of the interrupt path (the executor re-checks too, so a
+        // pause landing mid-batch is also honored - that leg is proved in the
+        // reconciler section). Pausing suspends exactly the BULK categories and no
+        // more: pausing the mirror must never make the next track stream.
+        let mut stale = pinned_entry("stale", 100, 1);
+        stale.stale = true;
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.entries = vec![stale];
+        input.window = vec![sid("about-to-play")];
+        input.pins = Some(PinSet::of_songs(vec![
+            song("stale", 100, "flac", Some("2024-05-01T12:00:00Z")),
+            song("bulk", 100, "flac", Some("2024-05-01T12:00:00Z")),
+        ]));
+        assert_eq!(
+            dls(&plan_pass(&input)),
+            vec![
+                ("about-to-play".to_string(), DownloadReason::Window),
+                ("stale".to_string(), DownloadReason::Stale),
+                ("bulk".to_string(), DownloadReason::Backfill),
+            ],
+            "unpaused, every category runs"
+        );
+
+        input.paused = true;
+        assert_eq!(
+            dls(&plan_pass(&input)),
+            vec![("about-to-play".to_string(), DownloadReason::Window)],
+            "paused, the bulk categories stop and the audible one does not"
+        );
+    }
+
+    #[test]
+    fn a_breached_reserve_writes_nothing_at_all_and_only_deletes() {
+        // THE GUARANTEE IN ITS SHARPEST FORM. A zero effective budget means the
+        // free-space reserve is breached, and then even Window and Suspect - which are
+        // deliberately never budget-gated anywhere else - are suppressed. A suppressed
+        // window download costs a track that streams instead of playing from disk,
+        // which nobody notices; 415 MiB written onto a disk at 99 % is a machine he
+        // cannot use.
+        let mut suspect = pinned_entry("suspect", 100, 5);
+        suspect.suspect = true;
+        let mut input = PassInput::new(PassMode::Full, 0);
+        input.entries = vec![suspect, pinned_entry("pin", 100, 5), entry("cold", 100, 1)];
+        input.window = vec![sid("suspect"), sid("not-yet-cached")];
+        input.pins = Some(PinSet::of_songs(vec![
+            song("suspect", 100, "flac", Some("2024-05-01T12:00:00Z")),
+            song("pin", 100, "flac", Some("2024-05-01T12:00:00Z")),
+            song("wanted", 100, "flac", None),
+        ]));
+        let (plan, status) = plan_pass_with_status(&input);
+        assert_eq!(
+            dls(&plan),
+            Vec::new(),
+            "no download of ANY reason - not backfill, not the window, not a suspect"
+        );
+        // ...and it only deletes. The window is still protected, because evicting what
+        // he is about to hear is never right even here.
+        assert_eq!(
+            evictions(&plan),
+            vec!["cold".to_string(), "pin".to_string()],
+            "everything unprotected is reclaimed, coldest-standing first"
+        );
+        let status = status.expect("status");
+        assert_eq!(status.waiting, StoreWaiting::ReserveBreached, "and it says why");
+        assert_eq!(status.effective_max, 0);
+    }
+
+    #[test]
+    fn a_breached_reserve_writes_nothing_on_a_light_pass_either() {
+        // THE OTHER HALF of the guarantee above, and the half that actually runs most
+        // often: a light kick fires at EVERY track boundary and queue edit, so if the
+        // suppression held only for `Full` the store would keep writing window
+        // originals onto a breached disk ten times per full-pass gap, each one deleted
+        // again by the next full pass. `writes_allowed` must be mode-blind.
+        //
+        // The other half of THAT is `run_pass` actually measuring the disk on a light
+        // pass, which is pinned by
+        // `a_light_pass_measures_the_disk_exactly_like_a_full_one` below - this test
+        // alone would pass even with the measurement skipped.
+        let mut suspect = entry("suspect", 100, 5);
+        suspect.suspect = true;
+        let mut input = PassInput::new(PassMode::Light, 0);
+        input.entries = vec![suspect];
+        input.window = vec![sid("suspect"), sid("not-yet-cached")];
+        let plan = plan_pass(&input);
+        assert_eq!(
+            dls(&plan),
+            Vec::new(),
+            "a light pass on a breached reserve writes nothing either"
+        );
+        // And a light pass never evicts: eviction reads a fresh scan, which only a full
+        // pass takes. The deleting half of the breach regime stays the full pass's job.
+        assert_eq!(evictions(&plan), Vec::<String>::new());
+    }
+
+    #[test]
+    fn opportunistic_bytes_are_reclaimed_to_admit_a_resident_pin_group() {
+        // THE STARVATION THIS EXISTS TO PREVENT. Window downloads are deliberately
+        // never budget-gated, so ordinary listening walks the store up to `max_bytes`
+        // in opportunistic cache. Eviction only fires ABOVE the budget and stops the
+        // instant it is at or under, so the steady state is total == max_bytes with ~0
+        // headroom - and admission, which spends `max_bytes - total`, then refuses
+        // every starred group FOREVER while reporting `waiting: none`. "Star an album
+        // and it is simply there later" would quietly stop being true once the store
+        // filled up.
+        //
+        // Bytes he ASKED FOR outrank bytes hypodj kept on spec, so the group takes the
+        // space back from the coldest cache - and the evictions must be planned BEFORE
+        // the downloads, because the executor walks the list front to back.
+        let album = grp(PinTier::Album, "al", &[("t1", 150), ("t2", 150)]);
+        let mut input = PassInput::new(PassMode::Full, 1000);
+        // Ten cold, unpinned, un-windowed entries filling the budget exactly.
+        input.entries = (0..10).map(|i| entry(&format!("c{i}"), 100, i as u64)).collect();
+        input.pins = Some(PinSet { groups: vec![album] });
+        let (plan, status) = plan_pass_with_status(&input);
+
+        assert_eq!(
+            dl_ids(&plan),
+            vec!["t1".to_string(), "t2".to_string()],
+            "the starred group is admitted, not starved"
+        );
+        assert_eq!(
+            evictions(&plan),
+            vec!["c0".to_string(), "c1".to_string(), "c2".to_string()],
+            "exactly enough of the COLDEST cache to cover 300 bytes, LRU first"
+        );
+        let first_evict = plan
+            .iter()
+            .position(|a| matches!(a, StoreAction::Evict(_)))
+            .expect("an eviction");
+        let first_dl = plan
+            .iter()
+            .position(|a| matches!(a, StoreAction::Download { .. }))
+            .expect("a download");
+        assert!(
+            first_evict < first_dl,
+            "the reclaim must precede the download it paid for - the executor walks the list in order:\n{plan:#?}"
+        );
+        let status = status.expect("status");
+        assert_eq!(status.pending_tracks, 2, "still pending, because the plan has not run yet");
+        assert_eq!(status.waiting, StoreWaiting::None);
+    }
+
+    #[test]
+    fn the_reclaim_is_all_or_nothing_and_never_takes_the_window_or_a_pin() {
+        // Three refusals the reclaim has to make, or it becomes the thrash it replaced.
+        //
+        // The queue window is off limits at any pressure (evicting what he is about to
+        // hear is never right), a group above the line is off limits (spending one
+        // pin's bytes on another is precisely the download-evict loop the frontier
+        // exists to forbid), and what is left over does not cover the group - so it
+        // evicts NOTHING. A PARTIAL reclaim would delete cache for a group that is
+        // still refused afterwards: a deletion that bought nothing and a re-download
+        // the next time he plays it.
+        //
+        // Budget 1000, so the pin ceiling is 750: `held` (50) plus `big` (700) is
+        // exactly resident, and both are above the line.
+        let held = grp(PinTier::Song, "s1", &[("held", 50)]);
+        let wanted = grp(PinTier::Album, "al", &[("big", 700)]);
+        let mut input = PassInput::new(PassMode::Full, 1000);
+        input.entries =
+            vec![pinned_entry("held", 50, 0), entry("win", 500, 1), entry("c0", 100, 2)];
+        input.window = vec![sid("win")];
+        input.pins = Some(PinSet { groups: vec![held, wanted] });
+        let plan = plan_pass(&input);
+        assert_eq!(
+            dl_ids(&plan),
+            Vec::<String>::new(),
+            "350 wanted, only the 100-byte cold entry may be taken: refused"
+        );
+        assert_eq!(
+            evictions(&plan),
+            Vec::<String>::new(),
+            "and NOTHING was deleted for it - not the window, not the held pin, not even the cold entry"
+        );
+    }
+
+    #[test]
+    fn the_reclaim_never_takes_an_id_the_same_pass_is_downloading() {
+        // EVICT-THEN-FETCH IS NOT A RECLAIM. A suspect entry's bytes are on disk and
+        // look like the coldest thing in the store, but this pass has already scheduled
+        // its replacement - taking them would spend a whole original to unlink it, and
+        // the space would be back to where it started the moment the download landed.
+        // With it excluded there is no donor at all, so the group waits instead.
+        let album = grp(PinTier::Album, "al", &[("t1", 350)]);
+        let mut input = PassInput::new(PassMode::Full, 1000);
+        let mut suspect = entry("sus", 700, 1);
+        suspect.suspect = true;
+        input.entries = vec![suspect];
+        input.pins = Some(PinSet { groups: vec![album] });
+        let plan = plan_pass(&input);
+        assert_eq!(
+            dl_ids(&plan),
+            vec!["sus".to_string()],
+            "only the suspect replacement - the backfill found no donor it was allowed to take"
+        );
+        assert_eq!(evictions(&plan), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_album_leaving_the_pin_set_demotes_exactly_its_tracks_and_they_evict_at_once() {
+        // UNSTARRING AN ALBUM. The demote path is key-agnostic - it diffs the entries
+        // against whatever ids the pin set carried, never against WHY they were in it -
+        // so this works for an album for free, PROVIDED the expansion happens inside
+        // pins() and the returned set is a COMPLETE desired set every pass.
+        let album = grp(PinTier::Album, "al", &[("t1", 100), ("t2", 100), ("t3", 100)]);
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.entries = vec![
+            pinned_entry("t1", 100, 1),
+            pinned_entry("t2", 100, 1),
+            pinned_entry("t3", 100, 1),
+            pinned_entry("kept", 100, 1),
+        ];
+        input.pins = Some(PinSet {
+            groups: vec![grp(PinTier::Song, "kept", &[("kept", 100)])],
+        });
+        let demoted: Vec<String> = plan_pass(&input)
+            .into_iter()
+            .filter_map(|a| match a {
+                StoreAction::SetPinned { id, pinned: false } => Some(id.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            demoted,
+            vec!["t1".to_string(), "t2".to_string(), "t3".to_string()],
+            "exactly the unstarred album's tracks demote, and the starred song does not"
+        );
+
+        // The bytes are KEPT (an accidental unstar and re-star costs zero downloads),
+        // but the entries are evictable in THIS SAME pass - eviction reads the pass's
+        // verdict, not the pre-pass sidecar flag.
+        input.max_bytes = 100;
+        let evicted = evictions(&plan_pass(&input));
+        assert_eq!(
+            evicted,
+            vec!["t1".to_string(), "t2".to_string(), "t3".to_string()],
+            "demoted bytes are ordinary LRU candidates at once; the pin is still spared"
+        );
+
+        // And re-starring the album costs nothing: the tracks are already on disk, so
+        // the next pass re-promotes them and schedules no download at all.
+        let mut restar = PassInput::new(PassMode::Full, 1 << 30);
+        restar.entries = vec![entry("t1", 100, 1), entry("t2", 100, 1), entry("t3", 100, 1)];
+        restar.pins = Some(PinSet { groups: vec![album] });
+        let plan = plan_pass(&restar);
+        assert_eq!(dls(&plan), Vec::new(), "re-starring re-downloads nothing");
+        assert_eq!(
+            plan.iter().filter(|a| matches!(a, StoreAction::SetPinned { pinned: true, .. })).count(),
+            3,
+            "it just re-promotes the bytes that never left"
+        );
+    }
+
+    #[test]
+    fn a_server_flap_never_costs_a_starred_file_even_over_budget() {
+        // Without an authoritative pin set there is NO frontier, so eviction degrades
+        // to exactly the rule that existed before it: unpinned entries only, by LRU.
+        // A transient getStarred2 failure must never be the reason a starred album is
+        // deleted.
+        let mut input = PassInput::new(PassMode::Full, 100);
+        input.pins = None;
+        input.entries = vec![
+            pinned_entry("starred", 100, 1),
+            entry("opportunistic", 100, 2),
+        ];
+        assert_eq!(
+            evictions(&plan_pass(&input)),
+            vec!["opportunistic".to_string()],
+            "the pin is untouchable while the pin set is unknown, even over budget"
+        );
+    }
+
+    #[test]
+    fn sort_albums_newest_first_prefers_created_then_year_then_id() {
+        // How a partly-resident artist chooses what to keep: their RECENT work, which
+        // is the "keep me current with them" reading of a standing subscription.
+        let al = |id: &str, created: Option<&str>, year: Option<u32>| Album {
+            id: crate::model::AlbumId(id.to_string()),
+            name: format!("al-{id}"),
+            artist: "ar".into(),
+            artist_id: None,
+            year,
+            genre: None,
+            cover_art: None,
+            song_count: 1,
+            created: created.map(|c| c.to_string()),
+        };
+        let mut albums = vec![
+            al("no-info", None, None),
+            al("old", Some("2019-01-01T00:00:00Z"), Some(2019)),
+            al("newest", Some("2024-06-01T00:00:00Z"), Some(2001)),
+            al("year-only-b", None, Some(2020)),
+            al("year-only-a", None, Some(2020)),
+        ];
+        sort_albums_newest_first(&mut albums);
+        assert_eq!(
+            albums.iter().map(|a| a.id.0.as_str()).collect::<Vec<_>>(),
+            // `created` dominates (even when `year` disagrees, as for "newest"), then
+            // `year`, then the id - so the order is TOTAL and two passes over the same
+            // catalogue draw the identical line.
+            vec!["newest", "old", "year-only-a", "year-only-b", "no-info"],
+        );
     }
 
     #[test]
     fn plan_pass_budgets_bulk_downloads_against_the_bytes_on_disk_right_now() {
-        // Evictions are emitted LAST, so a download admitted this pass must fit in
-        // the space that exists BEFORE they run - otherwise the store would
-        // transiently exceed max_bytes.
+        // The over-budget eviction is emitted LAST, so a download admitted this pass
+        // must fit in the space that exists BEFORE it runs - otherwise the store would
+        // transiently exceed max_bytes. The 200 bytes already on disk are the QUEUE
+        // WINDOW here, so they are off limits to the reclaim too (see
+        // `the_reclaim_is_all_or_nothing_and_never_takes_the_window_or_a_pin`) and the
+        // headroom really is only 50.
         let mut input = PassInput::new(PassMode::Full, 250);
         input.entries = vec![entry("old", 200, 1)];
-        input.pins = Some(vec![song("big", 100, "flac", None), song("small", 40, "flac", None)]);
+        input.window = vec![sid("old")];
+        input.pins = Some(PinSet::of_songs(vec![song("big", 100, "flac", None), song("small", 40, "flac", None)]));
         let plan = plan_pass(&input);
         // 50 bytes of headroom: `big` (100) does not fit, `small` (40) does.
         assert_eq!(dls(&plan), vec![("small".to_string(), DownloadReason::Backfill)]);
@@ -3987,19 +6143,21 @@ title = "Minimal"
         // exactly what the user is about to hear. Refusing them because the store is
         // full of pins would defeat the feature; their bytes are reclaimed by the
         // next pass's eviction like any others.
+        //
+        // Zero headroom AND nothing the reclaim may take: the 300 bytes on disk that
+        // are not the suspect entry itself are the queue WINDOW, which is off limits
+        // at any pressure. So the budgeted backfill is genuinely halted while the two
+        // audible categories go through anyway.
         let mut suspect = entry("suspect", 100, 0);
         suspect.suspect = true;
         suspect.pinned = true;
-        let mut pin = entry("pin", 400, 0);
-        pin.pinned = true;
-        let mut input = PassInput::new(PassMode::Full, 200);
-        input.entries = vec![suspect, pin];
-        input.window = vec![sid("about-to-play")];
-        input.pins = Some(vec![
+        let mut input = PassInput::new(PassMode::Full, 400);
+        input.entries = vec![suspect, entry("in-window", 300, 0)];
+        input.window = vec![sid("in-window"), sid("about-to-play")];
+        input.pins = Some(PinSet::of_songs(vec![
             song("suspect", 100, "flac", Some("2024-05-01T12:00:00Z")),
-            song("pin", 400, "flac", Some("2024-05-01T12:00:00Z")),
-            song("nice-to-have", 10, "flac", None),
-        ]);
+            song("nice-to-have", 150, "flac", None),
+        ]));
         let plan = plan_pass(&input);
         assert_eq!(
             dls(&plan),
@@ -4009,6 +6167,7 @@ title = "Minimal"
             ],
             "the audible work happens; the nice-to-have backfill is halted"
         );
+        assert_eq!(evictions(&plan), Vec::<String>::new(), "and nothing was deleted for it");
     }
 
     #[test]
@@ -4041,7 +6200,7 @@ title = "Minimal"
         input.entries = vec![suspect, dirty, entry("cold", 100, 0)];
         input.window = vec![sid("want")];
         input.protected = HashSet::from([sid("skip")]);
-        input.pins = Some(vec![song("newpin", 10, "flac", None)]);
+        input.pins = Some(PinSet::of_songs(vec![song("newpin", 10, "flac", None)]));
         input.stale_tmps = vec![PathBuf::from("/s/tmp.1.0")];
         let first = plan_pass(&input);
         assert_eq!(plan_pass(&input), first);
@@ -4063,9 +6222,15 @@ title = "Minimal"
         let mut input = PassInput::new(PassMode::Full, 64);
         input.entries = vec![entry("a", u64::MAX, 1), entry("b", u64::MAX, 2)];
         assert_eq!(evictions(&plan_pass(&input)), vec!["a".to_string()]);
-        // A saturating total also cannot manufacture download headroom.
-        input.pins = Some(vec![song("want", 10, "flac", None)]);
-        assert_eq!(dls(&plan_pass(&input)), Vec::new());
+        // A saturating total cannot manufacture headroom BEYOND THE BUDGET either: the
+        // reclaim credits what it freed and then re-derives against `max_bytes`, so the
+        // 10-byte pin lands behind ONE dropped nonsense entry rather than behind a
+        // credit of u64::MAX. The store is 64 bytes, and this pass plans to put 10 in
+        // it.
+        input.pins = Some(PinSet::of_songs(vec![song("want", 10, "flac", None)]));
+        let plan = plan_pass(&input);
+        assert_eq!(dls(&plan), vec![("want".to_string(), DownloadReason::Backfill)]);
+        assert_eq!(evictions(&plan), vec!["a".to_string()], "and it paid for it, once");
         // And with realistic sizes summing past u64::MAX, the same holds with no
         // panic in either profile.
         input.pins = None;
@@ -4107,7 +6272,7 @@ title = "Minimal"
         input.stale_tmps = scan.stale_tmps.clone();
         // `keep` is starred; `drop-me` is not, so it demotes and then - 64 bytes
         // against a 40 cap - it is the one thing reclaimable.
-        input.pins = Some(vec![dir_song("keep", 32)]);
+        input.pins = Some(PinSet::of_songs(vec![dir_song("keep", 32)]));
         let plan = plan_pass(&input);
         assert_eq!(
             plan,
@@ -4144,7 +6309,7 @@ title = "Minimal"
         assert_eq!(after.stale_tmps, Vec::<PathBuf>::new());
         let mut settled = PassInput::new(PassMode::Full, 40);
         settled.entries = after.entries;
-        settled.pins = Some(vec![dir_song("keep", 32)]);
+        settled.pins = Some(PinSet::of_songs(vec![dir_song("keep", 32)]));
         assert_eq!(plan_pass(&settled), Vec::new(), "the pass converges");
         assert_eq!(names(&dir), vec!["keep.flac".to_string(), "keep.toml".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4180,17 +6345,24 @@ title = "Minimal"
     struct SourceLog {
         pins_calls: usize,
         song_calls: usize,
+        invalidations: usize,
         fetches: Vec<String>,
     }
 
     struct FakeInner {
         log: Mutex<SourceLog>,
         /// `None` scripts a TRANSIENT pin-set failure.
-        pins: Mutex<Option<Vec<Song>>>,
+        pins: Mutex<Option<PinSet>>,
         /// Everything `song(id)` can resolve, for ids outside the pin set.
         catalog: Mutex<HashMap<String, Song>>,
         /// When false every fetch fails, which is how the backoff is exercised.
         fetch_ok: AtomicBool,
+        /// Fired at the START of every fetch. A test uses it to change the world
+        /// MID-PASS - the deck goes remote, the user pauses - which is the only way
+        /// to exercise the executor's re-check rather than the planner's once-per-pass
+        /// sample of the same facts.
+        #[allow(clippy::type_complexity)]
+        on_fetch: Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>,
     }
 
     /// A scripted [`PinSource`]: no server, no sockets. `fetch` writes exactly
@@ -4201,22 +6373,40 @@ title = "Minimal"
 
     impl FakeSource {
         fn new(pins: Option<Vec<Song>>) -> Self {
+            Self::with_pin_set(pins.map(PinSet::of_songs))
+        }
+
+        fn with_pin_set(pins: Option<PinSet>) -> Self {
             let catalog = pins
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| (s.id.0.clone(), s))
+                .iter()
+                .flat_map(|p| p.songs())
+                .map(|s| (s.id.0.clone(), s.clone()))
                 .collect();
             Self(Arc::new(FakeInner {
                 log: Mutex::new(SourceLog::default()),
                 pins: Mutex::new(pins),
                 catalog: Mutex::new(catalog),
                 fetch_ok: AtomicBool::new(true),
+                on_fetch: Mutex::new(None),
             }))
         }
 
+        /// Run `f` at the start of every fetch, so a test can move the world under a
+        /// pass that is already executing.
+        fn on_fetch(&self, f: impl Fn(&str) + Send + Sync + 'static) {
+            *self.0.on_fetch.lock().unwrap() = Some(Box::new(f));
+        }
+
         fn set_pins(&self, pins: Option<Vec<Song>>) {
+            *self.0.pins.lock().unwrap() = pins.map(PinSet::of_songs);
+        }
+
+        fn set_pin_set(&self, pins: Option<PinSet>) {
             *self.0.pins.lock().unwrap() = pins;
+        }
+
+        fn invalidations(&self) -> usize {
+            self.0.log.lock().unwrap().invalidations
         }
 
         fn add_to_catalog(&self, s: Song) {
@@ -4241,13 +6431,17 @@ title = "Minimal"
     }
 
     impl PinSource for FakeSource {
-        async fn pins(&self) -> Result<Vec<Song>, String> {
+        async fn pins(&self) -> Result<PinSet, String> {
             // Scoped so no std Mutex is ever held across an await.
             let scripted = {
                 self.0.log.lock().unwrap().pins_calls += 1;
                 self.0.pins.lock().unwrap().clone()
             };
             scripted.ok_or_else(|| "scripted transient failure".to_string())
+        }
+
+        fn invalidate(&self) {
+            self.0.log.lock().unwrap().invalidations += 1;
         }
 
         async fn song(&self, id: &SongId) -> Result<Song, String> {
@@ -4259,6 +6453,14 @@ title = "Minimal"
         }
 
         async fn fetch(&self, song: &Song, tmp: &Path) -> Result<u64, String> {
+            // Scoped, and there is no await inside: no std Mutex is ever held across
+            // one, here or anywhere else in this file.
+            {
+                let hook = self.0.on_fetch.lock().unwrap();
+                if let Some(f) = hook.as_ref() {
+                    f(&song.id.0);
+                }
+            }
             let ok = self.0.fetch_ok.load(Ordering::Relaxed);
             self.0.log.lock().unwrap().fetches.push(song.id.0.clone());
             if !ok {
@@ -4409,7 +6611,15 @@ title = "Minimal"
             }
         });
         let report = light_only.await.expect("light pass");
-        assert_eq!(report, PassReport::default(), "a light pass with no window does nothing");
+        assert_eq!(
+            report,
+            // A light pass DOES measure the disk (see
+            // `a_light_pass_measures_the_disk_exactly_like_a_full_one`), so it reports
+            // a budget; here the roomy test filesystem leaves the configured cap
+            // standing. Everything it could DO is still zero.
+            PassReport { budget: 1_000_000, ..PassReport::default() },
+            "a light pass with no window does nothing"
+        );
         assert!(dir.join("loose.flac").exists(), "a light pass deletes NOTHING");
         assert_eq!(source.pins_calls(), 0, "and never calls the server");
 
@@ -4539,6 +6749,41 @@ title = "Minimal"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // THE FREE-SPACE CLAMP IS NOT A FULL-PASS FEATURE. "hypodj cannot fill the disk"
+    // rests on `plan_pass` refusing every write at `max_bytes == 0`, and `max_bytes`
+    // only ever becomes 0 because `run_pass` measured the filesystem. A light kick
+    // fires at EVERY track boundary and queue edit, so measuring only on a full pass
+    // left the busiest path budgeting against the raw configured cap: window originals
+    // (31 MiB median, 415 MiB tail on his library) written onto a disk the previous
+    // full pass had already declared unwritable, roughly once per track, each one
+    // deleted again by the next full pass.
+    //
+    // Asserted without depending on this machine's free space: the configured cap is
+    // `u64::MAX`, and the reserve is at least `STORE_RESERVE_FLOOR`, so ANY successful
+    // measurement must come back strictly below the cap. A pass that skipped the
+    // measurement reports the cap verbatim.
+    #[tokio::test(start_paused = true)]
+    async fn a_light_pass_measures_the_disk_exactly_like_a_full_one() {
+        let dir = tmpdir("loop-light-budget");
+        let store = loop_store(&dir, u64::MAX, 900);
+        let source = Arc::new(FakeSource::new(Some(Vec::new())));
+        let mut backoff = Backoff::default();
+
+        let full =
+            run_pass(&store, source.as_ref(), PassMode::Full, &TokioClockForTest, &mut backoff, DOWNLOAD_BATCH)
+                .await;
+        assert!(full.budget < u64::MAX, "a full pass clamps to observed free space");
+
+        let light =
+            run_pass(&store, source.as_ref(), PassMode::Light, &TokioClockForTest, &mut backoff, DOWNLOAD_BATCH)
+                .await;
+        assert!(
+            light.budget < u64::MAX,
+            "and so does a LIGHT one - otherwise the breach regime is a full-pass-only promise"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_drifted_fingerprint_marks_stale_and_the_old_bytes_keep_serving() {
         let dir = tmpdir("loop-stale");
@@ -4636,6 +6881,147 @@ title = "Minimal"
         settle().await;
         assert_eq!(source.pins_calls(), 2, "a full kick runs a full pass at once");
         task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_a_kicked_full_pass_drops_the_memoised_expansion() {
+        // THE COST CONTROL for album and artist pins. A full pass expands every
+        // starred album, which on a real server is ~43 round trips and up to 90 s;
+        // and `re_enter` repeats the same mode after every drained batch of four, so
+        // a 290-track cold backfill is ~73 chained FULL passes. Invalidating on every
+        // one of them would multiply that by 73.
+        //
+        // A KICK is the one thing that means the PIN SET ITSELF may have changed - a
+        // star or unstar is the only thing that fires one - so it alone invalidates.
+        // The interval tick and the re-entry chain deliberately do not, and freshness
+        // on the gesture path is exact because the kick and the invalidation are the
+        // same event.
+        let dir = tmpdir("loop-invalidate");
+        let store = loop_store(&dir, 1_000_000, 60);
+        // Four pins of the same size: draining a full batch of four is what makes the
+        // loop re-enter, which is the chain this memo exists for.
+        let pins: Vec<Song> = (0..8)
+            .map(|i| song(&format!("p{i}"), 12, "flac", Some("2024-05-01T12:00:00Z")))
+            .collect();
+        let source = Arc::new(FakeSource::new(Some(pins)));
+        let task = tokio::spawn(run(store.clone(), source.clone(), TokioClockForTest));
+
+        settle_until("all eight committed", || store.entries().len() == 8).await;
+        // The backfill chained at least one re-entry (8 pins, batch of 4)...
+        assert!(source.pins_calls() >= 2, "the chain re-entered: {}", source.pins_calls());
+        // ...and not one of those passes threw the expansion away.
+        assert_eq!(
+            source.invalidations(),
+            0,
+            "a re-entry chain must never re-expand: that is 73 expansions on a cold mirror"
+        );
+
+        // An interval tick is likewise not a reason to re-expand.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        settle().await;
+        assert_eq!(source.invalidations(), 0, "nor does the ordinary cadence");
+
+        // A star or unstar does.
+        store.kick_full();
+        settle_until("the kicked pass invalidated", || source.invalidations() == 1).await;
+        assert_eq!(source.invalidations(), 1, "a star flip re-expands, exactly once");
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn playback_starting_mid_pass_abandons_bulk_work_but_never_the_window() {
+        // `defer_bulk` is sampled ONCE per pass, so without a re-check inside the
+        // executor the rest of a four-deep backfill batch keeps pulling originals
+        // after he presses play - which is precisely what the deferral exists to
+        // prevent, and a 12 GiB backfill is exactly the case it exists for.
+        let dir = tmpdir("loop-yield");
+        let store = loop_store(&dir, 1_000_000, 3600);
+        let pins: Vec<Song> = (0..4)
+            .map(|i| song(&format!("b{i}"), 12, "flac", Some("2024-05-01T12:00:00Z")))
+            .collect();
+        let source = Arc::new(FakeSource::with_pin_set(Some(PinSet::of_songs(pins))));
+        // A window id nobody has cached: the work he is about to HEAR.
+        let wanted = song("window-id", 12, "flac", Some("2024-05-01T12:00:00Z"));
+        source.add_to_catalog(wanted.clone());
+        store.set_window(vec![sid("window-id")]);
+
+        // THE DECK IS QUIET WHEN THE PASS IS PLANNED, so the planner admits the
+        // window download AND all four backfills. He presses play during the first
+        // fetch. Only a re-check inside the executor can catch that - the planner
+        // sampled `defer_bulk` once, before any of this happened.
+        let deck = store.clone();
+        source.on_fetch(move |id| {
+            if id == "window-id" {
+                deck.set_playback_remote(true);
+            }
+        });
+
+        let mut backoff = Backoff::default();
+        run_pass(&store, source.as_ref(), PassMode::Full, &TokioClockForTest, &mut backoff, 8)
+            .await;
+        assert_eq!(
+            source.fetches(),
+            vec!["window-id".to_string()],
+            "the window download he is about to hear completes, and the four backfills \
+             the same plan admitted all yield the moment the deck goes remote"
+        );
+
+        // Stopped, the same work proceeds - the deferral is a wait, not a refusal.
+        source.on_fetch(|_| {});
+        store.set_playback_remote(false);
+        run_pass(&store, source.as_ref(), PassMode::Full, &TokioClockForTest, &mut backoff, 8)
+            .await;
+        assert_eq!(store.entries().len(), 5, "a quiet deck mirrors everything");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_pause_suspends_bulk_work_without_ever_silencing_the_next_track() {
+        // The interrupt path the store had none of. `store pause` suspends the same
+        // bulk categories `defer_bulk` does - and no more: pausing the MIRROR must
+        // never make the next track stream.
+        let dir = tmpdir("loop-paused");
+        let store = loop_store(&dir, 1_000_000, 3600);
+        let source = Arc::new(FakeSource::new(Some(vec![song(
+            "bulk",
+            12,
+            "flac",
+            Some("2024-05-01T12:00:00Z"),
+        )])));
+        source.add_to_catalog(song("window-id", 12, "flac", Some("2024-05-01T12:00:00Z")));
+        store.set_window(vec![sid("window-id")]);
+        store.set_paused(true);
+
+        let mut backoff = Backoff::default();
+        run_pass(&store, source.as_ref(), PassMode::Full, &TokioClockForTest, &mut backoff, 8)
+            .await;
+        assert_eq!(
+            source.fetches(),
+            vec!["window-id".to_string()],
+            "paused, the mirror still fetches what he is about to hear"
+        );
+        assert_eq!(store.status().waiting, StoreWaiting::Paused, "and it says why");
+
+        // Resuming both clears the suspension and asks for a pass at once, so
+        // "resume" is not indistinguishable from "still paused" for fifteen minutes.
+        assert!(!store.set_paused(false));
+        assert!(store.take_full_request_for_test(), "resume kicks a full pass");
+        run_pass(&store, source.as_ref(), PassMode::Full, &TokioClockForTest, &mut backoff, 8)
+            .await;
+        assert!(
+            source.fetches().contains(&"bulk".to_string()),
+            "and the bulk work resumes: {:?}",
+            source.fetches()
+        );
+
+        // NEVER PERSISTED: the flag lives in the process, so a restart resumes
+        // mirroring and pausing can never become a forgotten config.
+        store.set_paused(true);
+        drop(store);
+        let reopened = loop_store(&dir, 1_000_000, 3600);
+        assert!(!reopened.paused(), "a restart always resumes the mirror");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4762,14 +7148,14 @@ title = "Minimal"
     #[test]
     fn re_enter_requires_progress_not_merely_outstanding_work() {
         // A full batch that landed something: keep draining.
-        assert!(PassReport { scheduled: 4, given_up: 0, committed: 1, evicted: 0 }.re_enter(4, 0));
+        assert!(PassReport { scheduled: 4, given_up: 0, committed: 1, evicted: 0, ..PassReport::default() }.re_enter(4, 0));
         // A full batch that landed NOTHING must sleep, or a permanently failing
         // download would spin the reconciler at full speed forever.
-        assert!(!PassReport { scheduled: 4, given_up: 0, committed: 0, evicted: 0 }.re_enter(4, 0));
+        assert!(!PassReport { scheduled: 4, given_up: 0, committed: 0, evicted: 0, ..PassReport::default() }.re_enter(4, 0));
         // A partial batch is all there was: nothing more to drain.
-        assert!(!PassReport { scheduled: 2, given_up: 0, committed: 2, evicted: 0 }.re_enter(4, 0));
+        assert!(!PassReport { scheduled: 2, given_up: 0, committed: 2, evicted: 0, ..PassReport::default() }.re_enter(4, 0));
         // An eviction re-enters so the reclaimed headroom is usable now.
-        assert!(PassReport { scheduled: 0, given_up: 0, committed: 0, evicted: 1 }.re_enter(4, 0));
+        assert!(PassReport { scheduled: 0, given_up: 0, committed: 0, evicted: 1, ..PassReport::default() }.re_enter(4, 0));
     }
 
     #[test]
@@ -4778,7 +7164,7 @@ title = "Minimal"
         // filesystem that reports reclamation it did not perform gets at most
         // MAX_EVICTION_CHAIN passes, not an endless run of directory scans and
         // getStarred2 round trips.
-        let evicting = PassReport { scheduled: 0, given_up: 0, committed: 0, evicted: 1 };
+        let evicting = PassReport { scheduled: 0, given_up: 0, committed: 0, evicted: 1, ..PassReport::default() };
         assert!(evicting.re_enter(4, MAX_EVICTION_CHAIN - 1), "the last link is allowed");
         assert!(!evicting.re_enter(4, MAX_EVICTION_CHAIN), "and then the loop must wait");
         assert!(!evicting.re_enter(4, MAX_EVICTION_CHAIN + 9));
@@ -4786,12 +7172,12 @@ title = "Minimal"
         // A chain of COMMITTED downloads is not capped: every link cost a real
         // original, the desired set is finite, and capping it would stall a cold
         // backfill for a whole interval.
-        let draining = PassReport { scheduled: 4, given_up: 0, committed: 4, evicted: 0 };
+        let draining = PassReport { scheduled: 4, given_up: 0, committed: 4, evicted: 0, ..PassReport::default() };
         assert!(draining.re_enter(4, MAX_EVICTION_CHAIN * 100));
         assert!(draining.drained_a_full_batch(4), "which is what resets the chain");
         assert!(!evicting.drained_a_full_batch(4));
         // A pass that both drained a batch and evicted still counts as draining.
-        let both = PassReport { scheduled: 4, given_up: 0, committed: 1, evicted: 2 };
+        let both = PassReport { scheduled: 4, given_up: 0, committed: 1, evicted: 2, ..PassReport::default() };
         assert!(both.re_enter(4, MAX_EVICTION_CHAIN));
     }
 
@@ -4946,7 +7332,372 @@ title = "Minimal"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn pin_starred_false_is_an_authoritative_empty_set_not_an_unknown_one() {
+        // THE ONE PATH where widening `pins()` from `Vec<Song>` to a `PinSet` could
+        // have silently started returning "no information" instead of "nothing is
+        // starred". An `Err` here would KEEP every claim - transient-keeps-the-claim
+        // is the whole of offline mode - so the knob would quietly stop demoting
+        // anything and the mirror would freeze exactly as it was, forever.
+        //
+        // It is also the one path that must answer WITHOUT the network: the port
+        // below refuses connections, so a `pins()` that reached the server at all
+        // would fail this rather than pass it.
+        let cfg = crate::config::ServerConfig {
+            url: "http://127.0.0.1:1/never-called".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            client_name: "test".to_string(),
+        };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => Arc::new(c),
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return;
+            }
+        };
+        let source = SubsonicPinSource::new(client, false, TokioClockForTest);
+        let pins = source
+            .pins()
+            .await
+            .expect("pin_starred = false is a VERDICT, never a transient failure");
+        assert!(pins.is_empty(), "and the verdict is EMPTY, which demotes every tier");
+        assert_eq!(pins.groups, Vec::new());
+
+        // Fed to the planner it does exactly what the knob promises: every pin
+        // demotes, the bytes stay, and only the queue window is still mirrored.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.entries = vec![pinned_entry("was-song", 100, 1), pinned_entry("was-album", 100, 1)];
+        input.pins = Some(pins);
+        let demoted: Vec<String> = plan_pass(&input)
+            .into_iter()
+            .filter_map(|a| match a {
+                StoreAction::SetPinned { id, pinned: false } => Some(id.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(demoted, vec!["was-song".to_string(), "was-album".to_string()]);
+    }
+
     /// The production [`TokioClock`], re-exported under a local name so the loop
     /// tests read as "the same clock production uses, merely paused".
     use crate::clock::TokioClock as TokioClockForTest;
+
+    // ── The pin EXPANSION, over the catalogue seam ───────────────────────────
+    //
+    // Everything below exercises `PinExpansion` itself - the code that turns a
+    // starred album or artist into tracks. It is the actual feature, and a
+    // `PinSource` fake cannot reach it: a double there REPLACES the expansion.
+
+    /// What the fake catalogue answers for one album or artist.
+    enum Reply {
+        Songs(Vec<Song>),
+        Albums(Vec<Album>),
+        /// The server said, authoritatively, that it is gone (API code 70).
+        Gone,
+        /// A transport wobble - the case the all-or-nothing policy exists for.
+        Flaky,
+    }
+
+    #[derive(Default)]
+    struct FakeCatalog {
+        starred: Mutex<Option<Starred>>,
+        albums: Mutex<HashMap<String, Reply>>,
+        artists: Mutex<HashMap<String, Reply>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FakeCatalog {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn set_starred(&self, s: Starred) {
+            *self.starred.lock().unwrap() = Some(s);
+        }
+
+        fn set_album(&self, id: &str, r: Reply) {
+            self.albums.lock().unwrap().insert(id.to_string(), r);
+        }
+
+        fn set_artist(&self, id: &str, r: Reply) {
+            self.artists.lock().unwrap().insert(id.to_string(), r);
+        }
+
+        /// Every catalogue call this fake has served, in order.
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn album_calls(&self, id: &str) -> usize {
+            let want = format!("album:{id}");
+            self.calls.lock().unwrap().iter().filter(|c| **c == want).count()
+        }
+    }
+
+    impl PinCatalog for Arc<FakeCatalog> {
+        async fn starred(&self) -> Result<Starred, SubsonicError> {
+            self.calls.lock().unwrap().push("starred".to_string());
+            match self.starred.lock().unwrap().take() {
+                Some(s) => Ok(s),
+                None => Ok(Starred { songs: Vec::new(), albums: Vec::new(), artists: Vec::new() }),
+            }
+        }
+
+        async fn album_songs(&self, id: &AlbumId) -> Result<Vec<Song>, SubsonicError> {
+            self.calls.lock().unwrap().push(format!("album:{}", id.0));
+            match self.albums.lock().unwrap().get(&id.0) {
+                Some(Reply::Songs(v)) => Ok(v.clone()),
+                Some(Reply::Gone) => Err(SubsonicError::NotFound(id.0.clone())),
+                Some(Reply::Flaky) => Err(SubsonicError::Request("wobble".into())),
+                _ => Ok(Vec::new()),
+            }
+        }
+
+        async fn artist_albums(&self, id: &ArtistId) -> Result<Vec<Album>, SubsonicError> {
+            self.calls.lock().unwrap().push(format!("artist:{}", id.0));
+            match self.artists.lock().unwrap().get(&id.0) {
+                Some(Reply::Albums(v)) => Ok(v.clone()),
+                Some(Reply::Gone) => Err(SubsonicError::NotFound(id.0.clone())),
+                Some(Reply::Flaky) => Err(SubsonicError::Request("wobble".into())),
+                _ => Ok(Vec::new()),
+            }
+        }
+    }
+
+    fn album(id: &str, song_count: u32, created: Option<&str>) -> Album {
+        Album {
+            id: AlbumId(id.to_string()),
+            name: format!("al-{id}"),
+            artist: "ar".into(),
+            artist_id: None,
+            year: None,
+            genre: None,
+            cover_art: None,
+            song_count,
+            created: created.map(str::to_string),
+        }
+    }
+
+    fn artist(id: &str) -> crate::model::Artist {
+        crate::model::Artist {
+            id: ArtistId(id.to_string()),
+            name: format!("ar-{id}"),
+            album_count: 0,
+            starred: true,
+            cover_art: None,
+        }
+    }
+
+    /// The frontier-facing shape of an expansion: (tier, group id, name, track ids).
+    fn shape(set: &PinSet) -> Vec<(PinTier, String, String, Vec<String>)> {
+        set.groups
+            .iter()
+            .map(|g| {
+                (
+                    g.tier,
+                    g.id.clone(),
+                    g.name.clone(),
+                    g.songs.iter().map(|s| s.id.0.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_expansion_walks_songs_then_albums_then_one_group_per_artist_album() {
+        // THE THREE BUCKETS TO GROUPS, in the order the frontier then walks. A starred
+        // ARTIST fans out to ONE GROUP PER ALBUM, newest first, so a huge catalogue
+        // degrades album by album at the ceiling instead of being refused whole - and
+        // each group is NAMED "artist - album" so a deferral is legible in the `store`
+        // listing.
+        let cat = FakeCatalog::new();
+        cat.set_starred(Starred {
+            songs: vec![song("s1", 10, "flac", None)],
+            albums: vec![album("a1", 2, None)],
+            artists: vec![artist("ar1")],
+        });
+        cat.set_album("a1", Reply::Songs(vec![song("t1", 10, "flac", None), song("t2", 10, "flac", None)]));
+        cat.set_artist(
+            "ar1",
+            Reply::Albums(vec![
+                album("old", 1, Some("2019-01-01T00:00:00Z")),
+                album("new", 1, Some("2024-01-01T00:00:00Z")),
+            ]),
+        );
+        cat.set_album("old", Reply::Songs(vec![song("o1", 10, "flac", None)]));
+        cat.set_album("new", Reply::Songs(vec![song("n1", 10, "flac", None)]));
+
+        let exp = PinExpansion::new(cat.clone(), TokioClockForTest);
+        let set = exp.pins().await.expect("expansion");
+        assert_eq!(
+            shape(&set),
+            vec![
+                (PinTier::Song, "s1".to_string(), "t-s1".to_string(), vec!["s1".to_string()]),
+                (PinTier::Album, "a1".to_string(), "al-a1".to_string(), vec!["t1".to_string(), "t2".to_string()]),
+                (PinTier::Artist, "new".to_string(), "ar-ar1 - al-new".to_string(), vec!["n1".to_string()]),
+                (PinTier::Artist, "old".to_string(), "ar-ar1 - al-old".to_string(), vec!["o1".to_string()]),
+            ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gone_album_expands_to_nothing_while_a_flaky_one_aborts_the_whole_set() {
+        // THE POLICY THE ENTIRE DEMOTE-SAFETY ARGUMENT RESTS ON. A definitive NotFound
+        // is a VERDICT - that album is gone, so it expands to nothing and its tracks
+        // demote correctly. Any other error is TRANSIENT, and returning a partial set
+        // would look authoritative: 33 of 36 albums present would demote the other
+        // three over one wobbly `getAlbum` and evict them next pass. Getting these two
+        // backwards is silent and expensive in both directions, and nothing tested it.
+        let cat = FakeCatalog::new();
+        cat.set_starred(Starred {
+            songs: Vec::new(),
+            albums: vec![album("gone", 1, None), album("fine", 1, None)],
+            artists: Vec::new(),
+        });
+        cat.set_album("gone", Reply::Gone);
+        cat.set_album("fine", Reply::Songs(vec![song("f1", 10, "flac", None)]));
+        let exp = PinExpansion::new(cat.clone(), TokioClockForTest);
+        let set = exp.pins().await.expect("a gone album is not a failure");
+        assert_eq!(
+            shape(&set),
+            vec![
+                (PinTier::Album, "gone".to_string(), "al-gone".to_string(), Vec::new()),
+                (PinTier::Album, "fine".to_string(), "al-fine".to_string(), vec!["f1".to_string()]),
+            ],
+            "gone expands to an EMPTY group, and the rest of the walk continues"
+        );
+
+        // A transport wobble on ONE album takes the whole expansion with it.
+        let cat = FakeCatalog::new();
+        cat.set_starred(Starred {
+            songs: Vec::new(),
+            albums: vec![album("flaky", 1, None), album("fine", 1, None)],
+            artists: Vec::new(),
+        });
+        cat.set_album("flaky", Reply::Flaky);
+        cat.set_album("fine", Reply::Songs(vec![song("f1", 10, "flac", None)]));
+        let exp = PinExpansion::new(cat.clone(), TokioClockForTest);
+        assert!(exp.pins().await.is_err(), "a transient failure is ALL or nothing");
+
+        // Same rule one level up: a flaky getArtist aborts, a gone one expands to
+        // nothing.
+        let cat = FakeCatalog::new();
+        cat.set_starred(Starred {
+            songs: Vec::new(),
+            albums: Vec::new(),
+            artists: vec![artist("flaky")],
+        });
+        cat.set_artist("flaky", Reply::Flaky);
+        let exp = PinExpansion::new(cat.clone(), TokioClockForTest);
+        assert!(exp.pins().await.is_err());
+
+        let cat = FakeCatalog::new();
+        cat.set_starred(Starred { songs: Vec::new(), albums: Vec::new(), artists: vec![artist("gone")] });
+        cat.set_artist("gone", Reply::Gone);
+        let exp = PinExpansion::new(cat.clone(), TokioClockForTest);
+        assert_eq!(exp.pins().await.expect("gone artist").groups.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_artist_over_the_album_cap_keeps_the_newest_and_no_more() {
+        // A RUNAWAY BRAKE ON ROUND TRIPS, not a statement about what "starred" means.
+        // The cap truncates AFTER the newest-first sort, so what survives is their
+        // recent work rather than an arbitrary slice of whatever order the server used.
+        let cat = FakeCatalog::new();
+        cat.set_starred(Starred { songs: Vec::new(), albums: Vec::new(), artists: vec![artist("ar1")] });
+        // Oldest first on the wire, so an unsorted truncation would keep the wrong end.
+        let albums: Vec<Album> = (0..ARTIST_ALBUM_CAP + 5)
+            .map(|i| album(&format!("al{i:03}"), 1, Some(&format!("20{:02}-01-01T00:00:00Z", i % 100))))
+            .collect();
+        for a in &albums {
+            cat.set_album(&a.id.0, Reply::Songs(vec![song(&format!("s-{}", a.id.0), 10, "flac", None)]));
+        }
+        cat.set_artist("ar1", Reply::Albums(albums));
+        let exp = PinExpansion::new(cat.clone(), TokioClockForTest);
+        let set = exp.pins().await.expect("expansion");
+        assert_eq!(set.groups.len(), ARTIST_ALBUM_CAP, "capped");
+        assert_eq!(
+            set.groups[0].id, "al099",
+            "and the survivors are the NEWEST, not the first the server listed"
+        );
+        assert_eq!(
+            cat.calls().iter().filter(|c| c.starts_with("album:")).count(),
+            ARTIST_ALBUM_CAP,
+            "the cap is a brake on ROUND TRIPS - the truncated albums are never fetched"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_album_memo_expires_yields_to_a_song_count_change_and_drops_what_left() {
+        // The memo is what makes asking for the pin set on every pass affordable (36
+        // `getAlbum` calls at ~0.6 s each, otherwise). Its three escapes, each of which
+        // would ship green if it silently stopped working: the TTL, the `song_count`
+        // disagreement that catches a track ADDED before the TTL is up, and the drop of
+        // any album that left the starred set so the map cannot grow for the life of
+        // the process.
+        let cat = FakeCatalog::new();
+        let tracks = vec![song("t1", 10, "flac", None)];
+        cat.set_album("a1", Reply::Songs(tracks.clone()));
+        let exp = PinExpansion::new(cat.clone(), TokioClockForTest);
+
+        cat.set_starred(Starred { songs: Vec::new(), albums: vec![album("a1", 1, None)], artists: Vec::new() });
+        exp.pins().await.expect("first");
+        assert_eq!(cat.album_calls("a1"), 1);
+
+        // Past the pin-set memo but inside the album memo: no second getAlbum.
+        tokio::time::advance(PIN_SET_MEMO_TTL + Duration::from_secs(1)).await;
+        cat.set_starred(Starred { songs: Vec::new(), albums: vec![album("a1", 1, None)], artists: Vec::new() });
+        exp.pins().await.expect("memoised");
+        assert_eq!(cat.album_calls("a1"), 1, "the album memo served it");
+
+        // A song_count disagreement forces a refetch BEFORE the TTL: a track added to a
+        // starred album would otherwise be invisible for six hours.
+        tokio::time::advance(PIN_SET_MEMO_TTL + Duration::from_secs(1)).await;
+        cat.set_starred(Starred { songs: Vec::new(), albums: vec![album("a1", 2, None)], artists: Vec::new() });
+        exp.pins().await.expect("count changed");
+        assert_eq!(cat.album_calls("a1"), 2, "a song_count disagreement outranks the TTL");
+
+        // And the TTL itself.
+        tokio::time::advance(ALBUM_MEMO_TTL + Duration::from_secs(1)).await;
+        cat.set_starred(Starred { songs: Vec::new(), albums: vec![album("a1", 2, None)], artists: Vec::new() });
+        exp.pins().await.expect("expired");
+        assert_eq!(cat.album_calls("a1"), 3, "and the TTL expires it");
+
+        // Unstarred: the memo entry is dropped, so a re-star pays a fresh fetch rather
+        // than serving a six-hour-old list.
+        tokio::time::advance(PIN_SET_MEMO_TTL + Duration::from_secs(1)).await;
+        cat.set_starred(Starred { songs: Vec::new(), albums: Vec::new(), artists: Vec::new() });
+        exp.pins().await.expect("unstarred");
+        assert_eq!(exp.album_memo.lock().unwrap().len(), 0, "an album nobody wants cannot be consulted again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pin_set_memo_collapses_the_chain_and_a_star_invalidates_it() {
+        // A cold backfill re-enters the same pass after every drained batch of four -
+        // ~73 chained full passes for 290 tracks - and a naive expansion is 43 round
+        // trips each time. The memo collapses the chain; `invalidate` (called only on a
+        // KICKED full pass, i.e. a star or unstar) is what keeps the GESTURE path exact.
+        let cat = FakeCatalog::new();
+        let exp = PinExpansion::new(cat.clone(), TokioClockForTest);
+        cat.set_starred(Starred { songs: vec![song("s1", 10, "flac", None)], albums: Vec::new(), artists: Vec::new() });
+        exp.pins().await.expect("first");
+        exp.pins().await.expect("memoised");
+        assert_eq!(cat.calls(), vec!["starred".to_string()], "one getStarred2 for the chain");
+
+        // A star or unstar: the memoised set must go at once, not in 30 seconds.
+        cat.set_starred(Starred {
+            songs: vec![song("s1", 10, "flac", None), song("s2", 10, "flac", None)],
+            albums: Vec::new(),
+            artists: Vec::new(),
+        });
+        exp.invalidate();
+        let set = exp.pins().await.expect("after the gesture");
+        assert_eq!(set.groups.len(), 2, "the gesture path is exact, never memo-stale");
+
+        // And the TTL expires it on its own.
+        cat.set_starred(Starred { songs: Vec::new(), albums: Vec::new(), artists: Vec::new() });
+        tokio::time::advance(PIN_SET_MEMO_TTL + Duration::from_secs(1)).await;
+        assert_eq!(exp.pins().await.expect("expired").groups.len(), 0);
+    }
 }

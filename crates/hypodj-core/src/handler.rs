@@ -84,7 +84,75 @@ use crate::timer::{TimerGuard, TimerHandle};
 struct QueueItem {
     id: u64,
     entry: QueueEntry,
+    /// Wall-clock epoch seconds of the FIRST live position sample this entry ever
+    /// produced, or `None` while it has produced none. It is the only field that makes
+    /// [`State::trim_spent`] honest: "spent" must mean SOUND CAME OUT of this row, not
+    /// "this row sits behind `current`".
+    ///
+    /// The distinction is load-bearing in two directions. A failed-load WALK
+    /// ([`HypodjHandler::walk_origin_qid`]) steps `current` over entries mpv never
+    /// opened, so a position-based rule would trim - and write a ledger row claiming he
+    /// HEARD - music that never played a frame. And `play <pos>` jumping forward leaves
+    /// unplayed rows behind `current` that are still queued music, not history.
+    ///
+    /// Written at exactly one site, [`HypodjHandler::note_playback_progress`], the same
+    /// director-spine signal the EOF fuse already trusts as proof that audio flowed, and
+    /// gated by a lockless qid compare so it costs ONE short `State` lock per track
+    /// change rather than one per position tick. `crate::store::now_unix` is the vDSO
+    /// clock the spine can afford (the same call [`crate::heard::HeardRow::now`] makes
+    /// from the ICY arm). EPHEMERAL: never persisted to resume.toml - a restored queue
+    /// has heard nothing yet this run, which is exactly the safe answer.
+    played_at: Option<u64>,
+    /// This row came back from `resume.toml` at or behind the restored `current` -
+    /// history carried in from the previous session rather than anything this run
+    /// heard.
+    ///
+    /// It exists because [`played_at`](Self::played_at) is deliberately ephemeral, and
+    /// the two facts it collapses are not the same. `restore` rebuilds every row with
+    /// `played_at: None`, so a leading-run rule that read only `played_at` stopped at
+    /// index 0 for the whole process and [`State::trim_spent`] was DEAD after any
+    /// restart - which is the ordinary path here (the daemon restarts on every
+    /// `nixos-rebuild switch`), so the unbounded queue and unbounded `resume.toml`
+    /// task 85xw3mq set out to fix came straight back on the very session that
+    /// mattered most.
+    ///
+    /// Trimmable, never FILED: [`spent_heard_row`] keys on `played_at`, so a carried
+    /// row leaves the queue without writing a ledger line claiming this run heard it.
+    /// That is the honest split - the queue is bounded, and the record still only
+    /// records sound that actually came out. Set ONLY for rows the previous session had
+    /// already reached (index `<= current`); everything after it is queued music the
+    /// deck never got to.
+    carried: bool,
 }
+
+impl QueueItem {
+    /// A freshly QUEUED row: nothing has played it yet.
+    fn queued(id: u64, entry: QueueEntry) -> Self {
+        Self { id, entry, played_at: None, carried: false }
+    }
+
+    /// A row RESTORED from a resume snapshot. `carried` marks the ones the previous
+    /// session had already reached - its history, trimmable but never filed.
+    fn restored(id: u64, entry: QueueEntry, carried: bool) -> Self {
+        Self { id, entry, played_at: None, carried }
+    }
+}
+
+/// How many SPENT rows [`State::trim_spent`] leaves standing behind `current`.
+///
+/// Not a config key, deliberately: this is the size of a scrollback, and a number he
+/// would have to tune is a number he would have to think about. 25 rows is roughly the
+/// last hour and a half of listening at album-track length - long enough that "wait, what
+/// was that two tracks ago?" is answered by scrolling up in ncmpcpp and by `prev`
+/// stepping back through it, short enough that the queue reads as what is COMING rather
+/// than as a transcript. Everything older is not gone: it is in the heard ledger, which
+/// is append-only, retained across sessions, and read back with `dj heard all`.
+///
+/// It also bounds the two things that actually grew: the rendered queue, and
+/// `resume.toml`, which serialises the WHOLE queue on every checkpoint. With this the
+/// persisted size is `SPENT_KEEP` + whatever the lookahead has put ahead of `current` -
+/// a constant, in a session of any length.
+const SPENT_KEEP: usize = 25;
 
 struct State {
     queue: Vec<QueueItem>,
@@ -762,6 +830,43 @@ fn miss_row(outcome: &str, station: Option<&str>, url: &str) -> crate::heard::He
     }
 }
 
+/// The ledger row for one SPENT library track being trimmed off the queue
+/// ([`State::trim_spent`], task 85xw3mq). This is what makes the trim lossless: the row
+/// leaves the queue, the listen does not leave the record.
+///
+/// Stamped with [`QueueItem::played_at`] - WHEN IT PLAYED, not when it was trimmed - so
+/// the ledger stays a chronology. `played_at` is only ever set from a real position
+/// sample, so a row exists exactly when sound came out; that is also why `None` returns
+/// `None` rather than stamping now.
+///
+/// `owned: true` and `match_uri: song/<id>` because a library track is by definition
+/// already his: `dj heard` then collapses these into its "+N you already own" tally and
+/// `dj heard all` lists them, which is precisely the "what did I listen to" scrollback
+/// the queue used to hold. A raw STREAM yields no row here - a stream's record is the ICY
+/// rows it already wrote while playing, and its `file:` is a url, not a track.
+fn spent_heard_row(it: &QueueItem) -> Option<crate::heard::HeardRow> {
+    let QueueEntry::Song(s) = &it.entry else { return None };
+    let at_unix = it.played_at?;
+    let raw = match s.artist.as_deref().filter(|a| !a.trim().is_empty()) {
+        Some(artist) => format!("{artist} - {}", s.title),
+        None => s.title.clone(),
+    };
+    Some(crate::heard::HeardRow {
+        at_unix,
+        ev: "heard".to_string(),
+        src: Some("queue".to_string()),
+        kind: Some("track".to_string()),
+        raw: Some(raw),
+        artist: s.artist.clone(),
+        title: Some(s.title.clone()),
+        owned: true,
+        match_uri: Some(format!("song/{}", s.id.0)),
+        album: s.album.clone(),
+        year: s.year,
+        ..Default::default()
+    })
+}
+
 /// One recognition HIT row. Records ownership but never a star.
 fn recognize_hit_row(
     track: &crate::recognize::RecognizedTrack,
@@ -992,6 +1097,82 @@ impl State {
             Some(c) if pick == c => Some((pick + 1) % len),
             _ => Some(pick),
         }
+    }
+
+    /// Drop the OLDEST spent rows off the FRONT of the queue, keeping at most
+    /// [`SPENT_KEEP`] of them, and return what was removed so the caller can write each
+    /// one to the heard ledger. Returns empty when nothing may be trimmed.
+    ///
+    /// THE PRODUCT DECISION (task 85xw3mq). `consume` is false and nothing trimmed, so
+    /// an endless radio walk - now the NORMAL way to listen - grew the queue for the
+    /// whole session: an 8-hour sitting left several hundred dead rows to scroll past
+    /// and a `resume.toml` that serialised every one of them on every checkpoint. The
+    /// answer is NOT `consume` (which erases a track the instant it ends, so `prev` and
+    /// "what was that?" both die) and not an unbounded queue either. It is a bounded
+    /// WINDOW of history: the last [`SPENT_KEEP`] played rows stay in the queue where
+    /// `prev` and the client's scrollback can reach them, and everything older moves to
+    /// the heard ledger, which is the append-only record built for exactly this and is
+    /// read back with `dj heard all`. Nothing is lost; only the queue stops being the
+    /// place it is kept.
+    ///
+    /// FIVE GUARDS, each refusing rather than guessing:
+    ///
+    /// - SPENT MEANS AUDIBLE - or CARRIED. Only a leading run of rows carrying
+    ///   [`QueueItem::played_at`] or [`QueueItem::carried`] is eligible, never
+    ///   "everything below `current`". A failed-load walk moves `current` past entries
+    ///   that never produced a frame and `play <pos>` jumps over rows that are still
+    ///   queued music; trimming either would delete music he has not heard AND file a
+    ///   ledger row claiming he heard it. A CARRIED row is the third case and the one
+    ///   that keeps this alive across a restart: a restored row behind `current` is the
+    ///   previous session's history, so it is trimmable - and it still files nothing,
+    ///   because [`spent_heard_row`] keys on `played_at`, which a restore never sets.
+    ///   Without it the run stopped at index 0 for the rest of the process and the
+    ///   whole trim was dead on every resumed session.
+    /// - NEVER `current`. The run stops at `current` unconditionally, so the playing row
+    ///   is untouchable even though it is itself played.
+    /// - NEVER UNDER `repeat`. Repeat-all wraps to index 0, so trimming the front would
+    ///   silently redefine what the repeat repeats. Repeat means "this queue is the
+    ///   material" - so it is left whole.
+    /// - NEVER UNDER `random`. The walk draws from the WHOLE queue, so a played row is
+    ///   still a candidate; removing it changes the pool the user chose.
+    /// - NEVER WHILE A SKIP IS IN FLIGHT. [`State::pending_skip`] is an INDEX, not a
+    ///   qid, so a trim underneath it would silently repoint the reported current at the
+    ///   wrong track. The next advance trims instead.
+    ///
+    /// And it never removes the [`State::fresh_enqueue_anchor`] row. That anchor is a
+    /// qid and survives removals BY DESIGN, but its whole job is to name the freshly
+    /// queued tail past a played row LINGERING at position 0 - which is precisely the
+    /// row this trims - so the clamp keeps the seed source addressable. Defensive today
+    /// (every current-commit clears the anchor, so it is `None` whenever this can run)
+    /// and kept anyway, because "the anchor row is never trimmed" must be TOTAL rather
+    /// than true-by-coincidence of the call site.
+    ///
+    /// `current` is shifted down by exactly the number removed and `playlist_version` is
+    /// bumped once, so MPD clients see one ordinary queue change.
+    fn trim_spent(&mut self) -> Vec<QueueItem> {
+        let Some(cur) = self.current else { return Vec::new() };
+        if self.repeat || self.random || self.pending_skip.is_some() {
+            return Vec::new();
+        }
+        let mut spent = 0usize;
+        while spent < cur
+            && (self.queue[spent].played_at.is_some() || self.queue[spent].carried)
+        {
+            spent += 1;
+        }
+        let mut n = spent.saturating_sub(SPENT_KEEP);
+        if let Some(anchor) = self.fresh_enqueue_anchor {
+            if let Some(at) = self.queue.iter().position(|it| it.id == anchor) {
+                n = n.min(at);
+            }
+        }
+        if n == 0 {
+            return Vec::new();
+        }
+        let removed: Vec<QueueItem> = self.queue.drain(0..n).collect();
+        self.current = Some(cur - n);
+        self.playlist_version += 1;
+        removed
     }
 }
 
@@ -2276,6 +2457,30 @@ pub struct HypodjHandler {
     /// Lockless like [`Self::consecutive_eof_failures`], and level-triggered: an id no
     /// longer in the queue simply finds nothing to return to.
     walk_origin_qid: AtomicU64,
+    /// The MPD id ([`QueueItem::id`]) of the entry that most recently produced a live
+    /// position sample, PLUS ONE (0 = none yet, since `next_id` starts at 0 and the first
+    /// entry of a session is genuinely id 0). Purely an EDGE DETECTOR for
+    /// [`Self::note_playback_progress`]: the director calls that on every matching
+    /// `TimePos`, and comparing against this turns the per-tick stream into one event
+    /// per track change, so stamping [`QueueItem::played_at`] costs one short `State`
+    /// lock per track rather than one per sample.
+    ///
+    /// Lockless like [`Self::walk_origin_qid`], and read-modify-write in ONE `swap` so
+    /// two samples racing in cannot both see the edge. Never persisted; ids are
+    /// monotonic within a session, so a stale value cannot false-match a later entry.
+    audible_qid: AtomicU64,
+    /// SERIALISES the whole `station add` read-verdict-write (task 4i3s3ry). A
+    /// `tokio::sync::Mutex` - not `std` - because it is HELD ACROSS `.await`, which is
+    /// exactly what a std mutex may never be and exactly what this needs: the
+    /// idempotence rule reads the live station list, decides, and writes, and two
+    /// overlapping imports interleaving inside that window both see the name absent and
+    /// both Create.
+    ///
+    /// Guards nothing else. It is not a general station lock: reads
+    /// (`listplaylistinfo Stations`, `add station/<name>`) are unaffected, and `station
+    /// rm` needs no window (delete-by-resolved-id is idempotent - a second delete of the
+    /// same id fails loudly rather than damaging anything).
+    station_write: tokio::sync::Mutex<()>,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -2730,6 +2935,8 @@ impl HypodjHandler {
             restore_placeholders: Mutex::new(Vec::new()),
             consecutive_eof_failures: AtomicU32::new(0),
             walk_origin_qid: AtomicU64::new(0),
+            audible_qid: AtomicU64::new(0),
+            station_write: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -5227,6 +5434,137 @@ impl HypodjHandler {
     /// one pure function over `Vec<HeardRow>` so the whole view is unit-testable on
     /// fixtures.
     ///
+    // ── the offline store's surface ─────────────────────────────────────────
+
+    /// Render one byte count as GiB with one decimal, the unit the whole store
+    /// surface speaks in. A single formatter so `status` and `store` can never
+    /// disagree about the same number.
+    fn gib(bytes: u64) -> String {
+        format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+
+    /// The ONE compact pair `status` carries for the offline store, or nothing.
+    ///
+    /// Absent with no store, and absent until a full pass has actually published -
+    /// a row of zeros would read as "the mirror is empty", which is a different
+    /// claim from "nobody has looked yet".
+    pub(crate) fn store_status_pairs(&self) -> Vec<(&'static str, String)> {
+        let Some(store) = self.audio_store() else { return Vec::new() };
+        let st = store.status();
+        if !st.known {
+            return Vec::new();
+        }
+        let mut line = if st.complete() {
+            format!(
+                "complete, {} tracks, {} GiB",
+                st.cached_tracks,
+                Self::gib(st.bytes)
+            )
+        } else {
+            format!(
+                "{}/{} tracks, {}/{} GiB",
+                st.cached_tracks,
+                st.resident_tracks,
+                Self::gib(st.bytes),
+                Self::gib(st.effective_max)
+            )
+        };
+        // Why it is not moving, in words - otherwise a CORRECT deferral is
+        // indistinguishable from a stuck reconciler.
+        if st.waiting != crate::store::StoreWaiting::None {
+            line.push_str(&format!(", waiting ({})", st.waiting.label()));
+        }
+        if !st.deferred.is_empty() {
+            line.push_str(&format!(", {} deferred", st.deferred.len()));
+        }
+        if st.given_up > 0 {
+            line.push_str(&format!(", {} given up", st.given_up));
+        }
+        vec![("X-Store", line)]
+    }
+
+    /// `store` / `store pause` / `store resume` / `store now`.
+    ///
+    /// SYNC and cheap by contract: it answers from the status a pass already
+    /// published, so it costs no network and no directory scan however often a TUI
+    /// polls it. The nudges are two atomics and a kick.
+    ///
+    /// With no store registered it says so rather than ACKing: "off" is a real,
+    /// permanent state (a disabled store, no state directory, a refused directory),
+    /// and a client must be able to tell it apart from a failure.
+    pub(crate) fn handle_store(&self, cmd: crate::mpd::StoreCmd) -> MpdResponse {
+        use crate::mpd::StoreCmd;
+        let Some(store) = self.audio_store() else {
+            return MpdResponse::pairs().pair("X-Store", "off").build();
+        };
+        match cmd {
+            StoreCmd::Pause => {
+                store.set_paused(true);
+            }
+            StoreCmd::Resume => {
+                store.set_paused(false);
+            }
+            StoreCmd::Now => store.kick_full(),
+            StoreCmd::Show => {}
+        }
+        let st = store.status();
+        let mut b = MpdResponse::pairs()
+            .pair("X-StorePaused", if store.paused() { "1" } else { "0" });
+        if !st.known {
+            // Honest: the reconciler has not completed a full pass with an
+            // authoritative pin set yet, so every number would be invented.
+            return b.pair("X-Store", "starting").build();
+        }
+        b = b
+            .pair("X-Store", if st.complete() { "complete" } else { "mirroring" })
+            .pair("X-StoreBytes", st.bytes.to_string())
+            .pair("X-StoreEntries", st.entries.to_string())
+            .pair("X-StoreBudget", st.effective_max.to_string())
+            .pair("X-StoreBudgetConfigured", st.configured_max.to_string())
+            .pair("X-StoreBudgetSource", st.budget_source.label())
+            .pair("X-StoreFree", st.avail.to_string())
+            .pair("X-StoreReserve", st.reserve.to_string())
+            .pair("X-StoreResident", st.resident_tracks.to_string())
+            .pair("X-StoreResidentBytes", st.resident_bytes.to_string())
+            .pair("X-StoreCached", st.cached_tracks.to_string())
+            .pair("X-StorePending", st.pending_tracks.to_string())
+            .pair("X-StorePendingBytes", st.pending_bytes.to_string())
+            .pair("X-StoreWaiting", st.waiting.label())
+            // LOAD-BEARING: without it a pending count that will NEVER reach zero is
+            // indistinguishable from one that is merely slow.
+            .pair("X-StoreGivenUp", st.given_up.to_string());
+        for (i, tier) in [
+            crate::store::PinTier::Song,
+            crate::store::PinTier::Album,
+            crate::store::PinTier::Artist,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            b = b.pair(
+                "X-StoreTier",
+                format!("{} {} {}", tier.label(), st.tier_tracks[i], st.tier_bytes[i]),
+            );
+        }
+        // The shortfall as a NAMED LIST, which is the whole reason the old
+        // integer-only overflow warn was not good enough.
+        for d in &st.deferred {
+            b = b.pair(
+                "Deferred",
+                format!(
+                    "{}/{} \"{}\" {} tracks {} bytes ({})",
+                    d.kind.label(),
+                    d.id,
+                    d.name,
+                    d.tracks,
+                    d.bytes,
+                    d.tier.label()
+                ),
+            );
+        }
+        b.build()
+    }
+
     /// A CORRECTION to what this comment used to assert: the state directory is NOT 0700.
     /// The deployed systemd unit sets `StateDirectory=hypodj` with no `StateDirectoryMode`,
     /// so it is 0755 on disk and the client tools run as the same user - which is why a
@@ -6030,7 +6368,7 @@ impl HypodjHandler {
             for song in songs {
                 let qid = st.next_id;
                 st.next_id += 1;
-                st.queue.push(QueueItem { id: qid, entry: QueueEntry::Song(song) });
+                st.queue.push(QueueItem::queued(qid, QueueEntry::Song(song)));
             }
             st.playlist_version += 1;
             first
@@ -7208,7 +7546,18 @@ impl HypodjHandler {
     /// fuse exists for (an unreachable server, a queue of unplayable entries) is
     /// untouched. Level-triggered and lockless: a dropped `TimePos` costs nothing but
     /// the next sample, and the store is skipped when the run is already clear.
-    pub fn note_playback_progress(&self) {
+    ///
+    /// It is ALSO the one writer of [`QueueItem::played_at`], and for the same reason:
+    /// this signal - not `loadfile` Ok, not `StateChanged(Playing)` - is the daemon's
+    /// only proof that sound actually came out of an entry, and [`State::trim_spent`]
+    /// must not drop (or file a ledger row for) a row that never played a frame. `qid`
+    /// names WHICH entry the frame belongs to; the director already identity-matched it
+    /// against the latch before calling.
+    ///
+    /// SPINE COST IS ONE LOCK PER TRACK, not one per tick: the lockless `audible_qid`
+    /// swap turns the per-sample stream into a single edge, and only that edge takes the
+    /// short `State` lock. `None` (a position with no identity) stamps nothing.
+    pub fn note_playback_progress(&self, qid: Option<QueueId>) {
         if self.consecutive_eof_failures.load(Ordering::Relaxed) != 0 {
             self.consecutive_eof_failures.store(0, Ordering::Relaxed);
         }
@@ -7217,6 +7566,21 @@ impl HypodjHandler {
         // and any later cascade is an ordinary one (see [`Self::walk_origin_qid`]).
         if self.walk_origin_qid.load(Ordering::Relaxed) != 0 {
             self.latch_walk_origin(None);
+        }
+        let Some(QueueId(qid)) = qid else { return };
+        // PLUS ONE, exactly as [`Self::walk_origin_qid`] does, because `next_id` starts at
+        // ZERO: without the offset the sentinel and the FIRST queue entry of every session
+        // are the same value, so the very first track of every run would look like a
+        // repeat sample and never be stamped.
+        if self.audible_qid.swap(qid + 1, Ordering::Relaxed) == qid + 1 {
+            return;
+        }
+        // FIRST audible frame for this entry: stamp when it started being heard. A
+        // replay of the same row later re-enters here (the qid changed away and back)
+        // and re-stamps, which is right - the row is spent as of the LAST time it played.
+        let mut st = self.state.lock().unwrap();
+        if let Some(it) = st.queue.iter_mut().find(|it| it.id == qid) {
+            it.played_at = Some(crate::store::now_unix());
         }
     }
 
@@ -7489,6 +7853,18 @@ impl HypodjHandler {
     ///
     /// Never a bare OK: every success returns pairs naming what actually happened, so a
     /// client that only surfaces ACKs can still tell a create from a no-op.
+    ///
+    /// THE ADD IS SERIALISED (task 4i3s3ry). The read-verdict-write straddles two
+    /// `.await`s on an `Arc`-shared `&self` handler, so two overlapping imports - two
+    /// `dj stations import` runs, or an import racing a hand-typed `station add` - could
+    /// BOTH observe the name absent and BOTH `Create`, minting a duplicate that
+    /// [`station_for_name`] makes permanently unaddressable past the first. The whole
+    /// sequence is taken under [`Self::station_write`], a `tokio::sync::Mutex` precisely
+    /// because it IS held across `.await` (a `std::sync` one may never be). The lock is
+    /// per-daemon, so a THIRD-PARTY Subsonic client writing to the same server at the
+    /// same instant is still unprotected - which is why the write is followed by a
+    /// re-read that fails the gesture LOUDLY if a duplicate name now exists, rather than
+    /// implying a lock we do not hold.
     async fn handle_station(&self, cmd: StationCmd) -> MpdResponse {
         match cmd {
             StationCmd::Add { url, name } => {
@@ -7502,6 +7878,11 @@ impl HypodjHandler {
                 if name.is_empty() {
                     return ack(ACK_ERROR_ARG, "station", "station name must not be blank");
                 }
+                // HELD ACROSS EVERY AWAIT BELOW, and released by the guard at the end of
+                // this arm: the list, the verdict and the write are ONE critical section
+                // or the idempotence is only probabilistic. Cheap: the verb is a human /
+                // import gesture, never a hot path.
+                let _write = self.station_write.lock().await;
                 // The list is an `.await`, so NO std lock is held anywhere near it.
                 let stations = match self.client.get_internet_radio_stations().await {
                     Ok(s) => s,
@@ -7548,17 +7929,28 @@ impl HypodjHandler {
                         ("updated", prev)
                     }
                 };
+                // THE RE-READ, only after a write actually happened. Our own lock cannot
+                // see a third-party client (or another daemon) creating the same name in
+                // the same instant, and a duplicate name is the ONE outcome that is
+                // unrecoverable through this verb: `station rm <name>` and
+                // `add station/<name>` both resolve the FIRST match, so every row past it
+                // is unreachable forever. Say so instead of reporting a success that
+                // left the set broken. A failed re-read is NOT an error - it proves
+                // nothing either way, and the write did land.
                 if outcome != "unchanged" {
+                    if let Ok(after) = self.client.get_internet_radio_stations().await {
+                        if station_name_count(&after, name) > 1 {
+                            return ack(
+                                ACK_ERROR_EXIST,
+                                "station",
+                                "name is now used by more than one station (a concurrent write \
+                                 raced this one)",
+                            );
+                        }
+                    }
                     self.notify_change();
                 }
-                let mut b = MpdResponse::pairs()
-                    .pair("X-Station", outcome)
-                    .pair("Name", name)
-                    .pair("file", url);
-                if let Some(prev) = prev_url {
-                    b = b.pair("X-PrevUrl", prev);
-                }
-                b.build()
+                station_result_pairs(outcome, name, url, prev_url.as_deref())
             }
             StationCmd::Rm { name } => {
                 let name = name.trim();
@@ -7714,7 +8106,7 @@ impl HypodjHandler {
                     // placed at pos 0. For an album seed the exposure is the whole
                     // album.
                     st.push_autofill_seen(song.id.clone());
-                    st.queue.push(QueueItem { id, entry: QueueEntry::Song(song) });
+                    st.queue.push(QueueItem::queued(id, QueueEntry::Song(song)));
                     appended_ids.push(id);
                 }
                 st.playlist_version += 1;
@@ -8397,10 +8789,23 @@ impl HypodjHandler {
         // 2. Install the rebuilt queue + baseline under one short state-lock scope.
         {
             let mut st = self.state.lock().unwrap();
+            // Rows BEFORE the restored `current` are the previous session's history:
+            // marked CARRIED so [`State::trim_spent`] can retire them. Without the mark
+            // every restored row looks unplayed, the leading run is zero, and the trim
+            // never fires again for the life of the process - i.e. the queue and
+            // `resume.toml` grow unbounded on exactly the sessions that resume.
             st.queue = entries
                 .into_iter()
                 .enumerate()
-                .map(|(idx, entry)| QueueItem { id: idx as u64, entry })
+                .map(|(idx, entry)| {
+                    // `<=`, not `<`: the row the previous session was ON is history too
+                    // the moment the deck leaves it. `trim_spent` never touches `current`
+                    // itself, so marking it costs nothing - and omitting it left the
+                    // restored current as a permanent barrier in the one case where it
+                    // is never stamped (a degraded PAUSED restore he skips out of).
+                    let carried = new_current.is_some_and(|cur| idx <= cur);
+                    QueueItem::restored(idx as u64, entry, carried)
+                })
                 .collect();
             st.next_id = st.queue.len() as u64;
             st.current = new_current;
@@ -8887,10 +9292,10 @@ impl HypodjHandler {
                                 // current at it, and REUSE the slice-1 one-shot latch verbatim
                                 // (set only once the stream is genuinely current). No
                                 // play_index_inner / loadfile - mpv already advanced.
-                                st.queue.push(QueueItem {
-                                    id: w.qid,
-                                    entry: QueueEntry::Stream { url: w.url, title: w.title },
-                                });
+                                st.queue.push(QueueItem::queued(
+                                    w.qid,
+                                    QueueEntry::Stream { url: w.url, title: w.title },
+                                ));
                                 st.playlist_version += 1;
                                 st.current = Some(st.queue.len() - 1);
                                 st.pending_pause = false;
@@ -9049,10 +9454,10 @@ impl HypodjHandler {
             let mut st = self.state.lock().unwrap();
             let id = st.next_id;
             st.next_id += 1;
-            st.queue.push(QueueItem {
+            st.queue.push(QueueItem::queued(
                 id,
-                entry: QueueEntry::Stream { url: url.clone(), title: station.clone() },
-            });
+                QueueEntry::Stream { url: url.clone(), title: station.clone() },
+            ));
             st.playlist_version += 1;
             (st.queue.len() - 1, id)
         };
@@ -9232,7 +9637,7 @@ impl HypodjHandler {
                 let id = st.next_id;
                 st.next_id += 1;
                 st.push_autofill_seen(song.id.clone());
-                st.queue.push(QueueItem { id, entry: QueueEntry::Song(song) });
+                st.queue.push(QueueItem::queued(id, QueueEntry::Song(song)));
                 appended_ids.push(id);
             }
             st.playlist_version += 1;
@@ -9895,7 +10300,7 @@ impl HypodjHandler {
             .play_url(play.song_id, Some(play.qid), &play.url, play.local)
             .await
             .map_err(|e| e.to_string())?;
-        {
+        let trimmed = {
             let mut st = self.state.lock().unwrap();
             st.current = Some(idx);
             // A track is now current: the pending fresh-enqueue gesture is consumed /
@@ -9904,6 +10309,20 @@ impl HypodjHandler {
             // auto-advance, and PlayNow funnels through - the primary clear that keeps a
             // stale anchor from overriding recency on a LATER finish (scenario R).
             st.fresh_enqueue_anchor = None;
+            // ONE track moved forward, so retire one track's worth of history off the
+            // front (task 85xw3mq). Here because this is the same universal choke: every
+            // fresh play, EOF auto-advance and PlayNow passes through it, so the queue is
+            // bounded on every path that grows it, with no second trigger to keep in
+            // sync. Under the SAME lock as the current-commit, so no reader can ever
+            // observe a queue whose `current` has not been shifted over the removal.
+            st.trim_spent()
+        };
+        // The ledger write is OUTSIDE the lock and is itself lock-free and non-async
+        // ([`Self::append_heard`]), so the trim never puts I/O anywhere near the state.
+        for it in &trimmed {
+            if let Some(row) = spent_heard_row(it) {
+                self.append_heard(row);
+            }
         }
         self.notify_change();
         // (Re)arm the LEAD continuation warm behind the freshly-playing entry (slice 2).
@@ -9940,7 +10359,7 @@ impl HypodjHandler {
             for song in songs {
                 let qid = st.next_id;
                 st.next_id += 1;
-                st.queue.push(QueueItem { id: qid, entry: QueueEntry::Song(song) });
+                st.queue.push(QueueItem::queued(qid, QueueEntry::Song(song)));
             }
             st.playlist_version += 1;
             drop(st);
@@ -10010,7 +10429,7 @@ impl HypodjHandler {
         let mut st = self.state.lock().unwrap();
         let id = st.next_id;
         st.next_id += 1;
-        st.queue.push(QueueItem { id, entry });
+        st.queue.push(QueueItem::queued(id, entry));
         st.playlist_version += 1;
         drop(st);
         self.notify_change();
@@ -10034,10 +10453,7 @@ impl HypodjHandler {
             let mut st = self.state.lock().unwrap();
             let id = st.next_id;
             st.next_id += 1;
-            st.queue.push(QueueItem {
-                id,
-                entry: QueueEntry::Song(song),
-            });
+            st.queue.push(QueueItem::queued(id, QueueEntry::Song(song)));
             st.playlist_version += 1;
             id
         };
@@ -10804,6 +11220,14 @@ impl MpdHandler for HypodjHandler {
                 for (k, v) in self.continuation_status_pairs() {
                     b = b.pair(k, v);
                 }
+                // Surface the OFFLINE STORE's progress as one compact pair, present
+                // only once a full pass has published. It rides `status` because a
+                // client already polls that on every change, so a moving number
+                // costs no extra round trip, and MPD clients skip unknown status
+                // keys - ncmpcpp ignores it entirely.
+                for (k, v) in self.store_status_pairs() {
+                    b = b.pair(k, v);
+                }
                 b.build()
             }
 
@@ -10978,6 +11402,8 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Identify => self.identify().await,
             MpdCommand::Mark(target) => self.mark(target).await,
             MpdCommand::Heard(q) => self.heard(q).await,
+
+            MpdCommand::Store(cmd) => self.handle_store(cmd),
             MpdCommand::Next => {
                 // A manual `next` always advances (single governs only auto-advance);
                 // random/repeat/consume are honored via plan_next. The transition
@@ -12935,6 +13361,40 @@ fn station_url_for_name(stations: &[Station], name: &str) -> Option<String> {
     station_for_name(stations, name).map(|s| s.stream_url.clone())
 }
 
+/// The `station add` SUCCESS FRAME, built from the outcome the verdict produced. PURE,
+/// which is the whole point: the `X-Station` contract is what
+/// `hypodj-cli`'s importer parses to decide whether it printed `created`, `updated` or
+/// `unchanged`, and before this it existed only as an inline builder inside one async
+/// arm that no test could reach without a server. Now BOTH sides - this and the CLI's
+/// parser - are asserted against the same three literals, so they cannot drift.
+///
+/// `X-Station` FIRST and always present; `Name` is the name as saved; `file` is the
+/// stream url, so the frame doubles as a browse row. `X-PrevUrl` appears only on an
+/// `updated` that actually MOVED the url, so a re-point is visible rather than silent.
+fn station_result_pairs(
+    outcome: &str,
+    name: &str,
+    url: &str,
+    prev_url: Option<&str>,
+) -> MpdResponse {
+    let mut b = MpdResponse::pairs()
+        .pair("X-Station", outcome)
+        .pair("Name", name)
+        .pair("file", url);
+    if let Some(prev) = prev_url {
+        b = b.pair("X-PrevUrl", prev);
+    }
+    b.build()
+}
+
+/// How many saved stations carry `name`, under the SAME case-insensitive rule
+/// [`station_for_name`] resolves with. Pure, so the post-write duplicate check in
+/// `station add` is testable with no server. `> 1` is the unrecoverable state: every row
+/// past the first is unaddressable by name forever.
+fn station_name_count(stations: &[Station], name: &str) -> usize {
+    stations.iter().filter(|s| s.name.eq_ignore_ascii_case(name)).count()
+}
+
 /// Resolve a saved station BY NAME (case-insensitive, ASCII) to its full [`Station`],
 /// or `None` when none carries that name. Backs the P1 station-name carry (task
 /// lq54isr): `add station/<name>` reads BOTH the canonical name (the Stream title) and
@@ -13983,6 +14443,7 @@ mod tests {
         Album {
             id: AlbumId(id.to_string()),
             name: format!("Album {id}"),
+            created: None,
             artist: artist.to_string(),
             artist_id: None,
             year: None,
@@ -15967,6 +16428,353 @@ mod tests {
         assert_eq!(h2.similar_seed_id(), Some(SongId("A".into())), "seed stays A on a 0-match");
     }
 
+    // ── the SPENT-ROW TRIM: a bounded queue with its history intact (85xw3mq) ──
+    //
+    // `consume` is false and nothing trimmed, so an endless radio walk grew the queue for
+    // a whole session: hundreds of dead rows to scroll past and a resume.toml that
+    // serialised every one of them on every checkpoint. The decision is a bounded WINDOW
+    // of history in the queue (SPENT_KEEP) with everything older moved to the heard
+    // ledger, which is where "what did I listen to" now lives.
+    //
+    // The ANCHOR tests come FIRST, deliberately: `fresh_enqueue_anchor` exists precisely
+    // because a played row LINGERS at position 0 with consume off, which is exactly the
+    // row this trims, so it is the coupling most likely to be got wrong.
+
+    /// A queue of `n` library rows, the first `played` of them already audible.
+    fn spent_queue(n: usize, played: usize) -> State {
+        let mut st = State::default();
+        for i in 0..n {
+            let mut it =
+                QueueItem::queued(i as u64, QueueEntry::Song(playlist_test_song(&i.to_string())));
+            if i < played {
+                it.played_at = Some(1_700_000_000 + i as u64);
+            }
+            st.queue.push(it);
+        }
+        st.next_id = n as u64;
+        st
+    }
+
+    #[test]
+    fn a_trim_never_removes_the_fresh_enqueue_anchor_row() {
+        // The anchor names the freshly-queued tail PAST the lingering played head. If a
+        // trim could take its row, `seed_source` would lose the music the gesture pointed
+        // at. The clamp stops the trim exactly at the anchor's index.
+        let mut st = spent_queue(80, 70);
+        st.current = Some(70);
+        st.fresh_enqueue_anchor = Some(5); // qid 5 sits at index 5, deep inside the spent run
+        let removed = st.trim_spent();
+        assert_eq!(removed.len(), 5, "the trim stops AT the anchor row, never through it");
+        assert_eq!(
+            st.queue.first().map(|it| it.id),
+            Some(5),
+            "the anchor row is now the head and is still addressable"
+        );
+        assert!(
+            st.queue.iter().any(|it| it.id == 5),
+            "the anchor row survived a trim that wanted to take 45 rows"
+        );
+        assert_eq!(st.current, Some(65), "current followed the removal exactly");
+    }
+
+    #[test]
+    fn a_trim_keeps_current_playing_and_its_index_consistent() {
+        let mut st = spent_queue(120, 100);
+        st.current = Some(100);
+        let cur_qid = st.queue[100].id;
+        let removed = st.trim_spent();
+        assert_eq!(removed.len(), 100 - SPENT_KEEP, "everything older than the window goes");
+        assert_eq!(
+            st.queue[st.current.unwrap()].id,
+            cur_qid,
+            "current still points at the SAME entry after the shift"
+        );
+        assert_eq!(st.current, Some(SPENT_KEEP), "and it sits exactly SPENT_KEEP rows in");
+        assert_eq!(st.queue.len(), 120 - (100 - SPENT_KEEP));
+        // `prev` still walks back through the whole kept window.
+        assert_eq!(st.queue[..SPENT_KEEP].len(), SPENT_KEEP, "the scrollback is the window");
+    }
+
+    #[test]
+    fn a_trim_takes_nothing_until_the_window_is_full() {
+        let mut st = spent_queue(40, SPENT_KEEP);
+        st.current = Some(SPENT_KEEP);
+        assert!(st.trim_spent().is_empty(), "exactly SPENT_KEEP spent rows is not too many");
+        assert_eq!(st.queue.len(), 40);
+        assert_eq!(st.current, Some(SPENT_KEEP), "and nothing moved");
+    }
+
+    #[test]
+    fn a_row_that_never_played_a_frame_is_never_trimmed() {
+        // THE HONESTY GUARD. A failed-load walk steps `current` over entries mpv never
+        // opened, and `play <pos>` jumps over rows that are still queued music. A
+        // position-based rule would delete both - and file a ledger row claiming he heard
+        // them. Only a leading run of AUDIBLE rows is eligible, so an unplayed row at the
+        // head stops the trim dead no matter how much played behind it.
+        let mut st = spent_queue(120, 0);
+        for i in 1..100 {
+            st.queue[i].played_at = Some(1_700_000_000 + i as u64);
+        }
+        st.current = Some(100);
+        assert!(
+            st.trim_spent().is_empty(),
+            "one never-played row at the head refuses the whole trim"
+        );
+        assert_eq!(st.queue.len(), 120);
+
+        // Once it too has played, the run is contiguous and the trim proceeds.
+        st.queue[0].played_at = Some(1_700_000_000);
+        assert_eq!(st.trim_spent().len(), 100 - SPENT_KEEP);
+    }
+
+    #[test]
+    fn the_current_row_is_never_trimmed_even_though_it_has_played() {
+        // Every row including `current` is spent, and the whole queue is longer than the
+        // window: the run must still stop AT current.
+        let mut st = spent_queue(30, 30);
+        st.current = Some(29);
+        let removed = st.trim_spent();
+        assert_eq!(removed.len(), 29 - SPENT_KEEP);
+        assert_eq!(st.queue.len(), 30 - (29 - SPENT_KEEP));
+        assert_eq!(st.current, Some(SPENT_KEEP));
+        assert_eq!(st.queue.last().map(|it| it.id), Some(29), "the playing row is untouched");
+    }
+
+    #[test]
+    fn repeat_random_and_an_in_flight_skip_each_refuse_the_trim() {
+        // repeat-all wraps to index 0, so trimming the front would silently redefine what
+        // it repeats; random draws from the WHOLE queue, so a played row is still a
+        // candidate; and `pending_skip` is an INDEX, so a trim underneath it would
+        // repoint the reported current at the wrong track.
+        for (label, set) in [
+            ("repeat", (|st: &mut State| st.repeat = true) as fn(&mut State)),
+            ("random", |st: &mut State| st.random = true),
+            ("pending_skip", |st: &mut State| st.pending_skip = Some(101)),
+        ] {
+            let mut st = spent_queue(120, 100);
+            st.current = Some(100);
+            set(&mut st);
+            assert!(st.trim_spent().is_empty(), "{label} must refuse the trim");
+            assert_eq!(st.queue.len(), 120, "{label} left the queue whole");
+            assert_eq!(st.current, Some(100), "{label} left current where it was");
+        }
+    }
+
+    #[test]
+    fn a_stopped_deck_trims_nothing() {
+        // No current means nothing has moved forward, so there is no history to retire.
+        let mut st = spent_queue(120, 120);
+        st.current = None;
+        assert!(st.trim_spent().is_empty());
+        assert_eq!(st.queue.len(), 120);
+    }
+
+    #[test]
+    fn the_queue_and_the_resume_snapshot_stay_bounded_across_a_long_session() {
+        // THE ACTUAL BUG. An 8-hour walk is ~120 tracks; here 200 advances, each appending
+        // one lookahead row ahead of `current` exactly as the radio walk does. Without the
+        // trim both the queue and the resume payload grow linearly with the session; with
+        // it they are constant.
+        let mut st = State::default();
+        // Seed one playing row plus a little lookahead.
+        for i in 0..3u64 {
+            st.queue.push(QueueItem::queued(i, QueueEntry::Song(playlist_test_song(&i.to_string()))));
+        }
+        st.next_id = 3;
+        st.current = Some(0);
+        st.queue[0].played_at = Some(1_700_000_000);
+        let mut peak = 0usize;
+        for step in 0..200u64 {
+            // The walk tops the tail up as it goes.
+            let id = st.next_id;
+            st.next_id += 1;
+            st.queue.push(QueueItem::queued(id, QueueEntry::Song(playlist_test_song(&id.to_string()))));
+            // Advance one row and let it become audible.
+            let next = st.current.unwrap() + 1;
+            st.current = Some(next);
+            st.queue[next].played_at = Some(1_700_000_100 + step);
+            st.trim_spent();
+            peak = peak.max(st.queue.len());
+        }
+        // SPENT_KEEP behind + the current row + whatever the lookahead left ahead. The
+        // bound is a constant; the session length does not appear in it.
+        assert!(
+            peak <= SPENT_KEEP + 8,
+            "the queue must stay bounded across a long session, peaked at {peak}"
+        );
+        assert!(
+            st.current.unwrap() <= SPENT_KEEP,
+            "current never walks off into a huge index either"
+        );
+        // resume.toml serialises the WHOLE queue on every checkpoint, so bounding the
+        // queue is exactly what bounds the checkpoint.
+        assert_eq!(st.queue.len(), peak.min(st.queue.len()));
+        assert!(st.queue.len() <= SPENT_KEEP + 8);
+    }
+
+    #[test]
+    fn every_trimmed_library_track_becomes_a_heard_row_stamped_when_it_played() {
+        // The trim is only defensible if nothing is LOST: the row leaves the queue, the
+        // listen does not leave the record. `dj heard all` is where it lands.
+        let mut st = spent_queue(120, 100);
+        st.current = Some(100);
+        let removed = st.trim_spent();
+        assert_eq!(removed.len(), 100 - SPENT_KEEP);
+        for it in &removed {
+            let row = spent_heard_row(it).expect("every trimmed library track writes a row");
+            assert_eq!(row.ev, "heard");
+            assert_eq!(row.src.as_deref(), Some("queue"));
+            assert_eq!(row.kind.as_deref(), Some("track"));
+            assert!(row.owned, "a library track is his already, so `dj heard` tallies it as owned");
+            assert_eq!(
+                row.at_unix,
+                it.played_at.unwrap(),
+                "stamped WHEN IT PLAYED, not when it was trimmed - the ledger is a chronology"
+            );
+            let QueueEntry::Song(s) = &it.entry else { panic!("library rows only") };
+            assert_eq!(row.match_uri.as_deref(), Some(format!("song/{}", s.id.0).as_str()));
+            assert_eq!(row.title.as_deref(), Some(s.title.as_str()));
+        }
+    }
+
+    #[test]
+    fn a_spent_row_that_never_played_and_a_stream_row_write_no_ledger_row() {
+        // A row with no `played_at` is not evidence of anything, so it never claims to be
+        // heard. And a raw STREAM already wrote its own ICY rows while playing; its
+        // `file:` is a url, not a track, so it adds nothing here.
+        let unplayed = QueueItem::queued(1, QueueEntry::Song(playlist_test_song("x")));
+        assert!(spent_heard_row(&unplayed).is_none());
+        let mut stream = QueueItem::queued(
+            2,
+            QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
+        );
+        stream.played_at = Some(1_700_000_000);
+        assert!(spent_heard_row(&stream).is_none());
+    }
+
+    #[test]
+    fn a_spent_row_names_the_artist_when_the_track_carries_one() {
+        let mut it = QueueItem::queued(1, QueueEntry::Song(playlist_test_song("a")));
+        it.played_at = Some(1_700_000_000);
+        let QueueEntry::Song(s) = &mut it.entry else { unreachable!() };
+        s.artist = Some("Kalabrese".to_string());
+        s.album = Some("Let Love Rumpel".to_string());
+        s.year = Some(2010);
+        let row = spent_heard_row(&it).expect("a row");
+        assert_eq!(row.raw.as_deref(), Some("Kalabrese - Song a"));
+        assert_eq!(row.artist.as_deref(), Some("Kalabrese"));
+        assert_eq!(row.album.as_deref(), Some("Let Love Rumpel"));
+        assert_eq!(row.year, Some(2010));
+        // A track with no artist is named by its title alone, never "  - Title".
+        let mut bare = QueueItem::queued(2, QueueEntry::Song(playlist_test_song("b")));
+        bare.played_at = Some(1_700_000_000);
+        assert_eq!(spent_heard_row(&bare).unwrap().raw.as_deref(), Some("Song b"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_endless_walk_trims_the_queue_and_files_what_it_dropped() {
+        // END TO END on the path the bug lives on: the EOF auto-advance, which is how an
+        // endless radio walk actually moves. Proves the trim is WIRED (it runs inside
+        // play_index_inner, the universal current-commit choke) and that nothing is lost -
+        // every dropped row is in the ledger `dj heard all` reads.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let (ledger, ldir) = ledger_rig("trim-walk");
+        h.set_heard_ledger(ledger, ldir.clone(), 1800);
+        let n = SPENT_KEEP + 6;
+        for i in 0..n {
+            h.enqueue_song_for_test(playlist_test_song(&format!("t{i:03}"))).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.note_playback_progress(cur_qid(&h));
+        for _ in 1..n {
+            h.advance_on_eof(EofSignal::default()).await;
+            h.note_playback_progress(cur_qid(&h));
+        }
+
+        let dropped = n - 1 - SPENT_KEEP;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(
+                st.queue.len(),
+                n - dropped,
+                "the queue is bounded by the window, not by the length of the session"
+            );
+            assert_eq!(st.current, Some(SPENT_KEEP), "the playing row sits at the window's end");
+            assert_eq!(
+                st.queue[st.current.unwrap()].id,
+                (n - 1) as u64,
+                "and it is still the entry that is actually playing"
+            );
+            assert_eq!(
+                st.queue.first().map(|it| it.id),
+                Some(dropped as u64),
+                "the head is the oldest row still inside the window"
+            );
+        }
+        // resume.toml serialises the WHOLE queue on every checkpoint, so this is the
+        // growth that is actually fixed.
+        assert_eq!(h.resume_snapshot(0.0).queue.len(), n - dropped);
+
+        // session row + one heard row per dropped track, in the order they played.
+        let rows = settle_rows(&ldir, dropped + 1).await;
+        let heard: Vec<&crate::heard::HeardRow> =
+            rows.iter().filter(|r| r.src.as_deref() == Some("queue")).collect();
+        assert_eq!(heard.len(), dropped, "every trimmed library track wrote exactly one row");
+        for (i, r) in heard.iter().enumerate() {
+            assert_eq!(r.ev, "heard");
+            assert!(r.owned);
+            assert_eq!(
+                r.match_uri.as_deref(),
+                Some(format!("song/t{i:03}").as_str()),
+                "the record is in the order it played"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    #[tokio::test]
+    async fn a_live_position_sample_is_what_marks_a_row_spent() {
+        // `played_at` has exactly ONE writer, and it is the same director-spine signal the
+        // EOF fuse already trusts as proof that audio flowed. A queued row that nothing
+        // ever played carries nothing; the sample stamps it; and a repeat sample for the
+        // SAME entry is a no-op, which is what keeps the cost at one State lock per track
+        // change rather than one per position tick.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        assert_eq!(qid, 0, "next_id starts at zero, so the FIRST entry of a session is id 0");
+        assert!(
+            h.state.lock().unwrap().queue[0].played_at.is_none(),
+            "queued is not played"
+        );
+        // THE VERY FIRST SAMPLE OF THE SESSION, on the very first entry. The edge detector
+        // stores qid PLUS ONE for exactly this: with a bare qid the sentinel and entry 0
+        // are the same value, so the first track of every run would look like a repeat
+        // sample and never be stamped - and would then never be trimmable or recorded.
+        h.note_playback_progress(Some(QueueId(qid)));
+        let stamped = h.state.lock().unwrap().queue[0].played_at;
+        assert!(stamped.is_some(), "the first live position sample marks the row spent");
+        // A further sample for the same entry is the no-op edge, which is what keeps the
+        // cost at one State lock per track change rather than one per position tick.
+        h.note_playback_progress(Some(QueueId(qid)));
+        assert_eq!(
+            h.state.lock().unwrap().queue[0].played_at,
+            stamped,
+            "a further sample for the same entry is a no-op, not a re-stamp"
+        );
+        // A second entry, to prove the two ways a sample stamps NOTHING.
+        let other = h.enqueue_stream_for_test(NTS).await;
+        h.note_playback_progress(None);
+        assert!(
+            h.state.lock().unwrap().queue[1].played_at.is_none(),
+            "a position with no identity attributes to nothing"
+        );
+        h.note_playback_progress(Some(QueueId(other + 999)));
+        assert!(
+            h.state.lock().unwrap().queue[1].played_at.is_none(),
+            "a sample for an entry that is not in the queue stamps nothing"
+        );
+    }
+
     /// LIVE (task ambient-context-hint): the append-only Enqueue ACTION end to end seeds
     /// the freshly-appended music OVER a lingering finished head on an idle deck.
     /// Synthesizes a finished track A LINGERING at queue pos0 (consume off) with the
@@ -17305,8 +18113,8 @@ mod tests {
             other => panic!("expected Pairs, got {other:?}"),
         };
         for verb in [
-            "mark", "heard", "identify", "knob", "nl", "plan", "continuation", "radio",
-            "station", "searchall", "field", "sleep", "winddown", "wake",
+            "mark", "heard", "store", "identify", "knob", "nl", "plan", "continuation",
+            "radio", "station", "searchall", "field", "sleep", "winddown", "wake",
         ] {
             assert!(
                 !listed.iter().any(|c| c == verb),
@@ -17355,6 +18163,13 @@ mod tests {
 
     fn pair_of(pairs: &[(String, String)], key: &str) -> Option<String> {
         pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    /// The qid of whatever is current - what the director's identity-matched `TimePos`
+    /// carries into [`HypodjHandler::note_playback_progress`].
+    fn cur_qid(h: &HypodjHandler) -> Option<QueueId> {
+        let st = h.state.lock().unwrap();
+        st.current.and_then(|i| st.queue.get(i)).map(|it| QueueId(it.id))
     }
 
     async fn mark_pairs(h: &HypodjHandler, t: crate::heard::MarkTarget) -> Vec<(String, String)> {
@@ -19752,10 +20567,10 @@ mod tests {
     fn save_station_defaults_name_to_icy_when_present() {
         // A currently-playing stream whose stream_meta (keyed to its qid) carries an
         // icy-name: saving THAT url defaults the label to the live station name.
-        let item = QueueItem {
-            id: 7,
-            entry: QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
-        };
+        let item = QueueItem::queued(
+            7,
+            QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
+        );
         let meta = (
             QueueId(7),
             StreamMeta { name: Some("NTS 1".to_string()), title: Some("Floating Points".to_string()), ..Default::default() },
@@ -19768,10 +20583,10 @@ mod tests {
         // The NTS-mixtape case: the stream carries no ICY name, so the default label
         // falls back to the raw URL - both when the slot exists with name None and
         // when there is no stored slot at all.
-        let item = QueueItem {
-            id: 7,
-            entry: QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
-        };
+        let item = QueueItem::queued(
+            7,
+            QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
+        );
         let no_name = (QueueId(7), StreamMeta { name: None, title: None, ..Default::default() });
         assert_eq!(resolve_station_name(NTS, Some(&item), Some(&no_name)), NTS);
         assert_eq!(resolve_station_name(NTS, Some(&item), None), NTS);
@@ -19785,26 +20600,26 @@ mod tests {
         // stream_meta keyed to a DIFFERENT qid must not label this save (mirrors the
         // currentsong qid gate); a library-song current or a url mismatch also falls
         // back to the raw URL.
-        let stream = QueueItem {
-            id: 7,
-            entry: QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
-        };
+        let stream = QueueItem::queued(
+            7,
+            QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
+        );
         let wrong_qid = (QueueId(99), StreamMeta { name: Some("Wrong".to_string()), title: None, ..Default::default() });
         assert_eq!(resolve_station_name(NTS, Some(&stream), Some(&wrong_qid)), NTS);
 
         // A library-song current never yields a station name.
-        let song = QueueItem { id: 7, entry: QueueEntry::Song(playlist_test_song("lib")) };
+        let song = QueueItem::queued(7, QueueEntry::Song(playlist_test_song("lib")));
         let meta = (QueueId(7), StreamMeta { name: Some("X".to_string()), title: None, ..Default::default() });
         assert_eq!(resolve_station_name(NTS, Some(&song), Some(&meta)), NTS);
 
         // A stream playing a DIFFERENT url than the one being saved falls back.
-        let other = QueueItem {
-            id: 7,
-            entry: QueueEntry::Stream {
+        let other = QueueItem::queued(
+            7,
+            QueueEntry::Stream {
                 url: "https://example.com/other".to_string(),
                 title: "x".to_string(),
             },
-        };
+        );
         assert_eq!(resolve_station_name(NTS, Some(&other), Some(&meta)), NTS);
 
         // Nothing playing at all -> the url.
@@ -19937,6 +20752,138 @@ mod tests {
         assert_eq!(saved.len(), pls.len(), "no station was minted twice");
     }
 
+    // ── the `station add` RESULT FRAME, and its concurrency guard (4i3s3ry) ────
+
+    #[test]
+    fn station_result_pairs_pins_the_x_station_contract() {
+        // The three words `hypodj-cli`'s importer parses, and their exact frame. This
+        // existed only inline inside an async arm no test could reach without a server,
+        // so the wire contract the CLI depends on was unpinned on the daemon side.
+        let created = pairs_of(station_result_pairs("created", "NTS 1", "https://n/1", None));
+        assert_eq!(
+            created,
+            vec![
+                ("X-Station".to_string(), "created".to_string()),
+                ("Name".to_string(), "NTS 1".to_string()),
+                ("file".to_string(), "https://n/1".to_string()),
+            ],
+            "X-Station leads; Name and file complete a row a client can also browse"
+        );
+
+        let unchanged = pairs_of(station_result_pairs("unchanged", "NTS 1", "https://n/1", None));
+        assert_eq!(pair_of(&unchanged, "X-Station").as_deref(), Some("unchanged"));
+        assert!(
+            pair_of(&unchanged, "X-PrevUrl").is_none(),
+            "nothing moved, so no previous url is claimed"
+        );
+
+        // An update that MOVED the endpoint echoes where it came from, so a re-point is
+        // visible in the import output instead of silent.
+        let moved =
+            pairs_of(station_result_pairs("updated", "KFJC", "http://k/320", Some("http://k/128")));
+        assert_eq!(pair_of(&moved, "X-Station").as_deref(), Some("updated"));
+        assert_eq!(pair_of(&moved, "X-PrevUrl").as_deref(), Some("http://k/128"));
+        // A pure RENAME is also `updated` but moved no url, so it carries no X-PrevUrl.
+        let renamed = pairs_of(station_result_pairs("updated", "KFJC 89.7", "http://k/320", None));
+        assert_eq!(pair_of(&renamed, "X-Station").as_deref(), Some("updated"));
+        assert!(pair_of(&renamed, "X-PrevUrl").is_none());
+    }
+
+    #[test]
+    fn station_name_count_sees_the_duplicate_the_lock_cannot_prevent() {
+        // The post-write re-read predicate. Case-insensitive, because that is the rule
+        // `station_for_name` resolves with - so "already used" means exactly "a later
+        // `add station/<name>` will find the wrong one, or cannot reach this one at all".
+        let one = vec![st("1", "NTS 1", "https://n/1"), st("2", "KFJC", "http://k/1")];
+        assert_eq!(station_name_count(&one, "NTS 1"), 1);
+        assert_eq!(station_name_count(&one, "nts 1"), 1);
+        assert_eq!(station_name_count(&one, "nope"), 0);
+
+        // What a raced double-Create leaves behind: station 3 is unaddressable forever.
+        let raced = vec![
+            st("1", "NTS 1", "https://n/1"),
+            st("2", "KFJC", "http://k/1"),
+            st("3", "nts 1", "https://n/1"),
+        ];
+        assert_eq!(station_name_count(&raced, "NTS 1"), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_station_add_cannot_enter_while_another_holds_the_write_window() {
+        // THE RACE (task 4i3s3ry): the read-verdict-write straddles two awaits on an
+        // Arc-shared &self handler, so without a lock two overlapping imports both observe
+        // the name absent and both Create - and a duplicate name makes every row past the
+        // first unaddressable by `station rm` / `add station/<name>` forever.
+        //
+        // OBSERVED, not asserted about the mutex in isolation: hold the window, then
+        // dispatch a real, WELL-FORMED `station add` and watch it fail to finish. It parks
+        // ON the lock - everything before it is sync (the uri and blank-name refusals), so
+        // there is no other await it could be waiting at. `timeout` then DROPS the future
+        // at that await, so the add is cancelled before it ever reaches a round trip, and
+        // the test handler's client points at 127.0.0.1:1 regardless.
+        //
+        // A third-party Subsonic client is still unprotected by this lock, which is why
+        // the write is followed by the `station_name_count` re-read.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let held = h.station_write.lock().await;
+        let blocked = h.handle(MpdCommand::Station(StationCmd::Add {
+            url: "https://stream.example/never-reached".to_string(),
+            name: "Never Reached".to_string(),
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), blocked).await.is_err(),
+            "a second station add must not enter the read-verdict-write window"
+        );
+        drop(held);
+        assert!(
+            h.station_write.try_lock().is_ok(),
+            "and the window reopens the moment the first one leaves it"
+        );
+    }
+
+    #[tokio::test]
+    async fn station_add_rejects_a_non_stream_uri_through_dispatch() {
+        // A HANDLER-DISPATCH test, which did not exist for this verb at all: it proves
+        // `handle` actually routes MpdCommand::Station to handle_station, and it pins the
+        // pre-network refusals - the two branches that answer without touching the server,
+        // which is what makes them assertable in the certless Nix sandbox too.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let r = h
+            .handle(MpdCommand::Station(StationCmd::Add {
+                url: "not a url".to_string(),
+                name: "Whatever".to_string(),
+            }))
+            .await;
+        match r {
+            MpdResponse::Ack { code, command, message } => {
+                assert_eq!(code, ACK_ERROR_NO_EXIST);
+                assert_eq!(command, "station");
+                assert!(message.contains("not a stream url"), "{message}");
+            }
+            other => panic!("a non-stream uri must ACK before any round trip: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn station_add_rejects_a_blank_name_through_dispatch() {
+        // A blank name would mint a row `add station/<name>` could never address.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let r = h
+            .handle(MpdCommand::Station(StationCmd::Add {
+                url: "https://stream.example/x".to_string(),
+                name: "   ".to_string(),
+            }))
+            .await;
+        match r {
+            MpdResponse::Ack { code, command, message } => {
+                assert_eq!(code, ACK_ERROR_ARG);
+                assert_eq!(command, "station");
+                assert!(message.contains("blank"), "{message}");
+            }
+            other => panic!("a blank station name must ACK before any round trip: {other:?}"),
+        }
+    }
+
     // ── stations as the FOURTH searchall result kind ───────────────────────────
 
     #[test]
@@ -20010,6 +20957,7 @@ mod tests {
             genre: None,
             cover_art: None,
             song_count: 9,
+            created: None,
         }];
         let stations = vec![
             st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
@@ -23041,6 +23989,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── the offline audio store: the STATUS SURFACE ─────────────────────────
+
+    /// Every `(key, value)` pair of a pairs response, for the surface assertions.
+    fn pairs_of(r: MpdResponse) -> Vec<(String, String)> {
+        match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_store_verb_says_off_rather_than_acking_when_there_is_no_store() {
+        // "off" is a REAL, permanent state - a disabled store, no state directory, a
+        // refused directory - and a client must be able to tell it apart from a
+        // failure, so it is a pair and never an ACK. This is also exactly the certless
+        // Nix sandbox's own state, which is what makes this test meaningful THERE
+        // rather than skipped.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        assert!(h.audio_store().is_none(), "the rig starts without a store");
+        for cmd in [
+            crate::mpd::StoreCmd::Show,
+            crate::mpd::StoreCmd::Pause,
+            crate::mpd::StoreCmd::Resume,
+            crate::mpd::StoreCmd::Now,
+        ] {
+            let pairs = pairs_of(h.handle(MpdCommand::Store(cmd)).await);
+            assert_eq!(
+                pairs,
+                vec![("X-Store".to_string(), "off".to_string())],
+                "with no store every form answers `off`, never an ACK: {cmd:?}"
+            );
+        }
+
+        // And `status` carries NO store pair at all: a row of zeros would read as
+        // "the mirror is empty", which is a different claim from "there is no mirror".
+        let pairs = pairs_of(h.handle(MpdCommand::Status).await);
+        assert!(
+            !pairs.iter().any(|(k, _)| k == "X-Store"),
+            "a store-less build must not advertise a store on status"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_store_verb_is_honest_before_the_first_pass_and_nudges_after() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-verb");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        // BEFORE any pass published: "starting", and NOT a set of invented numbers.
+        let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Show)).await);
+        let get = |k: &str| pairs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        assert_eq!(get("X-Store").as_deref(), Some("starting"));
+        assert_eq!(get("X-StorePaused").as_deref(), Some("0"));
+        assert!(get("X-StoreBudget").is_none(), "no budget is reported before one is measured");
+        // Nor does `status` carry the badge yet.
+        assert!(
+            !pairs_of(h.handle(MpdCommand::Status).await).iter().any(|(k, _)| k == "X-Store"),
+            "the badge appears only once a pass has published"
+        );
+
+        // The nudges are real state, readable back in the same response.
+        let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Pause)).await);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "X-StorePaused").map(|(_, v)| v.as_str()),
+            Some("1"),
+            "`store pause` suspends bulk mirroring and says so"
+        );
+        assert!(store.paused(), "and the store itself is paused");
+        assert!(!store.take_full_request_for_test(), "pausing asks the reconciler for nothing");
+        let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Resume)).await);
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "X-StorePaused").map(|(_, v)| v.as_str()),
+            Some("0")
+        );
+        assert!(!store.paused());
+        // Resuming starts AT ONCE rather than at the next fifteen-minute tick -
+        // otherwise "resume" would be indistinguishable from "still paused" for a
+        // quarter of an hour.
+        assert!(store.take_full_request_for_test(), "`store resume` kicks a full pass");
+
+        // `store now` asks for a FULL pass too, which is the only mode that re-reads
+        // the pin set - a light kick would never notice a newly starred album.
+        h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Now)).await;
+        assert!(store.take_full_request_for_test(), "`store now` requests a FULL pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_published_store_status_reaches_both_the_badge_and_the_verb() {
+        // One published status, two readers, and they must agree - the badge is the
+        // "is it moving / is it done" signal and the verb is the detail behind it.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-published");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        let mut input = crate::store::PassInput::new(crate::store::PassMode::Full, 1000);
+        input.configured_max = 4000;
+        input.budget_source = crate::store::BudgetSource::FreeSpace;
+        input.pins = Some(crate::store::PinSet {
+            groups: vec![
+                crate::store::PinGroup {
+                    kind: crate::store::PinKind::Song,
+                    id: "keep".into(),
+                    name: "Keep".into(),
+                    tier: crate::store::PinTier::Song,
+                    songs: vec![store_song("keep", 400)],
+                },
+                crate::store::PinGroup {
+                    kind: crate::store::PinKind::Album,
+                    id: "al-big".into(),
+                    name: "A Big Album".into(),
+                    tier: crate::store::PinTier::Album,
+                    songs: vec![store_song("big-1", 900)],
+                },
+            ],
+        });
+        let (_plan, status) = crate::store::plan_pass_with_status(&input);
+        store.publish_status_for_test(status.expect("a full pass with pins publishes"));
+
+        // The badge: a MOVING number, plus the named shortfall's COUNT.
+        let pairs = pairs_of(h.handle(MpdCommand::Status).await);
+        let badge = pairs
+            .iter()
+            .find(|(k, _)| k == "X-Store")
+            .map(|(_, v)| v.clone())
+            .expect("the badge is present once a pass published");
+        assert!(badge.starts_with("0/1 tracks"), "cached/resident tracks lead: {badge}");
+        assert!(badge.ends_with("1 deferred"), "and the shortfall is counted: {badge}");
+
+        // The verb: the same facts, plus the shortfall BY NAME, which is the whole
+        // reason the old integer-only overflow warn was not good enough.
+        let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Show)).await);
+        let get = |k: &str| pairs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        assert_eq!(get("X-Store").as_deref(), Some("mirroring"));
+        assert_eq!(get("X-StoreBudget").as_deref(), Some("1000"), "the EFFECTIVE budget");
+        assert_eq!(
+            get("X-StoreBudgetConfigured").as_deref(),
+            Some("4000"),
+            "and the configured cap it was clamped down from"
+        );
+        assert_eq!(get("X-StoreBudgetSource").as_deref(), Some("free-space"));
+        assert_eq!(get("X-StoreResident").as_deref(), Some("1"));
+        assert_eq!(get("X-StorePending").as_deref(), Some("1"));
+        assert_eq!(get("X-StorePendingBytes").as_deref(), Some("400"));
+        // LOAD-BEARING: without it a pending count that will NEVER reach zero is
+        // indistinguishable from one that is merely slow.
+        assert_eq!(get("X-StoreGivenUp").as_deref(), Some("0"));
+        let deferred: Vec<&String> =
+            pairs.iter().filter(|(k, _)| k == "Deferred").map(|(_, v)| v).collect();
+        assert_eq!(deferred.len(), 1, "one group did not fit");
+        assert!(
+            deferred[0].contains("album/al-big") && deferred[0].contains("A Big Album"),
+            "the shortfall names the album: {}",
+            deferred[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── the offline audio store: the SUSPECT path (step 8) ──────────────────
 
     #[tokio::test]
@@ -23270,6 +24378,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_queue_is_still_trimmable_and_files_nothing_for_what_it_carried() {
+        // TASK 85xw3mq, ON THE PATH IT ACTUALLY RUNS. `played_at` is EPHEMERAL, so every
+        // restored row comes back unplayed - and a leading-run rule that read only
+        // `played_at` therefore stopped at index 0 and `trim_spent` was DEAD for the rest
+        // of the process. That is not an edge: the daemon restores its queue on every
+        // `nixos-rebuild switch`, so the unbounded queue and unbounded resume.toml came
+        // straight back on precisely the sessions that resume. `carried` is what keeps
+        // the trim alive across a restart, and it must file NOTHING: this run heard none
+        // of those rows, and the ledger is a record of sound, not of positions.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("restore-trim");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        let ids: Vec<String> = (0..SPENT_KEEP + 40).map(|i| format!("r{i:03}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let cur = SPENT_KEEP + 30;
+        let mut s = offline_resume_state(&refs, Some(cur));
+        s.play_state = ResumePlayState::Paused;
+        h.restore(&s).await.expect("restore succeeds");
+
+        let removed = {
+            let mut st = h.state.lock().unwrap();
+            assert!(
+                st.queue[..=cur].iter().all(|it| it.carried),
+                "every row the previous session had reached is history it carried in"
+            );
+            assert!(
+                st.queue[cur + 1..].iter().all(|it| !it.carried),
+                "and nothing ahead of it is - that is queued music the deck never reached"
+            );
+            st.trim_spent()
+        };
+        assert_eq!(removed.len(), cur - SPENT_KEEP, "history past the window is retired at once");
+        assert!(
+            removed.iter().all(|it| spent_heard_row(it).is_none()),
+            "and NOT ONE of them claims this run heard it"
+        );
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.current, Some(SPENT_KEEP), "the playing row sits at the window's end");
+            assert_eq!(st.queue.len(), ids.len() - (cur - SPENT_KEEP));
+        }
+
+        // AND IT STAYS ALIVE. 200 more advances, each appending one lookahead row the way
+        // the radio walk does: without `carried` the leading run is zero forever and this
+        // grows by one row per track for the whole session.
+        let mut peak = 0usize;
+        {
+            let mut st = h.state.lock().unwrap();
+            for step in 0..200u64 {
+                let id = st.next_id;
+                st.next_id += 1;
+                st.queue.push(QueueItem::queued(id, QueueEntry::Song(playlist_test_song(&id.to_string()))));
+                let next = st.current.unwrap() + 1;
+                st.current = Some(next);
+                st.queue[next].played_at = Some(1_700_000_100 + step);
+                st.trim_spent();
+                peak = peak.max(st.queue.len());
+            }
+        }
+        assert!(
+            peak <= SPENT_KEEP + 20,
+            "a resumed session is bounded exactly like a fresh one, peaked at {peak}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// THE LONG-LIVED-INTENT DEFECT, on the headline offline path.
     ///
     /// `pending_pause` was born SHORT-lived (a pause requested, its fade still
@@ -23477,7 +24654,7 @@ mod tests {
         // feeds note_playback_progress from every identity-matched TimePos). Well past
         // MAX_CONSECUTIVE_EOF_FAILURES, and the walk never stops.
         for expected in 1..=6usize {
-            h.note_playback_progress();
+            h.note_playback_progress(cur_qid(&h));
             h.advance_on_eof(failed()).await;
             assert_eq!(
                 h.state.lock().unwrap().current,
@@ -23492,7 +24669,7 @@ mod tests {
 
         // The fuse is NOT disarmed by any of that: from here, three loads that produce
         // no sound at all still stop the walk - that is the systemic case it exists for.
-        h.note_playback_progress();
+        h.note_playback_progress(cur_qid(&h));
         h.advance_on_eof(failed()).await;
         h.advance_on_eof(failed()).await;
         assert_eq!(h.state.lock().unwrap().current, Some(8), "two silent failures still walk");
@@ -23753,7 +24930,7 @@ mod tests {
         // And consume still works for a track that genuinely PLAYED: audio flowed, so
         // this is an ordinary advance, not a walk.
         h.set_pause(Some(false)).await.expect("resume gesture");
-        h.note_playback_progress(); // the director's identity-matched TimePos
+        h.note_playback_progress(cur_qid(&h)); // the director's identity-matched TimePos
         h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(
             h.state.lock().unwrap().queue.len(),
@@ -23819,7 +24996,7 @@ mod tests {
         h.set_pause(Some(false)).await.expect("resume gesture");
         assert_eq!(h.reported_play_state(), PlayState::Playing, "one attempt was all it needed");
         assert_eq!(h.state.lock().unwrap().current, Some(3), "on the entry that was held");
-        h.note_playback_progress(); // the director's identity-matched TimePos
+        h.note_playback_progress(cur_qid(&h)); // the director's identity-matched TimePos
 
         // Full budget back: two dead tracks are skipped past exactly as they always were.
         let failed = || EofSignal { errored: true, ..EofSignal::default() };
@@ -23862,7 +25039,7 @@ mod tests {
         // Entry 0 PLAYED - that is what makes the advance to entry 1 an ordinary one and
         // the halt below hold entry 1 rather than hand the position back to a gesture
         // that never got its audio (see [`HypodjHandler::walk_origin_qid`]).
-        h.note_playback_progress();
+        h.note_playback_progress(cur_qid(&h));
         // The load that failed published its own honest stop, so the player holds
         // NOTHING. (A NullPlayer's own loads all succeed, so the stop is explicit here.)
         let _ = h.player.stop().await;
@@ -23967,7 +25144,7 @@ mod tests {
         // Entry 0 played (so the advance to entry 1 is an ordinary one), and then the
         // overnight terminal: the server went away, the EOF walk halted on the entry it
         // could not load, and the player holds nothing.
-        h.note_playback_progress();
+        h.note_playback_progress(cur_qid(&h));
         let _ = h.player.stop().await;
         h.state.lock().unwrap().current = Some(1);
         h.halt_failed_advance();

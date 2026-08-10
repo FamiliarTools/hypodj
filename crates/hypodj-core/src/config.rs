@@ -304,13 +304,28 @@ pub struct StoreConfig {
     /// running without a store rather than deleting a byte of it.
     #[serde(default)]
     pub dir: Option<PathBuf>,
-    /// Hard byte budget for stored AUDIO (originals, so FLACs count full). When
-    /// the total exceeds it, unpinned entries evict by oldest `last_played`; pins
-    /// are NEVER silently evicted - a pinned set that alone exceeds the budget
-    /// warns per pass naming the shortfall and halts pin downloads at the cap.
+    /// SOFT byte budget for stored AUDIO (originals, so FLACs count full) - the
+    /// absolute cap, never the whole rule.
+    ///
+    /// The EFFECTIVE budget each pass is
+    /// `min(max_bytes, (free + own) - reserve)`, measured from the store
+    /// filesystem itself (see [`crate::store::derive_budget`]). So this knob can
+    /// only ever LOWER what the store uses: when the disk fills, the effective
+    /// budget falls below it and the store hands space back. That is what makes
+    /// "hypodj cannot fill the disk" a property rather than a hope, and it is why
+    /// the number here could be raised without a new knob.
+    ///
+    /// Over budget, the store evicts in ONE order: opportunistic entries by oldest
+    /// `last_played`, then whole pin groups from the tail of the pin frontier
+    /// backwards. Nothing is exempt any more - a pin set that alone exceeds the
+    /// budget is DEFERRED by name (the `store` verb lists which albums), rather
+    /// than silently halting forever.
+    ///
     /// Floored to [`STORE_MIN_MAX_BYTES`] at load: below that the budget cannot
     /// hold even a couple of FLAC originals, so eviction would thrash against
-    /// every download instead of bounding anything.
+    /// every download instead of bounding anything. The DERIVED budget is
+    /// deliberately allowed below that floor, including to zero - "the disk is
+    /// nearly full" must beat "the store would like at least 64 MiB".
     #[serde(default = "d_store_max_bytes")]
     pub max_bytes: u64,
     /// How many UPCOMING queue Song entries beyond the current one join the
@@ -335,8 +350,18 @@ pub struct StoreConfig {
 }
 
 pub const DEFAULT_STORE_ENABLE: bool = true;
-/// 8 GiB: roughly 350 to 400 FLAC originals at the live-observed ~22 MB each.
-pub const DEFAULT_STORE_MAX_BYTES: u64 = 8_589_934_592;
+/// 16 GiB, and the sizing is MEASURED rather than guessed.
+///
+/// The union of one real user's three starred kinds (47 songs, 36 albums, 1
+/// artist) is 347 unique tracks. Per stored original the live store gives a
+/// median of 31 MiB and a mean of 37 MiB - not the ~22 MB this constant used to
+/// claim - so that union is about 12.3 GiB. 16 GiB covers it plus roughly 25 %
+/// for stars added before anyone looks at this number again.
+///
+/// It is a CAP, not an allocation: nothing is written until it is wanted, and the
+/// free-space clamp above ([`StoreConfig::max_bytes`]) can pull the effective
+/// budget below it at any moment.
+pub const DEFAULT_STORE_MAX_BYTES: u64 = 17_179_869_184;
 pub const DEFAULT_STORE_QUEUE_AHEAD: u32 = 3;
 pub const DEFAULT_STORE_SYNC_INTERVAL_SECS: u64 = 900;
 pub const DEFAULT_STORE_PIN_STARRED: bool = true;
@@ -1324,11 +1349,11 @@ mod tests {
     #[test]
     fn store_section_defaults_on_with_the_documented_budget() {
         // No [store] section at all -> the store is ON by default (the offline path
-        // is meant to be the everyday path) with the documented 8 GiB budget.
+        // is meant to be the everyday path) with the documented 16 GiB budget.
         let cfg = Config::from_str(BARE).unwrap();
         assert!(cfg.store.enable, "the store defaults ON");
         assert_eq!(cfg.store.dir, None, "dir defaults to <state_dir>/store");
-        assert_eq!(cfg.store.max_bytes, 8_589_934_592, "8 GiB");
+        assert_eq!(cfg.store.max_bytes, 17_179_869_184, "16 GiB");
         assert_eq!(cfg.store.queue_ahead, 3);
         assert_eq!(cfg.store.sync_interval_secs, 900);
         assert!(cfg.store.pin_starred, "starred is the pin set by default");

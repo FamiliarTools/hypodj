@@ -90,6 +90,13 @@ pub struct Album {
     pub genre: Option<String>,
     pub cover_art: Option<String>,
     pub song_count: u32,
+    /// The server's `created` timestamp for the album, when it reported one.
+    ///
+    /// Carried for ONE reason: ordering a starred ARTIST's albums newest-first in
+    /// the offline store's pin frontier, so a partly-resident artist keeps their
+    /// recent work rather than an arbitrary slice. `year` is the fallback when the
+    /// server omits it.
+    pub created: Option<String>,
 }
 
 /// A library track.

@@ -72,6 +72,21 @@ pub struct NowPlaying {
     /// future made visible BEFORE the drain handoff; `None` (disarmed / unconfigured)
     /// renders nothing, keeping a lean status silent exactly like the armed/hint HUD.
     pub continuation: Option<String>,
+    /// The OFFLINE STORE in one already-rendered sentence, from the daemon's `X-Store`
+    /// status pair - e.g. `318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)` or
+    /// `complete, 347 tracks, 9.8 GiB`.
+    ///
+    /// Rendered daemon-side on purpose: the numbers and the reasons live there, and one
+    /// formatter means `dj status` and the dj-gui badge can never disagree about the
+    /// same mirror. This is the ONLY passive window a client has into a backfill that
+    /// runs for days - without it "is it running, stuck, or done?" is answerable only by
+    /// opening a socket and typing `store` by hand, because `store` is deliberately
+    /// absent from the `commands` advertisement.
+    ///
+    /// `None` with no store configured, and also until the reconciler has completed one
+    /// full pass with an authoritative pin set - a row of zeros would read as "the
+    /// mirror is empty", which is a different claim from "nobody has looked yet".
+    pub store: Option<String>,
 }
 
 /// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
@@ -249,7 +264,34 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         field: FieldState::parse(status),
         hint: AmbientHint::parse(status),
         continuation: parse_continuation(status),
+        store: find(status, "X-Store").map(str::to_string),
     }
+}
+
+/// The offline-store line as a COMPACT badge: everything up to the first comma, plus
+/// any of the trailing clauses that report something is wrong or held ("waiting",
+/// "deferred", "given up"). So a healthy mirror reads `318/347 tracks` or `complete`
+/// and a held one reads `318/347 tracks, waiting (playback-remote)` - the size and
+/// budget figures, which only matter when he is actually asking, stay in the full
+/// `dj status` line.
+///
+/// Split on the daemon's own comma-joined shape rather than re-deriving anything, so
+/// the two renders cannot drift apart. `None` when there is no store line at all.
+pub fn store_badge(line: &str) -> Option<String> {
+    let mut parts = line.split(", ");
+    let head = parts.next()?.trim();
+    if head.is_empty() {
+        return None;
+    }
+    let mut out = head.to_string();
+    for p in parts {
+        let p = p.trim();
+        if p.starts_with("waiting") || p.ends_with("deferred") || p.ends_with("given up") {
+            out.push_str(", ");
+            out.push_str(p);
+        }
+    }
+    Some(out)
 }
 
 /// Format a `secs` remaining as a compact human-readable string: `Hh MMm`, `MMm`,
@@ -681,5 +723,39 @@ mod tests {
     #[test]
     fn parse_queue_empty() {
         assert!(parse_queue(&[]).is_empty());
+    }
+
+    #[test]
+    fn now_playing_carries_the_offline_store_line() {
+        // The daemon has emitted `X-Store` on `status` all along and no client read it,
+        // so a multi-day starred backfill was invisible from `dj` and `dj-gui` alike -
+        // reachable only by opening a socket and typing `store`, which is deliberately
+        // not in the `commands` advertisement. This is that wire, and a status without
+        // the pair (no store, or no full pass yet) must stay None rather than invent a
+        // row of zeros.
+        let np = now_playing(&p(&[("X-Store", "318/347 tracks, 12.1/16.0 GiB")]), &[]);
+        assert_eq!(np.store.as_deref(), Some("318/347 tracks, 12.1/16.0 GiB"));
+        assert_eq!(now_playing(&[], &[]).store, None);
+    }
+
+    #[test]
+    fn the_store_badge_keeps_the_headline_and_every_reason_it_is_held() {
+        // The badge is the compact half of the same sentence: the headline count always,
+        // plus anything that says the mirror is HELD - because "stuck" and "slow" looking
+        // identical is the exact failure the status surface exists to eliminate. The size
+        // and budget figures only matter when he is asking, so they stay in `dj status`.
+        assert_eq!(
+            store_badge("318/347 tracks, 12.1/16.0 GiB").as_deref(),
+            Some("318/347 tracks"),
+        );
+        assert_eq!(store_badge("complete, 347 tracks, 9.8 GiB").as_deref(), Some("complete"));
+        assert_eq!(
+            store_badge("318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote), 3 deferred, 2 given up")
+                .as_deref(),
+            Some("318/347 tracks, waiting (playback-remote), 3 deferred, 2 given up"),
+        );
+        // Total over anything the daemon might say, including nothing.
+        assert_eq!(store_badge(""), None);
+        assert_eq!(store_badge("starting").as_deref(), Some("starting"));
     }
 }

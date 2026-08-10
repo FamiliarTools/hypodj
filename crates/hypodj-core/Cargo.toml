@@ -52,6 +52,14 @@ zbus = { version = "4.4", features = ["tokio"] }
 # reqwest 0.13.4). Only ever fetches the state-held cover URL gated by the
 # current stream entry - never an arbitrary client-supplied URL.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+# ONE `statvfs` call: the offline store's byte ceiling is derived from OBSERVED
+# free space, which is what makes "hypodj cannot fill the disk" a property rather
+# than a hope. std exposes no free-space API. This reverses a stated judgement
+# that declined libc for the tape, and the footprint half of that judgement no
+# longer holds: libc is already resolved in Cargo.lock, already a DIRECT dep of
+# hypodj-tui, and already pulled by tokio and mio, so naming it here adds ZERO
+# nodes to the build graph (the same argument that pins reqwest above).
+libc = "0.2"
 
 [dev-dependencies]
 # Deserialize the exact camelCase wire JSON in the wire->model mapping tests,

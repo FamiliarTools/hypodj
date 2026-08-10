@@ -465,7 +465,7 @@ async fn spine<C: Clock>(
                             // position of exactly 0 is a load that has not decoded yet,
                             // so it is not yet evidence.
                             if pos > 0.0 {
-                                handler.note_playback_progress();
+                                handler.note_playback_progress(queue_id);
                             }
                             let p = pos_to_duration(pos);
                             let rem = pubr.time_remaining(p);

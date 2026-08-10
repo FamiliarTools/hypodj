@@ -7,7 +7,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use hypodj_client::model::{fmt_remaining, ArmedFeatures, FieldState, HintKind, NowPlaying};
+use hypodj_client::model::{
+    fmt_remaining, store_badge, ArmedFeatures, FieldState, HintKind, NowPlaying,
+};
 
 use crate::keymap;
 use crate::find::{FindRow, Focus, Phase};
@@ -26,6 +28,12 @@ use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState}
 /// short terminal keeps exactly the historical 12, because on 24 rows a bigger pane
 /// leaves the queue list unusable, and a cover is worth less than seeing what is playing
 /// next.
+/// The stretch of ambient wave the idle bottom bar keeps for itself, whatever else
+/// wants the row. The store badge is drawn only when it fits BESIDE this many cells,
+/// so a long mirror line can never turn the quietest row on the screen into a status
+/// bar.
+const MIN_WAVE_CELLS: usize = 16;
+
 fn now_playing_h(total: u16) -> u16 {
     match total {
         0..=29 => 12,
@@ -1448,6 +1456,35 @@ mod tests {
     }
 
     #[test]
+    fn bottom_bar_carries_the_store_badge_and_gives_it_up_when_the_row_is_narrow() {
+        // THE PASSIVE WINDOW. A starred backfill runs for days; without a badge the only
+        // way to know whether it is running, held, or done is to open a socket and type
+        // `store` by hand (the verb is deliberately absent from the `commands`
+        // advertisement, so ncmpcpp will never show it either). The badge rides the
+        // quietest row on the screen, left of the help hint.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.store = Some("318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)".into());
+        let out = render_to_lines_sized(&s, 100, 30).join("\n");
+        assert!(
+            out.contains("[318/347 tracks, waiting (playback-remote)]"),
+            "the badge is drawn with the reason it is held:\n{out}"
+        );
+        assert!(out.contains("? help"), "and it does not displace the help hint:\n{out}");
+
+        // No store line -> nothing drawn, exactly like the armed/field HUDs.
+        s.now.store = None;
+        let out = render_to_lines_sized(&s, 100, 30).join("\n");
+        assert!(!out.contains("318/347"), "a lean status draws no badge:\n{out}");
+
+        // A narrow terminal keeps the ambient row for itself rather than truncating the
+        // badge into nonsense - `dj status` always carries the full sentence.
+        s.now.store = Some("318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)".into());
+        let out = render_to_lines_sized(&s, 40, 30).join("\n");
+        assert!(!out.contains("318/347"), "no badge where it would eat the whole row:\n{out}");
+    }
+
+    #[test]
     fn sigil_fills_art_slot_when_no_cover_and_no_image_protocol() {
         use crate::album_color::{ImageProtocol, TermBg};
         use crate::sigil::Sigil;
@@ -2637,7 +2674,21 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 const HINT: &str = " ? help";
                 let full = area.width as usize;
                 let hint_len = if full > HINT.len() + 2 { HINT.len() } else { 0 };
-                let width = full.saturating_sub(hint_len);
+                // THE STORE BADGE, left of the help hint: the passive answer to "is
+                // the mirror running, held, or done?". Drawn only when the daemon
+                // published one AND the bar is wide enough to keep a real stretch of
+                // wave (a badge that eats the whole row would be a status bar, not a
+                // badge); below that width it simply is not drawn, never truncated
+                // into nonsense. `dj status` always carries the full sentence.
+                let badge = state
+                    .now
+                    .store
+                    .as_deref()
+                    .and_then(store_badge)
+                    .map(|b| format!(" [{b}]"))
+                    .filter(|b| full > hint_len + b.chars().count() + MIN_WAVE_CELLS);
+                let badge_len = badge.as_ref().map_or(0, |b| b.chars().count());
+                let width = full.saturating_sub(hint_len + badge_len);
                 let seed = track_seed(&state.now);
                 let wave = if state.viz_active {
                     level_wave_row(width, state.anim_secs, seed, state.viz_env, state.viz_playing)
@@ -2660,6 +2711,12 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                     None => Style::default().add_modifier(Modifier::DIM),
                 };
                 let mut spans = vec![Span::styled(wave, wave_style)];
+                if let Some(badge) = badge {
+                    spans.push(Span::styled(
+                        badge,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
                 if hint_len > 0 {
                     spans.push(Span::styled(
                         HINT,

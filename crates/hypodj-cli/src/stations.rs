@@ -148,6 +148,7 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
     let mut created = 0usize;
     let mut updated = 0usize;
     let mut unchanged = 0usize;
+    let mut unknown = 0usize;
     let mut failed = 0usize;
     // The (name, url) pairs this run has already sent. Both are per-station unique keys
     // on the server, and the daemon only ever sees one call at a time, so keeping them
@@ -249,6 +250,7 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
                 Reported::Created => created += 1,
                 Reported::Updated => updated += 1,
                 Reported::Unchanged => unchanged += 1,
+                Reported::Unknown => unknown += 1,
                 Reported::Failed => failed += 1,
             }
         }
@@ -258,16 +260,25 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
         "{} file{}: {}",
         files.len(),
         if files.len() == 1 { "" } else { "s" },
-        summary(dry_run, created, updated, unchanged, failed)
+        summary(dry_run, created, updated, unchanged, unknown, failed)
     );
-    Ok(failed == 0)
+    // An UNKNOWN outcome is not a success. The run wrote something the client could not
+    // confirm, so the exit status must not claim a clean import.
+    Ok(failed == 0 && unknown == 0)
 }
 
 /// The tally line. Only non-zero counts appear (a run of 22 unchanged should not have to
 /// be read past three zeros), and a run that did literally nothing says so rather than
 /// printing an empty list. Under `--dry-run` the write verbs are conditional, because
 /// nothing was written.
-fn summary(dry_run: bool, created: usize, updated: usize, unchanged: usize, failed: usize) -> String {
+fn summary(
+    dry_run: bool,
+    created: usize,
+    updated: usize,
+    unchanged: usize,
+    unknown: usize,
+    failed: usize,
+) -> String {
     let word = |would: &str, did: &str| if dry_run { format!("would {would}") } else { did.to_string() };
     let mut parts = Vec::new();
     if created > 0 {
@@ -279,6 +290,9 @@ fn summary(dry_run: bool, created: usize, updated: usize, unchanged: usize, fail
     if unchanged > 0 {
         parts.push(format!("{unchanged} unchanged"));
     }
+    if unknown > 0 {
+        parts.push(format!("{unknown} unknown"));
+    }
     if failed > 0 {
         parts.push(format!("{failed} {}", word("fail", "failed")));
     }
@@ -289,11 +303,34 @@ fn summary(dry_run: bool, created: usize, updated: usize, unchanged: usize, fail
 }
 
 /// What one entry ended up as, for the summary tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reported {
     Created,
     Updated,
     Unchanged,
+    /// The daemon answered OK but did not say what it did: no `X-Station` pair at all, or
+    /// one carrying a word this client does not know. NOT `Created` - the write may or
+    /// may not have happened and this client cannot tell, so it says so instead of
+    /// inventing the most flattering of the two.
+    Unknown,
     Failed,
+}
+
+/// Read the daemon's `X-Station` pair. THE CLIENT HALF of the contract the daemon's
+/// `station_result_pairs` writes, kept pure so both halves are asserted against the same
+/// three literals and cannot drift apart unnoticed.
+///
+/// `None` (the pair absent) and an unrecognised word both mean [`Reported::Unknown`],
+/// never `Created`: a client that guesses the flattering answer reports a run of
+/// confident creations nothing verified, which is worse than admitting the daemon said
+/// something it does not understand.
+fn classify_station_outcome(outcome: Option<&str>) -> Reported {
+    match outcome {
+        Some("created") => Reported::Created,
+        Some("updated") => Reported::Updated,
+        Some("unchanged") => Reported::Unchanged,
+        _ => Reported::Unknown,
+    }
 }
 
 /// Send one `station add` and print what the daemon says it did. `Ok(None)` means the
@@ -307,25 +344,32 @@ fn send_add(
     let line = format!("station add {} {}", quote_arg(url), quote_arg(name));
     match conn.command(&line) {
         Ok(pairs) => {
-            let outcome = pair(&pairs, "X-Station").unwrap_or_else(|| "created".to_string());
+            // NO DEFAULT TO "created". A missing or unrecognised `X-Station` used to be
+            // printed as a create and tallied as one, so a daemon too old to carry the
+            // pair - or one answering with a word added later - reported a run of
+            // confident creations that nothing had verified. The pair IS the contract
+            // (`station_result_pairs` in the daemon); when it is absent, the honest
+            // report is that we do not know.
+            let outcome = pair(&pairs, "X-Station");
             let canonical = pair(&pairs, "Name").unwrap_or_else(|| name.to_string());
-            Ok(Some(match outcome.as_str() {
-                "unchanged" => {
-                    println!("unchanged  {canonical}{suffix}");
-                    Reported::Unchanged
-                }
-                "updated" => {
-                    match pair(&pairs, "X-PrevUrl") {
-                        Some(prev) => println!("updated    {canonical}{suffix}  {prev} -> {url}"),
-                        None => println!("updated    {canonical}{suffix}"),
+            let reported = classify_station_outcome(outcome.as_deref());
+            match reported {
+                Reported::Unchanged => println!("unchanged  {canonical}{suffix}"),
+                Reported::Updated => match pair(&pairs, "X-PrevUrl") {
+                    Some(prev) => println!("updated    {canonical}{suffix}  {prev} -> {url}"),
+                    None => println!("updated    {canonical}{suffix}"),
+                },
+                Reported::Created => println!("created    {canonical}{suffix}"),
+                Reported::Unknown => match outcome.as_deref() {
+                    Some(other) => {
+                        println!("unknown    {canonical}{suffix}  (daemon said \"{other}\")")
                     }
-                    Reported::Updated
-                }
-                _ => {
-                    println!("created    {canonical}{suffix}");
-                    Reported::Created
-                }
-            }))
+                    None => println!("unknown    {canonical}{suffix}  (daemon sent no X-Station)"),
+                },
+                // Never produced by the classifier; a rejection arrives as an Ack below.
+                Reported::Failed => println!("failed     {canonical}{suffix}"),
+            }
+            Ok(Some(reported))
         }
         // A per-station rejection is recorded and the loop CONTINUES: each entry is an
         // independent idempotent upsert, so a re-run after fixing the cause converges,
@@ -610,12 +654,47 @@ mod tests {
 
     #[test]
     fn the_summary_states_only_what_happened() {
-        assert_eq!(summary(false, 3, 1, 18, 1), "3 created, 1 updated, 18 unchanged, 1 failed");
+        assert_eq!(summary(false, 3, 1, 18, 0, 1), "3 created, 1 updated, 18 unchanged, 1 failed");
         // The second import of the same collection: no write verbs at all.
-        assert_eq!(summary(false, 0, 0, 22, 0), "22 unchanged");
-        assert_eq!(summary(true, 22, 0, 0, 0), "22 would create");
-        assert_eq!(summary(true, 0, 0, 0, 1), "1 would fail");
-        assert_eq!(summary(false, 0, 0, 0, 0), "nothing to do");
+        assert_eq!(summary(false, 0, 0, 22, 0, 0), "22 unchanged");
+        assert_eq!(summary(true, 22, 0, 0, 0, 0), "22 would create");
+        assert_eq!(summary(true, 0, 0, 0, 0, 1), "1 would fail");
+        assert_eq!(summary(false, 0, 0, 0, 0, 0), "nothing to do");
+        // An unconfirmable outcome gets its own word in the tally rather than hiding
+        // inside "created" - the run is not a clean import and must not read like one.
+        assert_eq!(summary(false, 1, 0, 0, 2, 0), "1 created, 2 unknown");
+    }
+
+    // ── the X-Station contract, CLIENT half (task 4i3s3ry) ──────────────────
+    //
+    // The daemon's `station_result_pairs` writes exactly three words. This asserts the
+    // client reads exactly those three and, crucially, refuses to GUESS for anything
+    // else: the old code defaulted a missing pair to "created" and tallied a create, so
+    // an older daemon (or a word added later) produced a run of confident creations that
+    // nothing had verified.
+    #[test]
+    fn the_three_contract_words_classify_and_nothing_else_does() {
+        assert_eq!(classify_station_outcome(Some("created")), Reported::Created);
+        assert_eq!(classify_station_outcome(Some("updated")), Reported::Updated);
+        assert_eq!(classify_station_outcome(Some("unchanged")), Reported::Unchanged);
+    }
+
+    #[test]
+    fn a_missing_or_unrecognised_x_station_is_unknown_never_created() {
+        assert_eq!(
+            classify_station_outcome(None),
+            Reported::Unknown,
+            "no X-Station pair at all must never be reported as a create"
+        );
+        assert_eq!(
+            classify_station_outcome(Some("relocated")),
+            Reported::Unknown,
+            "a word this client does not know must never be reported as a create"
+        );
+        // Case matters: the daemon emits lowercase literals, and silently accepting a
+        // near-miss would let a real contract break through as a success.
+        assert_eq!(classify_station_outcome(Some("Created")), Reported::Unknown);
+        assert_eq!(classify_station_outcome(Some("")), Reported::Unknown);
     }
 
     #[test]

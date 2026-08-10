@@ -271,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
                         let source = Arc::new(hypodj_core::store::SubsonicPinSource::new(
                             client.clone(),
                             cfg.store.pin_starred,
+                            hypodj_core::clock::TokioClock,
                         ));
                         tokio::spawn(hypodj_core::store::run(
                             store,

@@ -285,6 +285,23 @@ pub enum MpdCommand {
     /// absent from `commands`. See [`crate::heard::HeardQuery`].
     Heard(crate::heard::HeardQuery),
 
+    /// `store` / `store pause` / `store resume` / `store now` - READ BACK (and
+    /// nudge) the OFFLINE AUDIO STORE.
+    ///
+    /// The store had NO surface at all: every fact about it - the budget, the
+    /// backfill's progress, which starred albums did not fit, which downloads were
+    /// given up on - reached the user only as `tracing` output, so "is it working"
+    /// and "is it done" were unanswerable from any client. This is that surface.
+    /// It answers from the in-memory status a pass already computed: no network, no
+    /// directory scan.
+    ///
+    /// NOT a standard MPD command; a hypodj extension, and like its siblings
+    /// (`mark`, `heard`, `knob`, `nl`, `continuation`, `radio`, `station`,
+    /// `searchall`) deliberately ABSENT from the `commands` advertisement, with
+    /// `ADVERTISED_MPD_VERSION` untouched. See [`StoreCmd`] and
+    /// [`crate::handler::HypodjHandler::handle_store`].
+    Store(StoreCmd),
+
     /// `continuation on|off` / `continuation [status]` - the startle-safe opt-in for
     /// end-of-queue CONTINUATION radio: when the play queue drains, flow into a
     /// configured online radio station instead of stopping silent. Default OFF,
@@ -443,6 +460,34 @@ fn parse_mark(args: &[String], line: &str) -> MpdCommand {
         Some("previous") | Some("prev") | Some("last") => {
             MpdCommand::Mark(crate::heard::MarkTarget::Previous)
         }
+        _ => MpdCommand::Unsupported(line.to_string()),
+    }
+}
+
+/// What a `store` request asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreCmd {
+    /// The bare form: report. Read-only, and the only form a client needs.
+    Show,
+    /// Suspend BULK mirroring (stale replacements and starred backfill) for this
+    /// process. Window and suspect downloads are unaffected - pausing the mirror
+    /// must never make the next track stream.
+    Pause,
+    /// Resume bulk mirroring, and kick a full pass so it starts at once.
+    Resume,
+    /// Kick a full pass now instead of waiting out the interval.
+    Now,
+}
+
+/// Parse a `store` request: the bare form, or one of the three nudges. Anything
+/// else is `Unsupported`, which ACKs rather than silently reporting.
+fn parse_store(args: &[String], line: &str) -> MpdCommand {
+    match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+        None => MpdCommand::Store(StoreCmd::Show),
+        Some("status") | Some("show") if args.len() == 1 => MpdCommand::Store(StoreCmd::Show),
+        Some("pause") if args.len() == 1 => MpdCommand::Store(StoreCmd::Pause),
+        Some("resume") if args.len() == 1 => MpdCommand::Store(StoreCmd::Resume),
+        Some("now") if args.len() == 1 => MpdCommand::Store(StoreCmd::Now),
         _ => MpdCommand::Unsupported(line.to_string()),
     }
 }
@@ -1370,6 +1415,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "identify" => MpdCommand::Identify,
         "mark" => parse_mark(&args, line),
         "heard" => parse_heard(&args, line),
+        "store" => parse_store(&args, line),
         "continuation" => parse_continuation(&args, line),
         "radio" => parse_radio(&args, line),
         "station" => parse_station(&args, line),
@@ -1578,6 +1624,35 @@ mod parse_tests {
         assert!(matches!(parse("mark next"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("mark this one"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("mark previous please"), MpdCommand::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_the_store_verb_and_its_three_nudges() {
+        // The bare form is the one a client needs, and both spellings of "just tell
+        // me" mean the same thing - a read-back must never be a typo away from a
+        // state change.
+        for (line, want) in [
+            ("store", StoreCmd::Show),
+            ("store status", StoreCmd::Show),
+            ("store show", StoreCmd::Show),
+            ("store pause", StoreCmd::Pause),
+            ("store resume", StoreCmd::Resume),
+            ("store now", StoreCmd::Now),
+            // Case-insensitive like every other subcommand word here.
+            ("store PAUSE", StoreCmd::Pause),
+        ] {
+            assert!(
+                matches!(parse(line), MpdCommand::Store(got) if got == want),
+                "`{line}` must parse as {want:?}"
+            );
+        }
+        // Anything else ACKs rather than silently reporting: a mistyped nudge that
+        // quietly degraded to a read-back would leave the mirror running while the
+        // user believed it was paused.
+        assert!(matches!(parse("store stop"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("store pause now"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("store now please"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("store status extra"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

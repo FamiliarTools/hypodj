@@ -268,12 +268,20 @@ impl SubsonicClient {
     /// each `Child` into our `Song`. This is the "resolve an album's tracks so
     /// we can queue+stream them" step the play-probe needs to pick a real song
     /// id without guessing.
+    ///
+    /// Errors route through [`map_request_error`], so an API code 70 arrives as
+    /// [`SubsonicError::NotFound`] rather than [`SubsonicError::Request`]. That
+    /// distinction is LOAD-BEARING for the offline store's album pins: a DELETED
+    /// album must expand to nothing (its tracks demote), while a flapping server
+    /// must abort the whole pin set (nothing demotes). Mapping every failure to
+    /// `Request` - as this did - collapses those two into one and would have made
+    /// the split silently inoperative.
     pub async fn album_songs(&self, id: &AlbumId) -> Result<Vec<Song>, SubsonicError> {
         let album = self
             .inner
             .get_album(&id.0)
             .await
-            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+            .map_err(map_request_error)?;
         Ok(album.song.into_iter().map(map_song).collect())
     }
 
@@ -281,12 +289,16 @@ impl SubsonicClient {
     /// `ArtistWithAlbumsId3`, whose `album: Vec<AlbumId3>` are the albums) and
     /// maps each into our `Album`. Backs the MPD `lsinfo` drill-down into an
     /// artist directory.
+    ///
+    /// Errors route through [`map_request_error`] for the same reason
+    /// [`album_songs`](Self::album_songs) does: a deleted artist must expand to
+    /// nothing, a flapping server must abort the pin set.
     pub async fn artist_albums(&self, id: &ArtistId) -> Result<Vec<Album>, SubsonicError> {
         let artist = self
             .inner
             .get_artist(&id.0)
             .await
-            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+            .map_err(map_request_error)?;
         Ok(artist.album.into_iter().map(map_album).collect())
     }
 
@@ -828,6 +840,7 @@ fn map_album(a: data::AlbumId3) -> Album {
         genre: a.genre,
         cover_art: a.cover_art,
         song_count: i64_to_u32(a.song_count.unwrap_or(0)),
+        created: a.created,
     }
 }
 
