@@ -298,6 +298,10 @@ fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     }
 
     let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    // Record the measured max so the scroll keys can clamp against it: without it `j`
+    // past the end keeps incrementing an offset only the renderer clamps, and `k` then
+    // appears stuck at the bottom while it unwinds the phantom distance.
+    state.heard_max_scroll.set(max_scroll);
     let scroll = state.heard_scroll.min(max_scroll);
     let title = if max_scroll > 0 {
         format!("Marked - the tape ({}/{})  j/k scroll  t closes", scroll + 1, max_scroll + 1)
@@ -397,6 +401,8 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     // is clamped to the last full page so a short terminal can still reach every binding.
     let inner_h = popup.height.saturating_sub(2);
     let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    // See `render_heard_overlay`: the keys clamp against this measured max.
+    state.help_max_scroll.set(max_scroll);
     let scroll = state.help_scroll.min(max_scroll);
     let title = if max_scroll > 0 {
         format!("Help - keys ({}/{})  j/k scroll", scroll + 1, max_scroll + 1)

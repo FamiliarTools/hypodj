@@ -544,6 +544,12 @@ pub struct TuiState {
     /// is taller than the terminal; nav keys scroll it and the renderer clamps it to the
     /// real max so a short terminal can still reach every binding. Reset when help opens.
     pub help_scroll: u16,
+    /// The last max scroll offset the renderer measured for the help overlay (content
+    /// rows minus the visible inner height). Written every frame the overlay is drawn and
+    /// read by the scroll keys so `j` CANNOT run past the end: without it the offset kept
+    /// incrementing invisibly and `k` had to walk all that phantom distance back before
+    /// the view moved at all.
+    pub help_max_scroll: Cell<u16>,
     /// The daemon's `heard` read-back, one entry per rendered line, or empty when the
     /// overlay has never been asked for. THE TAPE'S ONLY WINDOW in this process: `mark`
     /// keeps audio, and the segment outlives by weeks the one-line banner that announced
@@ -559,6 +565,9 @@ pub struct TuiState {
     /// The overlay's vertical scroll offset (rows), clamped by the renderer against the
     /// real content so a short terminal can still reach the last row. Reset on open.
     pub heard_scroll: u16,
+    /// The heard overlay's measured max scroll, in the exact shape of
+    /// [`Self::help_max_scroll`] and for the same reason.
+    pub heard_max_scroll: Cell<u16>,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -659,9 +668,11 @@ impl Default for TuiState {
             menu: None,
             help_open: false,
             help_scroll: 0,
+            help_max_scroll: Cell::new(0),
             heard_lines: Vec::new(),
             heard_open: false,
             heard_scroll: 0,
+            heard_max_scroll: Cell::new(0),
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             sixel_cell_px: None,
@@ -827,22 +838,23 @@ impl TuiState {
         if self.help_open {
             // A true modal: `?`/Esc/q close it; j/k/arrows/PgUp/PgDn scroll it (so a
             // short terminal that cannot show the whole table can still reach every
-            // binding); everything else is swallowed. The offset is clamped against the
-            // real content/viewport in the renderer, so an over-scroll just pins to the
-            // last page.
+            // binding); everything else is swallowed. The offset is clamped HERE against
+            // the max the renderer last measured, so `j` at the bottom is a no-op rather
+            // than silently inflating an offset `k` would then have to unwind.
+            let help_max = self.help_max_scroll.get();
             match key.code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.help_open = false;
                     self.help_scroll = 0;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.help_scroll = self.help_scroll.saturating_add(1);
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(help_max);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                    self.help_scroll = self.help_scroll.min(help_max).saturating_sub(1);
                 }
                 KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.help_scroll = self.help_scroll.saturating_add(10);
+                    self.help_scroll = self.help_scroll.saturating_add(10).min(help_max);
                 }
                 KeyCode::PageUp => {
                     self.help_scroll = self.help_scroll.saturating_sub(10);
@@ -856,19 +868,21 @@ impl TuiState {
         // to read than the next keypress, so it must NOT be dismissed by any key the way
         // a one-line banner is.
         if self.heard_open {
+            // Offsets clamped against the renderer's measured max, same as help.
+            let heard_max = self.heard_max_scroll.get();
             match key.code {
                 KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.heard_open = false;
                     self.heard_scroll = 0;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.heard_scroll = self.heard_scroll.saturating_add(1);
+                    self.heard_scroll = self.heard_scroll.saturating_add(1).min(heard_max);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.heard_scroll = self.heard_scroll.saturating_sub(1);
+                    self.heard_scroll = self.heard_scroll.min(heard_max).saturating_sub(1);
                 }
                 KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.heard_scroll = self.heard_scroll.saturating_add(10);
+                    self.heard_scroll = self.heard_scroll.saturating_add(10).min(heard_max);
                 }
                 KeyCode::PageUp => {
                     self.heard_scroll = self.heard_scroll.saturating_sub(10);
@@ -2952,12 +2966,53 @@ mod tests {
     }
 
     #[test]
+    fn help_scroll_stops_at_the_measured_end_so_k_moves_immediately() {
+        // The bug: `j` past the bottom kept incrementing an offset only the RENDERER
+        // clamped, so the view sat still while the number ran away - and `k` then had to
+        // unwind all that phantom distance before the overlay appeared to move at all.
+        let mut s = TuiState::new();
+        s.handle_key(ch('?'));
+        s.help_max_scroll.set(3);
+        for _ in 0..20 {
+            s.handle_key(ch('j'));
+        }
+        assert_eq!(s.help_scroll, 3, "j pins at the last page instead of running past it");
+        // One `k` moves one row up - immediately.
+        s.handle_key(ch('k'));
+        assert_eq!(s.help_scroll, 2);
+        // PgDn is bounded the same way, and a stale offset from a taller terminal (the
+        // window was resized shorter, shrinking the max) is pulled back on the first key.
+        s.handle_key(key(KeyCode::PageDown));
+        assert_eq!(s.help_scroll, 3);
+        s.help_scroll = 50;
+        s.handle_key(ch('k'));
+        assert_eq!(s.help_scroll, 2, "an over-large offset resolves against the real max");
+    }
+
+    #[test]
+    fn heard_scroll_stops_at_the_measured_end() {
+        // Same contract as help: the tape overlay cannot over-scroll either.
+        let mut s = TuiState::new();
+        s.open_heard(vec!["a".into(), "b".into(), "c".into()]);
+        s.heard_max_scroll.set(1);
+        for _ in 0..10 {
+            s.handle_key(ch('j'));
+        }
+        assert_eq!(s.heard_scroll, 1);
+        s.handle_key(ch('k'));
+        assert_eq!(s.heard_scroll, 0);
+    }
+
+    #[test]
     fn help_overlay_scrolls_and_resets() {
         let mut s = TuiState::new();
         // `?` opens help at the top.
         assert_eq!(s.handle_key(ch('?')), None);
         assert!(s.help_open);
         assert_eq!(s.help_scroll, 0);
+        // Stand in for a frame having been drawn: the keys clamp against the max the
+        // renderer measured, and a tall-enough viewport leaves plenty of room here.
+        s.help_max_scroll.set(100);
         // j / Down scroll down; k / Up scroll up (clamped at 0). PageDown jumps.
         s.handle_key(ch('j'));
         s.handle_key(key(KeyCode::Down));
@@ -3289,6 +3344,7 @@ mod tests {
         s.open_heard(vec!["3 marks, oldest first".into(), "23:17  * NTS 2  [tape 2: 5m, window]".into()]);
         assert!(s.heard_open);
         assert_eq!(s.heard_scroll, 0);
+        s.heard_max_scroll.set(100);
         // Scrolls.
         assert_eq!(s.handle_key(ch('j')), None);
         assert_eq!(s.heard_scroll, 1);
