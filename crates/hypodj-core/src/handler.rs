@@ -154,6 +154,17 @@ impl QueueItem {
 /// a constant, in a session of any length.
 const SPENT_KEEP: usize = 25;
 
+/// How far ahead the cover PREFETCH warms when no offline audio store is configured
+/// to lend its `queue_ahead`. Covers are tens of KiB, so warming a handful of tracks
+/// ahead is bandwidth the listener will spend anyway, moved off the moment the art
+/// pane asks for it.
+const DEFAULT_COVER_PREFETCH_AHEAD: usize = 3;
+
+/// How many times one prefetch flight will re-walk a window that moved under it before
+/// handing off to the next queue edge. Three absorbs an ordinary burst (a multi-track
+/// enqueue, a skip landing mid-walk) while keeping the task's lifetime bounded.
+const COVER_PREFETCH_ROUNDS: usize = 3;
+
 struct State {
     queue: Vec<QueueItem>,
     next_id: u64,
@@ -2202,6 +2213,27 @@ pub struct HypodjHandler {
     /// albumart in many small offset chunks; caching avoids re-fetching the whole
     /// image per chunk. Longer TTL (art rarely changes).
     cover_cache: TtlLru<String, Vec<u8>>,
+    /// The DISK layer under [`Self::cover_cache`], when one is configured. Same keys,
+    /// so a cover fetched by any path is warm for every other path and survives both
+    /// the memory cache's TTL and a daemon restart. Unset (`None`) in a raw handler
+    /// and whenever no state dir resolves, in which case every read falls through to
+    /// the network exactly as before.
+    cover_store: std::sync::OnceLock<Arc<crate::cover_store::CoverStore>>,
+    /// Guards the cover PREFETCH task, so the many `notify_change` edges a single
+    /// track boundary produces cost ONE warm-up walk rather than one per edge.
+    cover_prefetch: tokio::sync::Mutex<()>,
+    /// Set by every prefetch request, cleared by the walk that is about to serve it.
+    ///
+    /// This is what makes the single flight CONVERGE instead of merely deduplicate. A
+    /// burst (six `add`s in a row) moves the window while a walk is already running;
+    /// dropping those requests leaves the FINAL window - the one that is actually
+    /// about to play - unwarmed, which a live proof caught doing exactly that. The
+    /// running walk re-checks this flag and goes round again on the current window.
+    cover_prefetch_dirty: std::sync::atomic::AtomicBool,
+    /// The window [`Self::prefetch_covers`] last warmed. An unchanged window is the
+    /// common case (most `notify_change` edges do not move the queue's head), and
+    /// skipping it there keeps the prefetch a per-TRACK cost, not a per-mutation one.
+    cover_window: std::sync::Mutex<Vec<String>>,
     /// Dedicated HTTP client for a RECOGNIZED remote stream cover (task kmrhj8m).
     /// Built once in the constructor with connect 2s / total 2.5s (strictly under
     /// the tui 3s ART_TIMEOUT so the daemon never outlives the client's patience)
@@ -2870,6 +2902,10 @@ impl HypodjHandler {
             listings: TtlLru::new(256, Duration::from_secs(60)),
             dir_cache: TtlLru::new(256, Duration::from_secs(60)),
             cover_cache: TtlLru::new(64, Duration::from_secs(600)),
+            cover_store: std::sync::OnceLock::new(),
+            cover_prefetch: tokio::sync::Mutex::new(()),
+            cover_prefetch_dirty: std::sync::atomic::AtomicBool::new(false),
+            cover_window: std::sync::Mutex::new(Vec::new()),
             cover_http: build_cover_http_client(),
             // The station-identity catalogue client: no auth, a 4s total ceiling (a
             // one-shot off-spine resolve, bounded but not as tight as the cover client).
@@ -6341,6 +6377,14 @@ impl HypodjHandler {
         // structural property instead of a per-command convention nobody can forget.
         // A no-op without a store, and a kick only when the window truly moved.
         self.update_store_window();
+        // Warm the covers for the same window off the same edge, and for the same
+        // reason: this is the one place every queue mutation and EOF advance passes
+        // through, so "the art for what you are about to hear is already here" cannot
+        // be forgotten by a new command. Needs an Arc (it spawns), so a handler with
+        // no self-ref simply does not prefetch.
+        if let Some(this) = self.arc_self() {
+            this.prefetch_covers();
+        }
         self.changed.notify_waiters();
     }
 
@@ -7220,6 +7264,143 @@ impl HypodjHandler {
     /// with a handler lock held.
     pub(crate) fn audio_store(&self) -> Option<Arc<AudioStore>> {
         self.audio_store.lock().unwrap().clone()
+    }
+
+    // ── the cover store ─────────────────────────────────────────────────────
+
+    /// Register the DISK COVER CACHE, plumbed once at daemon startup like the audio
+    /// store. A handler without one behaves exactly as it did before it existed.
+    pub fn set_cover_store(&self, store: Arc<crate::cover_store::CoverStore>) {
+        let _ = self.cover_store.set(store);
+    }
+
+    /// The cover bytes for `key`, from the nearest layer that has them: the memory
+    /// cache, then the disk store, then `fetch`. A hit from any layer below memory is
+    /// promoted upward, so the next read is as fast as it can be.
+    ///
+    /// This is the ONE place the three-layer order is expressed. The `albumart`
+    /// library path, the stream-cover paths and the prefetch all go through it, which
+    /// is what makes "a cover is fetched from the server once, ever" a property of the
+    /// handler rather than a convention three call sites have to remember.
+    ///
+    /// `fetch` is only awaited on a full miss, and NO lock is held across it (the
+    /// cache is internally synchronized and the disk store takes none).
+    async fn cover_bytes<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<u8>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<Vec<u8>>>,
+    {
+        if let Some(b) = self.cover_cache.get(&key.to_string()) {
+            return Some(b);
+        }
+        if let Some(store) = self.cover_store.get() {
+            if let Some(b) = store.get(key) {
+                // Promote: the memory cache is the hot window over the warm disk.
+                self.cover_cache.put(key.to_string(), b.clone());
+                return Some(b);
+            }
+        }
+        let bytes = fetch().await.filter(|b| !b.is_empty())?;
+        self.cover_cache.put(key.to_string(), bytes.clone());
+        if let Some(store) = self.cover_store.get() {
+            store.put(key, &bytes);
+        }
+        Some(bytes)
+    }
+
+    /// Warm the covers for the CURRENT queue window, off the playback path.
+    ///
+    /// The felt problem this closes: the art pane asks for a cover the instant a track
+    /// starts, and on a cold cache that request is a full server round trip on the
+    /// pane's critical path - the "the cover takes a few seconds, or never shows"
+    /// symptom. Fetching the window's covers a track ahead means the pane's request is
+    /// answered from memory or disk at the moment it is made.
+    ///
+    /// Shape deliberately mirrors [`Self::update_store_window`]: the same anchor (the
+    /// REPORTED current, so a skip dip already leads from where we are going), the same
+    /// window length (`store.queue_ahead`, defaulted when no store is configured), and
+    /// the same one-short-lock-then-release discipline. Entirely best-effort: every
+    /// failure is a silent miss the ordinary `albumart` path will retry.
+    /// The `(cache key, cover id)` pairs the prefetch would warm, in play order: the
+    /// reported-current entry plus the same lookahead the store window uses. Split out
+    /// from [`Self::prefetch_covers`] so the window RULE is testable without a runtime
+    /// to spawn into or a server to fetch from. One short state lock, no await.
+    fn cover_prefetch_window(&self) -> Vec<(String, String)> {
+        let ahead = self
+            .audio_store()
+            .map(|s| s.config().queue_ahead as usize)
+            .unwrap_or(DEFAULT_COVER_PREFETCH_AHEAD);
+        let st = self.state.lock().unwrap();
+        let from = st.reported_current().unwrap_or(0);
+        st.queue
+            .iter()
+            .skip(from)
+            .take(ahead.saturating_add(1))
+            .filter_map(|item| match &item.entry {
+                // The queue entry already carries the cover id, so warming costs no
+                // `getSong` - exactly the resolve `albumart` does, minus a round trip.
+                // The fallback to the song id mirrors that path.
+                QueueEntry::Song(s) => {
+                    let cover_id = s.cover_art.clone().unwrap_or_else(|| s.id.0.clone());
+                    Some((format!("cover/{cover_id}"), cover_id))
+                }
+                // A raw stream's cover is recognized later, if at all, and is gated on
+                // being the CURRENT entry - nothing to warm ahead.
+                QueueEntry::Stream { .. } => None,
+            })
+            .collect()
+    }
+
+    fn prefetch_covers(self: &Arc<Self>) {
+        let wanted = self.cover_prefetch_window();
+        if wanted.is_empty() {
+            return;
+        }
+        // Only on a REAL window change, the same "kick only when it moved" rule the
+        // store window follows.
+        {
+            let keys: Vec<String> = wanted.iter().map(|(k, _)| k.clone()).collect();
+            let mut last = self.cover_window.lock().unwrap();
+            if *last == keys {
+                return;
+            }
+            *last = keys;
+        }
+        // A handler driven outside a tokio runtime (unit tests, the sync probe bins)
+        // has nowhere to spawn; warming is best-effort, so that is simply a no-op.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        // Announce the request BEFORE trying to claim the flight, so a walk that is
+        // finishing right now cannot miss it.
+        self.cover_prefetch_dirty.store(true, Ordering::Release);
+        let this = self.clone();
+        tokio::spawn(async move {
+            // Single-flight: one warm-up walk at a time. A track boundary fires several
+            // `notify_change` edges and each would otherwise start its own. The walk
+            // that HAS the flight serves this request through the dirty flag, so a
+            // skipped spawn loses nothing.
+            let Ok(_guard) = this.cover_prefetch.try_lock() else { return };
+            // Bounded convergence: each round clears the flag and warms the window as
+            // it stands NOW, so a request that arrived mid-round is served by the next
+            // one. The cap keeps a pathological churn (a client rewriting the queue
+            // continuously) from pinning a task forever - it simply stops, and the next
+            // queue edge starts a fresh flight.
+            for _ in 0..COVER_PREFETCH_ROUNDS {
+                if !this.cover_prefetch_dirty.swap(false, Ordering::AcqRel) {
+                    break;
+                }
+                for (key, cover_id) in this.cover_prefetch_window() {
+                    // `cover_bytes` is cache-first, so an already-warm cover costs a map
+                    // lookup and no network at all.
+                    let _ = this
+                        .cover_bytes(&key, || async {
+                            this.client.cover_art(&cover_id).await.ok()
+                        })
+                        .await;
+                }
+            }
+        });
     }
 
     // ── the heard ledger ────────────────────────────────────────────────────
@@ -12637,17 +12818,13 @@ impl HypodjHandler {
             // If we can't resolve the song, still try the id directly.
             Err(_) => song_id.0.clone(),
         };
-        // Fetch (cached) the full image bytes.
-        let bytes = match self.cover_cache.get(&format!("cover/{cover_id}")) {
-            Some(b) => b,
-            None => match self.client.cover_art(&cover_id).await {
-                Ok(b) if !b.is_empty() => {
-                    self.cover_cache.put(format!("cover/{cover_id}"), b.clone());
-                    b
-                }
-                // Empty or errored: gracefully ACK no-exist (never panic).
-                _ => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
-            },
+        // Memory -> disk -> server, in that order (see `cover_bytes`). Empty or
+        // errored: gracefully ACK no-exist (never panic).
+        let key = format!("cover/{cover_id}");
+        let Some(bytes) =
+            self.cover_bytes(&key, || async { self.client.cover_art(&cover_id).await.ok() }).await
+        else {
+            return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists");
         };
         self.binary_tail(&bytes, offset)
     }
@@ -12705,29 +12882,25 @@ impl HypodjHandler {
             // guards (https-only, 2 MiB cap) correctly do not apply to our own server.
             StreamCoverSource::Library { cover_id, .. } => {
                 let cache_key = format!("cover/{cover_id}");
-                match self.cover_cache.get(&cache_key) {
+                match self
+                    .cover_bytes(&cache_key, || async {
+                        self.client.cover_art(&cover_id).await.ok()
+                    })
+                    .await
+                {
                     Some(b) => b,
-                    None => match self.client.cover_art(&cover_id).await {
-                        Ok(b) if !b.is_empty() => {
-                            self.cover_cache.put(cache_key, b.clone());
-                            b
-                        }
-                        _ => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
-                    },
+                    None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
                 }
             }
             StreamCoverSource::Remote(cover_url) => {
                 let cache_key = format!("remote/{cover_url}");
-                match self.cover_cache.get(&cache_key) {
+                match self
+                    .cover_bytes(&cache_key, || self.fetch_remote_cover(&cover_url))
+                    .await
+                {
                     Some(b) => b,
-                    None => match self.fetch_remote_cover(&cover_url).await {
-                        Some(b) => {
-                            self.cover_cache.put(cache_key, b.clone());
-                            b
-                        }
-                        // Fetch failed/timed out/rejected: same no-exist as the library path.
-                        None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
-                    },
+                    // Fetch failed/timed out/rejected: same no-exist as the library path.
+                    None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
                 }
             }
         };
@@ -24011,6 +24184,112 @@ mod tests {
         h.update_store_window();
         h.set_store_skip_pin(Some(SongId("s-1".into())));
         h.bust_star_caches();
+    }
+
+    #[tokio::test]
+    async fn a_cover_on_disk_is_served_without_touching_the_server() {
+        // The whole point of the disk layer: after a restart (or after the memory
+        // cache's TTL) the bytes are still one read away, and the fetch closure - which
+        // stands in for the Subsonic round trip that costs the art pane its seconds -
+        // is never called.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("covers-disk");
+        let covers =
+            crate::cover_store::CoverStore::open(dir.join("covers"), 8 * 1024 * 1024).unwrap();
+        covers.put("cover/c1", b"JPEGBYTES");
+        h.set_cover_store(Arc::new(covers));
+
+        let fetched = std::sync::atomic::AtomicBool::new(false);
+        let got = h
+            .cover_bytes("cover/c1", || async {
+                fetched.store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            })
+            .await;
+        assert_eq!(got.as_deref(), Some(&b"JPEGBYTES"[..]), "served from disk");
+        assert!(!fetched.load(std::sync::atomic::Ordering::SeqCst), "no server round trip");
+
+        // And it was promoted into memory, so the NEXT read does not even hit the disk.
+        assert_eq!(
+            h.cover_cache.get(&"cover/c1".to_string()).as_deref(),
+            Some(&b"JPEGBYTES"[..]),
+            "a disk hit warms the memory cache"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_fetched_cover_is_written_through_to_disk_once() {
+        // A miss must land in BOTH layers, or the next daemon start pays for it again -
+        // which is exactly the behaviour the disk store exists to end.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("covers-writethrough");
+        let root = dir.join("covers");
+        let covers = crate::cover_store::CoverStore::open(root.clone(), 8 * 1024 * 1024).unwrap();
+        h.set_cover_store(Arc::new(covers));
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetch = || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(b"FRESH".to_vec())
+        };
+        assert_eq!(h.cover_bytes("cover/c2", fetch).await.as_deref(), Some(&b"FRESH"[..]));
+        assert_eq!(h.cover_bytes("cover/c2", fetch).await.as_deref(), Some(&b"FRESH"[..]));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "fetched once, ever");
+
+        // Prove the DISK copy independently of this handler's memory cache.
+        let reopened = crate::cover_store::CoverStore::open(root, 8 * 1024 * 1024).unwrap();
+        assert_eq!(reopened.get("cover/c2").as_deref(), Some(&b"FRESH"[..]), "survives a restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_failed_fetch_caches_nothing() {
+        // A miss must stay a miss: caching an empty body would turn one bad response
+        // into a permanently coverless track.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("covers-empty");
+        let root = dir.join("covers");
+        let covers = crate::cover_store::CoverStore::open(root.clone(), 8 * 1024 * 1024).unwrap();
+        h.set_cover_store(Arc::new(covers));
+
+        assert_eq!(h.cover_bytes("cover/c3", || async { Some(Vec::new()) }).await, None);
+        assert_eq!(h.cover_bytes("cover/c4", || async { None }).await, None);
+        let reopened = crate::cover_store::CoverStore::open(root, 8 * 1024 * 1024).unwrap();
+        assert_eq!(reopened.get("cover/c3"), None);
+        assert_eq!(reopened.get("cover/c4"), None);
+        // A later good answer for the same key still lands.
+        assert_eq!(
+            h.cover_bytes("cover/c3", || async { Some(b"LATER".to_vec()) }).await.as_deref(),
+            Some(&b"LATER"[..]),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_cover_prefetch_window_follows_the_queue_like_the_store_window() {
+        // Same anchor and same lookahead as `update_store_window`, so the art for what
+        // is about to play is warmed and nothing else is.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for i in 0..6 {
+            h.enqueue_song_for_test(store_song(&format!("w{i}"), 16)).await;
+        }
+        let keys = |h: &HypodjHandler| {
+            h.cover_prefetch_window().into_iter().map(|(k, _)| k).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(&h),
+            vec!["cover/w0", "cover/w1", "cover/w2", "cover/w3"],
+            "current plus the default lookahead, in play order"
+        );
+
+        // A raw stream has no cover id to warm ahead of time and is skipped, never a hole.
+        h.enqueue_stream_for_test(NTS).await;
+        assert_eq!(keys(&h).len(), 4);
+
+        // And the window leads from the CURRENT entry.
+        h.state.lock().unwrap().current = Some(2);
+        assert_eq!(keys(&h), vec!["cover/w2", "cover/w3", "cover/w4", "cover/w5"]);
     }
 
     #[tokio::test]
