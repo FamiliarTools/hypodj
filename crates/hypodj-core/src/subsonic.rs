@@ -927,6 +927,20 @@ fn map_song(c: data::Child) -> Song {
         suffix: c.suffix,
         content_type: c.content_type,
         created: c.created,
+        // The user's listening history, as the server records it. Both are
+        // `Option` on the wire AND the server omits the keys entirely when
+        // there is no play record - it never sends `0` or `null` - so `None`
+        // here honestly means "never played", and a missing stat can never read
+        // as "played zero times just now". Do NOT `unwrap_or(0)` these the way
+        // the count fields above do: a fabricated zero would be indistinguishable
+        // from a real never-played row and would destroy the only signal.
+        //
+        // The count goes through the shared saturating cast (negative -> 0, huge
+        // -> u32::MAX) but is `map`ped rather than `unwrap_or(0)`-ed, which is
+        // the whole distinction. `played` is kept VERBATIM, exactly like
+        // `created` - parsing is `Song::played_days_ago`'s job and cannot panic.
+        play_count: c.play_count.map(i64_to_u32),
+        played: c.played,
     }
 }
 
@@ -1158,6 +1172,92 @@ mod tests {
         )
         .unwrap();
         assert_eq!(map_song(negative).size, Some(0));
+    }
+
+    #[test]
+    fn map_song_carries_the_user_play_stats_from_the_camelcase_wire() {
+        // `playCount` / `played` ride along on responses the daemon already makes
+        // (getStarred2, getAlbum, search3, getSimilarSongs2), so a drift in either
+        // wire field name must fail HERE and not silently degrade to "no history"
+        // everywhere. The stamp is carried VERBATIM, offset and all - `map_song`
+        // does no date arithmetic.
+        let wire: data::Child = serde_json::from_str(
+            r#"{ "id": "so-20", "title": "The Beginning of the End", "isDir": false,
+                 "playCount": 21, "played": "2026-08-06T14:17:24+01:00" }"#,
+        )
+        .unwrap();
+        let s = map_song(wire);
+        assert_eq!(s.play_count, Some(21));
+        assert_eq!(s.played.as_deref(), Some("2026-08-06T14:17:24+01:00"));
+
+        // Nanosecond precision is a real shape on the wire and must survive
+        // untouched too - it is the parser's problem, not the mapper's.
+        let nanos: data::Child = serde_json::from_str(
+            r#"{ "id": "so-21", "title": "Z", "isDir": false,
+                 "playCount": 1, "played": "2026-07-10T11:45:09.98345312+01:00" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            map_song(nanos).played.as_deref(),
+            Some("2026-07-10T11:45:09.98345312+01:00")
+        );
+    }
+
+    #[test]
+    fn map_song_absent_play_stats_are_none_and_never_a_fabricated_zero() {
+        // THE load-bearing null case. The server OMITS both keys when there is no
+        // play record - it never sends 0 and never sends null - so absence IS the
+        // never-played signal. Mapping it to `Some(0)` (the `unwrap_or(0)` the
+        // count fields above use) would make "never played" indistinguishable from
+        // "played zero times just now" and destroy the signal entirely.
+        let bare: data::Child =
+            serde_json::from_str(r#"{ "id": "so-22", "title": "X", "isDir": false }"#).unwrap();
+        let s = map_song(bare);
+        assert_eq!(s.play_count, None, "absent playCount must NOT become Some(0)");
+        assert_ne!(s.play_count, Some(0));
+        assert_eq!(s.played, None);
+        assert_eq!(s.played_days_ago(1_786_320_000), None);
+
+        // One key present without the other is honest in both directions: neither
+        // is inferred from the other.
+        let only_count: data::Child = serde_json::from_str(
+            r#"{ "id": "so-23", "title": "X", "isDir": false, "playCount": 4 }"#,
+        )
+        .unwrap();
+        let s = map_song(only_count);
+        assert_eq!(s.play_count, Some(4));
+        assert_eq!(s.played, None);
+
+        let only_played: data::Child = serde_json::from_str(
+            r#"{ "id": "so-24", "title": "X", "isDir": false,
+                 "played": "2026-08-06T14:17:24+01:00" }"#,
+        )
+        .unwrap();
+        let s = map_song(only_played);
+        assert_eq!(s.play_count, None);
+        assert_eq!(s.played.as_deref(), Some("2026-08-06T14:17:24+01:00"));
+    }
+
+    #[test]
+    fn map_song_play_count_saturates_instead_of_wrapping() {
+        // A negative count is nonsense: clamp to 0 rather than wrapping into ~4.3e9,
+        // which would read as the most-played track in the library forever. Note
+        // this is `Some(0)` - a PRESENT but absurd count - which is a different
+        // fact from the absent case above, and stays distinguishable.
+        let negative: data::Child = serde_json::from_str(
+            r#"{ "id": "so-25", "title": "X", "isDir": false, "playCount": -7 }"#,
+        )
+        .unwrap();
+        assert_eq!(map_song(negative).play_count, Some(0));
+
+        // A count beyond u32 saturates at the ceiling rather than truncating to a
+        // small number (a plain `as u32` on i64::MAX would yield u32::MAX here by
+        // luck, but on 2^32 would yield 0 - the case that must not silently pass).
+        let huge: data::Child = serde_json::from_str(
+            r#"{ "id": "so-26", "title": "X", "isDir": false, "playCount": 4294967296 }"#,
+        )
+        .unwrap();
+        assert_eq!(map_song(huge).play_count, Some(u32::MAX));
     }
 
     #[test]

@@ -722,19 +722,34 @@ pub enum DownloadReason {
 // The PIN SET: what starring actually asks the store to keep
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Which starred GESTURE claimed a track, and - in declaration order - how much
-/// that gesture is worth when the budget runs out.
+/// Which starred GESTURE claimed a track.
 ///
-/// The order is the whole priority model, and it is defensible one clause at a
-/// time. A starred SONG is a per-track act: the most specific statement of intent
-/// and the smallest, so it is the last thing to go. A starred ALBUM is a statement
-/// about a work, so the way to respect it is to hold it WHOLE or not at all. A
-/// starred ARTIST is a standing subscription - the weakest per-track evidence and
-/// the only UNBOUNDED one (it means everything they have and everything they
-/// release from now on) - so it yields first.
+/// DECLARATION ORDER IS NOT THE PRIORITY MODEL and must not be reordered: `tier as
+/// usize` indexes the fixed per-tier arrays on the status surface, so flipping the
+/// variants would silently mislabel every per-tier count while still compiling. The
+/// priority lives in [`PinTier::class`] and [`PinTier::rank`], which are exhaustive
+/// matches - a new variant is then a compile error rather than a wrong number.
 ///
-/// Concretely: starring two hundred more albums can never evict one starred song.
-/// It can only fail to download.
+/// The gesture is only the SECOND thing the frontier asks. The first is neglect (see
+/// [`Frontier::build`]): "music I haven't played for a long time, especially from
+/// albums I favorited" leads with the neglect and makes the album an emphasis, so
+/// neglect decides and the tier breaks the tie.
+///
+/// What the tier still decides, and this half is load-bearing:
+///
+/// - A starred ARTIST is a standing subscription, and the only UNBOUNDED gesture -
+///   it means everything they have and everything they release from now on. So it is
+///   FLOORED by [`PinTier::class`]: however neglected, an artist's fan-out can never
+///   outrank a hand-picked gesture. Otherwise starring one prolific artist with five
+///   hundred never-played albums would own the top of the order forever.
+/// - Between the two HAND-PICKED gestures, a starred ALBUM is a statement about a
+///   work and wins the tie against a loose starred song. That is the "especially
+///   from albums I favorited" clause, and it is a tie-break rather than a gate on
+///   purpose: an album-first GATE would defer essentially every hand-starred song,
+///   which is a visible "I starred this and it vanished" regression nobody asked for.
+///   Keeping that promise takes one more thing than ordering the clause below
+///   neglect, because a whole decile of groups can tie at once: it speaks only where
+///   there IS neglect to emphasise (see [`emphasis_rank`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PinTier {
     Song,
@@ -750,6 +765,140 @@ impl PinTier {
             PinTier::Album => "album",
             PinTier::Artist => "artist",
         }
+    }
+
+    /// The frontier's FLOOR, and the first thing its comparator asks: `0` for a
+    /// hand-picked gesture (a starred song or a starred album), `1` for the fan-out
+    /// of a starred artist. Above neglect in the key, so an unbounded subscription
+    /// can never outrank something he pointed at.
+    fn class(self) -> u8 {
+        match self {
+            PinTier::Song | PinTier::Album => 0,
+            PinTier::Artist => 1,
+        }
+    }
+
+    /// The tie-break AFTER neglect has spoken, within a class: an album before a
+    /// loose starred song. Artist is last for completeness - it is already alone in
+    /// its class, so this arm never decides anything.
+    fn rank(self) -> u8 {
+        match self {
+            PinTier::Album => 0,
+            PinTier::Song => 1,
+            PinTier::Artist => 2,
+        }
+    }
+}
+
+/// [`PinTier::rank`], but only WHERE THERE IS NEGLECT TO EMPHASISE.
+///
+/// "especially from albums I favorited" is a clause about NEGLECTED music - it says
+/// which of the music he has not played for a long time to prefer. A group with no
+/// neglected bytes at all is outside that clause entirely: there is nothing to
+/// emphasise, and applying the album preference there anyway is what turned a
+/// tie-break into the GATE the tier's own doc says it must not be.
+///
+/// That is measured, not feared. On one real 88-group library 65 groups score decile
+/// 0 and the ceiling cuts THROUGH that block, so ranking every starred album ahead of
+/// every loose starred song inside it deferred 24 of his 47 hand-starred songs (767
+/// MiB) while decile-0 albums he plays weekly stayed - the exact "I starred this and
+/// it vanished" outcome [`PinTier`] promises to avoid.
+///
+/// So: where a group has cold bytes the ask's order stands (album, then song). Where a
+/// group has none, the cheapest and most precise gesture goes first (song, then
+/// album), and behind every group that does have some neglect - which keeps the
+/// primary key's own direction. Both halves are constant per group up to a real
+/// crossing, so neither can churn.
+fn emphasis_rank(tier: PinTier, has_cold: bool) -> u8 {
+    if has_cold {
+        tier.rank()
+    } else {
+        match tier {
+            PinTier::Song => 3,
+            PinTier::Album => 4,
+            PinTier::Artist => 5,
+        }
+    }
+}
+
+/// How long since a play before a track counts as NEGLECTED, in whole days.
+///
+/// THE ONE CONSTANT in the frontier's ranking, and a named `const` rather than
+/// config on purpose: a knob invites tuning and makes "why did the order change?"
+/// unanswerable, while a constant makes the rule one sentence a human can recompute.
+///
+/// Anchored to a measured distribution rather than fitted: across one real user's
+/// 347-track pin set the per-track ages are 44 with no record at all, 17 under a
+/// week, 142 within a month, 71 within three, 33 within six and 40 beyond - so a
+/// 60-day line puts roughly half the tracks on the cold side. Near the middle is the
+/// only condition under which a ranking key discriminates at all; a line that puts
+/// everything (or nothing) on one side is a key that decides nothing.
+pub const STALE_PLAY_DAYS: u32 = 60;
+
+/// The most of the mirror a HAND-PICKED star can be guaranteed, in bytes.
+pub const STAR_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// ...and never more than this fraction of the whole ceiling (1/2).
+const STAR_FLOOR_SHARE_DEN: u64 = 2;
+
+/// The reservation [`Frontier`] admits hand-picked stars into BEFORE the neglect
+/// walk sees anything.
+///
+/// WHY A FLOOR EXISTS AT ALL, and it is not a hedge - it repairs a real inversion the
+/// neglect key produces. He stars a song WHILE IT IS PLAYING, so a hand-picked star is
+/// played-today almost by definition and scores decile 0: the ranking sorts the very
+/// gesture that is most deliberate to the very bottom. Measured on his real library at
+/// a 3.01 GiB ceiling, pure neglect order kept 7 of 47 hand-starred songs where
+/// arrival order kept all 47. The `emphasis_rank` tie-break cannot reach this, because
+/// it only speaks among groups that HAVE neglect to emphasise and only once the cut
+/// descends into the decile-0 block - which under real disk pressure it never does.
+///
+/// So the floor is not a weight to be traded off against the score; it is a slice of
+/// the budget the score does not get to spend. Above it, neglect decides everything,
+/// which is what he asked for. A starred song is free to win space in the main walk
+/// too - the floor is a minimum, not a cap.
+///
+/// BOUNDED TWO WAYS so it can never become the whole policy: an absolute
+/// [`STAR_FLOOR_BYTES`], and half the ceiling, whichever is smaller. The fraction is
+/// what matters on a small store - a flat 2 GiB against a 1 GiB budget would reserve
+/// the entire mirror for songs and silently delete the album ranking.
+pub fn star_floor(ceiling: u64) -> u64 {
+    STAR_FLOOR_BYTES.min(ceiling / STAR_FLOOR_SHARE_DEN)
+}
+
+/// The frontier's rule in ONE line, so the rule and its outcome are readable
+/// together and a future rule change is self-documenting on the wire.
+///
+/// Built from [`STALE_PLAY_DAYS`] rather than restating it, so the sentence cannot
+/// drift from the number the comparator actually used.
+pub fn frontier_rule() -> String {
+    format!(
+        "not played in {STALE_PLAY_DAYS} days first, by share of the album; \
+         what is already on disk keeps a tie; starred albums before loose starred \
+         songs where anything is neglected, loose starred songs first where nothing \
+         is; a starred artist's other albums last"
+    )
+}
+
+/// Is this track NEGLECTED - no usable play record at all, or last played at least
+/// [`STALE_PLAY_DAYS`] ago?
+///
+/// Absence counts as cold, and that is exact rather than defensive: the server OMITS
+/// `played` precisely when there is no play record, so "no record" IS "not played in
+/// a long time" (longer, in fact, than its whole history horizon). An UNPARSEABLE
+/// stamp lands here too, via [`Song::played_days_ago`], which fails open toward
+/// keeping his music offline: a parse regression can only make a group win space,
+/// never starve it.
+fn is_cold(s: &Song, now_unix: u64) -> bool {
+    match s.played_days_ago(now_unix) {
+        // No usable STAMP. A play COUNT is still a record that he played it, so the
+        // missing date is a gap in the server's bookkeeping rather than evidence of
+        // neglect - Navidrome carries the two fields independently and can hold one
+        // without the other. Scoring such a track maximally cold prints a line that
+        // contradicts itself ("10/10 neglected, 4 plays, 0 never played") on the one
+        // surface whose entire job is to be checkable by eye.
+        None => s.play_count.unwrap_or(0) == 0,
+        Some(d) => d >= STALE_PLAY_DAYS,
     }
 }
 
@@ -1055,16 +1204,111 @@ pub enum StoreAction {
     Evict(SongId),
 }
 
-/// One pin group the frontier could not fit, named so the shortfall is a LIST OF
-/// ALBUMS rather than an integer in a log line nobody reads.
+/// Where one pin group ended up relative to the frontier line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupStanding {
+    /// Above the line: downloaded and kept.
+    Resident,
+    /// Below the line, with tracks nothing else holds - a real shortfall, named.
+    Deferred,
+    /// It holds nothing of its OWN, because every one of its tracks is already held
+    /// by a RESIDENT group that reached them first - a starred song inside a starred
+    /// album, which on one real library is 20 of 47 starred songs. Nothing is missing,
+    /// so naming it as deferred would be a lie; but it is not carrying anything
+    /// either, so calling it resident would credit it with bytes another group paid
+    /// for.
+    ///
+    /// RESIDENT is the load-bearing word: a group whose tracks are only wanted by
+    /// another group BELOW the line is not covered by anything - those bytes are on
+    /// nobody's disk - and it is Deferred like any other shortfall.
+    Covered,
+}
+
+impl GroupStanding {
+    pub fn label(self) -> &'static str {
+        match self {
+            GroupStanding::Resident => "resident",
+            GroupStanding::Deferred => "deferred",
+            GroupStanding::Covered => "covered",
+        }
+    }
+}
+
+/// One pin group as the frontier ranked it, WITH the evidence it was ranked on.
+///
+/// Every group gets one of these, won or lost, and the numbers here are READ OFF the
+/// very integers the comparator sorted on - never re-derived for display. That is
+/// what makes "why is this album deferred?" answerable with an answer that cannot
+/// drift from the decision: a ranking that is clever but unexplainable is worse than
+/// one that is dumb and predictable, because a good decision then looks exactly like
+/// a bug.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeferredGroup {
+pub struct RankedGroup {
     pub kind: PinKind,
     pub id: String,
     pub name: String,
     pub tier: PinTier,
+    pub standing: GroupStanding,
+    /// Position in the frontier order, 0-based. The group ranked one above is
+    /// literally the line before this one in the `store frontier` listing, which is
+    /// why "what did it lose to?" needs no per-group lookup.
+    pub rank: usize,
+    /// The group's OWN unique storable tracks and their total byte cost - what it
+    /// asks for, and the denominator `cold_decile` divides.
     pub tracks: usize,
     pub bytes: u64,
+    /// What is actually NOT on offer because of this group's standing: its OWN tracks
+    /// that no resident group holds. Zero for `Resident` and for `Covered` by
+    /// construction, so no line of the shortfall list ever overstates itself.
+    ///
+    /// PER GROUP, not a partition: one track wanted by two deferred groups is counted
+    /// by both, because each of them really is missing it. Summing the column across
+    /// the list is therefore an upper bound on the shortfall, not the shortfall - the
+    /// alternative (attributing each track to one group) makes some group report a
+    /// shortfall of zero while its music is on nobody's disk, which is the worse lie
+    /// by far.
+    pub missing_tracks: usize,
+    pub missing_bytes: u64,
+    /// THE KEY, 0..=10: how much of the space this group asks for goes to music he
+    /// has not heard in [`STALE_PLAY_DAYS`] days. Bytes-weighted, so a long neglected
+    /// album outweighs a short one.
+    pub cold_decile: u8,
+    /// Whether any of this group's tracks were already on disk when the frontier
+    /// ranked it - the INCUMBENCY clause, which decides exact ties (see
+    /// [`Frontier::build`]). On the wire because it is part of the decision: an
+    /// explanation missing the clause that decided is not an explanation.
+    pub held: bool,
+    pub cold_tracks: usize,
+    pub cold_bytes: u64,
+    /// Tracks with NO usable play record (the server sent none, or the stamp did not
+    /// parse). A subset of `cold_tracks`.
+    pub never_played: usize,
+    /// Total plays across the group. EVIDENCE ONLY - never part of the key. It is
+    /// here so he can check the decision, not so it can confuse it.
+    pub plays: u32,
+    /// Age in whole days of the FRESHEST played track, and of the STALEST one that
+    /// has a record at all. `None` when nothing in the group was ever played.
+    pub last_played_days: Option<u32>,
+    pub oldest_played_days: Option<u32>,
+    /// Bytes it missed by, at its own turn in the walk: the cost charged to it minus
+    /// the headroom left under the pin ceiling when it came up. Zero for a group that
+    /// fitted. Together with `blocked_by` this is the literal answer to "why not this
+    /// one" - you needed N more bytes at your position, and that is what took them.
+    pub over_by: u64,
+    /// The group admitted immediately before this one was refused.
+    pub blocked_by: Option<String>,
+    /// Refused by the hand-picked RESERVATION rather than by a full mirror (see
+    /// [`star_floor`]). On the wire because it is the ONE refusal the rest of the
+    /// evidence cannot account for: the ceiling visibly had room, and without this the
+    /// line reads as the walk contradicting its own arithmetic.
+    pub held_back_by_floor: bool,
+}
+
+impl RankedGroup {
+    /// The browse uri (`song/<id>`, `album/<id>`) this group names.
+    pub fn uri(&self) -> String {
+        format!("{}/{}", self.kind.label(), self.id)
+    }
 }
 
 /// Why bulk store work is not moving right now. `None` is the answer that means
@@ -1131,8 +1375,10 @@ pub struct StoreStatus {
     /// Resident tracks per tier, in [`PinTier`] order (song, album, artist).
     pub tier_tracks: [usize; 3],
     pub tier_bytes: [u64; 3],
-    /// Groups below the frontier: never downloaded, evicted first.
-    pub deferred: Vec<DeferredGroup>,
+    /// EVERY pin group in frontier order, won or lost, with the evidence it was
+    /// ranked on. ONE source: the badge count, the deferred list and the full
+    /// ranking are all views of this vector, so they cannot disagree.
+    pub frontier: Vec<RankedGroup>,
     /// Ids this process has given up downloading. LOAD-BEARING: without it a
     /// pending count that will NEVER reach zero is indistinguishable from one that
     /// is merely slow.
@@ -1147,6 +1393,21 @@ impl StoreStatus {
         self.known && self.pending_tracks == 0
     }
 
+    /// The groups below the line that a resident group does NOT already cover, in
+    /// frontier order - the shortfall as a LIST OF ALBUMS rather than an integer in
+    /// a log nobody reads. A filter over `frontier`, never a second list.
+    pub fn deferred(&self) -> impl Iterator<Item = &RankedGroup> {
+        self.frontier
+            .iter()
+            .filter(|g| g.standing == GroupStanding::Deferred)
+    }
+
+    /// How many groups the shortfall names. Same filter as [`StoreStatus::deferred`]
+    /// by construction, so the badge count can never exceed the list under it.
+    pub fn deferred_count(&self) -> usize {
+        self.deferred().count()
+    }
+
     /// The fields a one-line badge is built from. Compared between passes so the
     /// log speaks only when something actually moved.
     fn digest(&self) -> (usize, usize, usize, usize, u64, StoreWaiting) {
@@ -1154,7 +1415,7 @@ impl StoreStatus {
             self.resident_tracks,
             self.cached_tracks,
             self.pending_tracks,
-            self.deferred.len(),
+            self.deferred_count(),
             self.effective_max,
             self.waiting,
         )
@@ -1210,6 +1471,25 @@ pub struct PassInput {
     /// Per process and deliberately NOT persisted, so a restart resumes mirroring
     /// and pausing can never become a forgotten config.
     pub paused: bool,
+    /// CALENDAR NOW, in unix seconds, read ONCE at the impure boundary in `run_pass`
+    /// and threaded in - which is what keeps this function pure and the frontier's
+    /// neglect ranking table-testable at any chosen date.
+    ///
+    /// It deliberately does NOT go through [`crate::clock::Clock`]: that seam is a
+    /// monotonic `tokio::time::Instant` for SCHEDULING and cannot express a persisted
+    /// calendar timestamp (see [`now_unix`]). Injection is this repo's established
+    /// pattern for pure wall-clock-dependent logic - the same shape as
+    /// `plan::validate`'s `now_civil` - and it is what makes a 60-day threshold
+    /// sweepable in a test instead of observable once.
+    ///
+    /// ZERO is the default for a caller that does not care, and it is NOT neutral:
+    /// every stamp is then in the future, no track is [`is_cold`], and the neglect key
+    /// INVERTS rather than falls silent - decile 0 for a genuinely stale album and for
+    /// one played this morning alike, leaving the whole order to the tie-breaks. That
+    /// is a deterministic and safe order, but it is not the ranking, so any test that
+    /// asserts anything about neglect must set a real date. Only `run_pass` and those
+    /// tests set it.
+    pub now_unix: u64,
 }
 
 impl PassInput {
@@ -1234,6 +1514,7 @@ impl PassInput {
             download_batch: DOWNLOAD_BATCH,
             defer_bulk: false,
             paused: false,
+            now_unix: 0,
         }
     }
 }
@@ -1298,10 +1579,24 @@ enum Standing {
 /// shape of bug that fills a disk slowly. Here a group below the line is still
 /// below the line next pass over identical input, so it is never re-admitted.
 struct Frontier<'a> {
-    /// Groups in frontier order: `(tier, position within the pin set, id)`.
+    /// Groups in frontier order - see [`Frontier::build`] for the key.
     order: Vec<&'a PinGroup>,
     /// Parallel to `order`: whether the group fitted under the ceiling.
     resident: Vec<bool>,
+    /// Parallel to `order`: the neglect evidence each group was RANKED on, computed
+    /// once before the walk. The explanation is read off this, so the reason a group
+    /// lost is literally the integers the comparator compared.
+    score: Vec<GroupScore>,
+    /// Parallel to `order`: whether the group already had bytes on disk when it was
+    /// ranked - the incumbency clause, kept so the explanation carries it too.
+    held: Vec<bool>,
+    /// Parallel to `order`: bytes the group missed by at its own turn, and the group
+    /// admitted just before it. Recorded AT the refusal site - the only place that
+    /// knows both numbers - so neither is reconstructed afterwards.
+    over_by: Vec<u64>,
+    blocked_by: Vec<Option<String>>,
+    /// Per slot: refused by the hand-picked reservation (see [`star_floor`]).
+    held_back_by_floor: Vec<bool>,
     /// Storable song id -> slot in `order` for the RESIDENT group that claimed it.
     /// First claim wins in frontier order, so a track that is both a starred song
     /// and an album track is claimed at the SONG tier and cannot be dragged out by
@@ -1327,33 +1622,90 @@ impl<'a> Frontier<'a> {
     /// reported size, falling back to what is on disk, and zero when neither knows
     /// (rare, bounded by the pin set, and settled by the commit's exact-length
     /// gate).
+    ///
+    /// THE ORDER: COLD SHARE FIRST. The key is a lexicographic tuple of small
+    /// integers, every one of which a human can recompute from the printed evidence:
+    ///
+    /// ```text
+    /// (class, 10 - cold_decile, not held on disk, emphasis_rank, position in the pin set, id)
+    /// ```
+    ///
+    /// - `class` FLOORS the unbounded gesture: a starred artist's fan-out can never
+    ///   outrank something hand-picked, however neglected (see [`PinTier::class`]).
+    /// - `cold_decile` is the primary key, because the ask leads with "music I
+    ///   haven't played for a long time" and makes the album an emphasis, not a gate.
+    ///   It is measured PER TRACK and weighted by bytes: at ALBUM granularity the
+    ///   server's `played` is a max over songs, so a mostly-neglected album that he
+    ///   dipped into last week looks fresh and the signal hides inside it. On one
+    ///   real library that is the difference between 0.62 GiB and 3.34 GiB of
+    ///   90-day-stale material - between a key that decorates and a key that decides.
+    /// - `held on disk` is INCUMBENCY, and it speaks ONLY on an exact tie: between two
+    ///   groups the neglect key cannot separate, the one whose bytes are already here
+    ///   keeps its place. Moving bytes costs a download and a delete; a tie is by
+    ///   definition not worth either. See the stability paragraph below - this clause
+    ///   is what makes stability a property rather than a hope.
+    /// - `emphasis_rank` is the "especially from albums I favorited" clause, speaking
+    ///   only on a tie - which quantizing to ten buckets deliberately manufactures -
+    ///   and only among groups that HAVE neglect to emphasise (see [`emphasis_rank`]).
+    ///
+    /// WHY DECILES rather than a percentage or a curve: it kills boundary churn, it
+    /// creates the ties the tier clause needs in order to speak at all, and it makes
+    /// the number a sentence ("8/10 of this album is music you have not played in two
+    /// months") instead of an unfalsifiable rank.
+    ///
+    /// PLAY COUNT IS NOT IN THE KEY. He did not ask for it, and a frequency term
+    /// fights the primary key head on - the most-played album is also the
+    /// most-recently-played. It is carried and printed as evidence, which is where it
+    /// belongs: it lets him check the decision without being able to confuse it.
+    ///
+    /// STABILITY IS A PROPERTY HERE, NOT A HOPE, and it matters more than the
+    /// ranking: an order that reshuffles between passes makes the mirror download and
+    /// evict the same albums forever, which is strictly worse than the arbitrary
+    /// order it replaces. Absent a new play a track's age only increases, so `cold`
+    /// is a ONE-WAY LATCH and a group's decile is monotone non-decreasing, taking at
+    /// most eleven values in its lifetime.
+    ///
+    /// PER-GROUP MONOTONICITY IS NOT PAIRWISE STABILITY, and assuming it was is a bug
+    /// this design shipped once. Two groups whose tracks cross the 60-day line on
+    /// interleaved days ratchet PAST each other: A leads at deciles 2 v 2, B takes it
+    /// at 2 v 5, A takes it back at 5 v 5 because the tie fell through to arrival
+    /// position, B at 5 v 7, and so on - a lead handed back and forth on every tick of
+    /// either group's decile. Measured on the real planner with a ceiling that fits
+    /// one of the two: six reversals and 28 downloads against 24 evictions in seventy
+    /// days, for two four-track albums. That is the download-evict loop this whole
+    /// structure exists to forbid, at album granularity.
+    ///
+    /// So the tie is broken by INCUMBENCY instead of by position: what is already on
+    /// disk keeps its place. The lead can then change only when the challenger's
+    /// decile STRICTLY exceeds the incumbent's, which makes the sequence of leader
+    /// deciles strictly increasing and therefore at most ten changes long over a
+    /// pair's whole life - each one a real crossing that genuinely reordered the two,
+    /// not a quantization artefact. No hysteresis CONSTANT is needed for that, and
+    /// none is introduced: a tie is worth zero bytes of movement, which is the whole
+    /// rule.
+    ///
+    /// `sort_by` is stable and the key ends in the id, so identical state draws the
+    /// identical line.
     fn build(
         pins: &'a PinSet,
         by_id: &HashMap<&str, &IndexEntry>,
         ceiling: u64,
+        now_unix: u64,
     ) -> Frontier<'a> {
-        let mut order: Vec<(usize, &'a PinGroup)> = pins.groups.iter().enumerate().collect();
-        // (tier, position, id). Position is already unique so the id only ever
-        // breaks a tie a caller manufactured, but a total, explicit comparator is
-        // what makes "two passes over identical state draw the identical line" a
-        // property rather than a hope.
-        order.sort_by(|(ia, a), (ib, b)| {
-            a.tier
-                .cmp(&b.tier)
-                .then_with(|| ia.cmp(ib))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let order: Vec<&'a PinGroup> = order.into_iter().map(|(_, g)| g).collect();
-
         let size_of = |s: &Song| -> u64 {
             s.size
                 .or_else(|| by_id.get(s.id.0.as_str()).map(|e| e.size))
                 .unwrap_or(0)
         };
 
+        // Sizes are gathered in the PIN SET's own order, BEFORE the sort. That is
+        // required rather than tidy: the score divides by these bytes, so building
+        // them from the walk's output would make the key a function of the order it
+        // is supposed to produce. It also removes an order-dependence in the size map
+        // itself, whose first-wins entry could otherwise change with the ranking.
         let mut all_ids: HashSet<&'a str> = HashSet::new();
         let mut size_by_id: HashMap<&'a str, u64> = HashMap::new();
-        for g in &order {
+        for g in &pins.groups {
             for s in &g.songs {
                 if is_storable_id(&s.id.0) {
                     all_ids.insert(s.id.0.as_str());
@@ -1362,10 +1714,129 @@ impl<'a> Frontier<'a> {
             }
         }
 
+        // The whole score, one pure pass over each group's own tracks.
+        let scored: Vec<GroupScore> = pins
+            .groups
+            .iter()
+            .map(|g| GroupScore::of(g, &size_by_id, now_unix))
+            .collect();
+
+        // INCUMBENCY, in the pin set's own index space like `scored`: does this group
+        // already have bytes here? Any one of its own tracks counts, which covers the
+        // group mid-backfill and the track he is playing right now as well as the
+        // fully mirrored album - all three are bytes a reorder would throw away.
+        let held: Vec<bool> = pins
+            .groups
+            .iter()
+            .map(|g| {
+                g.songs
+                    .iter()
+                    .any(|s| is_storable_id(&s.id.0) && by_id.contains_key(s.id.0.as_str()))
+            })
+            .collect();
+
+        let mut order: Vec<(usize, &'a PinGroup)> = pins.groups.iter().enumerate().collect();
+        order.sort_by(|(ia, a), (ib, b)| {
+            a.tier
+                .class()
+                .cmp(&b.tier.class())
+                // Higher decile FIRST, which is the `10 - decile` of the rule written
+                // as a reversed comparison so there is no subtraction to underflow.
+                .then_with(|| scored[*ib].cold_decile.cmp(&scored[*ia].cold_decile))
+                // Held FIRST, and only here: a tie is not worth a download plus a
+                // delete. Above the emphasis clause deliberately - what is already on
+                // disk outranks a preference between gestures, because the preference
+                // is free to express next time and the bytes are not.
+                .then_with(|| held[*ib].cmp(&held[*ia]))
+                .then_with(|| {
+                    emphasis_rank(a.tier, scored[*ia].cold_bytes > 0)
+                        .cmp(&emphasis_rank(b.tier, scored[*ib].cold_bytes > 0))
+                })
+                // Position within the pin set, as getStarred2 returned it. NOTE this
+                // is not a guarantee of anything: nothing here enforces or records
+                // starred-descending order, and the starred-at timestamp is dropped
+                // at the mapper. If the server's order changed, this key degrades to
+                // "arbitrary but consistent", never to a reshuffle - `sort_by` is
+                // stable and the id below is total.
+                .then_with(|| ia.cmp(ib))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let (positions, order): (Vec<usize>, Vec<&'a PinGroup>) = order.into_iter().unzip();
+        // Re-index the scores into frontier order, so `score[slot]` is the evidence
+        // for `order[slot]` and the explanation reads off the same vector the
+        // comparator sorted on.
+        let score: Vec<GroupScore> = positions.iter().map(|i| scored[*i].clone()).collect();
+        let held: Vec<bool> = positions.into_iter().map(|i| held[i]).collect();
+
         let mut claim: HashMap<&'a str, usize> = HashMap::new();
         let mut resident = vec![false; order.len()];
+        let mut over_by = vec![0u64; order.len()];
+        let mut blocked_by: Vec<Option<String>> = vec![None; order.len()];
+        // The last group to actually take space. That, and not merely the previous
+        // line, is what a refused group lost to.
+        let mut last_admitted: Option<String> = None;
         let mut resident_bytes = 0u64;
         let mut resident_tracks = 0usize;
+        // Refused by the hand-picked RESERVATION rather than by a full mirror -
+        // carried so the group can SAY so, since "N bytes short" beside a ceiling that
+        // visibly had room is the one outcome the printed evidence cannot account for.
+        let mut held_back_by_floor = vec![false; order.len()];
+
+        // THE RESERVATION, computed BEFORE the walk and spent DURING it. `star_ahead`
+        // is the byte cost of every hand-picked star still to come at each slot, so an
+        // album is offered the ceiling MINUS whatever the stars below it still need,
+        // capped at [`star_floor`]. As the walk passes each star the reservation
+        // shrinks, and once the stars are behind it the albums see the full ceiling.
+        //
+        // A RESERVATION AND NOT A PRE-PASS, which is the whole subtlety: admitting the
+        // stars first would also make them CLAIM the tracks they share with albums (20
+        // of one real user's 47 starred songs are also starred-album tracks), and the
+        // download walk emits a track at its claiming group's slot. The order would
+        // shift for shared tracks even when everything fits. Reserving budget instead
+        // touches only WHO IS ADMITTED under pressure and leaves the order, the
+        // claims, and therefore stability exactly as the comparator left them. When
+        // everything fits, this is a no-op by construction.
+        //
+        // AND ONLY FOR A STAR NOTHING ABOVE IT ALREADY WANTS. A hand-picked song that
+        // is also a track of a higher-ranked starred album is not at risk from the
+        // INVERSION - the album carries it, for free, at no extra byte. It is at risk
+        // only from the mirror being full, which is the ordinary scarcity the floor
+        // does not exist to fix and must not quietly start deciding. Exempting it
+        // keeps the reservation aimed at exactly the songs with nothing else to save
+        // them - 27 of one real user's 47 - instead of charging twice for the other 20
+        // and refusing albums that would have covered them anyway.
+        let floor = star_floor(ceiling);
+        let star_ahead: Vec<u64> = {
+            let mut wanted_above: HashSet<&str> = HashSet::new();
+            let mut own = vec![0u64; order.len()];
+            for (slot, g) in order.iter().enumerate() {
+                if g.tier == PinTier::Song {
+                    let ids: Vec<&str> = g
+                        .songs
+                        .iter()
+                        .map(|s| s.id.0.as_str())
+                        .filter(|id| is_storable_id(id))
+                        .collect();
+                    if !ids.is_empty() && !ids.iter().all(|id| wanted_above.contains(id)) {
+                        own[slot] = ids
+                            .iter()
+                            .map(|id| size_by_id.get(id).copied().unwrap_or(0))
+                            .fold(0u64, |a, b| a.saturating_add(b));
+                    }
+                }
+                for song in &g.songs {
+                    if is_storable_id(&song.id.0) {
+                        wanted_above.insert(song.id.0.as_str());
+                    }
+                }
+            }
+            let mut v = vec![0u64; order.len() + 1];
+            for slot in (0..order.len()).rev() {
+                v[slot] = v[slot + 1].saturating_add(own[slot]);
+            }
+            v
+        };
+
         for (slot, g) in order.iter().enumerate() {
             // A group's cost counts only the tracks no earlier group already holds:
             // 20 of one real user's 47 starred songs are also starred-album tracks,
@@ -1380,19 +1851,43 @@ impl<'a> Frontier<'a> {
                 fresh.push(id);
                 cost = cost.saturating_add(size_by_id.get(id).copied().unwrap_or(0));
             }
+            // What this group may actually spend. A star spends the whole ceiling: the
+            // floor exists FOR it and can never be an extra bound on it.
+            let reserved = if g.tier == PinTier::Song {
+                0
+            } else {
+                floor.min(star_ahead[slot])
+            };
+            let budget = ceiling.saturating_sub(reserved);
             // WHOLE OR ABSENT. A group that does not fit is refused entire and the
             // walk CONTINUES, so a smaller later album still lands - best-effort
             // fill, order-stable, no bin-packing cleverness. On real data this is
             // not theoretical: three albums are 4 GiB of a 12.3 GiB want, and
             // per-track admission would let those three eat the budget in arrival
             // order while the frontier refuses them BY NAME and fits the other 33.
-            if resident_bytes.saturating_add(cost) <= ceiling {
+            if resident_bytes.saturating_add(cost) <= budget {
                 resident[slot] = true;
                 resident_bytes = resident_bytes.saturating_add(cost);
                 resident_tracks += fresh.len();
                 for id in fresh {
                     claim.insert(id, slot);
                 }
+                // A zero-cost group takes no space, so it cannot be what anything
+                // later lost to. Naming it would send him to look at an album that
+                // was never the reason.
+                if cost > 0 {
+                    last_admitted = Some(g.name.clone());
+                }
+            } else {
+                // The two numbers that ARE the answer to "why not this one", taken
+                // here because this is the only point that knows both: what it was
+                // charged, and what was left when it came up.
+                over_by[slot] = cost.saturating_sub(budget.saturating_sub(resident_bytes));
+                blocked_by[slot] = last_admitted.clone();
+                // ...and WHICH bound refused it, because "3 bytes short" beside a
+                // mirror that visibly has room is the reading that looks like a bug.
+                held_back_by_floor[slot] = reserved > 0
+                    && resident_bytes.saturating_add(cost) <= ceiling;
             }
         }
 
@@ -1414,6 +1909,11 @@ impl<'a> Frontier<'a> {
         Frontier {
             order,
             resident,
+            score,
+            held,
+            over_by,
+            blocked_by,
+            held_back_by_floor,
             claim,
             below,
             all_ids,
@@ -1439,39 +1939,147 @@ impl<'a> Frontier<'a> {
         self.size_by_id.get(id).copied().unwrap_or(0)
     }
 
-    /// The groups below the line, in frontier order, named for the user.
-    fn deferred_groups(&self) -> Vec<DeferredGroup> {
-        let mut out = Vec::new();
+    /// EVERY group in frontier order, with its standing and the evidence it was
+    /// ranked on. The deferred list, the badge count and the full `store frontier`
+    /// listing are all views of this one vector, so the decision and the answer to
+    /// "why?" cannot drift apart.
+    fn ranked_groups(&self) -> Vec<RankedGroup> {
+        // What each group actually CARRIES: the tracks it claimed itself. Claims only
+        // ever go to a resident group, so a group with none is holding nothing of its
+        // own, whichever side of the line it landed on. Counted once, linearly.
+        let mut claimed_here = vec![0usize; self.order.len()];
+        for slot in self.claim.values() {
+            claimed_here[*slot] += 1;
+        }
+        let mut out = Vec::with_capacity(self.order.len());
         for (slot, g) in self.order.iter().enumerate() {
-            if self.resident[slot] {
-                continue;
-            }
-            let mut tracks = 0usize;
-            let mut bytes = 0u64;
+            // What this group's standing actually costs him: its OWN tracks that no
+            // RESIDENT group holds. Zero for a resident group by construction, and
+            // zero for one whose every track a resident group already covers.
+            //
+            // Asked of `claim` - who actually HOLDS the track - and never of `below`,
+            // which only attributes an unheld track to the FIRST deferred group that
+            // wants it. Attributing is right for a byte total and wrong for a verdict:
+            // a starred song sitting under a deferred album that also wants it would
+            // then report nothing missing and be filed as Covered, so twelve of one
+            // real user's forty-seven hand-starred songs vanished from the answer to
+            // "what did not fit?" while being on nobody's disk. A track wanted by two
+            // deferred groups is therefore named by both, each honestly counting its
+            // own shortfall.
+            let mut missing_tracks = 0usize;
+            let mut missing_bytes = 0u64;
             let mut counted: HashSet<&str> = HashSet::new();
             for s in &g.songs {
                 let id = s.id.0.as_str();
-                if is_storable_id(id) && self.below.get(id) == Some(&slot) && !counted.contains(id) {
-                    counted.insert(id);
-                    tracks += 1;
-                    bytes = bytes.saturating_add(self.size(id));
+                if is_storable_id(id) && !self.claim.contains_key(id) && counted.insert(id) {
+                    missing_tracks += 1;
+                    missing_bytes = missing_bytes.saturating_add(self.size(id));
                 }
             }
-            if tracks == 0 {
-                // Every track of it is held by a resident group - nothing is
-                // actually missing, so naming it would be a lie.
-                continue;
-            }
-            out.push(DeferredGroup {
+            let sc = &self.score[slot];
+            let standing = if claimed_here[slot] > 0 {
+                GroupStanding::Resident
+            } else if missing_tracks > 0 {
+                GroupStanding::Deferred
+            } else if sc.tracks > 0 {
+                // Every track it wants is held by a RESIDENT group that reached them
+                // first - so nothing of it is missing, whatever else also wants them.
+                GroupStanding::Covered
+            } else if self.resident[slot] {
+                // No storable tracks at all - an empty group above the line.
+                GroupStanding::Resident
+            } else {
+                GroupStanding::Deferred
+            };
+            out.push(RankedGroup {
                 kind: g.kind,
                 id: g.id.clone(),
                 name: g.name.clone(),
                 tier: g.tier,
-                tracks,
-                bytes,
+                standing,
+                rank: slot,
+                tracks: sc.tracks,
+                bytes: sc.bytes,
+                missing_tracks,
+                missing_bytes,
+                cold_decile: sc.cold_decile,
+                held: self.held[slot],
+                cold_tracks: sc.cold_tracks,
+                cold_bytes: sc.cold_bytes,
+                never_played: sc.never_played,
+                plays: sc.plays,
+                last_played_days: sc.last_played_days,
+                oldest_played_days: sc.oldest_played_days,
+                over_by: self.over_by[slot],
+                blocked_by: self.blocked_by[slot].clone(),
+                held_back_by_floor: self.held_back_by_floor[slot],
             });
         }
         out
+    }
+}
+
+/// The neglect evidence for ONE pin group, over the group's OWN tracks.
+///
+/// PURE and computed once per pass BEFORE the walk, so the sort key cannot depend on
+/// the walk that consumes it. Every field here is either part of the comparator's key
+/// or printed beside it, and nothing else recomputes any of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GroupScore {
+    tracks: usize,
+    bytes: u64,
+    cold_tracks: usize,
+    cold_bytes: u64,
+    never_played: usize,
+    plays: u32,
+    last_played_days: Option<u32>,
+    oldest_played_days: Option<u32>,
+    /// 0..=10, the bytes-weighted share of this group that is neglected.
+    cold_decile: u8,
+}
+
+impl GroupScore {
+    fn of(g: &PinGroup, size_by_id: &HashMap<&str, u64>, now_unix: u64) -> GroupScore {
+        let mut s = GroupScore::default();
+        let mut counted: HashSet<&str> = HashSet::new();
+        for song in &g.songs {
+            let id = song.id.0.as_str();
+            // Deduped within the group, exactly as the admission cost is: an album
+            // that listed a track twice must not weigh twice in its own share.
+            if !is_storable_id(id) || !counted.insert(id) {
+                continue;
+            }
+            let size = size_by_id.get(id).copied().unwrap_or(0);
+            s.tracks += 1;
+            s.bytes = s.bytes.saturating_add(size);
+            s.plays = s.plays.saturating_add(song.play_count.unwrap_or(0));
+            match song.played_days_ago(now_unix) {
+                // No usable stamp. Counted as never played only when there is no play
+                // count either, so the printed evidence agrees with [`is_cold`]'s
+                // verdict instead of contradicting it.
+                None if song.play_count.unwrap_or(0) == 0 => s.never_played += 1,
+                None => {}
+                Some(d) => {
+                    s.last_played_days = Some(s.last_played_days.map_or(d, |c| c.min(d)));
+                    s.oldest_played_days = Some(s.oldest_played_days.map_or(d, |c| c.max(d)));
+                }
+            }
+            if is_cold(song, now_unix) {
+                s.cold_tracks += 1;
+                s.cold_bytes = s.cold_bytes.saturating_add(size);
+            }
+        }
+        // Bytes-weighted, so a long neglected album outweighs a short one - it is the
+        // SPACE the decision is about. A group of unknown size scores 0 rather than
+        // dividing by zero: with no bytes to argue over there is nothing to rank.
+        // u128 because a percentage of a byte count would otherwise overflow above
+        // 184 exabytes, and a wrap here would be an invisible ranking bug.
+        s.cold_decile = if s.bytes == 0 {
+            0
+        } else {
+            ((s.cold_bytes as u128 * 100 / s.bytes as u128) / 10) as u8
+        };
+        s
     }
 }
 
@@ -1545,7 +2153,7 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
         .pins
         .as_ref()
         .filter(|_| verdicts)
-        .map(|pins| Frontier::build(pins, &by_id, pin_ceiling(input.max_bytes)));
+        .map(|pins| Frontier::build(pins, &by_id, pin_ceiling(input.max_bytes), input.now_unix));
     // Ids whose fingerprint drifted in THIS pass's verdicts. Collected as the
     // verdicts are formed rather than recomputed afterwards, so the pass stays
     // linear in (entries + pins) instead of quadratic.
@@ -2010,7 +2618,7 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
             pending_bytes,
             tier_tracks,
             tier_bytes,
-            deferred: front.deferred_groups(),
+            frontier: front.ranked_groups(),
             given_up: 0,
             waiting: if !writes_allowed {
                 StoreWaiting::ReserveBreached
@@ -3428,6 +4036,10 @@ async fn run_pass<C: Clock, P: PinSource>(
     input.download_batch = batch;
     input.defer_bulk = store.playback_remote();
     input.paused = store.paused();
+    // CALENDAR NOW, read ONCE here at the impure boundary - beside the statvfs, for
+    // the same reason - and threaded into the plan. `plan_pass` therefore stays pure
+    // and the frontier's neglect ranking is testable at any chosen date.
+    input.now_unix = now_unix();
 
     {
         // THE CEILING, re-measured EVERY pass, light ones included. `own` is the
@@ -3537,20 +4149,31 @@ async fn run_pass<C: Clock, P: PinSource>(
                 resident = status.resident_tracks,
                 cached = status.cached_tracks,
                 pending = status.pending_tracks,
-                deferred = status.deferred.len(),
+                deferred = status.deferred_count(),
                 bytes = status.bytes,
                 budget = status.effective_max,
                 source = status.budget_source.label(),
                 waiting = status.waiting.label(),
+                rule = %frontier_rule(),
                 "store: mirror frontier"
             );
-            for d in &status.deferred {
+            // The shortfall carries its REASON into the journal too, so the mirror
+            // explains itself with no client attached.
+            for d in status.deferred() {
                 tracing::info!(
-                    uri = %format!("{}/{}", d.kind.label(), d.id),
+                    uri = %d.uri(),
                     name = %d.name,
                     tier = d.tier.label(),
-                    tracks = d.tracks,
-                    bytes = d.bytes,
+                    rank = d.rank,
+                    tracks = d.missing_tracks,
+                    bytes = d.missing_bytes,
+                    cold_decile = d.cold_decile,
+                    cold_tracks = d.cold_tracks,
+                    never_played = d.never_played,
+                    plays = d.plays,
+                    last_played_days = ?d.last_played_days,
+                    over_by = d.over_by,
+                    blocked_by = ?d.blocked_by,
                     "store: deferred, over the pin ceiling"
                 );
             }
@@ -3883,6 +4506,8 @@ mod tests {
             suffix: Some(suffix.into()),
             content_type: Some("audio/flac".into()),
             created: created.map(|c| c.to_string()),
+            play_count: Some(7),
+            played: Some("2026-08-06T14:17:24+01:00".into()),
         }
     }
 
@@ -4127,6 +4752,9 @@ mod tests {
         assert_eq!(back.song.title, "t-so-1");
         assert_eq!(back.song.genre.as_deref(), Some("Electronic"));
         assert_eq!(back.song.duration_secs, Some(210));
+        // The server's play stats survive the sidecar too, stamp verbatim.
+        assert_eq!(back.song.play_count, Some(7));
+        assert_eq!(back.song.played.as_deref(), Some("2026-08-06T14:17:24+01:00"));
     }
 
     #[test]
@@ -4143,6 +4771,12 @@ mod tests {
         sparse.genre = None;
         sparse.bitrate = None;
         sparse.content_type = None;
+        // A never-played track is exactly this case and it is the common one: the
+        // server omits both keys, so both are None and the TOML serializer omits
+        // them in turn. The sidecar must still parse its own output - and it must
+        // read them back as None rather than inventing a zero.
+        sparse.play_count = None;
+        sparse.played = None;
         let sc = Sidecar {
             content_type: None,
             fingerprint: Fingerprint { size: 1024, suffix: "mp3".into(), created: None },
@@ -5530,13 +6164,18 @@ title = "Minimal"
         // Ceiling is 150 - min(512 MiB, 37) = 113, so exactly one 100-byte group
         // fits and the second is refused whole.
         assert_eq!(status.resident_tracks, 1);
+        let deferred: Vec<&RankedGroup> = status.deferred().collect();
         assert_eq!(
-            status.deferred.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+            deferred.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
             vec!["pin-b"],
             "the shortfall is a NAMED group, not an integer"
         );
-        assert_eq!(status.deferred[0].tracks, 1);
-        assert_eq!(status.deferred[0].bytes, 100);
+        assert_eq!(deferred[0].missing_tracks, 1);
+        assert_eq!(deferred[0].missing_bytes, 100);
+        // Both groups are ranked, won or lost, from the ONE vector - so the badge
+        // count, the list and the full order are views of the same decision.
+        assert_eq!(status.frontier.len(), 2);
+        assert_eq!(status.deferred_count(), 1);
         // Nothing below the line is ever downloaded; the queue window still is.
         assert_eq!(
             dls(&plan),
@@ -5570,6 +6209,63 @@ title = "Minimal"
         }
     }
 
+    /// The fixed calendar instant every neglect test measures back from:
+    /// 2026-08-10T00:00:00Z. INJECTED through `PassInput::now_unix`, never read from
+    /// the wall clock - which is what lets a 60-day threshold be swept
+    /// deterministically instead of observed once and then rotting silently.
+    const NOW_TEST: u64 = 1_786_320_000;
+
+    /// One song last played exactly `days_ago` whole days before [`NOW_TEST`].
+    /// `None` means the server has NO play record - the never-played case, which is
+    /// both the common one and the one that counts as cold.
+    fn aged_song(id: &str, size: u64, days_ago: Option<u32>) -> Song {
+        let mut s = song(id, size, "flac", Some("2024-05-01T12:00:00Z"));
+        match days_ago {
+            None => {
+                s.play_count = None;
+                s.played = None;
+            }
+            Some(d) => {
+                s.play_count = Some(1);
+                let at = NOW_TEST.saturating_sub(d as u64 * 86_400);
+                s.played = Some(
+                    chrono::DateTime::from_timestamp(at as i64, 0)
+                        .expect("a representable test instant")
+                        .to_rfc3339(),
+                );
+            }
+        }
+        s
+    }
+
+    /// A pin group whose tracks carry EXPLICIT play ages, one per track, in whole
+    /// days back from [`NOW_TEST`].
+    fn aged_grp(
+        tier: PinTier,
+        id: &str,
+        tracks: &[(&str, u64)],
+        ages: &[Option<u32>],
+    ) -> PinGroup {
+        assert_eq!(tracks.len(), ages.len(), "one age per track");
+        PinGroup {
+            kind: if tier == PinTier::Song { PinKind::Song } else { PinKind::Album },
+            id: id.to_string(),
+            name: format!("name-{id}"),
+            tier,
+            songs: tracks
+                .iter()
+                .zip(ages)
+                .map(|((t, size), age)| aged_song(t, *size, *age))
+                .collect(),
+        }
+    }
+
+    /// A pin group played TODAY throughout: maximally fresh, decile 0.
+    fn hot_grp(tier: PinTier, id: &str, tracks: &[(&str, u64)]) -> PinGroup {
+        let ages: Vec<Option<u32>> = tracks.iter().map(|_| Some(0)).collect();
+        aged_grp(tier, id, tracks, &ages)
+    }
+
     /// A pinned, on-disk entry - what a track that has already been mirrored looks
     /// like to a later pass.
     fn pinned_entry(id: &str, size: u64, last_played: u64) -> IndexEntry {
@@ -5584,28 +6280,986 @@ title = "Minimal"
     }
 
     #[test]
-    fn the_frontier_walks_song_then_album_then_artist_and_position_within_a_tier() {
-        // Declaration order of PinTier IS the priority model, and the pin set's own
-        // order (newest-starred-first, as getStarred2 returned it) breaks ties within
-        // a tier. The groups are declared here in DELIBERATELY scrambled order, so an
-        // implementation that merely preserved input order would fail.
+    fn the_hand_picked_floor_keeps_starred_songs_the_neglect_order_would_drop() {
+        // THE INVERSION THIS REPAIRS, and it is not hypothetical - it is what the
+        // neglect key does to a real library. He stars a song WHILE LISTENING to it,
+        // so a hand-picked star is played-today by construction and scores decile 0:
+        // the most deliberate gesture sorts to the very bottom, beneath every album he
+        // has not opened in months. Measured on his library at its real 3.01 GiB
+        // ceiling, pure neglect order kept 7 of 47 hand-starred songs.
+        //
+        // Here: one 60-byte album nobody has played in 200 days, and three fresh
+        // hand-starred songs of 10 bytes each. The ceiling fits the album OR the songs,
+        // not both, and neglect order alone would spend all of it on the album.
+        let mut input = PassInput::new(PassMode::Full, 100);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        let pins = PinSet {
+            groups: vec![
+                aged_grp(PinTier::Album, "al-1", &[("a1", 30), ("a2", 30)], &[Some(200), Some(200)]),
+                hot_grp(PinTier::Song, "so-1", &[("sng-a", 10)]),
+                hot_grp(PinTier::Song, "so-2", &[("sng-b", 10)]),
+                hot_grp(PinTier::Song, "so-3", &[("sng-c", 10)]),
+            ],
+        };
+        input.pins = Some(pins.clone());
+        let got = dl_ids(&plan_pass(&input));
+        for id in ["sng-a", "sng-b", "sng-c"] {
+            assert!(got.iter().any(|d| d == id), "{id} kept by the floor, got {got:?}");
+        }
+
+        // AND THE FLOOR IS A MINIMUM, NOT A CAP. Revert it and the songs vanish: this
+        // is the assertion that bites, because everything above still passes under a
+        // single-round walk that simply admits the album first.
+        let ceiling = pin_ceiling(input.max_bytes);
+        assert!(star_floor(ceiling) >= 30, "the floor must fit all three songs here");
+        let by_id = HashMap::new();
+        let f = Frontier::build(&pins, &by_id, ceiling, NOW_TEST);
+        let ranked = f.ranked_groups();
+        assert!(
+            ranked
+                .iter()
+                .any(|g| g.tier != PinTier::Song && g.held_back_by_floor),
+            "and whatever the reservation refused SAYS the reservation refused it, \
+             rather than printing a shortfall against a ceiling that had room"
+        );
+    }
+
+    #[test]
+    fn the_floor_never_becomes_the_whole_policy_on_a_small_store() {
+        // A FLAT reservation would quietly delete the album ranking on any store below
+        // it: 2 GiB of floor against a 1 GiB budget reserves everything, and every
+        // album is deferred forever with no line saying so. The fraction is what makes
+        // the rule total rather than merely well-behaved at his size.
+        for ceiling in [0u64, 1, 999, 1 << 20, 3 * GIB, 16 * GIB, u64::MAX] {
+            let f = star_floor(ceiling);
+            assert!(f <= ceiling / 2, "never more than half the mirror ({ceiling})");
+            assert!(f <= STAR_FLOOR_BYTES, "never more than the absolute cap ({ceiling})");
+        }
+        assert_eq!(star_floor(0), 0, "no budget reserves nothing");
+        // Large enough for the cap to bind rather than the fraction.
+        assert_eq!(star_floor(16 * GIB), STAR_FLOOR_BYTES);
+    }
+
+    #[test]
+    fn a_play_count_with_no_stamp_is_a_gap_in_the_records_not_neglect() {
+        // Navidrome carries `playCount` and `played` independently and can hold one
+        // without the other. Reading a missing STAMP as never-played then prints a line
+        // that contradicts itself - "10/10 neglected, 4 plays, 0 never played" - on the
+        // one surface whose whole job is to be checkable by eye.
+        let mut s = aged_song("x", 10, None);
+        assert!(is_cold(&s, NOW_TEST), "no stamp AND no plays really is neglect");
+        s.play_count = Some(4);
+        assert!(!is_cold(&s, NOW_TEST), "but a play count is a record that he played it");
+
+        let g = PinGroup { songs: vec![s], ..grp(PinTier::Album, "al", &[]) };
+        let sc = GroupScore::of(&g, &HashMap::from([("x", 10u64)]), NOW_TEST);
+        assert_eq!(sc.never_played, 0, "and the printed evidence agrees with the verdict");
+        assert_eq!(sc.cold_decile, 0);
+        assert_eq!(sc.plays, 4);
+    }
+
+    #[test]
+    fn at_equal_neglect_an_album_leads_a_loose_song_and_the_artist_fan_out_is_last() {
+        // THE TIER'S REMAINING JOB, once neglect has spoken. This test REPLACES an
+        // older one asserting song-then-album-then-artist: that was a preference, and
+        // it is the exact preference the ask contradicted ("especially from albums I
+        // favorited"). The ARTIST half of the old rule is untouched and is asserted
+        // below, because it is structural rather than taste - a starred artist is the
+        // only UNBOUNDED gesture.
+        //
+        // Every group here has identical neglect (one track, one stamp, all of it
+        // COLD), so the decile is a tie by construction and the emphasis clause is the
+        // only thing left to speak. The groups are declared in DELIBERATELY scrambled
+        // order, so an implementation that merely preserved input order would fail.
+        //
+        // COLD is load-bearing, not decoration: the clause is about which NEGLECTED
+        // music to prefer, so it speaks here and deliberately does not speak over
+        // groups with no neglect at all - the second half of this test.
+        let cold = |tier, id, track| aged_grp(tier, id, &[(track, 10)], &[Some(200)]);
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.now_unix = NOW_TEST;
         input.download_batch = 16;
         input.pins = Some(PinSet {
             groups: vec![
-                grp(PinTier::Artist, "ar-1", &[("art-a", 10)]),
-                grp(PinTier::Album, "al-1", &[("alb-a", 10)]),
-                grp(PinTier::Song, "so-1", &[("sng-a", 10)]),
-                grp(PinTier::Artist, "ar-2", &[("art-b", 10)]),
-                grp(PinTier::Album, "al-2", &[("alb-b", 10)]),
-                grp(PinTier::Song, "so-2", &[("sng-b", 10)]),
+                cold(PinTier::Artist, "ar-1", "art-a"),
+                cold(PinTier::Album, "al-1", "alb-a"),
+                cold(PinTier::Song, "so-1", "sng-a"),
+                cold(PinTier::Artist, "ar-2", "art-b"),
+                cold(PinTier::Album, "al-2", "alb-b"),
+                cold(PinTier::Song, "so-2", "sng-b"),
             ],
         });
         assert_eq!(
             dl_ids(&plan_pass(&input)),
-            vec!["sng-a", "sng-b", "alb-a", "alb-b", "art-a", "art-b"],
-            "songs first, then albums, then artists; within a tier, starred order"
+            vec!["alb-a", "alb-b", "sng-a", "sng-b", "art-a", "art-b"],
+            "albums, then loose starred songs, then the artist fan-out; within a tier, starred order"
         );
+
+        // THE NARROWING, and it is the half that keeps the tier's promise. Played
+        // today throughout: nothing is neglected, so the "especially from albums"
+        // clause has nothing to emphasise and the cheapest, most precise gesture leads
+        // instead. Without this the clause is a GATE over every group that ties at
+        // decile 0 - 65 of 88 groups on one real library, with the ceiling cutting
+        // straight through them - which defers essentially every hand-starred song.
+        // The artist floor is untouched by the narrowing.
+        input.pins = Some(PinSet {
+            groups: vec![
+                hot_grp(PinTier::Artist, "ar-1", &[("art-a", 10)]),
+                hot_grp(PinTier::Album, "al-1", &[("alb-a", 10)]),
+                hot_grp(PinTier::Song, "so-1", &[("sng-a", 10)]),
+                hot_grp(PinTier::Album, "al-2", &[("alb-b", 10)]),
+                hot_grp(PinTier::Song, "so-2", &[("sng-b", 10)]),
+            ],
+        });
+        assert_eq!(
+            dl_ids(&plan_pass(&input)),
+            vec!["sng-a", "sng-b", "alb-a", "alb-b", "art-a"],
+            "with NOTHING neglected the loose starred songs lead - and the unbounded \
+             artist fan-out is still last"
+        );
+
+        // And the narrowing is per GROUP, not per pass: one cold track is enough to
+        // put a group back under the ask's own clause, so the two halves coexist in
+        // one order.
+        input.pins = Some(PinSet {
+            groups: vec![
+                hot_grp(PinTier::Song, "so-1", &[("sng-a", 10)]),
+                aged_grp(PinTier::Album, "al-1", &[("alb-a", 10)], &[Some(200)]),
+                aged_grp(PinTier::Song, "so-2", &[("sng-b", 10)], &[Some(200)]),
+                hot_grp(PinTier::Album, "al-2", &[("alb-b", 10)]),
+            ],
+        });
+        assert_eq!(
+            dl_ids(&plan_pass(&input)),
+            vec!["alb-a", "sng-b", "sng-a", "alb-b"],
+            "the two COLD groups rank by the ask (album, then song) and both lead the \
+             two fresh ones, which rank song-first among themselves"
+        );
+    }
+
+    #[test]
+    fn the_artist_fan_out_is_floored_however_neglected_it_is() {
+        // THE SINGLE MOST IMPORTANT ORDERING ASSERTION. A starred artist is the only
+        // UNBOUNDED gesture - everything they have and everything they release - so
+        // its fan-out must never be able to outrank a hand-picked one, whatever the
+        // neglect signal says. Without the class floor, starring one prolific artist
+        // with five hundred never-played albums would own the top of the order
+        // forever and quietly starve every album and song he chose by hand.
+        //
+        // Here the artist album is MAXIMALLY neglected (never played at all, decile
+        // 10) and the two hand-picked groups are maximally fresh (played today,
+        // decile 0) - the strongest case the neglect key can make - and it still
+        // loses to both.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                aged_grp(PinTier::Artist, "ar", &[("art-a", 10)], &[None]),
+                hot_grp(PinTier::Song, "so", &[("sng-a", 10)]),
+                hot_grp(PinTier::Album, "al", &[("alb-a", 10)]),
+            ],
+        });
+        let (plan, status) = plan_pass_with_status(&input);
+        let status = status.expect("status");
+        assert_eq!(
+            dl_ids(&plan),
+            vec!["sng-a", "alb-a", "art-a"],
+            "the never-played artist album is still LAST, behind two tracks played today"
+        );
+        // The two hand-picked groups are both wholly fresh, so the ask's album clause
+        // has nothing to emphasise between them and the loose song leads - which is
+        // beside the point being tested here and asserted properly in
+        // `at_equal_neglect_an_album_leads_a_loose_song_and_the_artist_fan_out_is_last`.
+        // The FLOOR is what this test pins, and no neglect score can lift the artist
+        // through it.
+        //
+        // And the evidence says exactly that, so the outcome is checkable by eye.
+        let by = |id: &str| status.frontier.iter().find(|g| g.id == id).unwrap().clone();
+        assert_eq!(by("ar").cold_decile, 10, "maximally neglected");
+        assert_eq!(by("al").cold_decile, 0, "and it still loses to a decile 0 album");
+        assert_eq!(by("ar").rank, 2);
+    }
+
+    #[test]
+    fn neglect_outranks_the_tier_within_the_hand_picked_class() {
+        // NEGLECT IS THE PRIMARY KEY, not a tie-break below the tier: the ask leads
+        // with "music I haven't played for a long time" and makes the album clause
+        // the "especially". So a wholly neglected starred SONG must beat a
+        // freshly-played starred ALBUM, even though the album wins on a tie.
+        //
+        // This is the assertion that separates this design from one where the tier
+        // gates and neglect merely decorates - flip the two key positions and it
+        // fails.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                hot_grp(PinTier::Album, "fresh-album", &[("fa-1", 10)]),
+                aged_grp(PinTier::Song, "stale-song", &[("ss-1", 10)], &[Some(200)]),
+            ],
+        });
+        assert_eq!(
+            dl_ids(&plan_pass(&input)),
+            vec!["ss-1", "fa-1"],
+            "a song untouched for 200 days leads an album played today"
+        );
+        // And at EQUAL neglect the album takes it back - the emphasis clause speaking
+        // exactly where it was meant to, on the tie the deciles manufacture.
+        input.pins = Some(PinSet {
+            groups: vec![
+                aged_grp(PinTier::Song, "stale-song", &[("ss-1", 10)], &[Some(200)]),
+                aged_grp(PinTier::Album, "stale-album", &[("sa-1", 10)], &[Some(70)]),
+            ],
+        });
+        assert_eq!(
+            dl_ids(&plan_pass(&input)),
+            vec!["sa-1", "ss-1"],
+            "both fully cold, so the ALBUM leads - and the 130-day gap between them does not speak"
+        );
+    }
+
+    #[test]
+    fn the_cold_share_is_bytes_weighted_over_the_groups_own_tracks() {
+        // The decile is a share of the SPACE, not of the track count, because space is
+        // what the decision is about. Here both albums have two of four tracks cold,
+        // but one is cold in its BIG tracks - so it asks for more of its bytes on
+        // behalf of music he has not heard, and it goes first.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                // Cold in the SMALL tracks: 20 of 220 bytes = decile 0.
+                aged_grp(
+                    PinTier::Album,
+                    "cold-in-the-small",
+                    &[("s1", 10), ("s2", 10), ("s3", 100), ("s4", 100)],
+                    &[Some(200), Some(200), Some(1), Some(1)],
+                ),
+                // Cold in the BIG tracks: 200 of 220 bytes = decile 9.
+                aged_grp(
+                    PinTier::Album,
+                    "cold-in-the-large",
+                    &[("l1", 10), ("l2", 10), ("l3", 100), ("l4", 100)],
+                    &[Some(1), Some(1), Some(200), Some(200)],
+                ),
+            ],
+        });
+        let (plan, status) = plan_pass_with_status(&input);
+        let status = status.expect("status");
+        let by = |id: &str| status.frontier.iter().find(|g| g.id == id).unwrap().clone();
+        assert_eq!(by("cold-in-the-large").cold_decile, 9);
+        assert_eq!(by("cold-in-the-small").cold_decile, 0);
+        assert_eq!(
+            by("cold-in-the-large").cold_tracks,
+            2,
+            "the same TRACK count as the other - only the bytes differ"
+        );
+        assert_eq!(by("cold-in-the-small").cold_tracks, 2);
+        assert_eq!(
+            dl_ids(&plan)[0],
+            "l1",
+            "the album whose neglected half is the BIG half goes first"
+        );
+    }
+
+    #[test]
+    fn a_server_with_no_play_history_at_all_degrades_to_a_clean_tier_walk() {
+        // A plain-Subsonic server, a fresh user, or Navidrome after a history wipe:
+        // every track has no record, so every group is 100 % cold and every decile is
+        // 10. The key must then COLLAPSE to (class, tier_rank, position, id) - a clean
+        // tier-ordered walk - rather than hitting a cliff, an empty pin set or a
+        // divide by zero. Asserted rather than hoped for.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                aged_grp(PinTier::Artist, "ar-1", &[("art-a", 10)], &[None]),
+                aged_grp(PinTier::Song, "so-1", &[("sng-a", 10)], &[None]),
+                aged_grp(PinTier::Album, "al-1", &[("alb-a", 10)], &[None]),
+                aged_grp(PinTier::Song, "so-2", &[("sng-b", 10)], &[None]),
+                aged_grp(PinTier::Album, "al-2", &[("alb-b", 10)], &[None]),
+            ],
+        });
+        let (plan, status) = plan_pass_with_status(&input);
+        let status = status.expect("status");
+        assert!(
+            status.frontier.iter().all(|g| g.cold_decile == 10),
+            "with no history anywhere, every group is wholly neglected"
+        );
+        assert_eq!(
+            dl_ids(&plan),
+            vec!["alb-a", "alb-b", "sng-a", "sng-b", "art-a"],
+            "and the order is the tier walk, in pin-set position"
+        );
+        // The evidence is honest about WHY, so the surface does not claim a play it
+        // never saw.
+        let g = status.frontier.iter().find(|g| g.id == "al-1").unwrap();
+        assert_eq!(g.never_played, 1);
+        assert_eq!(g.plays, 0);
+        assert_eq!(g.last_played_days, None);
+        assert_eq!(g.oldest_played_days, None);
+    }
+
+    #[test]
+    fn a_group_of_unknown_size_scores_zero_rather_than_dividing_by_zero() {
+        // Neither the server nor the disk knows the size. There are no bytes to argue
+        // over, so there is nothing to rank - and the arithmetic must not panic.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        let mut sizeless = aged_grp(PinTier::Album, "sizeless", &[("z1", 0), ("z2", 0)], &[None, None]);
+        for s in &mut sizeless.songs {
+            s.size = None;
+        }
+        input.pins = Some(PinSet { groups: vec![sizeless] });
+        let (_, status) = plan_pass_with_status(&input);
+        let status = status.expect("status");
+        let g = &status.frontier[0];
+        assert_eq!(g.bytes, 0);
+        assert_eq!(g.cold_decile, 0, "no bytes, no share - and no divide by zero");
+        assert_eq!(g.cold_tracks, 2, "the tracks are still honestly counted as cold");
+    }
+
+    /// A pin set with real spread in every dimension the key reads - three classes,
+    /// mixed neglect, mixed sizes, some never-played - so a stability claim about it
+    /// is a claim about a ranking that is actually deciding something.
+    fn mixed_pin_set() -> PinSet {
+        PinSet {
+            groups: vec![
+                aged_grp(
+                    PinTier::Album,
+                    "al-fresh",
+                    &[("af1", 100), ("af2", 120), ("af3", 90)],
+                    &[Some(2), Some(5), Some(1)],
+                ),
+                aged_grp(
+                    PinTier::Album,
+                    "al-half",
+                    &[("ah1", 200), ("ah2", 30), ("ah3", 70)],
+                    &[Some(120), Some(3), Some(9)],
+                ),
+                aged_grp(
+                    PinTier::Album,
+                    "al-neglected",
+                    &[("an1", 150), ("an2", 150)],
+                    &[None, Some(300)],
+                ),
+                aged_grp(PinTier::Song, "so-old", &[("s1", 80)], &[Some(95)]),
+                aged_grp(PinTier::Song, "so-new", &[("s2", 60)], &[Some(4)]),
+                aged_grp(
+                    PinTier::Artist,
+                    "ar-a",
+                    &[("r1", 110), ("r2", 40)],
+                    &[None, Some(58)],
+                ),
+                aged_grp(PinTier::Artist, "ar-b", &[("r3", 55)], &[Some(61)]),
+            ],
+        }
+    }
+
+    fn ranked_ids(status: &StoreStatus) -> Vec<&str> {
+        status.frontier.iter().map(|g| g.id.as_str()).collect()
+    }
+
+    /// THE ACCEPTANCE ARTIFACT, replayed OFFLINE against a captured dump of one real
+    /// library - and it downloads nothing, calls nothing and writes nothing.
+    ///
+    /// It runs the REAL [`plan_pass_with_status`] over a pin set rebuilt from a live
+    /// `getStarred2` + `getAlbum` + `getArtist` capture, at the measured pin ceiling
+    /// and with `now_unix` pinned to the capture date, and prints three things:
+    ///
+    /// 1. the resident/deferred split BY NAME with byte deltas, which is what a human
+    ///    decides the DIRECTION on - the bet that "not played in a long time" should
+    ///    win is his to confirm, not this code's to assume;
+    /// 2. the DECILE HISTOGRAM, which is the falsifiability check on the one
+    ///    constant: if it is degenerate (everything at 0 or 10) then 60 days is the
+    ///    wrong line and gets re-derived FROM the histogram, not nudged until the
+    ///    outcome looks nice;
+    /// 3. never-played tracks left inside RESIDENT albums, which is the number that
+    ///    would later reopen the partial-admission question.
+    ///
+    /// Ignored by default because it needs the capture. Point it at one with
+    /// `HYPODJ_STATS_DUMP=<dir> cargo test -p hypodj-core -- --ignored replay`.
+    #[test]
+    #[ignore = "needs a captured live dump; see HYPODJ_STATS_DUMP"]
+    fn replay_the_frontier_over_a_captured_real_library() {
+        let Ok(dir) = std::env::var("HYPODJ_STATS_DUMP") else {
+            eprintln!("set HYPODJ_STATS_DUMP to a directory holding starred_raw.json + expanded_raw.json");
+            return;
+        };
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(std::path::Path::new(&dir).join(name)).expect("dump file"),
+            )
+            .expect("dump json")
+        };
+        let starred = read("starred_raw.json");
+        let expanded = read("expanded_raw.json");
+
+        // The capture instant, so the day arithmetic is the one the capture saw.
+        let now_unix = expanded["albums"]
+            .as_object()
+            .and_then(|m| m.values().find_map(|a| a["created"].as_str()))
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.timestamp() as u64)
+            .expect("a created stamp to date the capture from");
+
+        let to_song = |c: &serde_json::Value| Song {
+            id: SongId(c["id"].as_str().unwrap_or_default().to_string()),
+            title: c["title"].as_str().unwrap_or_default().to_string(),
+            album: None,
+            album_id: None,
+            artist: None,
+            track: None,
+            duration_secs: None,
+            cover_art: None,
+            starred: c.get("starred").is_some(),
+            musicbrainz_id: None,
+            disc: None,
+            year: None,
+            genre: None,
+            bitrate: None,
+            comment: None,
+            user_rating: None,
+            composer: None,
+            performer: None,
+            size: c["size"].as_u64(),
+            suffix: None,
+            content_type: None,
+            created: c["created"].as_str().map(str::to_string),
+            play_count: c["playCount"].as_u64().map(|n| n as u32),
+            played: c["played"].as_str().map(str::to_string),
+        };
+        let album_group = |id: &str, tier: PinTier, name: String| -> Option<PinGroup> {
+            let a = expanded["albums"].get(id)?;
+            Some(PinGroup {
+                kind: PinKind::Album,
+                id: id.to_string(),
+                name,
+                tier,
+                songs: a["song"].as_array()?.iter().map(to_song).collect(),
+            })
+        };
+
+        // The expansion's own shape: tier SONG per starred song, tier ALBUM per
+        // starred album, tier ARTIST one group PER ALBUM of each starred artist.
+        let mut groups: Vec<PinGroup> = Vec::new();
+        for s in starred["song"].as_array().into_iter().flatten() {
+            let song = to_song(s);
+            groups.push(PinGroup {
+                kind: PinKind::Song,
+                id: song.id.0.clone(),
+                name: song.title.clone(),
+                tier: PinTier::Song,
+                songs: vec![song],
+            });
+        }
+        for a in starred["album"].as_array().into_iter().flatten() {
+            let id = a["id"].as_str().unwrap_or_default();
+            if let Some(g) = album_group(id, PinTier::Album, a["name"].as_str().unwrap_or(id).into())
+            {
+                groups.push(g);
+            }
+        }
+        for ar in starred["artist"].as_array().into_iter().flatten() {
+            let aid = ar["id"].as_str().unwrap_or_default();
+            let aname = ar["name"].as_str().unwrap_or(aid);
+            for al in expanded["artists"]
+                .get(aid)
+                .and_then(|v| v["album"].as_array())
+                .into_iter()
+                .flatten()
+            {
+                let id = al["id"].as_str().unwrap_or_default();
+                let name = format!("{aname} - {}", al["name"].as_str().unwrap_or(id));
+                if let Some(g) = album_group(id, PinTier::Artist, name) {
+                    groups.push(g);
+                }
+            }
+        }
+        assert!(!groups.is_empty(), "the dump produced no pin groups");
+
+        // His measured effective budget, and the ceiling the frontier actually walks.
+        let mut input = PassInput::new(PassMode::Full, 10_468_982_784);
+        input.now_unix = now_unix;
+        input.pins = Some(PinSet { groups });
+        let status = plan_pass_with_status(&input).1.expect("a full pass publishes");
+
+        let mut hist = [0usize; 11];
+        for g in &status.frontier {
+            hist[g.cold_decile as usize] += 1;
+        }
+        let want: u64 = status.frontier.iter().map(|g| g.bytes).sum();
+        println!("\nCOLD SHARE FIRST, replayed over the captured library");
+        println!("rule: {}", frontier_rule());
+        println!(
+            "{} groups, {:.2} GiB wanted, ceiling {:.2} GiB",
+            status.frontier.len(),
+            want as f64 / 1024.0_f64.powi(3),
+            pin_ceiling(input.max_bytes) as f64 / 1024.0_f64.powi(3),
+        );
+        println!("\ndecile histogram (degenerate = the 60-day line is wrong):");
+        for (d, n) in hist.iter().enumerate() {
+            println!("  {d:>2}/10  {n:>3}  {}", "#".repeat(*n));
+        }
+        println!("\nthe cut, by name:");
+        for g in &status.frontier {
+            println!(
+                "  {:>3} {:<9} {:>2}/10 {:>10} B  {:<7} {}",
+                g.rank + 1,
+                g.standing.label(),
+                g.cold_decile,
+                g.bytes,
+                g.tier.label(),
+                g.name,
+            );
+        }
+        // An UPPER BOUND, said out loud: a track two deferred groups both want is
+        // counted by both, because each of them really is missing it (see
+        // `RankedGroup::missing_bytes`). Stated rather than quietly conflated.
+        let short: u64 = status.deferred().map(|g| g.missing_bytes).sum();
+        println!(
+            "\ndeferred: {} groups, at most {:.2} GiB (a track two deferred groups \
+             both want is counted by both)",
+            status.deferred_count(),
+            short as f64 / 1024.0_f64.powi(3)
+        );
+        // The number that would REOPEN the partial-admission question: never-played
+        // tracks sitting inside albums the frontier decided to keep whole. The BYTE
+        // figure is deliberately the cold bytes, which is an UPPER BOUND on the
+        // never-played ones - `RankedGroup` carries no never-played byte total, and
+        // adding one to the wire for a number only this replay prints would not earn
+        // its keep. Stated rather than quietly conflated.
+        let (nt, nb) = status
+            .frontier
+            .iter()
+            .filter(|g| g.standing == GroupStanding::Resident)
+            .fold((0usize, 0u64), |(t, b), g| (t + g.never_played, b + g.cold_bytes));
+        println!(
+            "never-played tracks inside RESIDENT groups: {nt}, holding at most {:.2} GiB \
+             (cold bytes, an upper bound on the never-played ones)",
+            nb as f64 / 1024.0_f64.powi(3)
+        );
+
+        // The one assertion, and it is the falsifiability check rather than a
+        // rubber stamp: a histogram piled entirely into one bucket means the constant
+        // discriminates nothing and must be re-derived.
+        let occupied = hist.iter().filter(|n| **n > 0).count();
+        assert!(
+            occupied >= 3,
+            "the decile histogram is degenerate ({occupied} buckets used) - \
+             STALE_PLAY_DAYS must be re-derived FROM this distribution"
+        );
+    }
+
+    #[test]
+    fn the_order_is_identical_between_passes_over_identical_input() {
+        // THE PROPERTY THAT MATTERS MOST, more than the ranking itself: an order that
+        // reshuffles makes the mirror download and evict the same albums forever,
+        // which is strictly WORSE than the arbitrary order it replaces. A ceiling
+        // that actually bites, so the resident/deferred split is a real cut and not a
+        // vacuous "everything fits".
+        let mut input = PassInput::new(PassMode::Full, 900);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        input.pins = Some(mixed_pin_set());
+
+        let (plan_a, status_a) = plan_pass_with_status(&input);
+        let status_a = status_a.expect("status");
+        let (plan_b, status_b) = plan_pass_with_status(&input);
+        let status_b = status_b.expect("status");
+        assert_eq!(status_a, status_b, "same input, byte-identical self-description");
+        assert_eq!(plan_a, plan_b, "and the identical plan");
+        assert!(
+            status_a.deferred_count() > 0 && status_a.resident_tracks > 0,
+            "the ceiling must actually cut, or this proves nothing"
+        );
+
+        // And it is a function of the STATE, not of the order the pin set arrived in.
+        // The server is free to hand back the same starred set in a different
+        // sequence; that must not move the line, or the mirror churns for nothing.
+        let mut shuffled = input.clone();
+        let mut groups = mixed_pin_set().groups;
+        groups.reverse();
+        shuffled.pins = Some(PinSet { groups });
+        let (_, status_c) = plan_pass_with_status(&shuffled);
+        let status_c = status_c.expect("status");
+        assert_eq!(
+            ranked_ids(&status_c)
+                .iter()
+                .filter(|id| {
+                    status_c
+                        .frontier
+                        .iter()
+                        .any(|g| &g.id == *id && g.standing == GroupStanding::Resident)
+                })
+                .count(),
+            status_a
+                .frontier
+                .iter()
+                .filter(|g| g.standing == GroupStanding::Resident)
+                .count(),
+            "the same groups are resident whatever order they arrived in"
+        );
+        let mut a_deferred: Vec<&str> = status_a.deferred().map(|g| g.id.as_str()).collect();
+        let mut c_deferred: Vec<&str> = status_c.deferred().map(|g| g.id.as_str()).collect();
+        a_deferred.sort_unstable();
+        c_deferred.sort_unstable();
+        assert_eq!(a_deferred, c_deferred, "and the same groups are refused");
+    }
+
+    #[test]
+    fn a_groups_neglect_only_ever_grows_and_never_falls_back_on_its_own() {
+        // THE STABILITY ARGUMENT, swept rather than asserted by hand. Absent a new
+        // play a track's age only increases, so `cold` is a ONE-WAY LATCH: every
+        // group's decile is monotone NON-DECREASING over time and takes at most
+        // eleven values ever.
+        //
+        // THAT ALONE IS NOT STABILITY, and this test used to pretend it was. Per-group
+        // monotonicity says nothing about a PAIR: two groups whose deciles ratchet on
+        // different days hand the lead back and forth, and the old bound here (a
+        // whole-order change count of at most seven over 400 days) could not see it -
+        // the real counterexample produced six reversals and a full download-evict
+        // cycle while passing. What this test still owns is the LATCH; the pairwise
+        // property is owned by
+        // `a_pair_that_ratchets_past_each_other_hands_over_once_not_forever`, which
+        // runs the counterexample against the store state itself.
+        //
+        // 400 days at one-day steps, over a fixture whose ages straddle the line.
+        let mut input = PassInput::new(PassMode::Full, 900);
+        input.download_batch = 16;
+        input.pins = Some(mixed_pin_set());
+
+        let mut last_decile: std::collections::HashMap<String, u8> = Default::default();
+        let mut moved = 0usize;
+        for day in 0..400u64 {
+            input.now_unix = NOW_TEST + day * 86_400;
+            let (_, status) = plan_pass_with_status(&input);
+            let status = status.expect("status");
+            for g in &status.frontier {
+                if let Some(prev) = last_decile.get(&g.id) {
+                    assert!(
+                        g.cold_decile >= *prev,
+                        "day {day}: {} fell from decile {prev} to {} - neglect is a \
+                         one-way latch and must never reverse without a play",
+                        g.id,
+                        g.cold_decile
+                    );
+                    if g.cold_decile > *prev {
+                        moved += 1;
+                    }
+                }
+                last_decile.insert(g.id.clone(), g.cold_decile);
+            }
+        }
+        assert!(moved > 0, "the sweep must actually cross the line, or it proves nothing");
+        // Eleven values per group, seven groups: the latch bounds the number of
+        // ratchets over ANY span, not just this one.
+        assert!(moved <= 7 * 10, "a decile moved {moved} times - the latch is not latching");
+    }
+
+    /// Sweep `days` days over one pin set, feeding each pass's plan back into the
+    /// entries so the next pass sees the store the previous one actually produced.
+    /// Returns (downloads, evictions, order reversals per pair, the day-by-day log).
+    ///
+    /// THE POINT: a churn claim is about the STORE, not about a printed order, so it
+    /// can only be measured by closing the loop. A sweep that never sets
+    /// `input.entries` cannot observe a single download or eviction and therefore
+    /// cannot fail on churn - which is exactly how the leapfrog defect shipped green.
+    fn sweep_days(pins: &PinSet, max_bytes: u64, days: u64) -> (usize, usize, usize, Vec<String>) {
+        let mut input = PassInput::new(PassMode::Full, max_bytes);
+        input.download_batch = 64;
+        input.pins = Some(pins.clone());
+        let mut on_disk: Vec<IndexEntry> = Vec::new();
+        let (mut downloads, mut evictions, mut reversals) = (0usize, 0usize, 0usize);
+        let mut last_order: Vec<String> = Vec::new();
+        let mut log: Vec<String> = Vec::new();
+        for day in 0..days {
+            input.now_unix = NOW_TEST + day * 86_400;
+            input.entries = on_disk.clone();
+            let (plan, status) = plan_pass_with_status(&input);
+            let status = status.expect("status");
+            let (mut got, mut gone) = (Vec::new(), Vec::new());
+            for a in &plan {
+                match a {
+                    StoreAction::Download { id, .. } => got.push(id.0.clone()),
+                    StoreAction::Evict(id) => gone.push(id.0.clone()),
+                    _ => {}
+                }
+            }
+            downloads += got.len();
+            evictions += gone.len();
+            if !got.is_empty() || !gone.is_empty() {
+                log.push(format!("day {day}: downloaded {got:?}, evicted {gone:?}"));
+            }
+            on_disk.retain(|e| !gone.contains(&e.id.0));
+            for id in &got {
+                let size = pins
+                    .songs()
+                    .find(|s| &s.id.0 == id)
+                    .and_then(|s| s.size)
+                    .unwrap_or(0);
+                on_disk.push(pinned_entry(id, size, input.now_unix));
+            }
+            let order: Vec<String> = status.frontier.iter().map(|g| g.id.clone()).collect();
+            if !last_order.is_empty() && order != last_order {
+                reversals += 1;
+                log.push(format!("day {day}: order {last_order:?} -> {order:?}"));
+            }
+            last_order = order;
+        }
+        (downloads, evictions, reversals, log)
+    }
+
+    #[test]
+    fn a_pair_that_ratchets_past_each_other_hands_over_once_not_forever() {
+        // THE COUNTEREXAMPLE THAT KILLED "no pair can oscillate". Two four-track
+        // albums of identical class, tier and size whose tracks cross the 60-day line
+        // on INTERLEAVED days. Both deciles are monotone non-decreasing throughout -
+        // the property the old argument rested on - and yet they ratchet past each
+        // other: A leads at 2 v 2, B takes it at 2 v 5, A takes it BACK at 5 v 5
+        // because the tie fell through to arrival position, B at 5 v 7, A at 7 v 7,
+        // and so on.
+        //
+        // With a ceiling that fits exactly one of them, every one of those reversals
+        // is a whole album deleted and the other one re-fetched. Measured on this
+        // planner before the fix: SIX reversals, 28 downloads and 24 evictions in
+        // seventy days, for eight tracks - on real data that is GiB of re-fetching an
+        // album he already had, against a disk that has hit 100 % once.
+        //
+        // The incumbency clause makes a tie worth zero bytes of movement, so the lead
+        // can change only when the challenger is STRICTLY more neglected. Here that
+        // happens exactly once, at day 5, and never again.
+        let pins = PinSet {
+            groups: vec![
+                aged_grp(
+                    PinTier::Album,
+                    "A",
+                    &[("a1", 25), ("a2", 25), ("a3", 25), ("a4", 25)],
+                    &[Some(61), Some(50), Some(20), Some(10)],
+                ),
+                aged_grp(
+                    PinTier::Album,
+                    "B",
+                    &[("b1", 25), ("b2", 25), ("b3", 25), ("b4", 25)],
+                    &[Some(61), Some(55), Some(45), Some(15)],
+                ),
+            ],
+        };
+        // 134 puts the pin ceiling at 101: one whole four-track album fits, never two.
+        let (downloads, evictions, reversals, log) = sweep_days(&pins, 134, 400);
+        assert_eq!(
+            reversals, 1,
+            "the lead changed {reversals} times - it may change only on a STRICT \
+             takeover, never on a tie the quantizer manufactured: {log:#?}"
+        );
+        assert_eq!(
+            (downloads, evictions),
+            (8, 4),
+            "eight tracks, fetched once each, with one handover - not a cycle: {log:#?}"
+        );
+        // And the handover really is the strict crossing, not an accident of the
+        // ceiling: B leads from day 5 with a higher decile than A, and holds it.
+        let mut input = PassInput::new(PassMode::Full, 134);
+        input.pins = Some(pins.clone());
+        input.now_unix = NOW_TEST + 5 * 86_400;
+        let status = plan_pass_with_status(&input).1.expect("status");
+        assert_eq!(ranked_ids(&status), vec!["B", "A"]);
+        assert!(status.frontier[0].cold_decile > status.frontier[1].cold_decile);
+    }
+
+    #[test]
+    fn nothing_the_mirror_holds_is_re_fetched_by_the_passage_of_time_alone() {
+        // The same closed loop over the spread fixture: 400 days of NOTHING HAPPENING
+        // but the calendar moving. Every group's neglect ratchets, the order settles
+        // repeatedly, and the store must still move each byte at most once - a mirror
+        // that re-fetches what it already has because a decile ticked is the failure
+        // mode the frontier exists to make structurally impossible.
+        let pins = mixed_pin_set();
+        let (downloads, evictions, _, log) = sweep_days(&pins, 900, 400);
+        let unique: usize = {
+            let mut ids: Vec<&str> = pins.songs().map(|s| s.id.0.as_str()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids.len()
+        };
+        assert!(
+            downloads <= unique,
+            "{downloads} downloads for {unique} distinct tracks over 400 days - \
+             something was fetched twice: {log:#?}"
+        );
+        assert_eq!(evictions, 0, "and nothing it fetched was ever taken back: {log:#?}");
+        assert!(downloads > 0, "the sweep must actually fetch something, or it proves nothing");
+    }
+
+    #[test]
+    fn playing_a_track_is_the_one_thing_that_moves_a_group_down() {
+        // The mirror answers to HIM, not to a timer. A play lowers a group's cold
+        // share, which is the one direction that can demote a group - and it is
+        // exactly the responsiveness wanted, because what he plays he gets on demand
+        // anyway (the window arm is not budget-gated), while what he never plays is
+        // the only thing the mirror can give him that playing cannot.
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        let neglected = |ages: &[Option<u32>]| {
+            aged_grp(PinTier::Album, "al", &[("t1", 100), ("t2", 100)], ages)
+        };
+        input.pins = Some(PinSet {
+            groups: vec![
+                neglected(&[Some(300), Some(300)]),
+                aged_grp(PinTier::Album, "other", &[("o1", 100), ("o2", 100)], &[Some(70), Some(1)]),
+            ],
+        });
+        let (_, before) = plan_pass_with_status(&input);
+        let before = before.expect("status");
+        assert_eq!(ranked_ids(&before), vec!["al", "other"]);
+        assert_eq!(before.frontier[0].cold_decile, 10);
+
+        // He plays both of its tracks today. Same pass, same everything else.
+        input.pins = Some(PinSet {
+            groups: vec![
+                neglected(&[Some(0), Some(0)]),
+                aged_grp(PinTier::Album, "other", &[("o1", 100), ("o2", 100)], &[Some(70), Some(1)]),
+            ],
+        });
+        let (_, after) = plan_pass_with_status(&input);
+        let after = after.expect("status");
+        assert_eq!(
+            ranked_ids(&after),
+            vec!["other", "al"],
+            "playing it moved it DOWN, which is the only direction a play can move anything"
+        );
+        assert_eq!(after.frontier[1].cold_decile, 0);
+    }
+
+    #[test]
+    fn no_group_is_ever_half_admitted_at_any_score() {
+        // WHOLE-ALBUM ADMISSION SURVIVES THE RANKING. The play signal decides ORDER
+        // and nothing else: half an album, with no protocol-level way to say which
+        // half, is worse than none. Swept across the whole budget range so it holds
+        // at every possible position of the line rather than at one convenient one.
+        let pins = mixed_pin_set();
+        let mut any_cut = false;
+        for max_bytes in (100u64..1400).step_by(37) {
+            let mut input = PassInput::new(PassMode::Full, max_bytes);
+            input.now_unix = NOW_TEST;
+            input.download_batch = 64;
+            input.pins = Some(pins.clone());
+            let (plan, status) = plan_pass_with_status(&input);
+            let status = status.expect("status");
+            let fetched: HashSet<String> = dl_ids(&plan).into_iter().collect();
+            for g in &pins.groups {
+                let got = g.songs.iter().filter(|s| fetched.contains(&s.id.0)).count();
+                assert!(
+                    got == 0 || got == g.songs.len(),
+                    "budget {max_bytes}: group {} is HALF fetched ({got} of {})",
+                    g.id,
+                    g.songs.len()
+                );
+            }
+            // A named shortfall must name real bytes, at every position of the line.
+            for d in status.deferred() {
+                assert!(d.missing_bytes > 0, "budget {max_bytes}: {} names nothing", d.id);
+                any_cut = true;
+            }
+        }
+        assert!(any_cut, "the sweep must actually refuse something somewhere");
+    }
+
+    #[test]
+    fn the_reported_reason_is_the_key_the_comparator_sorted_on() {
+        // EXPLAIN FIDELITY, as a property rather than a hope. The explanation is read
+        // off the same vector the walk used, so re-deriving the key from the reported
+        // evidence must reproduce the reported order exactly. If a display path ever
+        // recomputed a score of its own, this is where the two would part.
+        let mut input = PassInput::new(PassMode::Full, 900);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        input.pins = Some(mixed_pin_set());
+        // Some bytes already here, so the INCUMBENCY clause is live rather than
+        // uniformly false - a fidelity check over a key with one clause switched off
+        // proves nothing about that clause.
+        input.entries = vec![pinned_entry("ah1", 200, 10), pinned_entry("s1", 80, 20)];
+        let (_, status) = plan_pass_with_status(&input);
+        let status = status.expect("status");
+
+        // The key, rebuilt from ONLY what a reader can see on the wire - INCLUDING the
+        // incumbency clause and the emphasis narrowing, both of which are readable
+        // off `held` and `cold_bytes`. If a clause ever decided without being
+        // reported, this is where the reconstruction stops matching.
+        let key = |g: &RankedGroup| {
+            (
+                g.tier.class(),
+                10 - g.cold_decile,
+                u8::from(!g.held),
+                emphasis_rank(g.tier, g.cold_bytes > 0),
+            )
+        };
+        for pair in status.frontier.windows(2) {
+            assert!(
+                key(&pair[0]) <= key(&pair[1]),
+                "{} (rank {}) reports a WORSE key than {} below it: {:?} vs {:?}",
+                pair[0].id,
+                pair[0].rank,
+                pair[1].id,
+                key(&pair[0]),
+                key(&pair[1])
+            );
+            assert_eq!(pair[1].rank, pair[0].rank + 1, "ranks are the positions, densely");
+        }
+        // And each group's own numbers are internally consistent - a cold track count
+        // that exceeded the track count, or a decile that did not follow from the
+        // bytes, would mean the printed reason was assembled rather than read.
+        for g in &status.frontier {
+            assert!(g.cold_tracks <= g.tracks);
+            assert!(g.never_played <= g.cold_tracks);
+            assert!(g.cold_bytes <= g.bytes);
+            assert!(g.cold_decile <= 10);
+            let expected = if g.bytes == 0 { 0 } else { (g.cold_bytes * 100 / g.bytes / 10) as u8 };
+            assert_eq!(g.cold_decile, expected, "{}: the decile follows from the bytes", g.id);
+            if let (Some(last), Some(oldest)) = (g.last_played_days, g.oldest_played_days) {
+                assert!(last <= oldest, "{}: freshest cannot be older than stalest", g.id);
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_group_names_what_it_lost_to_and_by_how_much() {
+        // The literal answer to "why not this one": you needed N more bytes at your
+        // position, and THIS is what took the space. Both taken at the refusal site,
+        // and asserted BY VALUE - a plausible-looking blame string that named the
+        // wrong album would be worse than none, because he would go and look at it.
+        let mut input = PassInput::new(PassMode::Full, 400);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                // Wholly neglected, so it leads and takes 200 of the 300 ceiling.
+                aged_grp(PinTier::Album, "winner", &[("w1", 200)], &[Some(300)]),
+                // Also cold but shorter, so it comes second - and 150 does not fit in
+                // the 100 that is left.
+                aged_grp(PinTier::Album, "loser", &[("l1", 75), ("l2", 75)], &[Some(300), Some(300)]),
+            ],
+        });
+        let (_, status) = plan_pass_with_status(&input);
+        let status = status.expect("status");
+        let loser = status.frontier.iter().find(|g| g.id == "loser").unwrap();
+        assert_eq!(loser.standing, GroupStanding::Deferred);
+        assert_eq!(loser.over_by, 50, "150 wanted against the 100 left under the ceiling");
+        assert_eq!(
+            loser.blocked_by.as_deref(),
+            Some("name-winner"),
+            "and it names the group that actually took the space"
+        );
+        // The winner fitted, so it missed by nothing and blames nobody.
+        let winner = status.frontier.iter().find(|g| g.id == "winner").unwrap();
+        assert_eq!((winner.over_by, winner.blocked_by.clone()), (0, None));
     }
 
     #[test]
@@ -5633,34 +7287,117 @@ title = "Minimal"
         let status = status.expect("a full pass with pins publishes a status");
         assert_eq!(status.resident_tracks, 2);
         assert_eq!(
-            status.deferred.iter().map(|d| (d.id.as_str(), d.tracks, d.bytes)).collect::<Vec<_>>(),
+            status
+                .deferred()
+                .map(|d| (d.id.as_str(), d.missing_tracks, d.missing_bytes))
+                .collect::<Vec<_>>(),
             vec![("huge", 3, 300)],
             "and the shortfall is one NAMED album, not an integer"
         );
+        // WHY it lost, taken at its own turn: it was charged 300 against a 150
+        // ceiling with nothing yet admitted, so it was 150 short and there was no
+        // earlier group to blame. Read off the same integers the walk used.
+        let huge = status.frontier.iter().find(|g| g.id == "huge").unwrap();
+        assert_eq!(huge.over_by, 150);
+        assert_eq!(huge.blocked_by, None, "nothing was admitted before it to lose to");
+        let small = status.frontier.iter().find(|g| g.id == "small").unwrap();
+        assert_eq!(small.standing, GroupStanding::Resident);
+        assert_eq!(small.over_by, 0, "a group that fitted missed by nothing");
     }
 
     #[test]
-    fn a_track_is_claimed_at_the_highest_tier_that_wants_it() {
-        // 20 of one real user's 47 starred songs are also starred-album tracks.
-        // First claim wins in frontier order, so such a track is tier SONG: it evicts
-        // last, and an album-level decision can never drag it out. Charging for it
-        // twice would also defer albums that actually fit.
+    fn a_shared_track_is_charged_once_to_whichever_group_reaches_it_first() {
+        // 20 of one real user's 47 starred songs are also starred-album tracks, so
+        // this case is common rather than a corner. FIRST CLAIM WINS in frontier
+        // order, and the invariant that matters is the one that never moved: it is
+        // charged and downloaded exactly ONCE, never once per claiming group, or
+        // albums that actually fit would be deferred for bytes nobody spends twice.
+        //
+        // WHAT DID MOVE, deliberately: at equal neglect the ALBUM now runs first, so
+        // it is the album that charges the shared track, and the starred-song group
+        // is then COVERED - every one of its tracks is already held BY A RESIDENT
+        // group, so nothing is missing and it is not named as a shortfall. This test
+        // was rewritten with the policy rather than patched around it; the numbers
+        // below are the new policy stated out loud, not an accident of it.
+        //
+        // Both groups are wholly COLD, which is what puts them under the ask's album
+        // clause at all - see `emphasis_rank`.
         let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.now_unix = NOW_TEST;
         input.download_batch = 16;
         input.pins = Some(PinSet {
             groups: vec![
-                grp(PinTier::Album, "al", &[("shared", 100), ("only-album", 100)]),
-                grp(PinTier::Song, "shared", &[("shared", 100)]),
+                aged_grp(
+                    PinTier::Album,
+                    "al",
+                    &[("shared", 100), ("only-album", 100)],
+                    &[Some(200), Some(200)],
+                ),
+                aged_grp(PinTier::Song, "shared", &[("shared", 100)], &[Some(200)]),
             ],
         });
         let (plan, status) = plan_pass_with_status(&input);
         let status = status.expect("status");
-        assert_eq!(status.tier_tracks[PinTier::Song as usize], 1, "the shared track is a SONG pin");
-        assert_eq!(status.tier_tracks[PinTier::Album as usize], 1, "the album keeps only its own");
+        assert_eq!(
+            status.tier_tracks[PinTier::Album as usize],
+            2,
+            "the album reached the shared track first and is charged for it"
+        );
+        assert_eq!(status.tier_tracks[PinTier::Song as usize], 0);
         assert_eq!(status.resident_tracks, 2, "and it is counted ONCE, not twice");
-        assert_eq!(status.tier_bytes[PinTier::Album as usize], 100);
-        // Downloaded once, at the song tier's position - not once per claiming group.
+        assert_eq!(status.tier_bytes[PinTier::Album as usize], 200);
+        assert_eq!(status.tier_bytes[PinTier::Song as usize], 0);
+        // Downloaded once, at the album's position - not once per claiming group.
         assert_eq!(dl_ids(&plan), vec!["shared", "only-album"]);
+        // The song group is COVERED, not deferred: naming it as a shortfall would
+        // claim something is missing when the album holds every byte of it.
+        let sng = status.frontier.iter().find(|g| g.tier == PinTier::Song).unwrap();
+        assert_eq!(sng.standing, GroupStanding::Covered);
+        assert_eq!(sng.missing_tracks, 0);
+        assert_eq!(status.deferred_count(), 0, "nothing is actually missing");
+    }
+
+    #[test]
+    fn a_track_only_a_deferred_group_wants_leaves_its_song_group_deferred_too() {
+        // COVERED MEANS HELD, and by a RESIDENT group - never merely "some other group
+        // listed it first". The distinction is the whole answer to "what did not fit?":
+        // a starred song sitting under a starred ALBUM that itself lost is on NOBODY's
+        // disk, so filing it as Covered drops it out of `deferred()` and therefore out
+        // of the badge count, the `Deferred:` lines, `dj store` and the journal. On one
+        // real library that hid twelve of his forty-seven hand-starred songs - by name:
+        // "Interlude", "Survival", "Sleeper Car" - behind deferred albums.
+        //
+        // The ceiling here fits ONE 100-byte group. The album that wants the shared
+        // track is refused, so the shared track is unheld, so the song group that also
+        // wants it is a real shortfall and must say so.
+        let mut input = PassInput::new(PassMode::Full, 134);
+        input.now_unix = NOW_TEST;
+        input.download_batch = 16;
+        input.pins = Some(PinSet {
+            groups: vec![
+                aged_grp(PinTier::Album, "winner", &[("w1", 100)], &[None]),
+                aged_grp(PinTier::Album, "big", &[("shared", 100), ("other", 100)], &[None, None]),
+                aged_grp(PinTier::Song, "shared-song", &[("shared", 100)], &[None]),
+            ],
+        });
+        let (plan, status) = plan_pass_with_status(&input);
+        let status = status.expect("status");
+        assert_eq!(dl_ids(&plan), vec!["w1"], "only the one group fits");
+        let by = |id: &str| status.frontier.iter().find(|g| g.id == id).unwrap().clone();
+        assert_eq!(by("big").standing, GroupStanding::Deferred);
+        assert_eq!(
+            by("shared-song").standing,
+            GroupStanding::Deferred,
+            "its track is wanted by a group that lost too - that is missing, not covered"
+        );
+        assert_eq!(
+            (by("shared-song").missing_tracks, by("shared-song").missing_bytes),
+            (1, 100),
+            "and it names its own shortfall rather than reporting zero"
+        );
+        let named: Vec<&str> = status.deferred().map(|g| g.id.as_str()).collect();
+        assert_eq!(named, vec!["big", "shared-song"], "BOTH are named, in frontier order");
+        assert_eq!(status.deferred_count(), 2);
     }
 
     #[test]
@@ -5682,12 +7419,18 @@ title = "Minimal"
         // frontier to 350 and is refused. Those numbers are chosen so the FRONTIER is
         // the only thing refusing it: there is ample raw headroom for `doomed`, so a
         // planner that consulted the budget alone would happily fetch it.
+        //
+        // `doomed` is the ARTIST fan-out, which is what puts it below the line under
+        // the current rule whatever its neglect - so the property under test here is
+        // the anti-thrash one, uncoupled from which ordering opinion happens to draw
+        // the line.
         let mut input = PassInput::new(PassMode::Full, 400);
+        input.now_unix = NOW_TEST;
         input.download_batch = 16;
         input.pins = Some(PinSet {
             groups: vec![
-                grp(PinTier::Song, "keep", &[("keep", 200)]),
-                grp(PinTier::Album, "doomed", &[("d1", 75), ("d2", 75)]),
+                hot_grp(PinTier::Album, "keep", &[("keep", 200)]),
+                hot_grp(PinTier::Artist, "doomed", &[("d1", 75), ("d2", 75)]),
             ],
         });
 
@@ -5770,18 +7513,26 @@ title = "Minimal"
     }
 
     #[test]
-    fn a_starred_song_is_the_last_thing_the_store_will_give_up() {
-        // The priority model, end to end: opportunistic bytes go first by real LRU,
-        // then the weakest gesture (a standing artist subscription), then an album,
-        // and a per-track act survives all of it. Concretely: starring two hundred
-        // more albums can never evict one of his starred songs - it can only fail to
-        // download.
+    fn eviction_walks_the_same_one_ordering_backwards() {
+        // THE POINT OF HAVING ONE ORDERING: eviction is the frontier read from the
+        // tail, so what admission refuses last is what removal takes first, and the
+        // two halves cannot contradict each other.
+        //
+        // This test REPLACES one that asserted a starred song outlives a starred
+        // album. That clause was a preference and it is the one he contradicted;
+        // what survives untouched, and is asserted first, is that opportunistic bytes
+        // go before ANY pin and an unbounded artist subscription goes before any
+        // hand-picked gesture.
         let mut input = PassInput::new(PassMode::Full, 100);
+        input.now_unix = NOW_TEST;
+        // Wholly COLD throughout, so all three tie on the neglect key and the ask's
+        // own clause is the thing being walked backwards here (see `emphasis_rank`:
+        // the clause speaks over neglected groups, which these are).
         input.pins = Some(PinSet {
             groups: vec![
-                grp(PinTier::Song, "sng", &[("sng", 100)]),
-                grp(PinTier::Album, "al", &[("alb", 100)]),
-                grp(PinTier::Artist, "ar", &[("art", 100)]),
+                aged_grp(PinTier::Song, "sng", &[("sng", 100)], &[Some(200)]),
+                aged_grp(PinTier::Album, "al", &[("alb", 100)], &[Some(200)]),
+                aged_grp(PinTier::Artist, "ar", &[("art", 100)], &[Some(200)]),
             ],
         });
         input.entries = vec![
@@ -5797,9 +7548,32 @@ title = "Minimal"
             vec![
                 "cold-but-recent".to_string(),
                 "art".to_string(),
+                "sng".to_string(),
+            ],
+            "opportunistic, then the unbounded artist subscription, then - at equal \
+             neglect - the loose starred song before the starred album"
+        );
+
+        // And the SAME walk with the neglect signal turned on: the album is the fresh
+        // one now, so it goes before the song. Removal reads the neglect key exactly
+        // as admission does - if it did not, the two would disagree the moment a
+        // group crossed the line, which is the download-evict loop this design exists
+        // to make structurally impossible.
+        input.pins = Some(PinSet {
+            groups: vec![
+                aged_grp(PinTier::Song, "sng", &[("sng", 100)], &[Some(200)]),
+                hot_grp(PinTier::Album, "al", &[("alb", 100)]),
+                hot_grp(PinTier::Artist, "ar", &[("art", 100)]),
+            ],
+        });
+        assert_eq!(
+            evictions(&plan_pass(&input)),
+            vec![
+                "cold-but-recent".to_string(),
+                "art".to_string(),
                 "alb".to_string(),
             ],
-            "opportunistic, then artist, then album - and the starred song survives"
+            "the 200-day-cold song now outranks the album, and removal agrees"
         );
     }
 

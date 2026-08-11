@@ -188,6 +188,54 @@ pub struct Song {
     /// a background pass notices the server's bytes changed under a stable id.
     #[serde(default)]
     pub created: Option<String>,
+    // ── the current user's listening history, as the SERVER records it.
+    // Navidrome is the durable owner of play history (hypodj scrobbles TO it),
+    // so these are read back rather than tracked locally. Both ride along on
+    // responses the daemon already makes - getStarred2, getAlbum, search3,
+    // getSimilarSongs2 - so they cost no extra round trip.
+    //
+    // CRITICAL to their meaning: the server OMITS both keys when there is no
+    // play record at all. It never sends `0` and never sends `null`. So `None`
+    // means "never played (within the server's history)" and `Some(0)` cannot
+    // occur - absence is itself the signal, not a hole in the data.
+    /// How many times THIS user has played the track (wire `Child.play_count`).
+    /// `None` = no play record, which is NOT the same as zero-just-now.
+    #[serde(default)]
+    pub play_count: Option<u32>,
+    /// When this user last played the track, ISO-8601 / RFC 3339 with an offset
+    /// (wire `Child.played`), e.g. `2026-08-06T14:17:24+01:00`. Carried VERBATIM
+    /// exactly like `created`; interpret it with [`Song::played_days_ago`], which
+    /// never panics on a malformed stamp.
+    #[serde(default)]
+    pub played: Option<String>,
+}
+
+impl Song {
+    /// Whole days since this song was last played, measured from an INJECTED
+    /// epoch (unix seconds).
+    ///
+    /// The epoch is a parameter rather than a `SystemTime::now()` read because
+    /// this is the input to a ranking: injection is what makes it table-testable
+    /// at any chosen date (including sweeps across a threshold) instead of being
+    /// a wall-clock read that can only be observed once and never rots visibly.
+    /// It is the same shape as [`crate::plan::validate`]'s `now_civil`.
+    ///
+    /// `None` when the server has no record OR the stamp does not parse. Both
+    /// mean the same thing to every caller - no usable recency - and collapsing
+    /// them is deliberate: a parse regression must never masquerade as a fresh
+    /// play. A FUTURE stamp (server timezone ahead, host clock behind, an NTP
+    /// step) saturates to 0 rather than wrapping into a huge age.
+    pub fn played_days_ago(&self, now_unix: u64) -> Option<u32> {
+        let raw = self.played.as_deref()?;
+        // Accepts both shapes the server emits: whole seconds with an offset
+        // (`2026-08-06T14:17:24+01:00`) and sub-second precision
+        // (`2026-07-10T11:45:09.98345312+01:00`), offsets as well as `Z`.
+        let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+        let elapsed = (now_unix as i64).saturating_sub(dt.timestamp());
+        // Clamp at 0 first, so a future stamp reads as "played today" instead of
+        // underflowing; then whole days, truncating.
+        Some((elapsed.max(0) / 86_400) as u32)
+    }
 }
 
 /// One thing that can sit in the play queue: either a resolved Subsonic [`Song`]
@@ -266,6 +314,140 @@ pub struct Station {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reference epoch every recency test measures from: 2026-08-10T00:00:00Z.
+    /// A FIXED, injected instant rather than a wall-clock read - that is the whole
+    /// point of `played_days_ago` taking its epoch as a parameter, and it is what
+    /// lets a threshold be swept deterministically instead of observed once.
+    const NOW: u64 = 1_786_320_000;
+
+    /// A minimal song carrying only a `played` stamp, which is all these tests read.
+    fn played_song(played: Option<&str>) -> Song {
+        Song {
+            id: SongId("so-1".into()),
+            title: "t".into(),
+            album: None,
+            album_id: None,
+            artist: None,
+            track: None,
+            duration_secs: None,
+            cover_art: None,
+            starred: false,
+            musicbrainz_id: None,
+            disc: None,
+            year: None,
+            genre: None,
+            bitrate: None,
+            comment: None,
+            user_rating: None,
+            composer: None,
+            performer: None,
+            size: None,
+            suffix: None,
+            content_type: None,
+            created: None,
+            play_count: None,
+            played: played.map(|p| p.to_string()),
+        }
+    }
+
+    #[test]
+    fn played_days_ago_reads_both_stamp_shapes_the_server_emits() {
+        // Whole seconds with a +01:00 OFFSET (not `Z`) is the common Navidrome
+        // shape; some rows carry nanosecond precision. Both must parse.
+        assert_eq!(
+            played_song(Some("2026-08-06T14:17:24+01:00")).played_days_ago(NOW),
+            Some(3)
+        );
+        assert_eq!(
+            played_song(Some("2026-07-10T11:45:09.98345312+01:00")).played_days_ago(NOW),
+            Some(30)
+        );
+        // `Z` is accepted too, so a non-Navidrome server is not silently unread.
+        assert_eq!(
+            played_song(Some("2026-08-09T00:00:00Z")).played_days_ago(NOW),
+            Some(1)
+        );
+        // The offset is APPLIED, not ignored. 00:30+01:00 is 23:30 the previous
+        // UTC day, so this is 24.5h ago = 1 day; reading the stamp as if it were
+        // UTC would give 23.5h = 0 days. This case is chosen precisely because
+        // the two interpretations straddle a whole-day boundary.
+        assert_eq!(
+            played_song(Some("2026-08-09T00:30:00+01:00")).played_days_ago(NOW),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn played_days_ago_truncates_to_whole_days_across_a_threshold() {
+        // The sweep that matters for any staleness rule: 59 / 60 / 61 whole days
+        // must be distinct and exact, so a `>= N days` test lands on the intended
+        // side. Truncating (not rounding) means 59d23h is still 59.
+        assert_eq!(
+            played_song(Some("2026-06-12T00:00:00Z")).played_days_ago(NOW),
+            Some(59)
+        );
+        assert_eq!(
+            played_song(Some("2026-06-11T00:00:00Z")).played_days_ago(NOW),
+            Some(60)
+        );
+        assert_eq!(
+            played_song(Some("2026-06-10T00:00:00Z")).played_days_ago(NOW),
+            Some(61)
+        );
+        // 59 days and 23 hours has not become 60.
+        assert_eq!(
+            played_song(Some("2026-06-11T01:00:00Z")).played_days_ago(NOW),
+            Some(59)
+        );
+    }
+
+    #[test]
+    fn played_days_ago_saturates_a_future_stamp_to_zero() {
+        // Server timezone ahead, host clock behind, or an NTP step. This must read
+        // as "played today", NEVER wrap into a huge age (which would make the
+        // track look maximally neglected) and never panic.
+        assert_eq!(
+            played_song(Some("2027-01-01T00:00:00Z")).played_days_ago(NOW),
+            Some(0)
+        );
+        assert_eq!(played_song(Some("2026-08-10T00:00:00Z")).played_days_ago(NOW), Some(0));
+        // Even an absurdly distant future stamp stays at 0 rather than underflowing.
+        assert_eq!(
+            played_song(Some("9999-12-31T23:59:59Z")).played_days_ago(NOW),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn played_days_ago_is_none_for_absent_or_unparseable_and_never_panics() {
+        // No record and a malformed stamp collapse to the SAME answer, and that is
+        // deliberate: both mean "no usable recency". The dangerous alternative
+        // would be defaulting to the epoch itself, which would score an unreadable
+        // stamp as freshly played.
+        assert_eq!(played_song(None).played_days_ago(NOW), None);
+        for bad in [
+            "",
+            "   ",
+            "not a date",
+            "2026-08-06",              // date only, no time - not RFC 3339
+            "2026-08-06T14:17:24",     // no offset
+            "2026-13-45T99:99:99Z",    // structurally shaped but impossible
+            "2026-08-06T14:17:24+99:00",
+            "\u{4e2d}\u{6587}",
+        ] {
+            assert_eq!(
+                played_song(Some(bad)).played_days_ago(NOW),
+                None,
+                "unparseable stamp {bad:?} must be None, not a fabricated age"
+            );
+        }
+        // A zero epoch is legal input and must not panic either.
+        assert_eq!(
+            played_song(Some("2026-08-06T14:17:24+01:00")).played_days_ago(0),
+            Some(0)
+        );
+    }
 
     #[test]
     fn favorite_from_uri_routes_each_kind_by_prefix() {

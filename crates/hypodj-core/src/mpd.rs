@@ -469,6 +469,11 @@ fn parse_mark(args: &[String], line: &str) -> MpdCommand {
 pub enum StoreCmd {
     /// The bare form: report. Read-only, and the only form a client needs.
     Show,
+    /// The WHOLE ranked pin frontier - every group, resident and deferred, with the
+    /// neglect evidence it was ranked on. `Show` names only what LOST; this answers
+    /// "and why that one", because what a refused group lost to is literally the line
+    /// above it. Read-only.
+    Frontier,
     /// Suspend BULK mirroring (stale replacements and starred backfill) for this
     /// process. Window and suspect downloads are unaffected - pausing the mirror
     /// must never make the next track stream.
@@ -485,6 +490,7 @@ fn parse_store(args: &[String], line: &str) -> MpdCommand {
     match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
         None => MpdCommand::Store(StoreCmd::Show),
         Some("status") | Some("show") if args.len() == 1 => MpdCommand::Store(StoreCmd::Show),
+        Some("frontier") if args.len() == 1 => MpdCommand::Store(StoreCmd::Frontier),
         Some("pause") if args.len() == 1 => MpdCommand::Store(StoreCmd::Pause),
         Some("resume") if args.len() == 1 => MpdCommand::Store(StoreCmd::Resume),
         Some("now") if args.len() == 1 => MpdCommand::Store(StoreCmd::Now),
@@ -1638,8 +1644,11 @@ mod parse_tests {
             ("store pause", StoreCmd::Pause),
             ("store resume", StoreCmd::Resume),
             ("store now", StoreCmd::Now),
+            // The whole ranked order - a read-only VIEW beside the three nudges.
+            ("store frontier", StoreCmd::Frontier),
             // Case-insensitive like every other subcommand word here.
             ("store PAUSE", StoreCmd::Pause),
+            ("store FRONTIER", StoreCmd::Frontier),
         ] {
             assert!(
                 matches!(parse(line), MpdCommand::Store(got) if got == want),
@@ -1653,6 +1662,8 @@ mod parse_tests {
         assert!(matches!(parse("store pause now"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("store now please"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("store status extra"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("store frontier extra"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("store frontiers"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

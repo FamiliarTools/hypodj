@@ -7,6 +7,7 @@ mod heard;
 mod pls;
 mod render;
 mod stations;
+mod store;
 
 use std::io::{BufRead, Write};
 
@@ -48,6 +49,11 @@ USAGE:
                            With no PATH, reads $HYPODJ_STATIONS_DIR
   dj stations list | rm <name>
                           list / remove saved stations
+  dj store                the offline mirror: what is held, what is budgeted, and
+                           every favourite that did not fit - each with WHY it lost
+  dj store frontier       the whole ranked order, best to worst
+  dj store now | pause | resume
+                          reconcile now / suspend bulk mirroring / resume it
   dj <anything else>      natural language: e.g. \"fade out\", \"stop after this
                            album\", \"wake me at 7 with jazz\" - echoed + confirmed
 
@@ -171,6 +177,19 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         if !heard::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `store` is intercepted BEFORE route() for the third time and the same stated
+    // reason: route knows no store verb at all, so every form of this - including the
+    // bare one - would be handed to the NL translator, which has no store action.
+    if parsed.words.first().is_some_and(|w| w == "store") {
+        let env = Env { get: &|k| std::env::var(k).ok() };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        if !store::run(&mut conn, &parsed.words[1..])? {
             std::process::exit(1);
         }
         return Ok(());
@@ -516,6 +535,27 @@ mod tests {
         // The bare views DO route, which is what makes `:heard` work in the TUI.
         assert_eq!(route::route(&v(&["heard"])), Action::Command("heard".into()));
         assert_eq!(route::route(&v(&["heard", "all"])), Action::Command("heard all".into()));
+    }
+
+    #[test]
+    fn store_must_be_intercepted_because_route_knows_no_store_verb_at_all() {
+        // WHY `store` is claimed before route(), and it is a stronger case than
+        // `heard`: route knows the bare `heard` views, but it knows NO store form -
+        // so even `dj store` would be handed to the NL translator, which has no store
+        // action, and the answer to "what did not fit and why" would come back as a
+        // phrasing hint.
+        assert_eq!(route::route(&v(&["store"])), Action::Nl("store".into()));
+        assert_eq!(
+            route::route(&v(&["store", "frontier"])),
+            Action::Nl("store frontier".into())
+        );
+        // And the tokens survive parse_args intact, so the interception sees them.
+        let p = parse_args(v(&["store", "frontier"])).unwrap();
+        assert_eq!(p.words, v(&["store", "frontier"]));
+        assert_eq!(p.words.first().map(String::as_str), Some("store"));
+        let p = parse_args(v(&["--port", "6699", "store"])).unwrap();
+        assert_eq!(p.port, Some(6699));
+        assert_eq!(p.words, v(&["store"]));
     }
 
     #[test]

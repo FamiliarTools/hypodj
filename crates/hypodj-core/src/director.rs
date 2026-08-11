@@ -620,6 +620,8 @@ mod tests {
             suffix: None,
             content_type: None,
             created: None,
+            play_count: None,
+            played: None,
         }
     }
 

@@ -5474,8 +5474,9 @@ impl HypodjHandler {
         if st.waiting != crate::store::StoreWaiting::None {
             line.push_str(&format!(", waiting ({})", st.waiting.label()));
         }
-        if !st.deferred.is_empty() {
-            line.push_str(&format!(", {} deferred", st.deferred.len()));
+        let deferred = st.deferred_count();
+        if deferred > 0 {
+            line.push_str(&format!(", {deferred} deferred"));
         }
         if st.given_up > 0 {
             line.push_str(&format!(", {} given up", st.given_up));
@@ -5483,7 +5484,46 @@ impl HypodjHandler {
         vec![("X-Store", line)]
     }
 
-    /// `store` / `store pause` / `store resume` / `store now`.
+    /// The neglect evidence for one ranked group, in one line: the integers the
+    /// frontier's comparator actually sorted on, in the order it asked them.
+    ///
+    /// ONE formatter for the deferred list, the full frontier listing and anything
+    /// later - so no two surfaces can describe the same decision differently. It
+    /// reads only what [`crate::store::RankedGroup`] carries and derives nothing, which
+    /// is what makes the reason unable to drift from the decision.
+    fn rank_reason(g: &crate::store::RankedGroup) -> String {
+        let mut s = format!(
+            "cold {}/10 ({} of {} tracks, {} never played)",
+            g.cold_decile, g.cold_tracks, g.tracks, g.never_played
+        );
+        // The INCUMBENCY clause, printed because it decides exact ties - and a tie is
+        // where most of a big library sits. Without it the listed order looks
+        // arbitrary at every tie it settled.
+        if g.held {
+            s.push_str(", on disk");
+        }
+
+        s.push_str(&format!(", {} plays", g.plays));
+        match g.last_played_days {
+            Some(d) => s.push_str(&format!(", last {d}d ago")),
+            None => s.push_str(", never heard"),
+        }
+        if g.over_by > 0 {
+            s.push_str(&format!("; {} bytes short", g.over_by));
+            if let Some(prev) = &g.blocked_by {
+                s.push_str(&format!(" after \"{prev}\""));
+            }
+            // WHICH bound refused it. Omitting this leaves "N bytes short" printed
+            // against a mirror that visibly had room, which reads as the walk
+            // contradicting its own arithmetic rather than as a deliberate reservation.
+            if g.held_back_by_floor {
+                s.push_str(" (space held for hand-picked favourites)");
+            }
+        }
+        s
+    }
+
+    /// `store` / `store frontier` / `store pause` / `store resume` / `store now`.
     ///
     /// SYNC and cheap by contract: it answers from the status a pass already
     /// published, so it costs no network and no directory scan however often a TUI
@@ -5505,7 +5545,7 @@ impl HypodjHandler {
                 store.set_paused(false);
             }
             StoreCmd::Now => store.kick_full(),
-            StoreCmd::Show => {}
+            StoreCmd::Show | StoreCmd::Frontier => {}
         }
         let st = store.status();
         let mut b = MpdResponse::pairs()
@@ -5532,7 +5572,13 @@ impl HypodjHandler {
             .pair("X-StoreWaiting", st.waiting.label())
             // LOAD-BEARING: without it a pending count that will NEVER reach zero is
             // indistinguishable from one that is merely slow.
-            .pair("X-StoreGivenUp", st.given_up.to_string());
+            .pair("X-StoreGivenUp", st.given_up.to_string())
+            // THE ACTIVE RULE, in one line, next to its own outcome. Rule and result
+            // readable together is what turns "clever" into "predictable" - he can
+            // tell a good decision from a bug only if he knows what was being
+            // decided - and it makes a future rule change self-documenting on the
+            // wire instead of a silent reshuffle.
+            .pair("X-StoreRule", crate::store::frontier_rule());
         for (i, tier) in [
             crate::store::PinTier::Song,
             crate::store::PinTier::Album,
@@ -5546,19 +5592,48 @@ impl HypodjHandler {
                 format!("{} {} {}", tier.label(), st.tier_tracks[i], st.tier_bytes[i]),
             );
         }
+        // `store frontier`: the WHOLE ranked order, every group, in the order the
+        // walk saw them. Strictly more informative than a per-group "why" lookup and
+        // it needs no uri parsing, because what a refused group lost to is the line
+        // above it. The deciles read NON-INCREASING down each class, which is the
+        // decision-matches-explanation check anyone can do by eye.
+        if cmd == StoreCmd::Frontier {
+            for g in &st.frontier {
+                b = b.pair(
+                    "Frontier",
+                    format!(
+                        "{} {} {} \"{}\" {} tracks {} bytes ({}) {}",
+                        g.rank + 1,
+                        g.standing.label(),
+                        g.uri(),
+                        g.name,
+                        g.tracks,
+                        g.bytes,
+                        g.tier.label(),
+                        Self::rank_reason(g),
+                    ),
+                );
+            }
+        }
         // The shortfall as a NAMED LIST, which is the whole reason the old
-        // integer-only overflow warn was not good enough.
-        for d in &st.deferred {
+        // integer-only overflow warn was not good enough - now carrying WHY each one
+        // lost. The leading `<kind>/<id> "<name>" N tracks N bytes (<tier>)` shape is
+        // unchanged, so anything already parsing this pair keeps working, and the
+        // counts stay the MISSING ones: what he is actually not getting.
+        // ...and ONLY in the default view. `store frontier` already listed every
+        // group including these, so emitting both makes the one surface whose job is
+        // to look trustworthy print all 88 rows and then repeat 85 of them.
+        for d in st.deferred().into_iter().filter(|_| cmd != StoreCmd::Frontier) {
             b = b.pair(
                 "Deferred",
                 format!(
-                    "{}/{} \"{}\" {} tracks {} bytes ({})",
-                    d.kind.label(),
-                    d.id,
+                    "{} \"{}\" {} tracks {} bytes ({}) - {}",
+                    d.uri(),
                     d.name,
-                    d.tracks,
-                    d.bytes,
-                    d.tier.label()
+                    d.missing_tracks,
+                    d.missing_bytes,
+                    d.tier.label(),
+                    Self::rank_reason(d),
                 ),
             );
         }
@@ -10518,6 +10593,12 @@ fn placeholder_song(id: &SongId) -> Song {
         suffix: None,
         content_type: None,
         created: None,
+        // Nothing invented, per this function's contract: we do not know this
+        // track's play history yet, and `None` says exactly that. A `Some(0)`
+        // here would claim "never played" as a fact about the server's records
+        // rather than an admission of our own ignorance.
+        play_count: None,
+        played: None,
     }
 }
 
@@ -10531,7 +10612,7 @@ fn song_pairs(item: &QueueItem, pos: usize) -> Vec<(String, String)> {
                 ("file".to_string(), format!("song/{}", s.id.0)),
                 ("Title".to_string(), s.title.clone()),
             ];
-            push_song_tags(&mut p, s);
+            push_song_tags(&mut p, s, crate::store::now_unix());
             p
         }
         QueueEntry::Stream { url, title } => vec![
@@ -13441,12 +13522,35 @@ fn browse_song_pairs(s: &Song) -> Vec<(String, String)> {
         ("file".to_string(), format!("song/{}", s.id.0)),
         ("Title".to_string(), s.title.clone()),
     ];
-    push_song_tags(&mut p, s);
+    push_song_tags(&mut p, s, crate::store::now_unix());
     p
 }
 
 /// Append the common + richer tags for a song (shared by browse + queue rows).
-fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song) {
+///
+/// `now_unix` is INJECTED rather than read here so the day arithmetic on the play
+/// stats below is a pure function the tests can pin to a fixed date - the same reason
+/// the store's frontier takes its epoch as an argument.
+fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
+    // THE SERVER'S OWN LISTENING HISTORY, on every song row - browse, Find, the
+    // queue, and `currentsong`. Both are emitted ONLY when the server actually has a
+    // record (never a `0` or a placeholder line), exactly like `X-Starred` below,
+    // which is what keeps "never played" distinguishable from "played zero times".
+    //
+    // Same channel as the already-live `X-Starred` and `X-AlbumUri`: libmpdclient
+    // swallows unknown song-row keys, and ncmpcpp has run against those for months.
+    //
+    // `X-LastPlayed` carries WHOLE DAYS, not the raw stamp, and is rendered
+    // daemon-side for the reason the store line is: the numbers live here, so one
+    // formatter means two clients can never disagree about the same track. It reads
+    // through the one shared parser, so there is a single implementation and a single
+    // test table.
+    if let Some(n) = s.play_count {
+        p.push(("X-Plays".to_string(), n.to_string()));
+    }
+    if let Some(d) = s.played_days_ago(now_unix) {
+        p.push(("X-LastPlayed".to_string(), d.to_string()));
+    }
     // A non-standard hint so the clients can show a heart in Now Playing when the
     // current track is a Subsonic favorite. Emitted ONLY when starred (never a
     // `0` line), so the pair stays well-formed and strict MPD clients (ncmpcpp)
@@ -13645,6 +13749,8 @@ mod tests {
             suffix: None,
             content_type: None,
             created: None,
+            play_count: None,
+            played: None,
         }
     }
 
@@ -16933,6 +17039,46 @@ mod tests {
         assert_eq!(starred[0].1, "1");
     }
 
+    #[test]
+    fn push_song_tags_emits_the_play_stats_only_when_the_server_has_them() {
+        // The server OMITS its play keys when there is no record, so `None` here means
+        // "never played" rather than "unknown". Emitting a `0` or a placeholder would
+        // destroy that distinction on the wire for every client at once - so both
+        // pairs follow the `X-Starred` rule exactly and are absent when absent.
+        const NOW: u64 = 1_786_320_000; // 2026-08-10T00:00:00Z, injected.
+        let mut p = Vec::new();
+        let mut s = playlist_test_song("s-1");
+        push_song_tags(&mut p, &s, NOW);
+        assert!(!p.iter().any(|(k, _)| k == "X-Plays"), "never a fabricated 0 plays");
+        assert!(!p.iter().any(|(k, _)| k == "X-LastPlayed"));
+
+        // With a record: the count verbatim, and the age in WHOLE DAYS - rendered
+        // daemon-side through the one shared parser, so `dj` and a future dj-gui
+        // cannot disagree about the same track and there is one test table.
+        s.play_count = Some(23);
+        s.played = Some("2026-08-07T14:00:00+01:00".into());
+        let mut p = Vec::new();
+        push_song_tags(&mut p, &s, NOW);
+        let get = |k: &str| p.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        assert_eq!(get("X-Plays").as_deref(), Some("23"));
+        assert_eq!(get("X-LastPlayed").as_deref(), Some("2"), "days, not a stamp");
+
+        // One key without the other is a real shape and neither is inferred from the
+        // other: a count with no stamp must not invent an age.
+        s.played = None;
+        let mut p = Vec::new();
+        push_song_tags(&mut p, &s, NOW);
+        assert_eq!(p.iter().filter(|(k, _)| k == "X-Plays").count(), 1);
+        assert!(!p.iter().any(|(k, _)| k == "X-LastPlayed"));
+
+        // An unparseable stamp is silence, never a fabricated "played today" - which
+        // is the failure that would matter, because it reads as maximally fresh.
+        s.played = Some("not a date".into());
+        let mut p = Vec::new();
+        push_song_tags(&mut p, &s, NOW);
+        assert!(!p.iter().any(|(k, _)| k == "X-LastPlayed"));
+    }
+
     #[tokio::test]
     async fn set_queue_starred_flips_currentsong_heart_live() {
         let Some((h, _events)) = handler_with_null_player() else { return };
@@ -17575,6 +17721,8 @@ mod tests {
             suffix: None,
             content_type: None,
             created: None,
+            play_count: None,
+            played: None,
         }
     }
 
@@ -22293,6 +22441,8 @@ mod tests {
             suffix: None,
             content_type: None,
             created: None,
+            play_count: None,
+            played: None,
         }
     }
 
@@ -24146,6 +24296,144 @@ mod tests {
             "the shortfall names the album: {}",
             deferred[0]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pin set with a deliberate cut: one wholly neglected album that fits, and one
+    /// freshly played album that does not - so both the ranking and the reason have
+    /// something real to say.
+    fn ranked_status_fixture() -> crate::store::StoreStatus {
+        let played = |id: &str, size: u64, stamp: Option<&str>, plays: Option<u32>| {
+            let mut s = store_song(id, size);
+            s.played = stamp.map(str::to_string);
+            s.play_count = plays;
+            s
+        };
+        let mut input = crate::store::PassInput::new(crate::store::PassMode::Full, 1000);
+        input.configured_max = 4000;
+        // 2026-08-10T00:00:00Z, injected - never a wall-clock read, so the day
+        // figures below are fixed rather than drifting one per day.
+        input.now_unix = 1_786_320_000;
+        input.pins = Some(crate::store::PinSet {
+            groups: vec![
+                crate::store::PinGroup {
+                    kind: crate::store::PinKind::Album,
+                    id: "al-neglected".into(),
+                    name: "Never Touched".into(),
+                    tier: crate::store::PinTier::Album,
+                    songs: vec![
+                        played("c1", 300, None, None),
+                        played("c2", 300, Some("2025-01-01T00:00:00Z"), Some(2)),
+                    ],
+                },
+                crate::store::PinGroup {
+                    kind: crate::store::PinKind::Album,
+                    id: "al-fresh".into(),
+                    name: "Played Last Week".into(),
+                    tier: crate::store::PinTier::Album,
+                    songs: vec![played("h1", 900, Some("2026-08-05T00:00:00Z"), Some(103))],
+                },
+            ],
+        });
+        crate::store::plan_pass_with_status(&input)
+            .1
+            .expect("a full pass with pins publishes")
+    }
+
+    #[tokio::test]
+    async fn the_store_verb_states_the_rule_and_why_each_deferred_group_lost() {
+        // A ranking that is clever but unexplainable is WORSE than one that is dumb
+        // and predictable, because he cannot then tell a good decision from a bug. So
+        // the rule and the outcome must be readable together, and every refused group
+        // must carry the integers it was refused on.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-why");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        store.publish_status_for_test(ranked_status_fixture());
+
+        let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Show)).await);
+        let get = |k: &str| pairs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        // THE ACTIVE RULE, in one line, beside its own outcome - and single-sourced
+        // from the store, so it cannot describe a rule the comparator is not using.
+        assert_eq!(
+            get("X-StoreRule").as_deref(),
+            Some(crate::store::frontier_rule().as_str()),
+            "the rule ships next to the result, or the result is unreadable"
+        );
+
+        let deferred: Vec<&String> =
+            pairs.iter().filter(|(k, _)| k == "Deferred").map(|(_, v)| v).collect();
+        assert_eq!(deferred.len(), 1, "the FRESH album is the one that lost");
+        let d = deferred[0];
+        // The unchanged head, so anything already parsing this pair keeps working.
+        assert!(
+            d.starts_with("album/al-fresh \"Played Last Week\" 1 tracks 900 bytes (album)"),
+            "the existing shape leads: {d}"
+        );
+        // Then the reason, in the integers the comparator actually compared.
+        assert!(d.contains("cold 0/10 (0 of 1 tracks, 0 never played)"), "{d}");
+        assert!(d.contains("103 plays"), "the evidence he can check it against: {d}");
+        assert!(d.contains("last 5d ago"), "{d}");
+        assert!(
+            d.contains("bytes short after \"Never Touched\""),
+            "and what it actually lost to: {d}"
+        );
+        // The bare `store` view stays the SHORTFALL list: the full order is a
+        // different question and a different verb.
+        assert!(!pairs.iter().any(|(k, _)| k == "Frontier"), "`store` names only what lost");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn store_frontier_prints_the_whole_ranked_order_best_first() {
+        // "What did it lose to?" needs no per-group lookup and no uri parsing: it is
+        // literally the line above. That is why this is one listing rather than a
+        // `store why <uri>` - it is strictly more informative and strictly simpler.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-frontier");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        store.publish_status_for_test(ranked_status_fixture());
+
+        let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Frontier)).await);
+        let rows: Vec<&String> =
+            pairs.iter().filter(|(k, _)| k == "Frontier").map(|(_, v)| v).collect();
+        assert_eq!(rows.len(), 2, "EVERY group, won or lost - not just the shortfall");
+        // ...and ONLY that listing. The frontier already names every deferred group
+        // in place, so also emitting the shortfall list makes the surface print all
+        // of its rows and then repeat most of them - 176 lines where 91 were meant,
+        // on the one view whose entire job is to look trustworthy.
+        assert!(
+            !pairs.iter().any(|(k, _)| k == "Deferred"),
+            "the frontier view says everything once"
+        );
+        assert!(
+            rows[0].starts_with("1 resident album/al-neglected \"Never Touched\" 2 tracks 600 bytes (album) cold 10/10"),
+            "the neglected album leads, and says why: {}",
+            rows[0]
+        );
+        assert!(
+            rows[1].starts_with("2 deferred album/al-fresh \"Played Last Week\" 1 tracks 900 bytes (album) cold 0/10"),
+            "and the fresh one is below it: {}",
+            rows[1]
+        );
+        // The deciles read NON-INCREASING down the list, which is the
+        // decision-matches-explanation check anyone can do by eye on live output.
+        let deciles: Vec<u32> = rows
+            .iter()
+            .map(|r| {
+                // The reason clause is the TAIL of the row, so read the decile from
+                // the last `cold ` - a group whose name or id happens to contain the
+                // word must not be mistaken for it.
+                let at = r.rfind("cold ").expect("every row carries its decile");
+                r[at + 5..].split('/').next().unwrap().parse().unwrap()
+            })
+            .collect();
+        assert!(deciles.windows(2).all(|w| w[0] >= w[1]), "deciles must not rise: {deciles:?}");
+        // The listing is a VIEW: asking for it changes nothing about the mirror.
+        assert!(!store.take_full_request_for_test(), "`store frontier` is read-only");
+        assert!(!store.paused());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

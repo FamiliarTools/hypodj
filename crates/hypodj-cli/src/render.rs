@@ -74,6 +74,13 @@ pub fn render_card(np: &NowPlaying) -> String {
     if !status_bits.is_empty() {
         lines.push(status_bits.join(" | "));
     }
+    // The server's own listening history for this track, when it has one. A quiet
+    // line, and absent rather than zeroed when the server records nothing - "never
+    // played" is a claim the daemon makes by staying silent, and inventing "0 plays"
+    // here would put words in its mouth.
+    if let Some(l) = render_history(np.plays, np.last_played_days) {
+        lines.push(l);
+    }
     if let Some(a) = armed {
         lines.push(a);
     }
@@ -95,6 +102,29 @@ pub fn render_card(np: &NowPlaying) -> String {
         lines.push(format!("store: {store}"));
     }
     lines.join("\n")
+}
+
+/// The server's play history for the current track as one line, e.g.
+/// `23 plays, last heard 3 days ago`. `None` when the server records neither, so a
+/// track it has never seen played renders nothing at all rather than a row of zeros.
+///
+/// Both halves are independently optional because the daemon emits them
+/// independently: a count with no stamp, or a stamp with no count, is a real shape.
+fn render_history(plays: Option<u32>, last_played_days: Option<u32>) -> Option<String> {
+    let mut bits = Vec::new();
+    if let Some(n) = plays {
+        bits.push(format!("{n} {}", if n == 1 { "play" } else { "plays" }));
+    }
+    match last_played_days {
+        Some(0) => bits.push("last heard today".to_string()),
+        Some(1) => bits.push("last heard yesterday".to_string()),
+        Some(d) => bits.push(format!("last heard {d} days ago")),
+        None => {}
+    }
+    if bits.is_empty() {
+        return None;
+    }
+    Some(bits.join(", "))
 }
 
 /// The active latent-field pulls as one unobtrusive line, e.g.
@@ -430,5 +460,42 @@ mod tests {
         // No store (or no full pass yet): no line at all, exactly like the armed HUD.
         let lean = p(&[("state", "stop")]);
         assert!(!render_card(&now_playing(&lean, &[])).contains("store:"));
+    }
+
+    #[test]
+    fn the_card_shows_the_servers_play_history_and_stays_silent_without_it() {
+        let status = p(&[("state", "play"), ("volume", "70")]);
+        let card = render_card(&now_playing(
+            &status,
+            &p(&[
+                ("file", "song/42"),
+                ("Title", "Blue in Green"),
+                ("X-Plays", "23"),
+                ("X-LastPlayed", "3"),
+            ]),
+        ));
+        assert!(card.contains("23 plays, last heard 3 days ago"), "card: {card}");
+
+        // A track the server has never seen played renders NOTHING - not "0 plays",
+        // which would be a claim the daemon deliberately declined to make.
+        let card = render_card(&now_playing(
+            &status,
+            &p(&[("file", "song/42"), ("Title", "Blue in Green")]),
+        ));
+        assert!(!card.contains("plays"), "no history, no line: {card}");
+        assert!(!card.contains("last heard"), "card: {card}");
+
+        // The two English corners a bare "N days ago" gets wrong.
+        let today = render_card(&now_playing(
+            &status,
+            &p(&[("Title", "T"), ("X-Plays", "1"), ("X-LastPlayed", "0")]),
+        ));
+        assert!(today.contains("1 play, last heard today"), "card: {today}");
+        let yday = render_card(&now_playing(
+            &status,
+            &p(&[("Title", "T"), ("X-LastPlayed", "1")]),
+        ));
+        assert!(yday.contains("last heard yesterday"), "card: {yday}");
+        assert!(!yday.contains("plays"), "a stamp with no count invents no count: {yday}");
     }
 }

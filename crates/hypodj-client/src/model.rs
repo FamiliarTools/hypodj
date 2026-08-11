@@ -87,6 +87,19 @@ pub struct NowPlaying {
     /// full pass with an authoritative pin set - a row of zeros would read as "the
     /// mirror is empty", which is a different claim from "nobody has looked yet".
     pub store: Option<String>,
+    /// How many times the SERVER records this user playing the current track, from the
+    /// daemon's non-standard `X-Plays` pair on `currentsong`.
+    ///
+    /// `None` means the server has NO play record, which is a different claim from zero
+    /// and stays different here: the daemon omits the pair rather than sending a `0`,
+    /// so an un-played track and an old daemon both read as `None` and neither invents
+    /// a count.
+    pub plays: Option<u32>,
+    /// Whole days since the server last recorded this user playing the current track,
+    /// from the daemon's `X-LastPlayed` pair. Rendered daemon-side in DAYS rather than
+    /// as a stamp, so one formatter serves every client and the date arithmetic has one
+    /// implementation. `None` when there is no play record.
+    pub last_played_days: Option<u32>,
 }
 
 /// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
@@ -265,6 +278,10 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         hint: AmbientHint::parse(status),
         continuation: parse_continuation(status),
         store: find(status, "X-Store").map(str::to_string),
+        // Absent pair -> None, never a fabricated zero: the daemon emits these only
+        // when the server actually has a record.
+        plays: find(current, "X-Plays").and_then(|v| v.parse().ok()),
+        last_played_days: find(current, "X-LastPlayed").and_then(|v| v.parse().ok()),
     }
 }
 
@@ -422,6 +439,34 @@ mod tests {
         // A library song (no Name pair) leaves np.name None.
         let lib = now_playing(&status, &p(&[("file", "song/1"), ("Title", "T")]));
         assert!(lib.name.is_none(), "a library song carries no station Name");
+    }
+
+    #[test]
+    fn nowplaying_parses_the_servers_play_history_and_never_invents_it() {
+        // The daemon emits these ONLY when the server has a record, so an absent pair
+        // must stay `None` here rather than becoming a zero. "Never played" and
+        // "played zero times just now" are different claims, and an old daemon that
+        // sends neither must not be reported as a library nobody has ever listened to.
+        let current = p(&[
+            ("file", "song/42"),
+            ("Title", "Blue in Green"),
+            ("X-Plays", "23"),
+            ("X-LastPlayed", "3"),
+        ]);
+        let np = now_playing(&[], &current);
+        assert_eq!(np.plays, Some(23));
+        assert_eq!(np.last_played_days, Some(3), "whole days, rendered daemon-side");
+
+        let bare = now_playing(&[], &p(&[("file", "song/42"), ("Title", "T")]));
+        assert_eq!(bare.plays, None, "an absent pair is NOT zero plays");
+        assert_eq!(bare.last_played_days, None);
+
+        // Independently optional, and a malformed value degrades to None rather than
+        // to a fabricated number.
+        let partial = now_playing(&[], &p(&[("file", "song/42"), ("X-Plays", "1")]));
+        assert_eq!((partial.plays, partial.last_played_days), (Some(1), None));
+        let junk = now_playing(&[], &p(&[("X-Plays", "lots"), ("X-LastPlayed", "-4")]));
+        assert_eq!((junk.plays, junk.last_played_days), (None, None));
     }
 
     #[test]
