@@ -14,6 +14,7 @@
 pub mod cache;
 pub mod clock;
 pub mod config;
+pub mod cover_store;
 pub mod director;
 pub mod echo;
 pub mod event;

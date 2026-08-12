@@ -291,6 +291,30 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("offline store disabled by config");
     }
 
+    // THE COVER STORE: cover-art bytes on disk, a SIBLING of `store/` for the same
+    // structural reason the tape is one (the audio store's reconciler deletes
+    // everything in its own root that is not a valid cached song). No config section
+    // and no enable flag: it is pure derived data with a fixed budget, losing it costs
+    // a re-fetch, and the failure posture is the rest of this block's - a warn, then
+    // run without it (covers then come from the memory cache and the network, exactly
+    // as they did before).
+    if let Some(dir) = state_dir.as_ref().map(|d| d.join("covers")) {
+        match hypodj_core::cover_store::CoverStore::open(
+            dir.clone(),
+            hypodj_core::cover_store::DEFAULT_MAX_BYTES,
+        ) {
+            Ok(covers) => {
+                tracing::info!(dir = %dir.display(), bytes = covers.bytes(), "cover store open");
+                handler.set_cover_store(Arc::new(covers));
+            }
+            Err(e) => tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "cover store unavailable; covers will be fetched per session"
+            ),
+        }
+    }
+
     // THE HEARD LEDGER. Root: an explicit [heard].dir wins, else <state_dir>/heard -
     // the same shape the store root uses, and deliberately NOT inside `store/`, whose
     // reconciler owns its directory exclusively and deletes everything in it that is not
