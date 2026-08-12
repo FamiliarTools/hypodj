@@ -3132,6 +3132,49 @@ mod sixel_render_tests {
         assert_ne!(first, resized);
     }
 
+
+    /// A terminal that answers DA1 but has not published a pixel geometry yet
+    /// must still get images once it does.
+    ///
+    /// A freshly mapped window reports correct character dimensions at once but
+    /// takes 20 to 100 ms to report pixel dimensions, and 4 cold launches in 6
+    /// were measured reporting 0x0 at first. The startup probe lands inside
+    /// that window, so a session that asked once and never asked again lost
+    /// images for its whole lifetime - which is exactly the intermittent
+    /// "no cover in a new window" report.
+    ///
+    /// This pins the RENDER side of that contract: sixel is refused while the
+    /// geometry is missing, and drawn once it arrives, with no other state
+    /// having changed.
+    #[test]
+    fn a_late_pixel_geometry_still_yields_images() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let a = art();
+        let rect = Rect { x: 0, y: 0, width: 8, height: 4 };
+
+        // The window has not been allocated yet: no geometry, so no image.
+        terminal
+            .draw(|f| {
+                assert!(
+                    !render_sixel_art(f, rect, &a, None, false),
+                    "must refuse while the geometry is unknown"
+                );
+            })
+            .unwrap();
+
+        // The compositor allocates it and a cell size appears. Nothing else
+        // changed, and the image must now draw.
+        terminal
+            .draw(|f| {
+                assert!(
+                    render_sixel_art(f, rect, &a, Some((8, 17)), false),
+                    "must draw once the geometry arrives"
+                );
+                assert!(f.buffer_mut()[(0, 0)].symbol().starts_with("\x1bP"));
+            })
+            .unwrap();
+    }
+
     /// Refusals fall back rather than drawing something wrong.
     #[test]
     fn refuses_when_it_cannot_draw_safely() {

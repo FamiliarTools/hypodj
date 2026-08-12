@@ -573,6 +573,14 @@ pub struct TuiState {
     /// answers without parameter 4, or reports a zero-sized cell keeps the sextant
     /// renderer without any special casing. It is also why the existing TestBackend
     /// tests still exercise the cell path unchanged.
+
+    /// Whether the terminal ANSWERED that it can draw sixel.
+    ///
+    /// Kept apart from [`sixel_cell_px`] because only the geometry is racy: a
+    /// freshly mapped window answers DA1 at once but can take 20 to 100 ms to
+    /// publish a pixel size. Storing only the combined answer meant a startup
+    /// inside that window disabled images for the whole session.
+    pub sixel_supported: bool,
     pub sixel_cell_px: Option<(u16, u16)>,
     /// Whether an overlay (menu, help, heard, confirm) was painted on the PREVIOUS
     /// frame. A sixel image is cell-anchored: a popup drawn over the cover prints text
@@ -664,6 +672,7 @@ impl Default for TuiState {
             heard_scroll: 0,
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
+            sixel_supported: false,
             sixel_cell_px: None,
             sixel_covered: Cell::new(false),
             sixel_gen: Cell::new(false),
