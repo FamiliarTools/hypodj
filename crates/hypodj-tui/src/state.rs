@@ -5,6 +5,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -18,6 +19,16 @@ use crate::menu::{classify, ArtistRef, Avail, Menu, MenuAction, Origin, PlayHow,
 
 /// Vim-style scrolloff: keep this many rows of context above/below the cursor.
 const SCROLLOFF: usize = 3;
+
+/// Space enqueues and advances, so holding it walks the list adding as it goes -
+/// until the cursor hits the LAST row, where it can advance no further and a held
+/// key would pile that one row into the queue dozens of times. Past the tail an
+/// enqueue is therefore suppressed when the previous one landed within this window:
+/// autorepeat fires far faster than a hand can tap, so a deliberate tap on the last
+/// row still adds it (duplicate and all), which is the whole point of tapping it
+/// twice. Comfortably above any terminal's repeat INTERVAL, below its initial delay
+/// (a hold adds the tail row once, then stops).
+const ENQUEUE_REPEAT_WINDOW: Duration = Duration::from_millis(600);
 
 /// Scrub step in seconds for ctrl+f (forward) / ctrl+b (back).
 const SCRUB_STEP: i32 = 5;
@@ -466,6 +477,10 @@ pub struct TuiState {
     pub input: String,
     pub pending: Option<Pending>,
     pub status_msg: Option<String>,
+    /// When Space last enqueued the LAST row of a list (`None` anywhere else) -
+    /// only ever read to tell a held Space from a deliberate tap once the cursor
+    /// can advance no further. See [`ENQUEUE_REPEAT_WINDOW`].
+    pub last_enqueue: Option<Instant>,
     pub connected: bool,
     /// The MPD queue version (`playlist:` in `status`) of the currently-held
     /// `queue`. A refresh re-fetches the (expensive) full `playlistinfo` ONLY when
@@ -656,6 +671,7 @@ impl Default for TuiState {
             input: String::new(),
             pending: None,
             status_msg: None,
+            last_enqueue: None,
             connected: true,
             queue_version: None,
             art: None,
@@ -1413,24 +1429,43 @@ impl TuiState {
     /// Albums/dir/song row enqueues with `add <uri>`. Queue has nothing to add ->
     /// no-op.
     fn enqueue_selected(&mut self) -> Option<Intent> {
+        self.enqueue_selected_at(Instant::now())
+    }
+
+    /// [`enqueue_selected`](Self::enqueue_selected) with an injected clock, so the
+    /// held-key suppression is testable without sleeping.
+    fn enqueue_selected_at(&mut self, now: Instant) -> Option<Intent> {
         // The Find HIT list is not a `Browse`, so it must be claimed BEFORE the
         // active_browse() consultation below (which returns None off-drill).
-        if self.screen == Screen::Find && !self.find.drilling {
-            let uri = self.find.current_row()?.uri.clone();
-            self.find.move_selection(1);
-            return Some(Intent::Enqueue { uri, play: false });
-        }
-        let intent = match self.active_browse() {
-            Some(b) => {
-                let uri = b.rows.get(b.selected).map(|r| r.uri.clone())?;
-                match self.screen {
-                    Screen::Playlists => Intent::LoadPlaylist(uri),
-                    _ => Intent::Enqueue { uri, play: false },
-                }
-            }
-            None => return None,
+        let (uri, at_tail) = if self.screen == Screen::Find && !self.find.drilling {
+            let rows = self.find.hits.rows.len();
+            (self.find.current_row()?.uri.clone(), self.find.selected + 1 >= rows)
+        } else {
+            let b = self.active_browse()?;
+            (b.rows.get(b.selected)?.uri.clone(), b.selected + 1 >= b.rows.len())
         };
-        self.move_selection(1);
+        // Only the tail needs the guard: anywhere else the cursor advances, so a
+        // held Space adds a DIFFERENT row each repeat, which is what it is for.
+        // The mark is set only by a tail add, so sweeping INTO the last row still
+        // adds it (its predecessor was a different row) - only the repeats after it
+        // are dropped.
+        if at_tail && self.last_enqueue.is_some_and(|t| now.duration_since(t) < ENQUEUE_REPEAT_WINDOW)
+        {
+            // Refresh the mark so an unbroken hold stays suppressed rather than
+            // slipping one add through every window.
+            self.last_enqueue = Some(now);
+            return None;
+        }
+        self.last_enqueue = at_tail.then_some(now);
+        let intent = match self.screen {
+            Screen::Playlists => Intent::LoadPlaylist(uri),
+            _ => Intent::Enqueue { uri, play: false },
+        };
+        if self.screen == Screen::Find && !self.find.drilling {
+            self.find.move_selection(1);
+        } else {
+            self.move_selection(1);
+        }
         Some(intent)
     }
 
@@ -2875,6 +2910,43 @@ mod tests {
         s.find.query = "   ".into();
         assert_eq!(s.handle_key(key(KeyCode::Enter)), None);
         assert!(matches!(s.find.phase, crate::find::Phase::Cold));
+    }
+
+    #[test]
+    fn a_held_space_stops_adding_at_the_last_row_but_a_tap_still_duplicates() {
+        // Holding Space to add a whole album used to keep firing on the LAST row
+        // once the cursor could advance no further - one long press, twenty copies
+        // of the final track. Autorepeat is suppressed there; a tap is not.
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        s.albums.rows = vec![
+            BrowseRow { label: "one".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
+            BrowseRow { label: "two".into(), uri: "song/2".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
+        ];
+        let t0 = Instant::now();
+        assert_eq!(
+            s.enqueue_selected_at(t0),
+            Some(Intent::Enqueue { uri: "song/1".into(), play: false }),
+        );
+        // Repeat off the tail still adds - the cursor advanced, so it is a NEW row.
+        let t1 = t0 + Duration::from_millis(40);
+        assert_eq!(
+            s.enqueue_selected_at(t1),
+            Some(Intent::Enqueue { uri: "song/2".into(), play: false }),
+        );
+        assert_eq!(s.albums.selected, 1, "the cursor is parked on the last row");
+        // Still held: repeats land far inside the window and add nothing.
+        let mut t = t1;
+        for _ in 0..10 {
+            t += Duration::from_millis(40);
+            assert_eq!(s.enqueue_selected_at(t), None, "a held Space never piles up the tail row");
+        }
+        // A deliberate tap, long after the repeats, adds the duplicate on purpose.
+        assert_eq!(
+            s.enqueue_selected_at(t + ENQUEUE_REPEAT_WINDOW + Duration::from_millis(1)),
+            Some(Intent::Enqueue { uri: "song/2".into(), play: false }),
+            "tapping the last row again is how you deliberately queue it twice"
+        );
     }
 
     #[test]
