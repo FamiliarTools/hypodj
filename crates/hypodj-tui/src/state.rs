@@ -3,7 +3,7 @@
 //! machine. NO terminal, NO network - crossterm KeyEvents come in, Intents go out,
 //! and the event loop in main.rs does all the IO.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -592,6 +592,21 @@ pub struct TuiState {
     /// pixel rect, so one re-send fills every hole at once. A single frame, with no
     /// blank flash in between, which a clear-then-repaint would cost.
     pub sixel_gen: Cell<bool>,
+    /// The exact payload symbol the last frame wrote, HELD while an overlay is drawn.
+    ///
+    /// A cover can change while a popup is open - a track advances while the menu waits
+    /// for a decision - and the payload cell is not under the popup, so its symbol would
+    /// change, the diff would re-send the image, and the terminal would paint the new
+    /// cover's pixels straight over the popup. ratatui would not repair that: the popup's
+    /// own cells did not change, so it never redraws them, and the box stays erased until
+    /// some other keypress happens to dirty them.
+    ///
+    /// So while an overlay is up the payload is pinned to whatever was already on screen.
+    /// The image cannot be re-sent under a popup, and the frame the overlay closes flips
+    /// [`sixel_gen`] anyway, which re-sends the now-current cover. The user never sees a
+    /// stale cover: the only window it is stale in is the one where a popup is covering
+    /// it.
+    pub sixel_held: RefCell<Option<String>>,
     /// Whether the terminal advertises truecolor (else colors quantize to xterm-256).
     pub truecolor: bool,
     /// The cached album sigil, rebuilt only when the album identity changes (static -
@@ -667,6 +682,7 @@ impl Default for TuiState {
             sixel_cell_px: None,
             sixel_covered: Cell::new(false),
             sixel_gen: Cell::new(false),
+            sixel_held: RefCell::new(None),
             truecolor: false,
             sigil: None,
         }

@@ -660,7 +660,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         match &state.art {
             // A real cover is always preferred. Sixel when the terminal can draw it,
             // else the cell renderers.
-            Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px, state.sixel_gen.get()) => {}
+            Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px, state.sixel_gen.get(), &state.sixel_held, state.sixel_covered.get()) => {}
             Some(a) => f.render_widget(Paragraph::new(a.lines(art_cols, art_rows)), art_area),
             // No cover: draw the deterministic album sigil when no inline-image
             // protocol is available (the image-less fallback for the art slot); else a
@@ -2932,6 +2932,8 @@ fn render_sixel_art(
     art: &crate::art::AlbumArt,
     cell_px: Option<(u16, u16)>,
     gen: bool,
+    held: &std::cell::RefCell<Option<String>>,
+    covered: bool,
 ) -> bool {
     use crate::art::{art_mode, ArtMode};
 
@@ -2965,7 +2967,20 @@ fn render_sixel_art(
     // and its only job is to make this frame's symbol differ from the one the diff
     // already sent, which is what forces a covered image to be re-sent (see
     // `TuiState::sixel_gen`).
-    let payload = if gen { format!("{payload}\x1b[0m") } else { payload.to_string() };
+    // While an overlay is drawn, PIN the symbol to what is already on screen: a cover
+    // that changes under a popup would otherwise re-send the image straight over it (see
+    // `TuiState::sixel_held`). Otherwise take the current payload, with the generation
+    // mixed in as a trailing SGR reset that renders as nothing and exists only to differ
+    // from what the diff already sent.
+    let symbol: String = match (covered, held.borrow().as_deref()) {
+        (true, Some(pinned)) => pinned.to_string(),
+        _ if gen => format!("{payload}\x1b[0m"),
+        _ => payload.to_string(),
+    };
+    if !covered {
+        *held.borrow_mut() = Some(symbol.clone());
+    }
+    let payload = symbol;
     let buf = f.buffer_mut();
     for y in rect.y..rect.y + rect.height {
         for x in rect.x..rect.x + rect.width {
@@ -3058,6 +3073,69 @@ mod sixel_render_tests {
         assert!(third.starts_with(&first) || first.starts_with(&third));
     }
 
+    /// A cover that changes UNDER an open popup must not re-send the image.
+    ///
+    /// The failure this pins is silent and self-healing, which is what makes it easy to
+    /// dismiss: a track advances while the menu is open, the payload cell is not under
+    /// the popup so its symbol changes, the diff re-sends the image, and the terminal
+    /// paints the new cover's pixels straight over the popup. ratatui never repairs it -
+    /// the popup's own cells did not change, so it does not redraw them - and the box
+    /// stays erased until some later keypress happens to dirty those rows.
+    ///
+    /// Measured at the buffer, which is what the diff reads: while an overlay is drawn
+    /// the payload symbol must be IDENTICAL frame to frame, whatever the cover does.
+    #[test]
+    fn a_cover_that_changes_under_an_open_popup_is_not_resent_over_it() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut s = TuiState::new();
+        s.sixel_cell_px = Some((8, 17));
+        s.now.state = Some("play".into());
+        s.now.title = Some("A".into());
+        s.art = Some(art());
+
+        let payload_of = |t: &Terminal<TestBackend>| -> Option<String> {
+            t.backend().buffer().content().iter()
+                .map(|c| c.symbol().to_string())
+                .find(|sym| sym.starts_with("\x1bP"))
+        };
+
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert!(payload_of(&terminal).is_some(), "the cover is drawn as a sixel payload");
+
+        s.menu = Some(crate::menu::Menu::new(
+            crate::menu::Target {
+                kind: crate::menu::TargetKind::LibrarySong,
+                origin: crate::menu::Origin::NowPlaying,
+                label: "A".into(),
+                uri: Some("song/s1".into()),
+                album_uri: None,
+                artist: None,
+                artist_uri: None,
+                match_uri: None,
+            },
+            0,
+        ));
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let under_popup = payload_of(&terminal);
+
+        // The track advances while the menu is still up: a DIFFERENT cover.
+        s.art = Some(crate::art::AlbumArt::for_test_solid([20, 40, 220]));
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert_eq!(
+            under_popup,
+            payload_of(&terminal),
+            "the payload must be pinned while a popup is drawn, or the image is re-sent \
+             over it"
+        );
+
+        // Closing the popup re-sends, and now it is the CURRENT cover, not the pinned one.
+        s.menu = None;
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let after = payload_of(&terminal);
+        assert_ne!(under_popup, after, "the close frame re-sends the image");
+        assert!(after.is_some(), "and there is still a cover on screen");
+    }
+
     /// The payload goes in ONE cell and every other cell of the rect is skipped.
     ///
     /// Both halves matter. The payload cell is what the frame diff watches, so it
@@ -3075,7 +3153,7 @@ mod sixel_render_tests {
         // drawn, so a skipped cell never appears there at all.
         terminal
             .draw(|f| {
-                assert!(render_sixel_art(f, rect, &a, Some((8, 17)), false));
+                assert!(render_sixel_art(f, rect, &a, Some((8, 17)), false, &std::cell::RefCell::new(None), false));
 
                 let buf = f.buffer_mut();
 
@@ -3141,21 +3219,21 @@ mod sixel_render_tests {
         terminal
             .draw(|f| {
                 // No cell geometry: the terminal never told us how big a cell is.
-                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 8, height: 4 }, &a, None, false));
+                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 8, height: 4 }, &a, None, false, &std::cell::RefCell::new(None), false));
 
                 // One column wide: the backend only emits MoveTo when the next cell
                 // is not (x+1, y), so the cell right of the payload has to exist.
-                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 1, height: 4 }, &a, Some((8, 17)), false));
+                assert!(!render_sixel_art(f, Rect { x: 0, y: 0, width: 1, height: 4 }, &a, Some((8, 17)), false, &std::cell::RefCell::new(None), false));
 
                 // Past the right edge: this terminal TRUNCATES a too-wide image
                 // rather than scaling it.
                 let w = f.area().width;
-                assert!(!render_sixel_art(f, Rect { x: w - 2, y: 0, width: 8, height: 4 }, &a, Some((8, 17)), false));
+                assert!(!render_sixel_art(f, Rect { x: w - 2, y: 0, width: 8, height: 4 }, &a, Some((8, 17)), false, &std::cell::RefCell::new(None), false));
 
                 // Last row: an image whose bottom lands on the bottom row scrolls
                 // the whole alternate screen.
                 let h = f.area().height;
-                assert!(!render_sixel_art(f, Rect { x: 0, y: h - 1, width: 8, height: 1 }, &a, Some((8, 17)), false));
+                assert!(!render_sixel_art(f, Rect { x: 0, y: h - 1, width: 8, height: 1 }, &a, Some((8, 17)), false, &std::cell::RefCell::new(None), false));
             })
             .unwrap();
     }
