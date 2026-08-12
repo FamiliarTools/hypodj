@@ -1322,6 +1322,30 @@ impl State {
     /// walk remembers, so a delete/move that reindexed the queue in between still lands
     /// on the RIGHT entry - and an entry that is genuinely gone leaves `current` alone
     /// rather than pointing it at whatever took its slot.
+    /// Remove the entry with `qid` from the queue, bump the playlist version, and
+    /// REMAP every index that outlives the shrink (`current`, `pending_skip`) over
+    /// it: an index after the removed slot shifts down one, an index AT it is
+    /// cleared (that entry is gone), an index before it is unchanged. Returns the
+    /// index the entry occupied, or `None` when no such entry is queued (an idempotent
+    /// no-op - a concurrent delete/clear already took it).
+    ///
+    /// The ONE place a queue eviction may happen outside `plan_next`'s `consume`, so
+    /// the remap arithmetic exists once rather than at each caller. Callers that also
+    /// commit a new `current` must write it AFTER this (see [`Terminal::SkipLoad`]).
+    fn evict_qid(&mut self, qid: QueueId) -> Option<usize> {
+        let pos = self.queue.iter().position(|it| it.id == qid.0)?;
+        self.queue.remove(pos);
+        self.playlist_version += 1;
+        let remap = |i: Option<usize>| match i {
+            Some(c) if c == pos => None,
+            Some(c) if c > pos => Some(c - 1),
+            other => other,
+        };
+        self.current = remap(self.current);
+        self.pending_skip = remap(self.pending_skip);
+        Some(pos)
+    }
+
     fn point_current_at_qid(&mut self, qid: u64) -> bool {
         match self.queue.iter().position(|it| it.id == qid) {
             Some(i) => {
@@ -1604,7 +1628,13 @@ enum Terminal {
     #[allow(dead_code)]
     None,
     /// `fade out`: stop playback and restore the baseline volume.
-    StopRestore,
+    ///
+    /// `evict` carries the QUEUE-DELETE half of a "remove the playing track when it
+    /// is the last one" gesture: the entry is dropped from the queue in the SAME
+    /// state lock that lands the stop, so the queue and the deck can never disagree
+    /// (no window where the deck plays an entry the queue no longer has). `None` for
+    /// every ordinary `fade out`.
+    StopRestore { evict: Option<QueueId> },
     /// `fade to <v>`: commit `v` as the new baseline volume.
     SetBaseline(u8),
     /// Startle-safe transport PAUSE: the ramp has reached silence, so now PAUSE mpv
@@ -1628,6 +1658,17 @@ enum Terminal {
     /// slot - one path, one arbiter.
     SkipLoad {
         idx: usize,
+        /// The entry to DROP from the queue at the instant the target commits - the
+        /// queue-delete half of a "remove the currently playing track" gesture. Held
+        /// as a [`QueueId`], never an index, so a concurrent queue edit cannot make
+        /// it point at the wrong track; the terminal re-derives the committed index
+        /// from `play.qid` after the shrink. `None` for an ordinary skip.
+        ///
+        /// THE INVARIANT: the eviction and the successor's commit land TOGETHER,
+        /// under one lock. A superseded dip never runs this terminal, so it never
+        /// evicts either - the queue and the deck stay in lockstep in both outcomes,
+        /// and no orphaned deck (audible track with no queue slot) is reachable.
+        evict: Option<QueueId>,
         play: ResolvedPlay,
         resume_spec: FadeSpec,
         resume_vol: u8,
@@ -1665,6 +1706,14 @@ pub struct FadeRequest {
 pub enum FadeIntent {
     /// Ramp to silence, then stop playback and restore the pre-fade baseline.
     Out,
+    /// REMOVE THE PLAYING TRACK when it is the last thing to play: a SHORT
+    /// DELIBERATE ramp to silence (like [`FadeIntent::PauseOut`], so the deck never
+    /// hard-cuts and the request always lands rather than being rejected as
+    /// too-short), then stop - and drop entry `qid` from the queue in the same lock
+    /// as the stop. Distinct from [`FadeIntent::Out`] only in the eviction and the
+    /// deliberate/clamp-up policy; it is still a transport STOP, so `installs_stop`
+    /// treats the two alike.
+    OutEvicting { qid: u64 },
     /// Startle-safe transport PAUSE: a SHORT DELIBERATE ramp to silence (3 dB/step,
     /// NOT the long sub-JND fade), then PAUSE mpv (not stop) leaving the baseline
     /// volume untouched, so a later RESUME ramps back to exactly the pre-pause level.
@@ -1801,7 +1850,16 @@ impl FadeIntent {
         floor_db: f64,
     ) -> (FadeTarget, bool, Terminal, bool) {
         match self {
-            FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore, false),
+            FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore { evict: None }, false),
+            // Deliberate + clamp_dur_up (NOT the long sub-JND `Out`): a queue delete is
+            // a responsive gesture, so it gets the same short click-safe ramp the pause
+            // transport uses, and must never be rejected for being too short.
+            FadeIntent::OutEvicting { qid } => (
+                FadeTarget::Silence,
+                false,
+                Terminal::StopRestore { evict: Some(QueueId(qid)) },
+                true,
+            ),
             // Short DELIBERATE ramp to silence, then PAUSE (not stop): the baseline
             // is preserved as the resume level. clamp_dur_up so a 0.5s request over a
             // large span extends to the safe minimum rather than being rejected.
@@ -1956,7 +2014,7 @@ fn fade_task(
                     drop(st);
                     changed.notify_waiters();
                 }
-                Terminal::StopRestore => {
+                Terminal::StopRestore { evict } => {
                     let restore = state.lock().unwrap().target_volume;
                     let _ = sink.stop().await;
                     // Re-assert the real mpv gain to the baseline so the next play
@@ -1987,6 +2045,14 @@ fn fade_task(
                         // MPD/MPRIS stop. A `fade out` says "wind down and stop", and
                         // honoring it means reporting Stopped, not Paused-holding-an-entry.
                         st.pending_pause = false;
+                        // The queue-delete half of "remove the playing track when it is
+                        // the last one": the entry leaves the queue in the SAME lock that
+                        // lands the stop, so it is audible for exactly as long as it has a
+                        // queue slot. A superseded fade never reaches here and so never
+                        // evicts - the gesture is all-or-nothing, never half-applied.
+                        if let Some(qid) = evict {
+                            st.evict_qid(qid);
+                        }
                     }
                     changed.notify_waiters();
                 }
@@ -2056,7 +2122,7 @@ fn fade_task(
                     // widget refresh) and MPD `idle` wakes.
                     changed.notify_waiters();
                 }
-                Terminal::SkipLoad { idx, play, resume_spec, resume_vol, dip_floor_db } => {
+                Terminal::SkipLoad { idx, evict, play, resume_spec, resume_vol, dip_floor_db } => {
                     // The dip reached its floor AND this is still the current epoch, so
                     // no superseding skip/setvol/stop got here first: it is SAFE to
                     // load the target. mpv's softvol (at the dip floor) persists across
@@ -2070,6 +2136,10 @@ fn fade_task(
                     // one the warm used), so the actor latches the right local/remote
                     // fact for the target's own later Eof - resolution cannot flip
                     // inside a gesture.
+                    // Captured before the partial move below: the target's stable queue
+                    // identity, which an `evict` makes the only trustworthy way to name
+                    // the committed slot (its INDEX shifts under the removal).
+                    let qid_for_commit = play.qid.0;
                     let _ = sink
                         .switch_warmed(play.song_id, Some(play.qid), &play.url, play.local)
                         .await;
@@ -2081,6 +2151,22 @@ fn fade_task(
                     // (now-finished) dip.
                     let epoch2 = {
                         let mut st = state.lock().unwrap();
+                        // DELETE-THE-PLAYING-TRACK: drop the outgoing entry in the SAME
+                        // lock that commits the incoming one. `idx` was captured BEFORE
+                        // the shrink, so re-derive the committed index from the target's
+                        // own QueueId (stable across the removal); `evict_qid`'s remap is
+                        // the fallback only if the target somehow left the queue too.
+                        let target_qid = QueueId(qid_for_commit);
+                        let idx = match evict {
+                            Some(gone) => {
+                                st.evict_qid(gone);
+                                st.queue
+                                    .iter()
+                                    .position(|it| it.id == target_qid.0)
+                                    .unwrap_or_else(|| idx.saturating_sub(1).min(st.queue.len().saturating_sub(1)))
+                            }
+                            None => idx,
+                        };
                         st.current = Some(idx);
                         st.pending_skip = None;
                         // A track is now current: clear any fresh-enqueue anchor
@@ -6587,7 +6673,7 @@ impl HypodjHandler {
         // behind a deck that is fading to a stop. Every other fade leaves the deck
         // playing (glide / knob / wind-down / resume-in) or pausing (PauseOut, which the
         // predicate's play-state gate already refuses via `pending_pause`).
-        let installs_stop = matches!(intent, FadeIntent::Out);
+        let installs_stop = matches!(intent, FadeIntent::Out | FadeIntent::OutEvicting { .. });
         // ANY fade that installs here SUPERSEDES whatever is running. If it superseded
         // a live skip dip, that dip's Terminal::SkipLoad/switch_warmed will NEVER run,
         // so `pending_skip` and the prefetched warm target are now STALE - the warm
@@ -10289,10 +10375,112 @@ impl HypodjHandler {
     async fn user_skip(&self, idx: usize) -> Result<(), String> {
         let has_current = self.state.lock().unwrap().current.is_some();
         if self.reported_play_state() == PlayState::Playing && has_current {
-            self.skip_with_fade(idx).await
+            self.skip_with_fade(idx, None).await
         } else {
             self.play_index(idx).await
         }
+    }
+
+    /// Remove queue entry `pos`. THE PRODUCT RULE: a queue delete is a PLAN edit
+    /// unless it removes the track you are hearing, in which case it is a TRANSPORT
+    /// gesture and takes the transport's startle-safe path - never a hard cut.
+    ///
+    /// Three cases, and the third is the one the safe-sound principles govern:
+    ///
+    /// 1. `pos` is not the loaded entry: a pure queue mutation, no audio event.
+    ///    [`State::evict_qid`] remaps `current`/`pending_skip` over the shrink, so a
+    ///    delete ABOVE the playing row cannot silently repoint playback (the old body
+    ///    remapped `current` but left `pending_skip` stale - a delete during a skip
+    ///    dip then committed the WRONG track).
+    /// 2. `pos` IS the loaded entry but the deck is not playing (paused / stopped):
+    ///    nothing is audible, so there is no transition to smooth. Drop it and stop
+    ///    the deck so the report stays honest rather than holding a vanished entry.
+    /// 3. `pos` IS the loaded entry and it is PLAYING: route it through the exact
+    ///    machinery a user skip already uses. With a successor, that is the skip dip
+    ///    (duck to [`SKIP_DIP_DB`], load the successor at the trough off the prefetched
+    ///    warm, ramp back up) carrying the eviction so queue and deck commit together.
+    ///    With nothing to play next it is a deliberate ramp to silence and then a stop
+    ///    ([`FadeIntent::OutEvicting`]) - the same "never end on an abrupt chord" rule
+    ///    the sleep/wind-down envelope obeys.
+    ///
+    /// `plan_next(false)` picks the successor under the live `random`/`repeat` flags
+    /// exactly as a manual `next` would, and composes with `consume` for free: under
+    /// consume it has ALREADY removed `pos`, so the eviction we carry is an idempotent
+    /// no-op and the successor index it returned is already remapped.
+    async fn delete_at(&self, pos: usize) {
+        let (is_loaded, qid) = {
+            let st = self.state.lock().unwrap();
+            match st.queue.get(pos) {
+                Some(item) => (st.current == Some(pos), QueueId(item.id)),
+                // Out of range: nothing to delete, and MPD answers OK either way.
+                None => return,
+            }
+        };
+        if !is_loaded {
+            // Case 1 - a plan edit. No audio event, no fade, no player call.
+            self.state.lock().unwrap().evict_qid(qid);
+            self.reschedule_continuation_warm().await;
+            return;
+        }
+        if self.reported_play_state() != PlayState::Playing {
+            // Case 2 - silent already; a ramp would be theatre. Stop the deck so it
+            // cannot keep holding an entry the queue no longer has.
+            self.state.lock().unwrap().evict_qid(qid);
+            let _ = self.player.stop().await;
+            self.set_store_playback_remote(false);
+            self.reschedule_continuation_warm().await;
+            return;
+        }
+        // Case 3 - a transport gesture. Pick the successor BEFORE the entry leaves the
+        // queue (plan_next anchors on it), and let the fade terminal do the removal.
+        // The successor must not BE the entry we are deleting. That is reachable: with
+        // `repeat` on and one entry left, plan_next wraps to index 0 - the very row
+        // being removed - and skipping to it would commit a track the terminal then
+        // evicts, leaving the deck on an entry the queue does not have. Compared by
+        // QUEUE ID, not index, because under `consume` plan_next has already removed
+        // the entry and every index has shifted.
+        let successor = self.plan_next(false).filter(|&idx| {
+            self.state.lock().unwrap().queue.get(idx).is_some_and(|it| it.id != qid.0)
+        });
+        match successor {
+            Some(idx) => {
+                let _ = self.skip_with_fade(idx, Some(qid)).await;
+            }
+            None => {
+                // Nothing follows: ramp to silence, then stop and evict together.
+                let dur = self.skip_fade_dur();
+                if self
+                    .start_fade_spec(FadeRequest {
+                        intent: FadeIntent::OutEvicting { qid: qid.0 },
+                        dur,
+                        commit_logical: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    // A rejected fade must not turn the delete into a no-op: fall back
+                    // to the plain stop path so the gesture still lands.
+                    self.state.lock().unwrap().evict_qid(qid);
+                    let _ = self.player.stop().await;
+                    self.set_store_playback_remote(false);
+                }
+            }
+        }
+        self.reschedule_continuation_warm().await;
+    }
+
+    /// [`Self::play_index`] plus the queue-delete half, in that order: the load
+    /// commits `current` on the target, THEN the evicted entry leaves the queue and
+    /// `evict_qid` remaps `current` over the shrink. Every degrade path out of the
+    /// skip dip routes through here so a rejected/unbuildable fade can never turn a
+    /// delete into a silent no-op - the gesture still lands, just without the ramp.
+    async fn play_index_evicting(&self, idx: usize, evict: Option<QueueId>) -> Result<(), String> {
+        let r = self.play_index(idx).await;
+        if let Some(qid) = evict {
+            self.state.lock().unwrap().evict_qid(qid);
+            self.notify_change();
+        }
+        r
     }
 
     /// The skip-fade composition: pre-resolve the target, pre-build the ResumeIn
@@ -10301,7 +10489,12 @@ impl HypodjHandler {
     /// the target from silence and hands off to the ResumeIn follow-on - all
     /// through the ONE active [`FadeSlot`]. A rejected/unresolvable spec degrades
     /// to a plain [`Self::play_index`] so a skip never gets stuck.
-    async fn skip_with_fade(&self, idx: usize) -> Result<(), String> {
+    ///
+    /// `evict`, when set, makes this the "remove the currently playing track"
+    /// gesture: the named entry is dropped from the queue at the SAME instant the
+    /// target commits (see [`Terminal::SkipLoad`]), so there is never a window where
+    /// the deck plays an entry the queue has already forgotten.
+    async fn skip_with_fade(&self, idx: usize, evict: Option<QueueId>) -> Result<(), String> {
         // Disarm any pending continuation warm FIRST (slice 2), before this skip installs
         // its OWN skip warm: the handler slot must die so the EOF attribution can never
         // claim a skip warm as the station, and so a Skip warm and a Continuation warm can
@@ -10317,7 +10510,7 @@ impl HypodjHandler {
         let Some(item) = item else { return Err("Bad song index".into()) };
         let play = match self.resolve_play(&item) {
             Ok(p) => p,
-            Err(_) => return self.play_index(idx).await,
+            Err(_) => return self.play_index_evicting(idx, evict).await,
         };
         // The target is about to be current but is not in the window yet, so pin it
         // against eviction for the length of the dip and kick a light pass in case
@@ -10343,7 +10536,7 @@ impl HypodjHandler {
         let resume_spec =
             match self.build_deliberate_spec(SKIP_DIP_DB, FadeTarget::Db(resume_db), dur) {
                 Ok(s) => s,
-                Err(_) => return self.play_index(idx).await,
+                Err(_) => return self.play_index_evicting(idx, evict).await,
             };
 
         // (c) Report the TARGET immediately during the dip (WITHOUT mutating
@@ -10382,12 +10575,12 @@ impl HypodjHandler {
         }
 
         // (e) Install the deliberate dip-out to silence -> Terminal::SkipLoad.
-        match self.install_skip_dip(dur, idx, play, resume_spec, baseline).await {
+        match self.install_skip_dip(dur, idx, evict, play, resume_spec, baseline).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "skip dip rejected; plain play");
                 self.state.lock().unwrap().pending_skip = None;
-                self.play_index(idx).await
+                self.play_index_evicting(idx, evict).await
             }
         }
     }
@@ -10401,6 +10594,7 @@ impl HypodjHandler {
         &self,
         dur: Duration,
         idx: usize,
+        evict: Option<QueueId>,
         play: ResolvedPlay,
         resume_spec: FadeSpec,
         resume_vol: u8,
@@ -10432,6 +10626,7 @@ impl HypodjHandler {
                         FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)?;
                     let terminal = Terminal::SkipLoad {
                         idx,
+                        evict,
                         play,
                         resume_spec,
                         resume_vol,
@@ -11847,21 +12042,10 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::Delete(spec) => {
-                {
-                    let mut st = self.state.lock().unwrap();
-                    if let Some(pos) = spec.and_then(|s| s.split(':').next().and_then(|p| p.parse::<usize>().ok())) {
-                        if pos < st.queue.len() {
-                            st.queue.remove(pos);
-                            st.playlist_version += 1;
-                            if let Some(c) = st.current {
-                                if c == pos {
-                                    st.current = None;
-                                } else if c > pos {
-                                    st.current = Some(c - 1);
-                                }
-                            }
-                        }
-                    }
+                let pos = spec
+                    .and_then(|s| s.split(':').next().and_then(|p| p.parse::<usize>().ok()));
+                if let Some(pos) = pos {
+                    self.delete_at(pos).await;
                 }
                 self.notify_change();
                 // A delete changes drain_is_next (deleting the tail can make the current
@@ -23142,6 +23326,131 @@ mod tests {
             .unwrap();
         assert!(wake_rem > 7100 && wake_rem <= 7200, "~2h remaining: {wake_rem}");
         assert!(pair(&resp, "X-hypodj-wake-at").is_some(), "wake-at epoch present");
+    }
+
+
+    // ── queue delete (`d` in dj-gui, MPD `delete`) ───────────────────────────
+    //
+    // THE RULE UNDER TEST: a delete is a plan edit unless it removes the track you
+    // are HEARING, and then it is a transport gesture that takes the startle-safe
+    // path - never a hard cut, and never a queue that disagrees with the deck.
+
+    // Deleting a NON-playing row is a pure queue mutation: the queue shrinks, the
+    // playlist version bumps, `current` is remapped over the shrink, and NO fade and
+    // no player transition happen at all (the audio is untouched).
+    #[tokio::test(start_paused = true)]
+    async fn delete_other_row_is_a_silent_plan_edit() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..3 {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(2))).await;
+        let ver = h.state.lock().unwrap().playlist_version;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+
+        assert!(!h.fade_active().await, "a plan edit installs no fade");
+        assert_eq!(h.player.state(), PlayState::Playing, "audio untouched");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 2);
+        assert!(st.playlist_version > ver, "version bumped");
+        // The playing row slid down one; playback did NOT silently repoint.
+        assert_eq!(st.current, Some(1), "current remapped over the shrink");
+    }
+
+    // Deleting the PLAYING row while a successor exists is the SKIP gesture: it
+    // installs a dip (never a cut), the old track keeps playing audibly through it,
+    // and the eviction lands in the SAME commit as the successor - so the queue and
+    // the deck are never out of step.
+    #[tokio::test(start_paused = true)]
+    async fn delete_playing_row_dips_and_evicts_with_the_successor_commit() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..2 {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        let successor_qid = h.state.lock().unwrap().queue[1].id;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+
+        // Mid-dip: NOT a cut. The deck still plays, and - the invariant - the entry
+        // is STILL QUEUED, because the eviction has not committed yet.
+        assert!(h.fade_active().await, "delete of the playing row installs a dip");
+        assert_eq!(h.player.state(), PlayState::Playing, "old track not cut");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "not evicted before the commit");
+
+        // Drive the dip to its terminal: the successor commits and the deleted entry
+        // leaves the queue together, and `current` names the successor by identity.
+        h.wait_for_fade().await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 1, "evicted at the commit");
+        assert_eq!(st.queue[0].id, successor_qid, "the successor is what remains");
+        assert_eq!(st.current, Some(0), "current re-derived over the shrink");
+        assert_eq!(st.pending_skip, None);
+        drop(st);
+        assert_eq!(h.player.state(), PlayState::Playing);
+    }
+
+    // Deleting the playing row when NOTHING follows must not end on an abrupt chord:
+    // it ramps to silence and THEN stops, evicting at the stop. Mid-fade the deck is
+    // still playing and the entry is still queued - all-or-nothing, as above.
+    #[tokio::test(start_paused = true)]
+    async fn delete_last_playing_row_fades_to_silence_then_stops() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+
+        assert!(h.fade_active().await, "ramps to silence rather than cutting");
+        assert_eq!(h.player.state(), PlayState::Playing, "still audible mid-ramp");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 1, "not evicted mid-ramp");
+
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Stopped, "stops at silence");
+        let st = h.state.lock().unwrap();
+        assert!(st.queue.is_empty(), "evicted at the stop");
+        assert_eq!(st.current, None);
+    }
+
+    // Deleting the loaded row while PAUSED needs no ramp (nothing is audible), but it
+    // must still stop the deck: a paused deck holding an entry the queue no longer has
+    // would report a track that cannot be resumed.
+    #[tokio::test(start_paused = true)]
+    async fn delete_loaded_row_while_paused_stops_the_deck() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        h.wait_for_fade().await; // the PauseOut ramp lands the real pause
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+
+        assert_eq!(h.player.state(), PlayState::Stopped, "deck released");
+        let st = h.state.lock().unwrap();
+        assert!(st.queue.is_empty());
+        assert_eq!(st.current, None);
+    }
+
+
+    // REPEAT + one entry left: plan_next wraps to index 0 - the very row being deleted.
+    // Skipping to it would commit a track the terminal then evicts, leaving the deck on
+    // an entry the queue no longer has. It must take the fade-to-silence-and-stop path
+    // instead, and end with an empty queue and a stopped deck.
+    #[tokio::test(start_paused = true)]
+    async fn delete_last_playing_row_under_repeat_does_not_skip_to_itself() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.handle(MpdCommand::Repeat(true)).await;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+        h.wait_for_fade().await;
+
+        assert_eq!(h.player.state(), PlayState::Stopped, "stopped, not looped onto itself");
+        let st = h.state.lock().unwrap();
+        assert!(st.queue.is_empty(), "the entry is gone");
+        assert_eq!(st.current, None);
     }
 
     // ── skip-fade (single-mpv dip-through-silence on a USER Next/Previous) ────

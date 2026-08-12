@@ -1588,7 +1588,9 @@ mod tests {
         // surface so the full two-column table lands (a cramped terminal clamps it).
         let mut s = TuiState::new();
         s.help_open = true;
-        let out = render_to_lines_sized(&s, 120, 48).join("\n");
+        // Height sized to hold EVERY row at once (grows with the keymap; the scrolling
+        // behaviour on a real terminal is the next test's job, not this one's).
+        let out = render_to_lines_sized(&s, 120, 64).join("\n");
         // A group header and a couple of known binding descriptions are present, all
         // derived from keymap::grouped (so the overlay can never drift).
         assert!(out.contains("View"), "group header rendered:\n{out}");

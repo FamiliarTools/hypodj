@@ -1044,6 +1044,17 @@ impl TuiState {
             // have yet.
             Act::Heard => Some(Intent::Command("heard marks".into())),
             Act::PlaySel => self.enter_action(),
+            // `d` / Delete removes the selected QUEUE row (elsewhere a deliberate no-op:
+            // a browse row is not IN the queue, so there is nothing to remove). The
+            // daemon owns the audio side - deleting the playing row is routed through
+            // the same startle-safe dip a skip uses - so this is just the gesture.
+            Act::RemoveSel => match self.screen {
+                Screen::Queue => self
+                    .queue
+                    .get(self.selected)
+                    .map(|it| Intent::Command(format!("delete {}", it.pos))),
+                _ => None,
+            },
             // Space ADDS the selected browse row to the queue (Queue: no-op).
             Act::Enqueue => self.enqueue_selected(),
             // `l` / Right DRILLS into the selected browse directory - the body `o` ran
