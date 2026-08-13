@@ -292,8 +292,13 @@ fn update_viz(state: &mut TuiState, workers: &Workers, dt: f64) {
             // "play" as not-playing. This is a belt against a daemon that stops
             // emitting frames on pause/stop without a trailing resting frame (older
             // builds): without it the stale playing=true slot freezes the field lit.
+            // UNKNOWN transport is NOT playing. `unwrap_or(true)` defaulted to motion
+            // in exactly the window where the TUI has no status to disagree with a
+            // stale `playing: true` slot - a reconnect, a dropped socket, the moment
+            // before the first status lands - and a lit, bobbing field under a deck
+            // that is not playing is the one reading this row must never produce.
             let transport_playing =
-                state.now.state.as_deref().map(|st| st == "play").unwrap_or(true);
+                state.now.state.as_deref().map(|st| st == "play").unwrap_or(false);
             let playing = s.playing && transport_playing;
             let target = state::normalize_level(s.post_gain_db());
             // Only drive up toward the target while playing; a paused/stopped daemon

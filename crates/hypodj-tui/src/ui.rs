@@ -1857,6 +1857,53 @@ mod tests {
     }
 
     #[test]
+    fn the_bars_never_move_under_a_deck_that_is_not_playing() {
+        // The bottom-bar field is the one moving thing on the screen, so motion there
+        // is a CLAIM: music is flowing. It was derived from `viz_playing`, a flag off
+        // the daemon's frames, which let a stale or optimistic slot keep the bars
+        // bobbing under a deck reading `paused` / `stopped` - the row contradicting the
+        // status line one pane above it.
+        let rest = wave_glyphs()[0];
+        // The ambient row is the one built from wave glyphs - found by that, never by
+        // the resting glyph itself, since a fully lit row contains none of it.
+        let ambient = |s: &TuiState| -> String {
+            render_to_lines_sized(s, 100, 30)
+                .into_iter()
+                .find(|r| r.chars().take(4).all(|c| wave_glyphs().contains(&c)))
+                .expect("the ambient row")
+        };
+        let mut s = TuiState::new();
+        s.now.file = Some("song/1".into());
+        // A LIT, PLAYING level slot - exactly the stale-slot case.
+        s.viz_active = true;
+        s.viz_playing = true;
+        s.viz_env = 0.9;
+        for state in ["pause", "stop"] {
+            s.now.state = Some(state.into());
+            let bar = ambient(&s);
+            let wave: String = bar.chars().take_while(|c| wave_glyphs().contains(c)).collect();
+            assert!(
+                !wave.is_empty() && wave.chars().all(|c| c == rest),
+                "{state}: the field rests flat, it does not bob: {bar:?}"
+            );
+        }
+        // An UNKNOWN transport is not playing either - a reconnect must not light it.
+        s.now.state = None;
+        let bar = ambient(&s);
+        let wave: String = bar.chars().take_while(|c| wave_glyphs().contains(c)).collect();
+        assert!(wave.chars().all(|c| c == rest), "unknown transport rests too: {bar:?}");
+
+        // And it DOES move again the moment the deck says it is playing, so this is a
+        // gate on the claim, not a dead row.
+        s.now.state = Some("play".into());
+        let bar = ambient(&s);
+        assert!(
+            bar.chars().any(|c| wave_glyphs().contains(&c) && c != rest),
+            "a playing deck lights the field: {bar:?}"
+        );
+    }
+
+    #[test]
     fn waveform_uses_album_swatch_color() {
         use crate::album_color::{info_color, Palette};
         let mut s = TuiState::new();
@@ -3045,11 +3092,24 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 let badge_len = badge.as_ref().map_or(0, |b| b.chars().count());
                 let width = full.saturating_sub(hint_len + badge_len);
                 let seed = track_seed(&state.now);
+                // ONE fact decides motion on BOTH paths: the transport state the card
+                // itself is showing. The level path used to trust `viz_playing` alone -
+                // a flag derived from the daemon's frames - so a stale or optimistic
+                // slot could keep the bars bobbing under a deck that reads `stopped`.
+                // Motion on this row means "music is flowing"; nothing but the deck's
+                // own state gets to make that claim, and disagreeing with the line
+                // directly above it is never the honest answer.
+                let playing = state.now.state.as_deref() == Some("play");
                 let wave = if state.viz_active {
-                    level_wave_row(width, state.anim_secs, seed, state.viz_env, state.viz_playing)
+                    level_wave_row(
+                        width,
+                        state.anim_secs,
+                        seed,
+                        state.viz_env,
+                        state.viz_playing && playing,
+                    )
                 } else {
-                    let animate = state.now.state.as_deref() == Some("play");
-                    wave_row(width, state.anim_secs, seed, animate)
+                    wave_row(width, state.anim_secs, seed, playing)
                 };
                 // Waveform color: an album swatch run through the INFO policy (>= 3:1
                 // vs the detected bg, hue-preserving), replacing the flat DIM styling.
