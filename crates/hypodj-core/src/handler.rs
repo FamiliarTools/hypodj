@@ -5490,15 +5490,18 @@ impl HypodjHandler {
         if !st.known {
             return Vec::new();
         }
+        // The HEAD is the one thing every surface keeps, so it has to stand alone as a
+        // sentence: "80 of 360 tracks", not "80/360". A bare ratio next to the deck's
+        // own "track 1 of 5" reads as a second position counter.
         let mut line = if st.complete() {
             format!(
-                "complete, {} tracks, {} GiB",
+                "all {} tracks, {} GiB",
                 st.cached_tracks,
                 Self::gib(st.bytes)
             )
         } else {
             format!(
-                "{}/{} tracks, {}/{} GiB",
+                "{} of {} tracks, {} of {} GiB",
                 st.cached_tracks,
                 st.resident_tracks,
                 Self::gib(st.bytes),
@@ -5506,16 +5509,27 @@ impl HypodjHandler {
             )
         };
         // Why it is not moving, in words - otherwise a CORRECT deferral is
-        // indistinguishable from a stuck reconciler.
-        if st.waiting != crate::store::StoreWaiting::None {
-            line.push_str(&format!(", waiting ({})", st.waiting.label()));
+        // indistinguishable from a stuck reconciler. The words are the store's own
+        // (`StoreWaiting::phrase`), so the enum and the sentence cannot drift.
+        if let Some(why) = st.waiting.phrase() {
+            line.push_str(", ");
+            line.push_str(why);
         }
         let deferred = st.deferred_count();
         if deferred > 0 {
-            line.push_str(&format!(", {deferred} deferred"));
+            // A deferred entry is a PIN GROUP, which is an album to the person reading
+            // it; "3 deferred" named a verb nobody applied to anything.
+            line.push_str(&format!(
+                ", {deferred} album{} would not fit",
+                if deferred == 1 { "" } else { "s" }
+            ));
         }
         if st.given_up > 0 {
-            line.push_str(&format!(", {} given up", st.given_up));
+            line.push_str(&format!(
+                ", {} track{} failed to download",
+                st.given_up,
+                if st.given_up == 1 { "" } else { "s" }
+            ));
         }
         vec![("X-Store", line)]
     }
@@ -24546,8 +24560,11 @@ mod tests {
             .find(|(k, _)| k == "X-Store")
             .map(|(_, v)| v.clone())
             .expect("the badge is present once a pass published");
-        assert!(badge.starts_with("0/1 tracks"), "cached/resident tracks lead: {badge}");
-        assert!(badge.ends_with("1 deferred"), "and the shortfall is counted: {badge}");
+        assert!(badge.starts_with("0 of 1 tracks"), "cached/resident tracks lead: {badge}");
+        assert!(
+            badge.ends_with("1 album would not fit"),
+            "and the shortfall is counted, SINGULAR, in the noun a person pins: {badge}"
+        );
 
         // The verb: the same facts, plus the shortfall BY NAME, which is the whole
         // reason the old integer-only overflow warn was not good enough.
