@@ -35,9 +35,15 @@ use crate::model::{AlbumId, SongId};
 /// acceptable bounded hole in an otherwise fully-bounded IR.
 pub const MAX_ENQUEUE: u32 = 100;
 
-/// Reserved plan origins for the convenience sleep/winddown/wake features. Each
-/// names the SINGLE active instance of its feature in the registry, so a
-/// `find_by_origin` lookup can replace/cancel it (single-instance control).
+/// The origins the DAEMON stamps on the plans it arms for the convenience
+/// sleep/winddown/wake features, so its own single active instance of a feature
+/// is identifiable in the registry (replace/cancel/status).
+///
+/// `RawPlan::origin` is a free, producer-chosen string - a client can send
+/// `plan add ... origin sleep` - so these names are NOT a capability and the
+/// registry never treats the string alone as one. The single-instance lookups
+/// match a registry-side flag (`PendingPlan::reserved`, set only where the
+/// daemon itself arms the plan) AND the origin.
 pub const ORIGIN_SLEEP: &str = "sleep";
 pub const ORIGIN_WINDDOWN: &str = "winddown";
 pub const ORIGIN_WAKE: &str = "wake";

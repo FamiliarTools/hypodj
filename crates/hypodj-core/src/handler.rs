@@ -3221,7 +3221,9 @@ impl HypodjHandler {
                 armed_at: now,
                 timer_id,
             };
-            pendings.push(PendingPlan { armed, guard, remaining_deadline: None });
+            // Never reserved: this is the path EVERY producer-supplied plan takes
+            // (`plan add`, `nl confirm`, a batch). Only `set_singleton` promotes.
+            pendings.push(PendingPlan { armed, guard, remaining_deadline: None, reserved: false });
             ids.push(id);
         }
         Ok((pendings, ids, immediates))
@@ -3270,10 +3272,14 @@ impl HypodjHandler {
 
     // ── convenience features: sleep / winddown / wake ────────────────────────
 
-    /// A read-only view of every armed plan's `(id, origin, deadline)`. The
+    /// A read-only view of EVERY armed plan's `(id, origin, deadline)`. The
     /// deadline is the absolute [`Instant`] for a [`Resolved::OnDeadline`] plan and
     /// `None` otherwise. Pure registry read (a short lock, no `.await`), so a
     /// remaining-time computation is fake-clock assertable.
+    ///
+    /// `origin` here is a producer-chosen string, NOT a capability: a client can
+    /// send `plan add ... origin sleep`. The convenience features read
+    /// [`Self::feature_deadlines`] instead.
     pub fn plan_deadlines(&self) -> Vec<(PlanId, String, Option<Instant>)> {
         self.plan_pending
             .lock()
@@ -3289,14 +3295,36 @@ impl HypodjHandler {
             .collect()
     }
 
-    /// The id of the SINGLE armed plan with this reserved origin, if any. Backs
-    /// single-instance control (replace/cancel) for the convenience features.
-    fn find_by_origin(&self, origin: &str) -> Option<PlanId> {
+    /// `(id, origin, deadline)` for the DAEMON-armed convenience-feature plans
+    /// only ([`PendingPlan::reserved`]). The feature surfaces (status pairs,
+    /// remaining, cancel) read THIS rather than [`Self::plan_deadlines`], so a
+    /// client plan that names a reserved origin is just a normal plan.
+    fn feature_deadlines(&self) -> Vec<(PlanId, String, Option<Instant>)> {
         self.plan_pending
             .lock()
             .unwrap()
             .iter()
-            .find(|pp| pp.armed.raw.origin == origin)
+            .filter(|pp| pp.reserved)
+            .map(|pp| {
+                let deadline = match pp.armed.resolved {
+                    Resolved::OnDeadline(inst) => Some(inst),
+                    _ => None,
+                };
+                (pp.armed.id, pp.armed.raw.origin.clone(), deadline)
+            })
+            .collect()
+    }
+
+    /// The id of the SINGLE armed FEATURE plan with this reserved origin, if any.
+    /// Backs single-instance control (replace/cancel) for the convenience
+    /// features. Matches on the reserved flag AND the origin, so a client plan
+    /// carrying the same origin string is never the one cancelled.
+    fn find_feature(&self, origin: &str) -> Option<PlanId> {
+        self.plan_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pp| pp.reserved && pp.armed.raw.origin == origin)
             .map(|pp| pp.armed.id)
     }
 
@@ -3311,10 +3339,17 @@ impl HypodjHandler {
     /// second instance. A failed validate leaves the old plan untouched (arm runs
     /// before the lock).
     fn set_singleton(&self, origin: &str, raw: RawPlan) -> Result<PlanId, PlanError> {
-        let (pendings, mut ids, immediates) = self.prepare_batch(vec![raw])?;
+        let (mut pendings, mut ids, immediates) = self.prepare_batch(vec![raw])?;
+        // The ONLY promotion to a reserved feature plan: armed here, by the daemon
+        // itself, for one of its own origins.
+        for pp in &mut pendings {
+            pp.reserved = true;
+        }
         {
             let mut g = self.plan_pending.lock().unwrap();
-            g.retain(|pp| pp.armed.raw.origin != origin);
+            // Drop only the prior FEATURE plan of this origin: a client plan that
+            // happens to carry the same origin string is not ours to delete.
+            g.retain(|pp| !(pp.reserved && pp.armed.raw.origin == origin));
             g.extend(pendings);
         }
         self.nudge_immediates(immediates);
@@ -3354,7 +3389,7 @@ impl HypodjHandler {
     /// deterministic under the fake clock).
     pub fn sleep_remaining(&self) -> Option<Duration> {
         let now = Instant::now();
-        self.plan_deadlines()
+        self.feature_deadlines()
             .into_iter()
             .find(|(_, origin, _)| origin == ORIGIN_SLEEP)
             .and_then(|(_, _, deadline)| deadline)
@@ -3363,7 +3398,7 @@ impl HypodjHandler {
 
     /// Cancel the armed sleep plan (RAII disarm). `true` if one was cancelled.
     pub fn sleep_cancel(&self) -> bool {
-        match self.find_by_origin(ORIGIN_SLEEP) {
+        match self.find_feature(ORIGIN_SLEEP) {
             Some(id) => self.plan_cancel(id),
             None => false,
         }
@@ -3395,7 +3430,7 @@ impl HypodjHandler {
 
     /// Cancel the armed winddown plan (RAII disarm). `true` if one was cancelled.
     pub fn winddown_cancel(&self) -> bool {
-        match self.find_by_origin(ORIGIN_WINDDOWN) {
+        match self.find_feature(ORIGIN_WINDDOWN) {
             Some(id) => self.plan_cancel(id),
             None => false,
         }
@@ -3423,7 +3458,7 @@ impl HypodjHandler {
     /// The remaining time on the armed wake plan, or `None` if none is armed.
     pub fn wake_remaining(&self) -> Option<Duration> {
         let now = Instant::now();
-        self.plan_deadlines()
+        self.feature_deadlines()
             .into_iter()
             .find(|(_, origin, _)| origin == ORIGIN_WAKE)
             .and_then(|(_, _, deadline)| deadline)
@@ -3432,7 +3467,7 @@ impl HypodjHandler {
 
     /// Cancel the armed wake plan (RAII disarm). `true` if one was cancelled.
     pub fn wake_cancel(&self) -> bool {
-        match self.find_by_origin(ORIGIN_WAKE) {
+        match self.find_feature(ORIGIN_WAKE) {
             Some(id) => self.plan_cancel(id),
             None => false,
         }
@@ -3441,8 +3476,10 @@ impl HypodjHandler {
     /// The armed human-features (sleep / wind-down / wake) as X- prefixed MPD
     /// status pairs, computed from a SINGLE plan-registry snapshot so the three
     /// features never desync among themselves. Empty when nothing is armed, so the
-    /// Status response stays lean. This is a pure SURFACING of the existing armed
-    /// plan deadlines (see [`Self::plan_deadlines`]) - it recomputes nothing.
+    /// Status response stays lean. This is a pure SURFACING of the DAEMON-armed
+    /// feature deadlines (see [`Self::feature_deadlines`]) - it recomputes
+    /// nothing, and a client plan carrying a reserved `origin` is not one of them
+    /// (it could otherwise emit a duplicate key: malformed MPD status).
     ///
     /// - `X-hypodj-sleep-remaining`   secs until the sleep fade-to-stop fires
     /// - `X-hypodj-winddown-active`   `1` while a wind-down plan is armed
@@ -3456,7 +3493,7 @@ impl HypodjHandler {
     /// status line stays well-formed.
     pub fn armed_feature_pairs(&self) -> Vec<(&'static str, String)> {
         let now = Instant::now();
-        let deadlines = self.plan_deadlines();
+        let deadlines = self.feature_deadlines();
         let mut out = Vec::new();
         for (_, origin, deadline) in &deadlines {
             let remaining = deadline.map(|inst| inst.saturating_duration_since(now));
@@ -23120,6 +23157,60 @@ mod tests {
             pair(&resp, "X-hypodj-sleep-remaining").expect("present").parse().expect("digits");
         // Reflects the LAST re-arm (900s), not a stale earlier one.
         assert!(remaining > 890 && remaining <= 900, "reflects last re-arm: {remaining}");
+    }
+
+    // SAFETY (reserved-origin masquerade): `plan add ... origin sleep` lets a
+    // CLIENT name a reserved singleton origin. Singleton identity must therefore
+    // rest on who ARMED the plan (the daemon's own convenience command), never on
+    // the untrusted string: an impostor must not duplicate the status key, must
+    // not be cancelled by `sleep off`, must not survive as the "armed sleep" after
+    // the genuine one is cancelled, and must not be swept away by a re-arm either.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_plan_cannot_masquerade_as_a_reserved_singleton() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        fn count(resp: &MpdResponse, key: &str) -> usize {
+            match resp {
+                MpdResponse::Pairs(p) => p.iter().filter(|(k, _)| k == key).count(),
+                _ => 0,
+            }
+        }
+        // The genuine feature plans.
+        h.sleep_set(Duration::from_secs(600)).expect("arm sleep");
+        h.winddown_set(Some(Duration::from_secs(600))).expect("arm winddown");
+
+        // The impostors, arriving exactly as a client sends them (the wire parse).
+        let at = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        for origin in [ORIGIN_SLEEP, ORIGIN_WINDDOWN] {
+            let cmd = crate::mpd::parse(&format!(
+                "plan add trigger at {at} action noop origin {origin}"
+            ));
+            assert!(
+                matches!(h.handle(cmd).await, MpdResponse::Pairs(_)),
+                "the plan still arms - it is a normal plan, just not a feature one",
+            );
+        }
+
+        // Status stays well-formed and reports the GENUINE deadlines only.
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(count(&resp, "X-hypodj-sleep-remaining"), 1, "impostor duplicated the key");
+        assert_eq!(count(&resp, "X-hypodj-winddown-active"), 1, "impostor duplicated the key");
+        let remaining: u64 =
+            pair(&resp, "X-hypodj-sleep-remaining").expect("present").parse().expect("digits");
+        assert!(remaining > 590 && remaining <= 600, "impostor's 2h leaked in: {remaining}");
+
+        // A re-arm replaces the genuine plan and leaves the client's plan alone.
+        h.sleep_set(Duration::from_secs(900)).expect("re-arm sleep");
+        assert_eq!(h.plan_list().len(), 4, "a re-arm must not delete a client plan");
+
+        // `sleep off` cancels the genuine plan, and NOTHING keeps counting down
+        // behind it (the impostor stays armed but was never the sleep timer).
+        assert!(h.sleep_cancel(), "cancels the genuine sleep");
+        assert!(h.winddown_cancel(), "cancels the genuine winddown");
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(count(&resp, "X-hypodj-sleep-remaining"), 0, "impostor kept counting down");
+        assert_eq!(count(&resp, "X-hypodj-winddown-active"), 0, "impostor kept the flag lit");
+        assert_eq!(h.sleep_remaining(), None, "no armed sleep remains");
+        assert_eq!(h.plan_list().len(), 2, "the client plans are untouched");
     }
 
     // Wind-down and wake each surface their own X- pairs when armed: an immediate

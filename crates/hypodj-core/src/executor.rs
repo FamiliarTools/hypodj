@@ -64,6 +64,16 @@ pub struct PendingPlan {
     /// position JUMPED (a seek) is detected and the timer re-armed; `None` when
     /// the plan is not a remaining-plan or is currently disarmed.
     pub remaining_deadline: Option<tokio::time::Instant>,
+    /// `true` only for a plan the DAEMON armed for one of its own reserved
+    /// convenience-feature origins (sleep / winddown / wake). Singleton identity
+    /// hangs off THIS, never off `armed.raw.origin` alone: `origin` is a free
+    /// string a client picks (`plan add ... origin sleep`), so a string-only
+    /// lookup let a client plan masquerade as the sleep timer - duplicating the
+    /// `X-hypodj-sleep-remaining` status key, surviving `sleep off` while still
+    /// counting down, and being swept away by an unrelated re-arm. Lives HERE
+    /// (registry-side) rather than in [`ArmedPlan`] so nothing serializable, and
+    /// therefore nothing a producer can author, can ever set it.
+    pub reserved: bool,
 }
 
 /// The executor task. Generic over the [`Clock`] so it runs identically under
