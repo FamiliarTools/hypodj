@@ -123,6 +123,23 @@ pub enum TrackSel {
 /// A bounded plan action. Mirrors the [`crate::handler::FadeIntent`] seam EXACTLY
 /// for fades (no arbitrary curve, no Ramp), so nothing here can express an op the
 /// startle-safe primitive would refuse.
+///
+/// ## What "bounded" does and does NOT mean (read before trusting a comment here)
+///
+/// Bounded means EXPRESSIVE bounds: a producer can only name ops in this enum,
+/// numerics are clamped ([`clamp_action`]), and the queue-edit selectors resolve
+/// against the live queue at execute time (a no-match is a clean no-op, never a
+/// wrong-target edit). That is the guarantee this module actually enforces.
+///
+/// It is NOT an authorization boundary, and no variant here is gated by the
+/// daemon. The `nl` route does echo a translated plan and wait for an owner's
+/// y/N before arming, but that is ONE route: `plan add trigger immediate action
+/// clear all` arms and runs the same action with no echo and no confirm, the MPD
+/// socket has NO authentication of any kind, and the executor re-enters these
+/// actions internally on a timer with no client connected. So any process that
+/// can open the port can run the destructive ones. Treat the echo
+/// ([`crate::echo`]) as a FIDELITY mechanism - "what is armed is what was shown"
+/// - not as a permission check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "act", rename_all = "snake_case")]
@@ -143,14 +160,17 @@ pub enum Action {
     /// Remove the entries a [`QueueSelector`] resolves against the LIVE queue. The
     /// selector resolves at EXECUTE time (like [`Action::Enqueue`]'s content
     /// selector), never pre-baked to indices, so a NO-MATCH is a clean no-op -
-    /// never a wrong-target delete. Destructive: only reachable through the
-    /// echo-before-arm + owner y/N gate.
+    /// never a wrong-target delete.
+    ///
+    /// DESTRUCTIVE, and NOT gated by the daemon (see the [`Action`] note): what
+    /// the selector buys is AIM, not authority.
     Remove { sel: QueueSelector },
     /// Move the selected entries to a destination position (order preserved). A
     /// no-match is a clean no-op. The currently-playing entry is tracked by stable
     /// id across the rebuild, so playback never jumps to a neighbour.
     Move { sel: QueueSelector, dest: MoveDest },
-    /// Clear part or all of the queue. Destructive: only through the confirm gate.
+    /// Clear part or all of the queue. DESTRUCTIVE, and NOT gated by the daemon
+    /// (see the [`Action`] note).
     Clear { scope: ClearScope },
     /// Jump playback to the FIRST entry the selector resolves. A no-match is a
     /// clean no-op (playback is left exactly where it was).
