@@ -250,6 +250,16 @@ pub fn resolve_selector(sel: &QueueSelector, texts: &[String], current: Option<u
 
 /// A local serde mirror of [`crate::handler::FadeIntent`], plus the duration the
 /// bare handler intent leaves implicit. `secs` is CLAMPED to `[min_dur, max_dur]`.
+///
+/// INVARIANT (the echo cannot lie about loudness): a level-targeting variant
+/// carries ONLY `vol` (0..=100). The perceptual dB the envelope actually drives
+/// toward is DERIVED from it through the cubic-softvol seam
+/// ([`crate::player::mpv_volume_to_db`]) at execute time
+/// ([`crate::executor::map_fade`]) - it is never a second, independent field.
+/// It used to be one, and because only `vol` reached the echo, a plan a human
+/// read as "fade to volume 40" could carry `target_db: -120` and actually fade to
+/// silence. Deriving makes that divergence UNREPRESENTABLE rather than merely
+/// unlikely: the rendered number IS the driven level.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "dir", rename_all = "snake_case")]
@@ -259,7 +269,7 @@ pub enum FadeIntentIr {
     /// Wake ramp up to the comfort ceiling.
     In { secs: f64 },
     /// Deliberate cue to an explicit level, committing `vol` on completion.
-    To { target_db: f64, vol: u8, secs: f64 },
+    To { vol: u8, secs: f64 },
     /// Sub-JND wind-down to the configured non-silence floor (`floor_level_db`),
     /// leaving playback running. The floor is read from the LIVE config at spawn
     /// (never baked into the raw plan), so `secs` is the only knob carried here.
@@ -267,7 +277,7 @@ pub enum FadeIntentIr {
     /// Sub-JND wake ramp UP from silence to the SAVED comfort level, committing
     /// `vol` as the restored baseline. Distinct from `In` (which targets the
     /// comfort ceiling / vol 100): a wake restores the exact saved comfort volume.
-    WakeTo { target_db: f64, vol: u8, secs: f64 },
+    WakeTo { vol: u8, secs: f64 },
 }
 
 /// A bounded content selector for [`Action::Enqueue`]. Unimplemented variants
@@ -404,33 +414,17 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
         Action::Fade(FadeIntentIr::In { secs }) => {
             Action::Fade(FadeIntentIr::In { secs: clamp_secs(*secs) })
         }
-        Action::Fade(FadeIntentIr::To { target_db, vol, secs }) => {
-            let td = if target_db.is_finite() {
-                target_db.clamp(bounds.synth_floor_db, bounds.wake_ceiling_db)
-            } else {
-                bounds.wake_ceiling_db
-            };
-            Action::Fade(FadeIntentIr::To {
-                target_db: td,
-                vol: (*vol).min(100),
-                secs: clamp_secs(*secs),
-            })
-        }
+        Action::Fade(FadeIntentIr::To { vol, secs }) => Action::Fade(FadeIntentIr::To {
+            vol: clamp_vol(*vol, bounds),
+            secs: clamp_secs(*secs),
+        }),
         Action::Fade(FadeIntentIr::ToFloor { secs }) => {
             Action::Fade(FadeIntentIr::ToFloor { secs: clamp_secs(*secs) })
         }
-        Action::Fade(FadeIntentIr::WakeTo { target_db, vol, secs }) => {
-            let td = if target_db.is_finite() {
-                target_db.clamp(bounds.synth_floor_db, bounds.wake_ceiling_db)
-            } else {
-                bounds.wake_ceiling_db
-            };
-            Action::Fade(FadeIntentIr::WakeTo {
-                target_db: td,
-                vol: (*vol).min(100),
-                secs: clamp_secs(*secs),
-            })
-        }
+        Action::Fade(FadeIntentIr::WakeTo { vol, secs }) => Action::Fade(FadeIntentIr::WakeTo {
+            vol: clamp_vol(*vol, bounds),
+            secs: clamp_secs(*secs),
+        }),
         Action::SetVolume(v) => Action::SetVolume((*v).min(100)),
         Action::Enqueue { selector, count } => Action::Enqueue {
             selector: selector.clone(),
@@ -470,6 +464,23 @@ pub fn clamp_raw(raw: &RawPlan, bounds: &PlanBounds) -> RawPlan {
         _ => {}
     }
     out
+}
+
+/// Clamp a fade target volume into `0..=ceiling`, where the ceiling is the mpv
+/// volume equivalent of the configured `wake_ceiling_db` (the SAME comfort
+/// ceiling the old `target_db` clamp used, expressed in the one field that now
+/// carries the level). Clamping the VOLUME rather than a separate dB keeps the
+/// echoed number and the driven level in lockstep - clamping the dB alone used
+/// to leave `vol` reporting a level the envelope never reached. TOTAL: a
+/// non-finite configured ceiling falls back to the full 0..=100 range rather
+/// than feeding NaN into a comparison.
+fn clamp_vol(vol: u8, bounds: &PlanBounds) -> u8 {
+    let ceiling = if bounds.wake_ceiling_db.is_finite() {
+        crate::player::db_to_mpv_volume(bounds.wake_ceiling_db).round().clamp(0.0, 100.0) as u8
+    } else {
+        100
+    };
+    vol.min(100).min(ceiling)
 }
 
 fn clamp_secs_field(s: f64, bounds: &PlanBounds) -> f64 {
@@ -861,19 +872,15 @@ mod tests {
         }
     }
 
-    // clamps: target_db to [synth_floor, wake_ceiling], vol/SetVolume to 100,
+    // clamps: fade vol into 0..=the ceiling volume, SetVolume to 100,
     // secs/span/count clamped (clamped, never rejected).
     #[test]
     fn clamps_every_numeric() {
         let b = bounds();
-        // target_db above the ceiling clamps down; vol clamps to 100.
-        let a = clamp_action(
-            &Action::Fade(FadeIntentIr::To { target_db: 999.0, vol: 250, secs: 1e9 }),
-            &b,
-        );
+        // vol clamps to the ceiling volume (100 at the default 0 dB ceiling).
+        let a = clamp_action(&Action::Fade(FadeIntentIr::To { vol: 250, secs: 1e9 }), &b);
         match a {
-            Action::Fade(FadeIntentIr::To { target_db, vol, secs }) => {
-                assert!(target_db <= b.wake_ceiling_db && target_db >= b.synth_floor_db);
+            Action::Fade(FadeIntentIr::To { vol, secs }) => {
                 assert_eq!(vol, 100);
                 assert!(secs <= b.max_dur.as_secs_f64());
             }
@@ -908,9 +915,37 @@ mod tests {
         }
     }
 
+    // The comfort ceiling now bounds the fade target VOLUME (the single field that
+    // carries the level), so a ceiling below 0 dB is not a dead knob and the
+    // clamped number is still exactly what the envelope drives to. TOTAL: a
+    // non-finite ceiling degrades to the full 0..=100 range, never a NaN compare.
+    #[test]
+    fn fade_vol_clamped_by_the_comfort_ceiling() {
+        let mut b = bounds();
+        b.wake_ceiling_db = crate::player::mpv_volume_to_db(50.0);
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 100, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 50),
+            other => panic!("got {other:?}"),
+        }
+        match clamp_action(&Action::Fade(FadeIntentIr::WakeTo { vol: 90, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::WakeTo { vol, .. }) => assert_eq!(vol, 50),
+            other => panic!("got {other:?}"),
+        }
+        // Below the ceiling is untouched.
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 20, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 20),
+            other => panic!("got {other:?}"),
+        }
+        b.wake_ceiling_db = f64::NAN;
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 200, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 100),
+            other => panic!("got {other:?}"),
+        }
+    }
+
     // The NEW convenience-feature IR variants clamp exactly like their siblings:
-    // ToFloor secs into [min,max]; WakeTo target_db into [synth_floor, ceiling],
-    // vol -> 100, secs clamped; Action::Wake count -> MAX_ENQUEUE.
+    // ToFloor secs into [min,max]; WakeTo vol into 0..=the ceiling volume,
+    // secs clamped; Action::Wake count -> MAX_ENQUEUE.
     #[test]
     fn clamp_convenience_fade_and_wake_variants() {
         let b = bounds();
@@ -920,12 +955,8 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
-        match clamp_action(
-            &Action::Fade(FadeIntentIr::WakeTo { target_db: 999.0, vol: 250, secs: 1e9 }),
-            &b,
-        ) {
-            Action::Fade(FadeIntentIr::WakeTo { target_db, vol, secs }) => {
-                assert!(target_db >= b.synth_floor_db && target_db <= b.wake_ceiling_db);
+        match clamp_action(&Action::Fade(FadeIntentIr::WakeTo { vol: 250, secs: 1e9 }), &b) {
+            Action::Fade(FadeIntentIr::WakeTo { vol, secs }) => {
                 assert_eq!(vol, 100);
                 assert!(secs <= b.max_dur.as_secs_f64());
             }

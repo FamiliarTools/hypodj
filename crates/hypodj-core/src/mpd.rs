@@ -901,13 +901,10 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
             "to" => {
                 let vol = toks.get(2)?.parse::<u8>().ok()?;
                 let secs = parse_secs(toks.get(3)?)?;
-                // The target dB is derived from the requested 0..=100 volume (the
-                // same cubic-softvol seam the handler uses); validate clamps it.
-                Some(Action::Fade(FadeIntentIr::To {
-                    target_db: crate::player::mpv_volume_to_db(vol as f64),
-                    vol,
-                    secs,
-                }))
+                // Only the 0..=100 volume is carried; the target dB is derived from
+                // it (the same cubic-softvol seam the handler uses) at execute time,
+                // so the echoed level cannot diverge from the driven one.
+                Some(Action::Fade(FadeIntentIr::To { vol, secs }))
             }
             _ => None,
         },

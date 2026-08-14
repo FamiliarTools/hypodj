@@ -34,7 +34,7 @@ use crate::clock::Clock;
 use crate::event::{DjEvent, DjEventKind, QueueId};
 use crate::handler::{FadeIntent, FadeRequest, HypodjHandler, PlanOutcome};
 use crate::plan::{fires, Action, ArmedPlan, FadeIntentIr, Fire, PlanId, Resolved};
-use crate::player::PlayState;
+use crate::player::{mpv_volume_to_db, PlayState};
 use crate::timer::{TimerGuard, TimerHandle};
 
 /// A live-position jump larger than this (a seek, not the second-by-second
@@ -355,8 +355,11 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
     match ir {
         FadeIntentIr::Out { secs } => FadeRequest { intent: FadeIntent::Out, dur: dur(*secs), commit_logical: None },
         FadeIntentIr::In { secs } => FadeRequest { intent: FadeIntent::In, dur: dur(*secs), commit_logical: None },
-        FadeIntentIr::To { target_db, vol, secs } => FadeRequest {
-            intent: FadeIntent::To { target_db: *target_db, vol: *vol },
+        // The dB target is DERIVED from the requested 0..=100 volume through the
+        // cubic-softvol seam - the plan IR carries no independent dB, so the level
+        // the echo shows is exactly the level the envelope drives to.
+        FadeIntentIr::To { vol, secs } => FadeRequest {
+            intent: FadeIntent::To { target_db: mpv_volume_to_db(*vol as f64), vol: *vol },
             dur: dur(*secs),
             commit_logical: None,
         },
@@ -367,8 +370,8 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
             dur: dur(*secs),
             commit_logical: None,
         },
-        FadeIntentIr::WakeTo { target_db, vol, secs } => FadeRequest {
-            intent: FadeIntent::WakeTo { target_db: *target_db, vol: *vol },
+        FadeIntentIr::WakeTo { vol, secs } => FadeRequest {
+            intent: FadeIntent::WakeTo { target_db: mpv_volume_to_db(*vol as f64), vol: *vol },
             dur: dur(*secs),
             commit_logical: None,
         },
