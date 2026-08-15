@@ -26717,6 +26717,50 @@ mod tests {
         assert_eq!(h2.state.lock().unwrap().target_volume, 55, "the baseline is back");
     }
 
+    // The two remaining deterministic variants: a reorder and an absolute setvol.
+    // A `Move` is the case a diff-based journal would get wrong in silence (the
+    // inverse of a move is another move, and an off-by-one lands rows in the wrong
+    // order); the whole-queue snapshot cannot be wrong. A `SetVolume` glide, unlike
+    // a plan fade, COMMITS its baseline at install - and the dither means the level
+    // it commits is within one of what was asked, which is exactly why the entry
+    // records the live post-level rather than the requested one.
+    #[tokio::test(start_paused = true)]
+    async fn undo_of_a_move_and_of_a_setvol_put_the_order_and_the_level_back() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 4).await;
+        let before = rows(&h);
+        let mover = qid_at(&h, 3);
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Move {
+                    sel: crate::plan::QueueSelector::Qid(mover),
+                    dest: crate::plan::MoveDest::Position(1),
+                },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Moved(1)
+        );
+        assert_eq!(rows(&h)[0].0, mover, "the row really moved to the front");
+        assert_ne!(rows(&h), before);
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(rows(&h), before, "the order is back, row for row, id for id");
+
+        let Some((h2, _e2)) = handler_with_null_player() else { return };
+        seed_queue(&h2, 2).await;
+        h2.play_for_test(0).await;
+        h2.state.lock().unwrap().set_manual_volume(55, true);
+        assert_eq!(
+            h2.run_action_outcome(&Action::SetVolume(20), "mcp:s").await,
+            PlanOutcome::Effect("set volume to 20".into())
+        );
+        h2.wait_for_fade().await;
+        let landed = h2.state.lock().unwrap().target_volume;
+        assert!((19..=21).contains(&landed), "the glide committed {landed}, not ~20");
+        assert!(matches!(h2.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h2.state.lock().unwrap().target_volume, 55, "his level is back");
+    }
+
     // The APPEND leg (what `dj_enqueue` / `dj_play_now` cause). Its dispatch cannot
     // run here - every library selector resolves over the network and the test
     // client has no server - so the two halves are proven separately: the RESTORE
