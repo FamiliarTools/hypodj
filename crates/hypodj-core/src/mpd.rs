@@ -217,6 +217,17 @@ pub enum MpdCommand {
     /// [`PlanCmd`] and [`parse_plan`].
     Plan(PlanCmd),
 
+    /// `journal` - the UNDO RING: the last 32 [`crate::plan::Action`] executions
+    /// with the daemon's own outcome text, newest first, each flagged with whether
+    /// it is undoable RIGHT NOW. NOT a standard MPD command; a hypodj extension.
+    Journal,
+    /// `undo [<jid>]` - retract the top undoable journal entry, or the named one
+    /// (which must BE the top). The argument is carried RAW rather than pre-parsed
+    /// so a non-numeric id can ACK instead of silently degrading to "the top" - the
+    /// one thing a retraction verb must never do. NOT a standard MPD command; a
+    /// hypodj extension.
+    Undo(Option<String>),
+
     /// `nl "<request>"` / `nl confirm <token>` / `nl cancel <token>` - the P3
     /// OPTIONAL natural-language surface. Translate EMITS a validated plan echoed
     /// for confirmation; confirm arms it via the P2 registry; cancel drops the
@@ -1414,6 +1425,11 @@ pub fn parse(line: &str) -> MpdCommand {
         }
         "fade" => parse_fade(&args, line),
         "plan" => parse_plan(&args, line),
+        // The retraction surface. `journal` takes no argument; `undo` takes an
+        // OPTIONAL journal id, kept as a raw token so the handler can ACK a
+        // non-numeric one (see [`MpdCommand::Undo`]).
+        "journal" => MpdCommand::Journal,
+        "undo" => MpdCommand::Undo(arg(0)),
         "nl" => parse_nl(&args, line),
         "sleep" => parse_sleep(&args, line),
         "winddown" => parse_winddown(&args, line),
@@ -2228,6 +2244,24 @@ mod parse_tests {
         // A malformed plan is a fail-loud Unsupported, never a panic.
         assert!(matches!(parse("plan add trigger track"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("plan frobnicate"), MpdCommand::Unsupported(_)));
+    }
+
+    // The retraction verbs. `undo`'s argument is carried RAW so the handler can ACK
+    // a non-numeric id: silently degrading it to "the top" would retract something
+    // the caller did not name, which is the one thing a retraction verb must never
+    // do. A quoted or spaced id is still just one token.
+    #[test]
+    fn parses_journal_and_undo() {
+        assert!(matches!(parse("journal"), MpdCommand::Journal));
+        assert!(matches!(parse("undo"), MpdCommand::Undo(None)));
+        match parse("undo 7") {
+            MpdCommand::Undo(Some(s)) => assert_eq!(s, "7"),
+            other => panic!("got {other:?}"),
+        }
+        match parse("undo not-a-number") {
+            MpdCommand::Undo(Some(s)) => assert_eq!(s, "not-a-number"),
+            other => panic!("got {other:?}"),
+        }
     }
 
     // `id <qid>` parses to the stable-id selector: the only queue target that
