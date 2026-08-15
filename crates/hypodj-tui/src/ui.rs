@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use hypodj_client::model::{
-    fmt_remaining, store_badge, ArmedFeatures, FieldState, HintKind, NowPlaying,
+    fmt_remaining, store_badge, store_badge_short, ArmedFeatures, FieldState, HintKind, NowPlaying,
 };
 
 use crate::keymap;
@@ -298,11 +298,15 @@ fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     }
 
     let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    // Record the measured max so the scroll keys can clamp against it: without it `j`
+    // past the end keeps incrementing an offset only the renderer clamps, and `k` then
+    // appears stuck at the bottom while it unwinds the phantom distance.
+    state.heard_max_scroll.set(max_scroll);
     let scroll = state.heard_scroll.min(max_scroll);
     let title = if max_scroll > 0 {
-        format!("Marked - the tape ({}/{})  j/k scroll  t closes", scroll + 1, max_scroll + 1)
+        format!("Marks ({}/{})  j/k scroll  t closes", scroll + 1, max_scroll + 1)
     } else {
-        "Marked - the tape  t closes".to_string()
+        "Marks  t closes".to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -397,11 +401,15 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     // is clamped to the last full page so a short terminal can still reach every binding.
     let inner_h = popup.height.saturating_sub(2);
     let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    // See `render_heard_overlay`: the keys clamp against this measured max.
+    state.help_max_scroll.set(max_scroll);
     let scroll = state.help_scroll.min(max_scroll);
     let title = if max_scroll > 0 {
-        format!("Help - keys ({}/{})  j/k scroll", scroll + 1, max_scroll + 1)
+        // Every other overlay says how to leave it in its own title; the one titled
+        // "Help" was the single panel that did not.
+        format!("Help ({}/{})  j/k scroll  Esc closes", scroll + 1, max_scroll + 1)
     } else {
-        "Help - keys".to_string()
+        "Help  Esc closes".to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -601,6 +609,14 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         // them as subtle lines so the machine's hold stays visible. Field is the last,
         // quietest line.
         let mut lines = vec![Line::from("nothing playing")];
+        // THE ONE EMPTY STATE A NEW USER MEETS, so it is the one place a way forward
+        // has to be written down. Every route out of it is a function key nothing on
+        // screen explains, and the only pointer to the keymap is a dim `? help` in the
+        // far corner of the bottom bar. Two verbs cost one dim line.
+        lines.push(Line::from(Span::styled(
+            "F5 to search, F4 to ask the DJ",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
         if let Some(a) = &armed_line {
             lines.push(Line::from(Span::styled(
                 a.clone(),
@@ -644,7 +660,13 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         + armed_line.is_some() as u16
         + field_line.is_some() as u16;
     let text_h = (4u16 + extra).min(inner.height);
-    let art_h = inner.height.saturating_sub(text_h);
+    // The art takes what the text does not - but NEVER more rows than it can be square
+    // in. Beyond that the width clamp below stops widening it, so the extra rows only
+    // stretch the cover vertically while pushing the metadata down into a four-row
+    // footnote under a distorted image. Capping here means a tall pane leaves calm
+    // space under the card instead, and the art stays the shape the cover actually is.
+    let square_rows = square_art_rows(inner.width, state.sixel_cell_px);
+    let art_h = inner.height.saturating_sub(text_h).min(square_rows);
     if art_h > 0 {
         // Keep the art roughly square: each cell renders 2 vertical pixels, so a
         // square cover is about (rows*2) columns wide. Clamp to the pane width.
@@ -704,7 +726,18 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         )));
     }
     if let Some(artist) = np.artist.as_deref() {
-        lines.push(Line::from(artist.to_string()));
+        // A PLACEHOLDER artist is not information, so it does not get an information
+        // weight: `Various Artists` was rendering at full brightness as the second-most
+        // prominent thing on the card while saying strictly less than the album under
+        // it. Dimmed to the album's level, the eye goes to the two lines that identify
+        // the music. Still shown - the tag is what the server says, and hiding it would
+        // be a different claim.
+        let style = if is_placeholder_artist(artist) {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(artist.to_string(), style)));
     }
     if let Some(album) = np.album.as_deref() {
         lines.push(Line::from(Span::styled(
@@ -714,7 +747,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     }
     // Playback status: state | volume fader | N of M | M:SS.
     lines.push(Line::from(Span::styled(
-        status_line(np),
+        status_line(np, text_area.width as usize),
         Style::default().add_modifier(Modifier::DIM),
     )));
     if let Some(a) = armed_line {
@@ -733,16 +766,43 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(Paragraph::new(lines), text_area);
 }
 
+/// The rows the art may occupy and still be SQUARE inside `width` columns. Past this
+/// the width clamp in `render_current` pins the columns and the extra rows only
+/// stretch the cover. Mirrors that clamp's own aspect logic (real cell pixels under
+/// sixel, the 2:1 half-block ratio otherwise) so the two cannot disagree.
+fn square_art_rows(width: u16, cell_px: Option<(u16, u16)>) -> u16 {
+    match cell_px {
+        Some((cw, ch)) if ch > 0 => width.saturating_mul(cw) / ch,
+        _ => width / 2,
+    }
+}
+
+/// Whether an artist tag is a PLACEHOLDER rather than a name - the compilation and
+/// missing-tag values a server emits, which carry no identity and should not be
+/// rendered as though they do. Compared case-insensitively; anything else is a real
+/// artist and is left alone.
+fn is_placeholder_artist(artist: &str) -> bool {
+    matches!(
+        artist.trim().to_ascii_lowercase().as_str(),
+        "various artists" | "various" | "va" | "unknown artist" | "unknown" | "[unknown]"
+    )
+}
+
 /// The armed human-features (sleep / wind-down / wake) as one subtle HUD line, e.g.
-/// `[armed] sleep 12m | wake in 7h 00m`. `None` when nothing is armed, so a lean
-/// status renders no extra line. Surfaces the daemon's X- status pairs verbatim.
+/// `sleep in 12m \u{b7} wake in 7h 00m`. `None` when nothing is armed, so a lean status
+/// renders no extra line. Surfaces the daemon's X- status pairs verbatim.
+///
+/// No `[armed]` prefix: the line is nothing BUT armed state, so the tag labelled a
+/// category instead of telling him anything, on the surface with the least room. Each
+/// clause now says "in" where it means a countdown - `sleep 12m` could be read as a
+/// sleep timer of twelve minutes' length rather than one that fires in twelve.
 fn armed_hud(a: &ArmedFeatures) -> Option<String> {
     if !a.any() {
         return None;
     }
     let mut bits = Vec::new();
     if let Some(s) = a.sleep_remaining {
-        bits.push(format!("sleep {}", fmt_remaining(s)));
+        bits.push(format!("sleep in {}", fmt_remaining(s)));
     }
     if a.winddown_active {
         match a.winddown_remaining {
@@ -753,13 +813,20 @@ fn armed_hud(a: &ArmedFeatures) -> Option<String> {
     if let Some(s) = a.wake_remaining {
         bits.push(format!("wake in {}", fmt_remaining(s)));
     }
-    Some(format!("[armed] {}", bits.join(" | ")))
+    Some(bits.join(" \u{00b7} "))
 }
 
 /// The active latent-field pulls as one subtle HUD line, e.g.
-/// `toward calmer 0.58 3m | toward warmer 0.41 1m`. `None` when no pull is active, so
-/// a resting field renders no line (and reserves no row). Mirrors the CLI's
-/// `render_field` so the passive "see the field" HUD reads identically in both clients.
+/// `toward calmer (58%, 3m ago) \u{b7} toward warmer (41%, 1m ago)`. `None` when no pull
+/// is active, so a resting field renders no line (and reserves no row). Mirrors the
+/// CLI's `render_field` so the passive "see the field" HUD reads identically in both
+/// clients.
+///
+/// The two numbers are LABELLED, like everything else on this card: `toward calmer 0.58
+/// 3m` put a unitless fraction and a bare duration side by side with nothing saying
+/// which was strength and which was age, on the one surface whose entire job is making
+/// a nondeterministic mechanism inspectable. A percent is the same fact in the unit the
+/// rest of the UI already uses, and `ago` says the direction time runs.
 fn field_hud(field: &FieldState) -> Option<String> {
     if !field.active() {
         return None;
@@ -767,9 +834,9 @@ fn field_hud(field: &FieldState) -> Option<String> {
     let line = field
         .pulls
         .iter()
-        .map(|p| format!("toward {} {:.2} {}m", p.label, p.strength as f32 / 100.0, p.age_mins))
+        .map(|p| format!("toward {} ({}%, {}m ago)", p.label, p.strength, p.age_mins))
         .collect::<Vec<_>>()
-        .join(" | ");
+        .join(" \u{00b7} ");
     Some(line)
 }
 
@@ -805,56 +872,120 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
     let start = state.now.song.map(|c| c + 1).unwrap_or(0);
     let mut lines: Vec<Line> = Vec::new();
     let mut count = 0;
+    // The artist carried down from the row above, so a run of the same one is said
+    // once. Three rows reading `Various Artists` under three different titles spent the
+    // pane's whole sub-line budget on a word the reader had already discounted.
+    let mut previous_artist: Option<&str> = None;
     for it in state.queue.iter().skip(start) {
         if count >= 3 {
             break;
         }
-        lines.push(Line::from(Span::styled(
-            format!("{}. {}", it.pos + 1, it.title),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        if let Some(a) = it.artist.as_deref() {
-            lines.push(Line::from(Span::styled(
-                format!("   {a}"),
-                Style::default().add_modifier(Modifier::DIM),
-            )));
+        // `next` then `then`, NOT the absolute queue position. `2.` was the row's index
+        // in the whole queue, so the pane opened on a number that is neither first nor
+        // meaningful out of context - and it sat beside the card's own `track 1 of 5`,
+        // inviting the reading that this list was ranked or that a row was missing. The
+        // words are the same ones the continuation hint already uses ("then: <station>").
+        let lead = if count == 0 { "next" } else { "then" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{lead}  "), Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(it.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+        match it.artist.as_deref() {
+            Some(a) if previous_artist != Some(a) => {
+                lines.push(Line::from(Span::styled(
+                    format!("      {a}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            }
+            _ => {}
         }
+        previous_artist = it.artist.as_deref();
         lines.push(Line::from(""));
         count += 1;
     }
     if lines.is_empty() {
+        // What is true (nothing is queued) rather than where the cursor is (the end of
+        // a list), plus the one gesture that fills it.
         lines.push(Line::from(Span::styled(
-            "end of queue",
+            "nothing queued",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+        lines.push(Line::from(Span::styled(
+            "F5 to search, F4 to ask the DJ",
             Style::default().add_modifier(Modifier::DIM),
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// "[playing|paused|stopped] | vol V% | N of M | M:SS" - hide unknown volume,
-/// never render elapsed (the server does not emit it).
-fn status_line(np: &NowPlaying) -> String {
-    let mut bits = Vec::new();
-    match np.state.as_deref() {
-        Some("play") => bits.push("playing".to_string()),
-        Some("pause") => bits.push("paused".to_string()),
-        Some("stop") => bits.push("stopped".to_string()),
-        Some(other) => bits.push(other.to_string()),
-        None => {}
-    }
-    if let Some(v) = np.volume {
-        if v >= 0 {
-            bits.push(volume_slider(v.min(100) as u8, 12));
+/// "[playing|paused|stopped] · vol [==#--] V% · track N of M · M:SS total".
+///
+/// Every number is LABELLED, because the unlabelled version lied. A bare
+/// `[======#-----] 56% | 1 of 5 | 7:14` sits exactly where a seek bar sits in every
+/// other player, so the fader read as playback progress and the duration read as
+/// elapsed - two wrong beliefs from one line. `vol` in front of the fader and
+/// `total` after the time cost four cells and remove both. `track` does the same for
+/// the queue position, which otherwise competes with the store badge's own ratio.
+///
+/// The separator is a middle dot, not ` | `: three pipes in a forty-cell line read as
+/// table rules on a surface whose whole register is quiet.
+///
+/// Volume is hidden when unknown, and elapsed is NEVER rendered (the server does not
+/// emit it) - which is precisely why the duration must say what it is.
+///
+/// `width` is the pane's inner width, and the line SHEDS PARTS to fit it rather than
+/// being clipped. That is the whole reason width is a parameter: the paragraph does not
+/// wrap, so an overlong line loses its RIGHTMOST cells - which is `7:14 total`, the very
+/// number whose label this rewording exists to restore. Clipping would therefore
+/// reconstruct the original lie on exactly the terminals with the least room.
+///
+/// Shed in reverse order of worth: the fader first (a picture of a number that is
+/// printed beside it), then the volume entirely (a setting he just changed, and can
+/// see change), then the queue position. Transport state and duration are never
+/// dropped - they are what the line is FOR. Each surviving part keeps its label; a
+/// half-labelled line is worse than a shorter one.
+fn status_line(np: &NowPlaying, width: usize) -> String {
+    let volume = np.volume.filter(|v| *v >= 0).map(|v| v.min(100) as u8);
+    let compose = |fader: bool, show_volume: bool, show_position: bool| {
+        let mut bits = Vec::new();
+        match np.state.as_deref() {
+            Some("play") => bits.push("playing".to_string()),
+            Some("pause") => bits.push("paused".to_string()),
+            Some("stop") => bits.push("stopped".to_string()),
+            Some(other) => bits.push(other.to_string()),
+            None => {}
+        }
+        if let (Some(v), true) = (volume, show_volume) {
+            bits.push(if fader {
+                format!("vol {}", volume_slider(v, 12))
+            } else {
+                format!("vol {v}%")
+            });
+        }
+        if let (Some(song), Some(m), true) = (np.song, np.playlistlength, show_position) {
+            bits.push(format!("track {} of {}", song.saturating_add(1), m));
+        }
+        if let Some(d) = np.duration {
+            let total = d as u64;
+            bits.push(format!("{}:{:02} total", total / 60, total % 60));
+        }
+        bits.join(" \u{00b7} ")
+    };
+    let mut last = String::new();
+    for (fader, vol, pos) in [
+        (true, true, true),
+        (false, true, true),
+        (false, false, true),
+        (false, false, false),
+    ] {
+        last = compose(fader, vol, pos);
+        if last.chars().count() <= width {
+            return last;
         }
     }
-    if let (Some(song), Some(m)) = (np.song, np.playlistlength) {
-        bits.push(format!("{} of {}", song.saturating_add(1), m));
-    }
-    if let Some(d) = np.duration {
-        let total = d as u64;
-        bits.push(format!("{}:{:02}", total / 60, total % 60));
-    }
-    bits.join(" | ")
+    // Narrower than `playing · 7:14 total` - nothing left to shed, so the terminal
+    // clips the shortest honest line rather than a needlessly long one.
+    last
 }
 
 /// Render volume as a physical horizontal FADER: `[==#-----] V%`. `width` is the
@@ -879,8 +1010,10 @@ fn volume_slider(vol: u8, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        armed_hud, dj_prompt_line, field_hud, hit_style, level_wave_row, match_spans, stream_headline,
-        track_seed, volume_slider, wave_glyphs, wave_row, window_title, BLOCK_GLYPHS,
+        armed_hud, dj_prompt_line, field_hud, hit_style, level_wave_row,
+        match_spans, square_art_rows, status_line,
+        stream_headline, track_seed, volume_slider, wave_glyphs, wave_row, window_title,
+        BLOCK_GLYPHS,
     };
     use crate::state::{Mode, TuiState};
     use hypodj_client::model::{AmbientHint, ArmedFeatures, FieldPull, FieldState, HintKind, NowPlaying};
@@ -960,8 +1093,11 @@ mod tests {
             wake_at: Some(1750000000),
         };
         let hud = armed_hud(&a).expect("armed");
-        assert!(hud.contains("[armed]"), "hud: {hud}");
-        assert!(hud.contains("sleep 12m"), "hud: {hud}");
+        assert!(
+            !hud.contains("[armed]"),
+            "no category tag on a line that is nothing but armed state: {hud}"
+        );
+        assert!(hud.contains("sleep in 12m"), "every countdown says `in`: {hud}");
         assert!(hud.contains("winding down"), "hud: {hud}");
         assert!(hud.contains("wake in 7h 00m"), "hud: {hud}");
     }
@@ -979,7 +1115,7 @@ mod tests {
             ],
         };
         let hud = field_hud(&field).expect("active");
-        assert_eq!(hud, "toward calmer 0.58 3m | toward warmer 0.41 1m");
+        assert_eq!(hud, "toward calmer (58%, 3m ago) \u{b7} toward warmer (41%, 1m ago)");
     }
 
     #[test]
@@ -992,7 +1128,7 @@ mod tests {
             pulls: vec![FieldPull { label: "calmer".into(), strength: 58, age_mins: 3 }],
         };
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
-        assert!(out.contains("toward calmer 0.58 3m"), "field pull line drawn:\n{out}");
+        assert!(out.contains("toward calmer (58%, 3m ago)"), "field pull line drawn:\n{out}");
     }
 
     #[test]
@@ -1185,6 +1321,204 @@ mod tests {
         assert_eq!(inner.chars().filter(|&c| c == '#').count(), 1, "exactly one thumb");
     }
 
+    #[test]
+    fn every_number_on_the_transport_line_says_what_it_is() {
+        // THE LINE THAT LIED. Unlabelled, it read `[======#-----] 56% | 1 of 5 | 7:14`:
+        // a bar with a percent followed by a time, in the exact position every other
+        // player puts a seek bar - so the fader was read as playback progress and the
+        // duration as elapsed. Neither is true (the server emits no elapsed at all).
+        // Each label below is load-bearing against one of those readings.
+        let np = NowPlaying {
+            state: Some("play".into()),
+            volume: Some(56),
+            song: Some(0),
+            playlistlength: Some(5),
+            duration: Some(434.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            status_line(&np, 80),
+            "playing \u{b7} vol [======#-----] 56% \u{b7} track 1 of 5 \u{b7} 7:14 total"
+        );
+
+        // And it stays honest as fields drop out: no volume, no queue, no duration.
+        let lean = NowPlaying { state: Some("pause".into()), ..Default::default() };
+        assert_eq!(status_line(&lean, 80), "paused");
+
+        // An unknown volume (-1) is hidden rather than rendered as a fader at zero,
+        // which would claim silence the daemon never reported.
+        let unknown = NowPlaying {
+            state: Some("play".into()),
+            volume: Some(-1),
+            ..Default::default()
+        };
+        assert_eq!(status_line(&unknown, 80), "playing");
+
+        // NARROW: the fader is the first thing to go, because it is the only part that
+        // says nothing the number does not. Every label survives, which is the point -
+        // clipping would have taken `total` off the end and restored the old lie.
+        let narrow = status_line(&np, 50);
+        assert_eq!(narrow, "playing \u{b7} vol 56% \u{b7} track 1 of 5 \u{b7} 7:14 total");
+        assert!(narrow.chars().count() <= 50, "and it now fits: {narrow}");
+
+        // NARROWER STILL: the volume goes (he just set it, and can see it change), then
+        // the queue position. Transport state and duration never go, and nothing that
+        // survives loses its label.
+        let tight = status_line(&np, 38);
+        assert_eq!(tight, "playing \u{b7} track 1 of 5 \u{b7} 7:14 total");
+        assert!(tight.chars().count() <= 38, "fits: {tight}");
+        let tighter = status_line(&np, 25);
+        assert_eq!(tighter, "playing \u{b7} 7:14 total");
+
+        // Below even that there is nothing left to drop, so the shortest honest line is
+        // handed over and the terminal clips it - never a longer one.
+        assert_eq!(status_line(&np, 4), "playing \u{b7} 7:14 total");
+    }
+
+    #[test]
+    fn the_transport_line_is_drawn_labelled_in_a_real_frame() {
+        // The formatter is pure, so pin it in the composed frame too - the pane could
+        // clip the labels off and the unit test above would still pass.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Blue in Green".into());
+        s.now.volume = Some(56);
+        s.now.song = Some(0);
+        s.now.playlistlength = Some(5);
+        s.now.duration = Some(434.0);
+        let out = render_to_lines_sized(&s, 120, 40).join("\n");
+        assert!(out.contains("vol [======#-----] 56%"), "the fader is named:\n{out}");
+        assert!(out.contains("track 1 of 5"), "the position is named:\n{out}");
+        assert!(out.contains("7:14 total"), "the duration is named:\n{out}");
+    }
+
+    #[test]
+    fn the_empty_deck_says_how_to_leave_it() {
+        // The stopped card is the first thing a fresh install shows, and every way out
+        // of it is a function key. Before, the only pointer anywhere on screen was a dim
+        // `? help` in the opposite corner.
+        let s = TuiState::new();
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("nothing playing"), "the state is named:\n{out}");
+        assert!(out.contains("F5 to search, F4 to ask the DJ"), "and a way out:\n{out}");
+        // The same two verbs on the empty Up Next, which is the OTHER empty pane on the
+        // same screen - one wording, learned once.
+        assert!(out.contains("nothing queued"), "the queue pane is honest too:\n{out}");
+        assert!(!out.contains("end of queue"), "not a cursor position:\n{out}");
+    }
+
+    #[test]
+    fn up_next_leads_with_next_then_then_and_says_a_repeated_artist_once() {
+        // `2.` was the row's absolute queue index: the pane opened on a number that is
+        // neither first nor meaningful beside the card's own `track 1 of 5`. And a
+        // compilation put `Various Artists` under all three rows, spending the pane's
+        // whole sub-line budget on a word the reader discounts on sight.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.song = Some(0);
+        let item = |pos: usize, title: &str, artist: &str| hypodj_client::model::QueueItem {
+            pos,
+            title: title.into(),
+            artist: Some(artist.into()),
+            uri: Some(format!("song/{pos}")),
+            album_uri: None,
+        };
+        s.queue = vec![
+            item(0, "Playing", "Various Artists"),
+            item(1, "Second", "Various Artists"),
+            item(2, "Third", "Various Artists"),
+            item(3, "Fourth", "C418"),
+        ];
+        // The right half of the frame is the Up Next pane; the Queue screen on the left
+        // is a navigable list and keeps its own numbering and its own repeats.
+        let rows = render_to_lines_sized(&s, 120, 40);
+        let out: String = rows
+            .iter()
+            .map(|r| r.chars().skip(62).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("next  Second"), "the first row leads with `next`:\n{out}");
+        assert!(out.contains("then  Third"), "and the rest with `then`:\n{out}");
+        // (The Queue SCREEN still numbers its own rows - a list you navigate has
+        // positions. The preview pane is not one, which is the distinction.)
+        assert_eq!(
+            out.matches("Various Artists").count(),
+            1,
+            "a repeated artist is said once, not once per row:\n{out}"
+        );
+        assert!(out.contains("C418"), "but a CHANGE of artist is always said:\n{out}");
+    }
+
+    #[test]
+    fn a_placeholder_artist_is_dimmed_and_a_real_one_is_not() {
+        // `Various Artists` was rendering at full weight as the second-most prominent
+        // thing on the card while saying less than the dim album line under it.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Track".into());
+        s.now.album = Some("A Compilation".into());
+        let weight_of = |s: &TuiState, needle: &str| -> ratatui::style::Modifier {
+            use ratatui::backend::TestBackend;
+            use ratatui::Terminal;
+            let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            t.draw(|f| super::render(f, s)).unwrap();
+            let buf = t.backend().buffer().clone();
+            for y in 0..buf.area.height {
+                let row: String =
+                    (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                if row.contains(needle) {
+                    let x = row.find(needle).unwrap() as u16;
+                    return buf[(x, y)].style().add_modifier;
+                }
+            }
+            panic!("{needle:?} is not on screen");
+        };
+        s.now.artist = Some("Various Artists".into());
+        assert!(
+            weight_of(&s, "Various Artists").contains(ratatui::style::Modifier::DIM),
+            "a placeholder is dimmed to the album's level"
+        );
+        s.now.artist = Some("Miles Davis".into());
+        assert!(
+            !weight_of(&s, "Miles Davis").contains(ratatui::style::Modifier::DIM),
+            "a real artist keeps its weight"
+        );
+    }
+
+    #[test]
+    fn the_art_never_takes_more_rows_than_it_can_be_square_in() {
+        // Past the square limit the width clamp pins the columns, so extra rows only
+        // stretch the cover while pushing the metadata into a footnote under it.
+        assert_eq!(square_art_rows(60, None), 30, "half-block cells are 2:1");
+        assert_eq!(square_art_rows(60, Some((10, 20))), 30, "and real cell pixels are honored");
+        assert_eq!(square_art_rows(60, Some((20, 10))), 120);
+        // Total: a zero-height cell (a terminal that answered nonsense) must not divide
+        // by zero, and a zero-width pane simply has no room.
+        assert_eq!(square_art_rows(60, Some((10, 0))), 30, "falls back, never panics");
+        assert_eq!(square_art_rows(0, None), 0);
+        // Saturating: a huge reported cell width must not overflow the multiply.
+        assert_eq!(square_art_rows(u16::MAX, Some((u16::MAX, 1))), u16::MAX);
+    }
+
+    #[test]
+    fn the_narrow_bar_steps_the_badge_down_instead_of_dropping_it() {
+        // Dropping it outright made a HELD mirror and a finished one look identical on a
+        // narrow terminal, and an empty bar reads as "nothing to report".
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.store =
+            Some("318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming".into());
+        let out = render_to_lines_sized(&s, 70, 30).join("\n");
+        assert!(
+            out.contains("offline: 318 of 347 tracks (held)"),
+            "the count survives, and the fact that something stops it:\n{out}"
+        );
+        assert!(
+            !out.contains("paused while streaming"),
+            "the reason itself defers to `dj status` at this width:\n{out}"
+        );
+    }
+
     fn render_to_lines(state: &TuiState) -> Vec<String> {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1254,7 +1588,9 @@ mod tests {
         // surface so the full two-column table lands (a cramped terminal clamps it).
         let mut s = TuiState::new();
         s.help_open = true;
-        let out = render_to_lines_sized(&s, 120, 48).join("\n");
+        // Height sized to hold EVERY row at once (grows with the keymap; the scrolling
+        // behaviour on a real terminal is the next test's job, not this one's).
+        let out = render_to_lines_sized(&s, 120, 64).join("\n");
         // A group header and a couple of known binding descriptions are present, all
         // derived from keymap::grouped (so the overlay can never drift).
         assert!(out.contains("View"), "group header rendered:\n{out}");
@@ -1264,7 +1600,8 @@ mod tests {
             "the radio gesture is discoverable in the overlay:\n{out}"
         );
         assert!(out.contains("quit"), "quit binding rendered:\n{out}");
-        assert!(out.contains("Help - keys"), "overlay titled:\n{out}");
+        assert!(out.contains("Help"), "overlay titled:\n{out}");
+        assert!(out.contains("Esc closes"), "and says how to leave it:\n{out}");
     }
 
     #[test]
@@ -1277,7 +1614,7 @@ mod tests {
         s.help_open = true;
         s.help_scroll = 0;
         let top = render_to_lines_sized(&s, 60, 12).join("\n");
-        assert!(top.contains("Help - keys"), "overlay titled + fits:\n{top}");
+        assert!(top.contains("Help"), "overlay titled + fits:\n{top}");
         assert!(top.contains("scroll"), "scroll affordance shown when clamped:\n{top}");
         assert!(!top.contains("quit"), "tail binding is off-screen at the top:\n{top}");
         // The `quit` binding is off-screen at the top but becomes reachable by scrolling:
@@ -1464,24 +1801,26 @@ mod tests {
         // quietest row on the screen, left of the help hint.
         let mut s = TuiState::new();
         s.now.state = Some("play".into());
-        s.now.store = Some("318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)".into());
+        s.now.store =
+            Some("318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming".into());
         let out = render_to_lines_sized(&s, 100, 30).join("\n");
         assert!(
-            out.contains("[318/347 tracks, waiting (playback-remote)]"),
-            "the badge is drawn with the reason it is held:\n{out}"
+            out.contains("offline: 318 of 347 tracks, paused while streaming"),
+            "the badge names its SUBJECT and the reason it is held:\n{out}"
         );
         assert!(out.contains("? help"), "and it does not displace the help hint:\n{out}");
 
         // No store line -> nothing drawn, exactly like the armed/field HUDs.
         s.now.store = None;
         let out = render_to_lines_sized(&s, 100, 30).join("\n");
-        assert!(!out.contains("318/347"), "a lean status draws no badge:\n{out}");
+        assert!(!out.contains("offline:"), "a lean status draws no badge:\n{out}");
 
         // A narrow terminal keeps the ambient row for itself rather than truncating the
         // badge into nonsense - `dj status` always carries the full sentence.
-        s.now.store = Some("318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)".into());
+        s.now.store =
+            Some("318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming".into());
         let out = render_to_lines_sized(&s, 40, 30).join("\n");
-        assert!(!out.contains("318/347"), "no badge where it would eat the whole row:\n{out}");
+        assert!(!out.contains("offline:"), "no badge where it would eat the whole row:\n{out}");
     }
 
     #[test]
@@ -1517,6 +1856,53 @@ mod tests {
         s.now.starred = false;
         let plain = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(!plain.contains('\u{2665}'), "no heart when not starred:\n{plain}");
+    }
+
+    #[test]
+    fn the_bars_never_move_under_a_deck_that_is_not_playing() {
+        // The bottom-bar field is the one moving thing on the screen, so motion there
+        // is a CLAIM: music is flowing. It was derived from `viz_playing`, a flag off
+        // the daemon's frames, which let a stale or optimistic slot keep the bars
+        // bobbing under a deck reading `paused` / `stopped` - the row contradicting the
+        // status line one pane above it.
+        let rest = wave_glyphs()[0];
+        // The ambient row is the one built from wave glyphs - found by that, never by
+        // the resting glyph itself, since a fully lit row contains none of it.
+        let ambient = |s: &TuiState| -> String {
+            render_to_lines_sized(s, 100, 30)
+                .into_iter()
+                .find(|r| r.chars().take(4).all(|c| wave_glyphs().contains(&c)))
+                .expect("the ambient row")
+        };
+        let mut s = TuiState::new();
+        s.now.file = Some("song/1".into());
+        // A LIT, PLAYING level slot - exactly the stale-slot case.
+        s.viz_active = true;
+        s.viz_playing = true;
+        s.viz_env = 0.9;
+        for state in ["pause", "stop"] {
+            s.now.state = Some(state.into());
+            let bar = ambient(&s);
+            let wave: String = bar.chars().take_while(|c| wave_glyphs().contains(c)).collect();
+            assert!(
+                !wave.is_empty() && wave.chars().all(|c| c == rest),
+                "{state}: the field rests flat, it does not bob: {bar:?}"
+            );
+        }
+        // An UNKNOWN transport is not playing either - a reconnect must not light it.
+        s.now.state = None;
+        let bar = ambient(&s);
+        let wave: String = bar.chars().take_while(|c| wave_glyphs().contains(c)).collect();
+        assert!(wave.chars().all(|c| c == rest), "unknown transport rests too: {bar:?}");
+
+        // And it DOES move again the moment the deck says it is playing, so this is a
+        // gate on the claim, not a dead row.
+        s.now.state = Some("play".into());
+        let bar = ambient(&s);
+        assert!(
+            bar.chars().any(|c| wave_glyphs().contains(&c) && c != rest),
+            "a playing deck lights the field: {bar:?}"
+        );
     }
 
     #[test]
@@ -1670,7 +2056,7 @@ mod tests {
         ];
         s.heard_open = true;
         let out = render_flat(&s);
-        assert!(out.contains("Marked - the tape"), "the panel is titled:\n{out}");
+        assert!(out.contains("Marks"), "the panel is titled:\n{out}");
         assert!(out.contains("t closes"), "and says how to leave it:\n{out}");
         assert!(out.contains("Sun Ra - Space Is The Place"), "an ordinary mark is listed:\n{out}");
         // THE POINT: the tape annotation survives at 60 columns. That row is 84 chars, so
@@ -2671,30 +3057,61 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 // playing. Both are DIM so the row stays the least-prominent surface.
                 // Reserve the right edge for the subtle "? help" hint, drawing the
                 // wave into the remaining width so it never covers the hint.
-                const HINT: &str = " ? help";
+                // Two leading spaces, matching the badge's own gap: with one, the badge
+                // and the hint ran together into `...paused while streaming ? help`,
+                // which reads as a single phrase ending in a question.
+                const HINT: &str = "  ? help";
                 let full = area.width as usize;
                 let hint_len = if full > HINT.len() + 2 { HINT.len() } else { 0 };
                 // THE STORE BADGE, left of the help hint: the passive answer to "is
                 // the mirror running, held, or done?". Drawn only when the daemon
-                // published one AND the bar is wide enough to keep a real stretch of
-                // wave (a badge that eats the whole row would be a status bar, not a
-                // badge); below that width it simply is not drawn, never truncated
-                // into nonsense. `dj status` always carries the full sentence.
-                let badge = state
-                    .now
-                    .store
-                    .as_deref()
+                // published one AND the bar keeps a real stretch of wave (a badge that
+                // eats the whole row would be a status bar, not a badge). It is never
+                // truncated into nonsense - it STEPS DOWN instead, to the short form
+                // and then to nothing. `dj status` always carries the full sentence.
+                //
+                // Two forms rather than one, because dropping the badge outright made
+                // a held mirror and a finished one look identical on a narrow terminal,
+                // and silence reads as "nothing to report".
+                //
+                // Prefixed `offline:` and unbracketed: the numbers are meaningless
+                // without a SUBJECT (a bare `80 of 360` on the same screen as
+                // `track 1 of 5` invites exactly the wrong reading), and the brackets
+                // added a frame to a row that is already dim and spatially separated
+                // from the wave.
+                let fits = |b: &String| full > hint_len + b.chars().count() + MIN_WAVE_CELLS;
+                let store = state.now.store.as_deref();
+                let badge = store
                     .and_then(store_badge)
-                    .map(|b| format!(" [{b}]"))
-                    .filter(|b| full > hint_len + b.chars().count() + MIN_WAVE_CELLS);
+                    .map(|b| format!("  offline: {b}"))
+                    .filter(fits)
+                    .or_else(|| {
+                        store
+                            .and_then(store_badge_short)
+                            .map(|b| format!("  offline: {b}"))
+                            .filter(fits)
+                    });
                 let badge_len = badge.as_ref().map_or(0, |b| b.chars().count());
                 let width = full.saturating_sub(hint_len + badge_len);
                 let seed = track_seed(&state.now);
+                // ONE fact decides motion on BOTH paths: the transport state the card
+                // itself is showing. The level path used to trust `viz_playing` alone -
+                // a flag derived from the daemon's frames - so a stale or optimistic
+                // slot could keep the bars bobbing under a deck that reads `stopped`.
+                // Motion on this row means "music is flowing"; nothing but the deck's
+                // own state gets to make that claim, and disagreeing with the line
+                // directly above it is never the honest answer.
+                let playing = state.now.state.as_deref() == Some("play");
                 let wave = if state.viz_active {
-                    level_wave_row(width, state.anim_secs, seed, state.viz_env, state.viz_playing)
+                    level_wave_row(
+                        width,
+                        state.anim_secs,
+                        seed,
+                        state.viz_env,
+                        state.viz_playing && playing,
+                    )
                 } else {
-                    let animate = state.now.state.as_deref() == Some("play");
-                    wave_row(width, state.anim_secs, seed, animate)
+                    wave_row(width, state.anim_secs, seed, playing)
                 };
                 // Waveform color: an album swatch run through the INFO policy (>= 3:1
                 // vs the detected bg, hue-preserving), replacing the flat DIM styling.
@@ -3208,6 +3625,49 @@ mod sixel_render_tests {
         // A different geometry is a different image and must re-encode.
         let resized = a.sixel(80, 68);
         assert_ne!(first, resized);
+    }
+
+
+    /// A terminal that answers DA1 but has not published a pixel geometry yet
+    /// must still get images once it does.
+    ///
+    /// A freshly mapped window reports correct character dimensions at once but
+    /// takes 20 to 100 ms to report pixel dimensions, and 4 cold launches in 6
+    /// were measured reporting 0x0 at first. The startup probe lands inside
+    /// that window, so a session that asked once and never asked again lost
+    /// images for its whole lifetime - which is exactly the intermittent
+    /// "no cover in a new window" report.
+    ///
+    /// This pins the RENDER side of that contract: sixel is refused while the
+    /// geometry is missing, and drawn once it arrives, with no other state
+    /// having changed.
+    #[test]
+    fn a_late_pixel_geometry_still_yields_images() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let a = art();
+        let rect = Rect { x: 0, y: 0, width: 8, height: 4 };
+
+        // The window has not been allocated yet: no geometry, so no image.
+        terminal
+            .draw(|f| {
+                assert!(
+                    !render_sixel_art(f, rect, &a, None, false),
+                    "must refuse while the geometry is unknown"
+                );
+            })
+            .unwrap();
+
+        // The compositor allocates it and a cell size appears. Nothing else
+        // changed, and the image must now draw.
+        terminal
+            .draw(|f| {
+                assert!(
+                    render_sixel_art(f, rect, &a, Some((8, 17)), false),
+                    "must draw once the geometry arrives"
+                );
+                assert!(f.buffer_mut()[(0, 0)].symbol().starts_with("\x1bP"));
+            })
+            .unwrap();
     }
 
     /// Refusals fall back rather than drawing something wrong.

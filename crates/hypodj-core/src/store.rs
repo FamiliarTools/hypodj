@@ -1337,6 +1337,25 @@ impl StoreWaiting {
             StoreWaiting::ReserveBreached => "reserve-breached",
         }
     }
+
+    /// The same state as a SENTENCE, for the surfaces a person reads.
+    ///
+    /// `label` is the slug: stable, greppable, what a log and a machine-facing field
+    /// want. But `waiting (playback-remote)` on the client's badge told the user
+    /// nothing - it named an internal enum where the only question was "is it stuck?".
+    /// Each phrase answers that instead: it says the hold is deliberate and, where
+    /// there is one, what would end it. `None` has no phrase because a store that is
+    /// not waiting says nothing at all.
+    pub fn phrase(self) -> Option<&'static str> {
+        match self {
+            StoreWaiting::None => None,
+            StoreWaiting::PlaybackRemote => Some("paused while streaming"),
+            StoreWaiting::Paused => Some("paused by you"),
+            // No comma: the badge is comma-joined, and a clause that splits itself
+            // would arrive at the client as two.
+            StoreWaiting::ReserveBreached => Some("stopped - the disk is almost full"),
+        }
+    }
 }
 
 /// What the store knows about itself right now, recomputed by every full pass and

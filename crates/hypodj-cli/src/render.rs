@@ -128,9 +128,13 @@ fn render_history(plays: Option<u32>, last_played_days: Option<u32>) -> Option<S
 }
 
 /// The active latent-field pulls as one unobtrusive line, e.g.
-/// `toward calmer 0.58 3m | toward warmer 0.41 1m`. `None` when no pull is active,
-/// so a resting field renders no line. Reconstructed from the numeric X- pairs; the
-/// verbose provenance prose stays reserved for the interactive `field` command.
+/// `toward calmer (58%, 3m ago) \u{b7} toward warmer (41%, 1m ago)`. `None` when no
+/// pull is active, so a resting field renders no line. Reconstructed from the numeric
+/// X- pairs; the verbose provenance prose stays reserved for the interactive `field`
+/// command.
+///
+/// Both numbers are LABELLED, and the wording is byte-identical to the dj-gui's
+/// `field_hud` - one HUD, two clients, and a reader who learns it once.
 fn render_field(field: &FieldState) -> Option<String> {
     if !field.active() {
         return None;
@@ -138,21 +142,23 @@ fn render_field(field: &FieldState) -> Option<String> {
     let line = field
         .pulls
         .iter()
-        .map(|p| format!("toward {} {:.2} {}m", p.label, p.strength as f32 / 100.0, p.age_mins))
+        .map(|p| format!("toward {} ({}%, {}m ago)", p.label, p.strength, p.age_mins))
         .collect::<Vec<_>>()
-        .join(" | ");
+        .join(" \u{00b7} ");
     Some(line)
 }
 
 /// The armed human-features as one unobtrusive line, e.g.
-/// `sleep 12m | winding down | wake in 7h 00m`. `None` when nothing is armed.
+/// `sleep in 12m \u{b7} winding down \u{b7} wake in 7h 00m`. `None` when nothing is
+/// armed. Worded exactly as the dj-gui's `armed_hud`: `in` marks every countdown, so
+/// `sleep 12m` cannot be read as a twelve-minute-long timer.
 fn render_armed(a: &ArmedFeatures) -> Option<String> {
     if !a.any() {
         return None;
     }
     let mut bits = Vec::new();
     if let Some(s) = a.sleep_remaining {
-        bits.push(format!("sleep {}", fmt_remaining(s)));
+        bits.push(format!("sleep in {}", fmt_remaining(s)));
     }
     if a.winddown_active {
         match a.winddown_remaining {
@@ -163,7 +169,7 @@ fn render_armed(a: &ArmedFeatures) -> Option<String> {
     if let Some(s) = a.wake_remaining {
         bits.push(format!("wake in {}", fmt_remaining(s)));
     }
-    Some(bits.join(" | "))
+    Some(bits.join(" \u{00b7} "))
 }
 
 fn fmt_dur(secs: f64) -> String {
@@ -336,7 +342,7 @@ mod tests {
         ]);
         let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
         let card = render_card(&now_playing(&status, &current));
-        assert!(card.contains("sleep 12m"), "card: {card}");
+        assert!(card.contains("sleep in 12m"), "card: {card}");
         assert!(card.contains("wake in 7h 00m"), "card: {card}");
     }
 
@@ -376,9 +382,12 @@ mod tests {
         ]);
         let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
         let card = render_card(&now_playing(&status, &current));
-        assert!(card.contains("toward calmer 0.58 3m"), "card: {card}");
-        assert!(card.contains("toward warmer 0.41 1m"), "card: {card}");
-        assert!(card.contains("toward calmer 0.58 3m | toward warmer 0.41 1m"), "card: {card}");
+        assert!(card.contains("toward calmer (58%, 3m ago)"), "card: {card}");
+        assert!(card.contains("toward warmer (41%, 1m ago)"), "card: {card}");
+        assert!(
+            card.contains("toward calmer (58%, 3m ago) \u{b7} toward warmer (41%, 1m ago)"),
+            "card: {card}"
+        );
     }
 
     #[test]
@@ -400,7 +409,7 @@ mod tests {
         ]);
         let card = render_card(&now_playing(&status, &[]));
         assert!(card.contains("nothing playing"));
-        assert!(card.contains("toward calmer 0.58 3m"), "card: {card}");
+        assert!(card.contains("toward calmer (58%, 3m ago)"), "card: {card}");
     }
 
     #[test]
@@ -443,19 +452,19 @@ mod tests {
             ("playlistlength", "12"),
             ("state", "play"),
             ("song", "2"),
-            ("X-Store", "318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)"),
+            ("X-Store", "318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming"),
         ]);
         let current = p(&[("file", "song/42"), ("Title", "Blue in Green")]);
         let card = render_card(&now_playing(&status, &current));
         assert!(
-            card.contains("store: 318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)"),
+            card.contains("store: 318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming"),
             "card: {card}"
         );
 
-        let stopped = p(&[("state", "stop"), ("X-Store", "complete, 347 tracks, 9.8 GiB")]);
+        let stopped = p(&[("state", "stop"), ("X-Store", "all 347 tracks, 9.8 GiB")]);
         let card = render_card(&now_playing(&stopped, &[]));
         assert!(card.contains("nothing playing"));
-        assert!(card.contains("store: complete, 347 tracks, 9.8 GiB"), "card: {card}");
+        assert!(card.contains("store: all 347 tracks, 9.8 GiB"), "card: {card}");
 
         // No store (or no full pass yet): no line at all, exactly like the armed HUD.
         let lean = p(&[("state", "stop")]);

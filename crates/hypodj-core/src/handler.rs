@@ -452,18 +452,43 @@ struct ContinuationWarm {
     #[allow(dead_code)]
     guard: TimerGuard,
     /// Whether the background prefetch actually reached the actor (the
-    /// `PrefetchContinuation` Ok). Only when `true` do the fields below carry the
-    /// resolved station identity, and only then may the landed-commit append it.
+    /// `PrefetchContinuation` Ok). Only when `true` does `target` carry a resolved
+    /// identity, and only then may the landed-commit attribute it.
     warmed: bool,
-    /// The queue id minted for the station at prefetch time (attributed on the landed
-    /// handoff). Meaningful only when `warmed`.
+    /// The queue id minted (station) or carried (queue entry) at prefetch time, and
+    /// attributed on the landed handoff. Meaningful only when `warmed`.
     qid: u64,
-    /// The resolved station stream URL. Meaningful only when `warmed`.
-    url: String,
-    /// The station label (the configured station string), used as the appended
-    /// [`QueueEntry::Stream`] title exactly like the cold-start. Meaningful only when
+    /// The resolved stream URL parked behind the current entry. Meaningful only when
     /// `warmed`.
+    url: String,
+    /// The station label, used as the appended [`QueueEntry::Stream`] title exactly
+    /// like the cold-start. Empty and unused for a [`WarmTarget::QueueNext`].
     title: String,
+    /// WHAT is parked - the one field that makes this slot serve both handoffs.
+    target: WarmTarget,
+}
+
+/// What the ONE warm slot is holding.
+///
+/// WHY ONE SLOT AND NOT TWO, which is the load-bearing structural call here: the slot
+/// is disarmed or rescheduled from a dozen call sites (skip, pause, stop, setvol, seek,
+/// both fade paths, every fresh play, and queue edits), and EVERY one of those
+/// supersedes must also kill a queue warm. Carrying both handoffs in one slot means all
+/// of that plumbing covers the new case for free. A second parallel slot would mean
+/// re-auditing every site, and a single missed one leaves an entry parked that mpv
+/// AUTO-ADVANCES into - silent wrong-track audio, which is the worst failure available
+/// on this path and the one no test the user runs would catch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WarmTarget {
+    /// The end-of-queue continuation STATION, warmed at a true-drain boundary so the
+    /// current track's natural EOF flows gaplessly into radio.
+    Station,
+    /// The NEXT QUEUE ENTRY, warmed behind a finite current track so an ORDINARY
+    /// end-of-track advance is gapless instead of paying a cold loadfile as real
+    /// silence. `idx` is the queue index the warm was armed for, re-validated at the
+    /// landed commit so a queue edit that slipped past a disarm can still not commit
+    /// the wrong row.
+    QueueNext { idx: usize },
 }
 
 /// An ICY title that has been superseded on the SAME stream entry (see
@@ -1317,6 +1342,59 @@ impl State {
         self.pending_skip.or(self.current)
     }
 
+    /// The index a normal advance from `cur` would go to, honoring `single` (auto
+    /// only), `random` and `repeat` - and mutating NOTHING about the queue. This is
+    /// the pure index math [`HypodjHandler::plan_next`] layers its `consume` eviction
+    /// on top of, split out so a caller that only wants to ASK "what plays after this
+    /// one?" cannot accidentally perform an advance. A queue delete needs exactly that
+    /// question: it owns the removal itself, and letting `plan_next` also consume made
+    /// one `delete` remove TWO entries.
+    fn peek_next_from(&mut self, cur: usize, auto: bool) -> Option<usize> {
+        let len = self.queue.len();
+        if len == 0 {
+            return None;
+        }
+        if auto && self.single {
+            // single: stop after the current track, or (with repeat) replay it.
+            return if self.repeat { Some(cur) } else { None };
+        }
+        if self.random {
+            return self.random_next_index(Some(cur));
+        }
+        if cur + 1 < len {
+            Some(cur + 1)
+        } else if self.repeat {
+            // repeat-all at the end of the queue: wrap to the first entry.
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    /// Remove the entry with `qid` from the queue, bump the playlist version, and
+    /// REMAP every index that outlives the shrink (`current`, `pending_skip`) over
+    /// it: an index after the removed slot shifts down one, an index AT it is
+    /// cleared (that entry is gone), an index before it is unchanged. Returns the
+    /// index the entry occupied, or `None` when no such entry is queued (an idempotent
+    /// no-op - a concurrent delete/clear already took it).
+    ///
+    /// The ONE place a queue eviction may happen outside `plan_next`'s `consume`, so
+    /// the remap arithmetic exists once rather than at each caller. Callers that also
+    /// commit a new `current` must write it AFTER this (see [`Terminal::SkipLoad`]).
+    fn evict_qid(&mut self, qid: QueueId) -> Option<usize> {
+        let pos = self.queue.iter().position(|it| it.id == qid.0)?;
+        self.queue.remove(pos);
+        self.playlist_version += 1;
+        let remap = |i: Option<usize>| match i {
+            Some(c) if c == pos => None,
+            Some(c) if c > pos => Some(c - 1),
+            other => other,
+        };
+        self.current = remap(self.current);
+        self.pending_skip = remap(self.pending_skip);
+        Some(pos)
+    }
+
     /// Point `current` back at the queue entry carrying MPD id `qid`, if it is still
     /// there. Returns whether it was found. The id (not an index) is what the failed-load
     /// walk remembers, so a delete/move that reindexed the queue in between still lands
@@ -1422,6 +1500,103 @@ fn drain_is_next(st: &State) -> bool {
 /// the auto-advance instead of swallowing it - so this predicate omits that guard on
 /// purpose.
 fn continuation_warm_ready(st: &State, station_ok: bool, playing: bool) -> Option<f64> {
+    warm_ready(st, station_ok, playing).map(|(d, _)| d)
+}
+
+/// The warm predicate, now answering BOTH handoffs: returns the current finite Song's
+/// duration plus WHICH target should be parked behind it.
+///
+/// The shared guards are the ones the station warm already carried and they are not
+/// negotiable for either target: a GENUINELY PLAYING deck (never behind a stopped -
+/// `stop_playback` keeps `current` - paused, or fading-out deck), NO in-flight skip (a
+/// skip owns the warm slot and supersedes), NO live continuation stream (never warm
+/// behind the station itself), and a current entry that is a FINITE Song with a known
+/// duration, because a stream has no natural EOF to warm ahead of and an unknown
+/// duration cannot bound the LEAD.
+///
+/// The two targets are then selected by the SAME boundary test the cold paths use, so a
+/// warm can never arm for a boundary the advance would treat differently:
+/// - `drain_is_next` -> [`WarmTarget::Station`], gated additionally on the armed
+///   continuation toggle and a configured station in Radio mode.
+/// - otherwise, the next entry -> [`WarmTarget::QueueNext`], and ONLY when that entry is
+///   itself a library Song. A raw Stream is deliberately never queue-warmed: it has no
+///   duration, an ICY connection parked through the whole of the current track is stale
+///   by the time it lands, and the drain-edge station path already covers the case that
+///   matters.
+/// The next index a NON-random, NON-single auto-advance will take, computed WITHOUT
+/// touching a byte of state.
+///
+/// WHY THIS EXISTS RATHER THAN A CALL TO `peek_next_from`: that method is `&mut self`,
+/// and not incidentally - under `random` it DRAWS the next index through
+/// `random_next_index`, advancing the shuffle history. Asking it from a predicate would
+/// consume a draw the real advance then never sees, so the warm would park one track
+/// while `plan_next` later chose a different one - mpv auto-advancing into an entry the
+/// queue does not believe is next, which is exactly the silent wrong-track failure this
+/// whole design is arranged to make unrepresentable.
+///
+/// So random is simply NOT WARMABLE, and says so here rather than being worked around:
+/// its next entry is not knowable until the advance draws it. `single` is excluded for
+/// the same honesty - it either stops or replays the current entry, neither of which is
+/// a handoff to warm. Both fall back to today's cold load, which is correct and merely
+/// not gapless.
+fn peek_next_deterministic(st: &State, cur: usize) -> Option<usize> {
+    if st.random || st.single {
+        return None;
+    }
+    let len = st.queue.len();
+    if len == 0 {
+        return None;
+    }
+    if cur + 1 < len {
+        Some(cur + 1)
+    } else if st.repeat {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn warm_ready(st: &State, station_ok: bool, playing: bool) -> Option<(f64, WarmTarget)> {
+    if !(playing && st.pending_skip.is_none() && st.continuation_active.is_none()) {
+        return None;
+    }
+    let cur = st.current?;
+    // The current entry must be a finite Song with a usable duration for EITHER target.
+    let dur = match st.queue.get(cur).map(|it| &it.entry) {
+        Some(QueueEntry::Song(s)) => match s.duration_secs {
+            Some(d) if d > 0 => d as f64,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if drain_is_next(st) {
+        // The drain edge: the station handoff, unchanged.
+        if st.continuation && station_ok {
+            return Some((dur, WarmTarget::Station));
+        }
+        return None;
+    }
+    // Not draining, so an ORDINARY advance is next. Warm it when the target is a
+    // finite library Song - `peek_next_from` is the same planner `plan_next` uses, so
+    // the warm and the advance can never disagree about which row comes next.
+    let next = peek_next_deterministic(st, cur)?;
+    // NEVER warm an entry behind ITSELF. `repeat` over a single-entry queue makes the
+    // current row its own next, and parking it would append a second copy of the URL
+    // mpv is already playing - while the landed check (which matches on queue id) could
+    // not tell the replay from a real advance, because they ARE the same row. The cold
+    // replay path handles this correctly today and is left to.
+    if next == cur {
+        return None;
+    }
+    match st.queue.get(next).map(|it| &it.entry) {
+        Some(QueueEntry::Song(_)) => Some((dur, WarmTarget::QueueNext { idx: next })),
+        _ => None,
+    }
+}
+
+/// The ORIGINAL station-only predicate, kept verbatim for the drain-edge callers.
+#[allow(dead_code)]
+fn continuation_warm_ready_station(st: &State, station_ok: bool, playing: bool) -> Option<f64> {
     // The deck GENUINELY PLAYING (never arm behind a stopped/paused/fading-out deck -
     // stop_playback keeps `current`, so this play-state gate, not `current`, is what
     // refuses a warm on a stopped deck), the armed toggle ON, a station configured, NO
@@ -1604,7 +1779,13 @@ enum Terminal {
     #[allow(dead_code)]
     None,
     /// `fade out`: stop playback and restore the baseline volume.
-    StopRestore,
+    ///
+    /// `evict` carries the QUEUE-DELETE half of a "remove the playing track when it
+    /// is the last one" gesture: the entry is dropped from the queue in the SAME
+    /// state lock that lands the stop, so the queue and the deck can never disagree
+    /// (no window where the deck plays an entry the queue no longer has). `None` for
+    /// every ordinary `fade out`.
+    StopRestore { evict: Option<QueueId> },
     /// `fade to <v>`: commit `v` as the new baseline volume.
     SetBaseline(u8),
     /// Startle-safe transport PAUSE: the ramp has reached silence, so now PAUSE mpv
@@ -1628,6 +1809,17 @@ enum Terminal {
     /// slot - one path, one arbiter.
     SkipLoad {
         idx: usize,
+        /// The entry to DROP from the queue at the instant the target commits - the
+        /// queue-delete half of a "remove the currently playing track" gesture. Held
+        /// as a [`QueueId`], never an index, so a concurrent queue edit cannot make
+        /// it point at the wrong track; the terminal re-derives the committed index
+        /// from `play.qid` after the shrink. `None` for an ordinary skip.
+        ///
+        /// THE INVARIANT: the eviction and the successor's commit land TOGETHER,
+        /// under one lock. A superseded dip never runs this terminal, so it never
+        /// evicts either - the queue and the deck stay in lockstep in both outcomes,
+        /// and no orphaned deck (audible track with no queue slot) is reachable.
+        evict: Option<QueueId>,
         play: ResolvedPlay,
         resume_spec: FadeSpec,
         resume_vol: u8,
@@ -1665,6 +1857,14 @@ pub struct FadeRequest {
 pub enum FadeIntent {
     /// Ramp to silence, then stop playback and restore the pre-fade baseline.
     Out,
+    /// REMOVE THE PLAYING TRACK when it is the last thing to play: a SHORT
+    /// DELIBERATE ramp to silence (like [`FadeIntent::PauseOut`], so the deck never
+    /// hard-cuts and the request always lands rather than being rejected as
+    /// too-short), then stop - and drop entry `qid` from the queue in the same lock
+    /// as the stop. Distinct from [`FadeIntent::Out`] only in the eviction and the
+    /// deliberate/clamp-up policy; it is still a transport STOP, so `installs_stop`
+    /// treats the two alike.
+    OutEvicting { qid: u64 },
     /// Startle-safe transport PAUSE: a SHORT DELIBERATE ramp to silence (3 dB/step,
     /// NOT the long sub-JND fade), then PAUSE mpv (not stop) leaving the baseline
     /// volume untouched, so a later RESUME ramps back to exactly the pre-pause level.
@@ -1801,7 +2001,16 @@ impl FadeIntent {
         floor_db: f64,
     ) -> (FadeTarget, bool, Terminal, bool) {
         match self {
-            FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore, false),
+            FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore { evict: None }, false),
+            // Deliberate + clamp_dur_up (NOT the long sub-JND `Out`): a queue delete is
+            // a responsive gesture, so it gets the same short click-safe ramp the pause
+            // transport uses, and must never be rejected for being too short.
+            FadeIntent::OutEvicting { qid } => (
+                FadeTarget::Silence,
+                false,
+                Terminal::StopRestore { evict: Some(QueueId(qid)) },
+                true,
+            ),
             // Short DELIBERATE ramp to silence, then PAUSE (not stop): the baseline
             // is preserved as the resume level. clamp_dur_up so a 0.5s request over a
             // large span extends to the safe minimum rather than being rejected.
@@ -1956,7 +2165,7 @@ fn fade_task(
                     drop(st);
                     changed.notify_waiters();
                 }
-                Terminal::StopRestore => {
+                Terminal::StopRestore { evict } => {
                     let restore = state.lock().unwrap().target_volume;
                     let _ = sink.stop().await;
                     // Re-assert the real mpv gain to the baseline so the next play
@@ -1987,6 +2196,14 @@ fn fade_task(
                         // MPD/MPRIS stop. A `fade out` says "wind down and stop", and
                         // honoring it means reporting Stopped, not Paused-holding-an-entry.
                         st.pending_pause = false;
+                        // The queue-delete half of "remove the playing track when it is
+                        // the last one": the entry leaves the queue in the SAME lock that
+                        // lands the stop, so it is audible for exactly as long as it has a
+                        // queue slot. A superseded fade never reaches here and so never
+                        // evicts - the gesture is all-or-nothing, never half-applied.
+                        if let Some(qid) = evict {
+                            st.evict_qid(qid);
+                        }
                     }
                     changed.notify_waiters();
                 }
@@ -2056,7 +2273,7 @@ fn fade_task(
                     // widget refresh) and MPD `idle` wakes.
                     changed.notify_waiters();
                 }
-                Terminal::SkipLoad { idx, play, resume_spec, resume_vol, dip_floor_db } => {
+                Terminal::SkipLoad { idx, evict, play, resume_spec, resume_vol, dip_floor_db } => {
                     // The dip reached its floor AND this is still the current epoch, so
                     // no superseding skip/setvol/stop got here first: it is SAFE to
                     // load the target. mpv's softvol (at the dip floor) persists across
@@ -2070,6 +2287,10 @@ fn fade_task(
                     // one the warm used), so the actor latches the right local/remote
                     // fact for the target's own later Eof - resolution cannot flip
                     // inside a gesture.
+                    // Captured before the partial move below: the target's stable queue
+                    // identity, which an `evict` makes the only trustworthy way to name
+                    // the committed slot (its INDEX shifts under the removal).
+                    let qid_for_commit = play.qid.0;
                     let _ = sink
                         .switch_warmed(play.song_id, Some(play.qid), &play.url, play.local)
                         .await;
@@ -2081,7 +2302,24 @@ fn fade_task(
                     // (now-finished) dip.
                     let epoch2 = {
                         let mut st = state.lock().unwrap();
-                        st.current = Some(idx);
+                        // DELETE-THE-PLAYING-TRACK: drop the outgoing entry in the SAME
+                        // lock that commits the incoming one.
+                        if let Some(gone) = evict {
+                            st.evict_qid(gone);
+                        }
+                        // ALWAYS re-derive the committed index from the target's own
+                        // QueueId, never from the `idx` captured at install time. The
+                        // queue can shrink under a live dip from ANY direction - an
+                        // eviction here, but equally an ordinary `delete` of some
+                        // unrelated row on another connection - and a stale index then
+                        // commits the WRONG entry, or one past the end (which reports
+                        // Stopped over audible playback and drains the queue at the next
+                        // EOF). `_idx` is kept only to document what was targeted.
+                        let _ = idx;
+                        // A target that is no longer queued commits NOTHING rather than a
+                        // phantom index. delete_at supersedes the dip when the target
+                        // itself is deleted, so this is the belt-and-braces arm.
+                        st.current = st.queue.iter().position(|it| it.id == qid_for_commit);
                         st.pending_skip = None;
                         // A track is now current: clear any fresh-enqueue anchor
                         // (defensive - a skip always starts from a playing deck, so the
@@ -5490,15 +5728,18 @@ impl HypodjHandler {
         if !st.known {
             return Vec::new();
         }
+        // The HEAD is the one thing every surface keeps, so it has to stand alone as a
+        // sentence: "80 of 360 tracks", not "80/360". A bare ratio next to the deck's
+        // own "track 1 of 5" reads as a second position counter.
         let mut line = if st.complete() {
             format!(
-                "complete, {} tracks, {} GiB",
+                "all {} tracks, {} GiB",
                 st.cached_tracks,
                 Self::gib(st.bytes)
             )
         } else {
             format!(
-                "{}/{} tracks, {}/{} GiB",
+                "{} of {} tracks, {} of {} GiB",
                 st.cached_tracks,
                 st.resident_tracks,
                 Self::gib(st.bytes),
@@ -5506,16 +5747,27 @@ impl HypodjHandler {
             )
         };
         // Why it is not moving, in words - otherwise a CORRECT deferral is
-        // indistinguishable from a stuck reconciler.
-        if st.waiting != crate::store::StoreWaiting::None {
-            line.push_str(&format!(", waiting ({})", st.waiting.label()));
+        // indistinguishable from a stuck reconciler. The words are the store's own
+        // (`StoreWaiting::phrase`), so the enum and the sentence cannot drift.
+        if let Some(why) = st.waiting.phrase() {
+            line.push_str(", ");
+            line.push_str(why);
         }
         let deferred = st.deferred_count();
         if deferred > 0 {
-            line.push_str(&format!(", {deferred} deferred"));
+            // A deferred entry is a PIN GROUP, which is an album to the person reading
+            // it; "3 deferred" named a verb nobody applied to anything.
+            line.push_str(&format!(
+                ", {deferred} album{} would not fit",
+                if deferred == 1 { "" } else { "s" }
+            ));
         }
         if st.given_up > 0 {
-            line.push_str(&format!(", {} given up", st.given_up));
+            line.push_str(&format!(
+                ", {} track{} failed to download",
+                st.given_up,
+                if st.given_up == 1 { "" } else { "s" }
+            ));
         }
         vec![("X-Store", line)]
     }
@@ -6573,7 +6825,7 @@ impl HypodjHandler {
         // behind a deck that is fading to a stop. Every other fade leaves the deck
         // playing (glide / knob / wind-down / resume-in) or pausing (PauseOut, which the
         // predicate's play-state gate already refuses via `pending_pause`).
-        let installs_stop = matches!(intent, FadeIntent::Out);
+        let installs_stop = matches!(intent, FadeIntent::Out | FadeIntent::OutEvicting { .. });
         // ANY fade that installs here SUPERSEDES whatever is running. If it superseded
         // a live skip dip, that dip's Terminal::SkipLoad/switch_warmed will NEVER run,
         // so `pending_skip` and the prefetched warm target are now STALE - the warm
@@ -9378,23 +9630,7 @@ impl HypodjHandler {
             return None;
         }
         // The next index in PRE-consume terms.
-        let mut next: Option<usize> = if auto && st.single {
-            // single: stop after the current track, or (with repeat) replay it.
-            if st.repeat {
-                Some(cur)
-            } else {
-                None
-            }
-        } else if st.random {
-            st.random_next_index(Some(cur))
-        } else if cur + 1 < len {
-            Some(cur + 1)
-        } else if st.repeat {
-            // repeat-all at the end of the queue: wrap to the first entry.
-            Some(0)
-        } else {
-            None
-        };
+        let mut next: Option<usize> = st.peek_next_from(cur, auto);
         if st.consume && !walking {
             // Remove the just-finished entry, then remap the target index over the
             // shrink: indices AFTER the removed slot shift down by one; a target at
@@ -9505,6 +9741,34 @@ impl HypodjHandler {
         let next = self.plan_next(true);
         match next {
             Some(idx) => {
+                // THE GAPLESS ARM. A queue warm parked behind this track means mpv has
+                // ALREADY auto-advanced into the next entry at this very EOF - it never
+                // stopped, so there is no loadfile to pay for and no silence to hear.
+                // Commit the index without loading. Every leg is required: the actor must
+                // have reported the landing, the slot must have survived every disarm
+                // still warmed, its target must be a queue warm, and its qid must match
+                // the row `plan_next` independently chose. That last check is what makes
+                // a queue edit which slipped past a disarm unable to commit the wrong
+                // row - it can only fall through to the cold path, which is correct and
+                // merely not gapless.
+                let landed_next = continuation_landed && {
+                    let mut st = self.state.lock().unwrap();
+                    let ok = matches!(
+                        &st.pending_continuation_warm,
+                        Some(w) if w.warmed
+                            && matches!(w.target, WarmTarget::QueueNext { .. })
+                            && st.queue.get(idx).map(|it| it.id) == Some(w.qid)
+                    );
+                    if ok {
+                        st.pending_continuation_warm = None;
+                    }
+                    ok
+                };
+                if landed_next {
+                    self.commit_landed_advance(idx).await;
+                    self.top_up_lookahead().await;
+                    return;
+                }
                 // A natural EOF advance is NOT a user gesture: it must NOT cancel an
                 // in-flight fade or snap mpv's gain back to the baseline. A slow ramp
                 // (winddown/sleep) has to survive across the track boundary (mpv
@@ -10010,10 +10274,10 @@ impl HypodjHandler {
         // is what makes this reschedule idempotent-correct from every funnel.
         let playing = self.reported_play_state() == PlayState::Playing;
         // (2) Predicate + finite-Song duration under one short lock.
-        let dur = {
+        let (dur, target) = {
             let st = self.state.lock().unwrap();
-            match continuation_warm_ready(&st, station_ok, playing) {
-                Some(d) => d,
+            match warm_ready(&st, station_ok, playing) {
+                Some(pair) => pair,
                 None => return,
             }
         };
@@ -10030,6 +10294,7 @@ impl HypodjHandler {
             qid: 0,
             url: String::new(),
             title: String::new(),
+            target,
         });
     }
 
@@ -10070,7 +10335,7 @@ impl HypodjHandler {
         // (b) Re-check the predicate + still-ours under one short lock; capture a DECISION
         // (never hold the std guard across the disarm await - the Send invariant).
         enum FireDecision {
-            Prefetch(f64),
+            Prefetch(f64, WarmTarget),
             Disarm,
             Bail,
         }
@@ -10079,19 +10344,23 @@ impl HypodjHandler {
             if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
                 FireDecision::Bail
             } else {
-                match continuation_warm_ready(&st, station_ok, playing) {
-                    Some(d) => FireDecision::Prefetch(d),
+                // Re-derive the target rather than trusting the one the arm stored: a
+                // queue edit between arm and fire can have changed which row is next,
+                // and the freshly derived target is what the landed commit will be
+                // re-validated against.
+                match warm_ready(&st, station_ok, playing) {
+                    Some((d, t)) => FireDecision::Prefetch(d, t),
                     None => FireDecision::Disarm,
                 }
             }
         };
-        let dur = match decision {
+        let (dur, target) = match decision {
             FireDecision::Bail => return,
             FireDecision::Disarm => {
                 self.disarm_continuation_warm().await;
                 return;
             }
-            FireDecision::Prefetch(d) => d,
+            FireDecision::Prefetch(d, t) => (d, t),
         };
         // The remaining moved OUT past the LEAD (pause-resumed or a backward seek):
         // cancel-then-rearm ONE fresh timer at the new deadline, never a polling loop.
@@ -10100,30 +10369,69 @@ impl HypodjHandler {
             self.reschedule_continuation_warm().await;
             return;
         }
-        // (c) Resolve the station URL with NO lock held, then mint a qid + prefetch.
-        let Some(station) = station else {
-            self.disarm_continuation_warm().await;
-            return;
-        };
-        let Some(url) = self.resolve_continuation_url(&station).await else {
-            self.disarm_continuation_warm().await;
-            return;
-        };
-        let qid = {
-            let mut st = self.state.lock().unwrap();
-            if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
-                return;
+        // (c) Resolve what to park, with NO lock held across an await.
+        //
+        // The two targets differ ONLY here. A station is resolved from configuration and
+        // gets a FRESHLY MINTED qid, because the row does not exist until the landed
+        // commit appends it. A queue entry already IS a row: it carries its own qid, and
+        // minting a second one would attribute the landed advance to an identity nothing
+        // in the queue holds.
+        let (url, qid, station_title, warm_song, warm_local) = match &target {
+            WarmTarget::Station => {
+                let Some(station) = station else {
+                    self.disarm_continuation_warm().await;
+                    return;
+                };
+                let Some(url) = self.resolve_continuation_url(&station).await else {
+                    self.disarm_continuation_warm().await;
+                    return;
+                };
+                let minted = {
+                    let mut st = self.state.lock().unwrap();
+                    if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
+                        return;
+                    }
+                    // A skip owns the warm slot in both directions: refuse while pending_skip.
+                    if st.pending_skip.is_some() {
+                        return;
+                    }
+                    let minted = st.next_id;
+                    st.next_id += 1;
+                    minted
+                };
+                // A station is id-less by design: it must never scrobble.
+                (url, minted, station, None, false)
             }
-            // A skip owns the warm slot in both directions: refuse while pending_skip.
-            if st.pending_skip.is_some() {
-                return;
+            WarmTarget::QueueNext { idx } => {
+                let item = {
+                    let st = self.state.lock().unwrap();
+                    if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
+                        return;
+                    }
+                    if st.pending_skip.is_some() {
+                        return;
+                    }
+                    st.queue.get(*idx).cloned()
+                };
+                let Some(item) = item else {
+                    self.disarm_continuation_warm().await;
+                    return;
+                };
+                // Same resolution the cold advance performs, so the warmed URL and the
+                // one play_index_inner would have loaded cannot diverge.
+                let Ok(play) = self.resolve_play(&item) else {
+                    self.disarm_continuation_warm().await;
+                    return;
+                };
+                (play.url, item.id, String::new(), play.song_id, play.local)
             }
-            let minted = st.next_id;
-            st.next_id += 1;
-            minted
         };
         // Background prefetch (best-effort). No std lock across the await.
-        let ok = self.player.prefetch_continuation(&url, QueueId(qid)).await.is_ok();
+        let ok = self
+            .player
+            .prefetch_continuation(&url, QueueId(qid), warm_song, warm_local)
+            .await
+            .is_ok();
         // Decide under a short lock whether to KEEP (flip warmed) or DISCARD the slot.
         let discard_landed_prefetch = {
             let mut st = self.state.lock().unwrap();
@@ -10134,7 +10442,8 @@ impl HypodjHandler {
                     w.warmed = true;
                     w.qid = qid;
                     w.url = url;
-                    w.title = station;
+                    w.title = station_title;
+                    w.target = target;
                 }
                 false
             } else {
@@ -10218,6 +10527,16 @@ impl HypodjHandler {
     fn current_can_warm(&self) -> bool {
         let dur_secs = {
             let st = self.state.lock().unwrap();
+            // CONSUME makes `current` untrustworthy for this question: `plan_next`
+            // removes the just-finished entry WITHOUT remapping `current`, so by the
+            // time a skip reaches here the index names the SUCCESSOR and we would be
+            // measuring the wrong track's remaining time - happily parking a warm
+            // behind a track with a second left, which is exactly the near-EOF
+            // auto-advance bleed this guard exists to prevent. Declining costs only a
+            // prefetch optimization; trusting a stale index costs audible playback.
+            if st.consume {
+                return false;
+            }
             let Some(cur) = st.current else { return false };
             let Some(item) = st.queue.get(cur) else { return false };
             match &item.entry {
@@ -10275,10 +10594,181 @@ impl HypodjHandler {
     async fn user_skip(&self, idx: usize) -> Result<(), String> {
         let has_current = self.state.lock().unwrap().current.is_some();
         if self.reported_play_state() == PlayState::Playing && has_current {
-            self.skip_with_fade(idx).await
+            self.skip_with_fade(idx, None).await
         } else {
             self.play_index(idx).await
         }
+    }
+
+    /// Remove queue entry `pos`. THE PRODUCT RULE: a queue delete is a PLAN edit
+    /// unless it removes the track you are hearing, in which case it is a TRANSPORT
+    /// gesture and takes the transport's startle-safe path - never a hard cut.
+    ///
+    /// Three cases, and the third is the one the safe-sound principles govern:
+    ///
+    /// 1. `pos` is not the loaded entry: a pure queue mutation, no audio event.
+    ///    [`State::evict_qid`] remaps `current`/`pending_skip` over the shrink, so a
+    ///    delete ABOVE the playing row cannot silently repoint playback (the old body
+    ///    remapped `current` but left `pending_skip` stale - a delete during a skip
+    ///    dip then committed the WRONG track).
+    /// 2. `pos` IS the loaded entry but the deck is not playing (paused / stopped):
+    ///    nothing is audible, so there is no transition to smooth. Drop it and stop
+    ///    the deck so the report stays honest rather than holding a vanished entry.
+    /// 3. `pos` IS the loaded entry and it is PLAYING: route it through the exact
+    ///    machinery a user skip already uses. With a successor, that is the skip dip
+    ///    (duck to [`SKIP_DIP_DB`], load the successor at the trough off the prefetched
+    ///    warm, ramp back up) carrying the eviction so queue and deck commit together.
+    ///    With nothing to play next it is a deliberate ramp to silence and then a stop
+    ///    ([`FadeIntent::OutEvicting`]) - the same "never end on an abrupt chord" rule
+    ///    the sleep/wind-down envelope obeys.
+    ///
+    /// There is a case 0 ahead of those three: the row a live skip dip is about to
+    /// LOAD (`pending_skip`). It is not `current`, so classifying on `current` alone
+    /// would plan-edit it out from under the dip and leave the terminal loading a track
+    /// that is no longer queued. It supersedes the dip instead and stays on what is
+    /// playing.
+    ///
+    /// The successor comes from the NON-mutating [`State::peek_next_from`], anchored on
+    /// the row being deleted. Not `plan_next`: that is a real advance which, under
+    /// `consume`, evicts an entry itself - using it as a probe made one `delete` remove
+    /// two rows.
+    async fn delete_at(&self, pos: usize) {
+        let (is_loaded, is_skip_target, qid) = {
+            let st = self.state.lock().unwrap();
+            match st.queue.get(pos) {
+                Some(item) => {
+                    (st.current == Some(pos), st.pending_skip == Some(pos), QueueId(item.id))
+                }
+                // Out of range: nothing to delete, and MPD answers OK either way.
+                None => return,
+            }
+        };
+        // CASE 0 - the row a live skip dip is about to LOAD. It is not `current` (the
+        // old track is still the loaded one), so classifying on `current` alone would
+        // send it down the plan-edit path: the dip would survive its target's removal
+        // and its terminal would then load and play an entry the queue no longer has,
+        // committing `current` to whatever slid into the freed slot. That is the
+        // orphaned deck this design promises is unreachable, so it is closed HERE, by
+        // superseding the dip before the entry goes.
+        //
+        // The gesture the user made is "not that one" - so the deck simply STAYS on the
+        // track it is already playing. The dip left the gain ducked at the skip floor,
+        // so the cancel is paired with a deliberate ramp back to the baseline; without
+        // it the delete would leave the room quietly at -18 dB with nothing to explain
+        // why. This is the same cancel-under-one-slot-lock shape `stop_playback` uses.
+        if is_skip_target {
+            let baseline = self.state.lock().unwrap().target_volume;
+            self.fade
+                .cancel_with(|| {
+                    let mut st = self.state.lock().unwrap();
+                    // The skip is abandoned: nothing may still report or commit it.
+                    st.pending_skip = None;
+                    st.set_manual_volume(baseline, self.deck_loaded());
+                })
+                .await;
+            // The target was warmed as a parked mpv playlist entry; it must not survive
+            // to auto-advance behind the still-playing track at its natural EOF.
+            let _ = self.player.drop_warm().await;
+            self.state.lock().unwrap().evict_qid(qid);
+            // Rise back out of the duck the cancelled dip left behind.
+            let dur = self.skip_fade_dur();
+            let target_db = mpv_volume_to_db(baseline as f64);
+            let _ = self
+                .start_fade_spec(FadeRequest {
+                    intent: FadeIntent::Knob { target_db, vol: baseline },
+                    dur,
+                    commit_logical: None,
+                })
+                .await;
+            self.reschedule_continuation_warm().await;
+            return;
+        }
+        if !is_loaded {
+            // Case 1 - a plan edit. No audio event, no fade, no player call.
+            self.state.lock().unwrap().evict_qid(qid);
+            self.reschedule_continuation_warm().await;
+            return;
+        }
+        if self.reported_play_state() != PlayState::Playing {
+            // Case 2 - silent already; a ramp would be theatre. Stop the deck so it
+            // cannot keep holding an entry the queue no longer has.
+            //
+            // The stop goes through the SAME cancel-and-settle as `stop_playback`: the
+            // deck may be reported Paused while a PauseOut ramp is still descending (the
+            // intent is set when that ramp STARTS), and stopping out from under a live
+            // fade would leave it ticking set_volume against a dead deck and its
+            // terminal running on nothing. One slot lock, cancel and settle together.
+            self.fade
+                .cancel_with(|| {
+                    let mut st = self.state.lock().unwrap();
+                    let v = st.target_volume;
+                    st.set_manual_volume(v, self.deck_loaded());
+                    // A stop retires the pending-pause intent outright.
+                    st.pending_pause = false;
+                })
+                .await;
+            self.state.lock().unwrap().evict_qid(qid);
+            let _ = self.player.stop().await;
+            self.set_store_playback_remote(false);
+            self.reschedule_continuation_warm().await;
+            return;
+        }
+        // Case 3 - a transport gesture. Ask what would play after this row WITHOUT
+        // advancing: `peek_next_from`, not `plan_next`. plan_next is a real advance -
+        // under `consume` it removes an entry itself, so using it as a probe made a
+        // single `delete` remove TWO entries (and, anchored on `reported_current()`, it
+        // removed the wrong one during a dip). The delete owns the removal; the probe
+        // must only answer the question, and it is anchored on the row being deleted.
+        //
+        // The successor must not BE the entry we are deleting. That is reachable: with
+        // `repeat` on and one entry left, the peek wraps to index 0 - the very row being
+        // removed - and skipping to it would commit a track the terminal then evicts,
+        // leaving the deck on an entry the queue does not have. Compared by QUEUE ID,
+        // never index, so it stays right under any concurrent reindexing.
+        let successor = {
+            let mut st = self.state.lock().unwrap();
+            st.peek_next_from(pos, false)
+                .filter(|&idx| st.queue.get(idx).is_some_and(|it| it.id != qid.0))
+        };
+        match successor {
+            Some(idx) => {
+                let _ = self.skip_with_fade(idx, Some(qid)).await;
+            }
+            None => {
+                // Nothing follows: ramp to silence, then stop and evict together.
+                let dur = self.skip_fade_dur();
+                if self
+                    .start_fade_spec(FadeRequest {
+                        intent: FadeIntent::OutEvicting { qid: qid.0 },
+                        dur,
+                        commit_logical: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    // A rejected fade must not turn the delete into a no-op: fall back
+                    // to the plain stop path so the gesture still lands.
+                    self.state.lock().unwrap().evict_qid(qid);
+                    let _ = self.player.stop().await;
+                    self.set_store_playback_remote(false);
+                }
+            }
+        }
+        self.reschedule_continuation_warm().await;
+    }
+
+    /// [`Self::play_index`] plus the queue-delete half, in that order: the load
+    /// commits `current` on the target, THEN the evicted entry leaves the queue and
+    /// `evict_qid` remaps `current` over the shrink. Every degrade path out of the
+    /// skip dip routes through here so a rejected/unbuildable fade can never turn a
+    /// delete into a silent no-op - the gesture still lands, just without the ramp.
+    async fn play_index_evicting(&self, idx: usize, evict: Option<QueueId>) -> Result<(), String> {
+        let r = self.play_index(idx).await;
+        if let Some(qid) = evict {
+            self.state.lock().unwrap().evict_qid(qid);
+            self.notify_change();
+        }
+        r
     }
 
     /// The skip-fade composition: pre-resolve the target, pre-build the ResumeIn
@@ -10287,7 +10777,12 @@ impl HypodjHandler {
     /// the target from silence and hands off to the ResumeIn follow-on - all
     /// through the ONE active [`FadeSlot`]. A rejected/unresolvable spec degrades
     /// to a plain [`Self::play_index`] so a skip never gets stuck.
-    async fn skip_with_fade(&self, idx: usize) -> Result<(), String> {
+    ///
+    /// `evict`, when set, makes this the "remove the currently playing track"
+    /// gesture: the named entry is dropped from the queue at the SAME instant the
+    /// target commits (see [`Terminal::SkipLoad`]), so there is never a window where
+    /// the deck plays an entry the queue has already forgotten.
+    async fn skip_with_fade(&self, idx: usize, evict: Option<QueueId>) -> Result<(), String> {
         // Disarm any pending continuation warm FIRST (slice 2), before this skip installs
         // its OWN skip warm: the handler slot must die so the EOF attribution can never
         // claim a skip warm as the station, and so a Skip warm and a Continuation warm can
@@ -10303,7 +10798,7 @@ impl HypodjHandler {
         let Some(item) = item else { return Err("Bad song index".into()) };
         let play = match self.resolve_play(&item) {
             Ok(p) => p,
-            Err(_) => return self.play_index(idx).await,
+            Err(_) => return self.play_index_evicting(idx, evict).await,
         };
         // The target is about to be current but is not in the window yet, so pin it
         // against eviction for the length of the dip and kick a light pass in case
@@ -10329,7 +10824,7 @@ impl HypodjHandler {
         let resume_spec =
             match self.build_deliberate_spec(SKIP_DIP_DB, FadeTarget::Db(resume_db), dur) {
                 Ok(s) => s,
-                Err(_) => return self.play_index(idx).await,
+                Err(_) => return self.play_index_evicting(idx, evict).await,
             };
 
         // (c) Report the TARGET immediately during the dip (WITHOUT mutating
@@ -10368,12 +10863,12 @@ impl HypodjHandler {
         }
 
         // (e) Install the deliberate dip-out to silence -> Terminal::SkipLoad.
-        match self.install_skip_dip(dur, idx, play, resume_spec, baseline).await {
+        match self.install_skip_dip(dur, idx, evict, play, resume_spec, baseline).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "skip dip rejected; plain play");
                 self.state.lock().unwrap().pending_skip = None;
-                self.play_index(idx).await
+                self.play_index_evicting(idx, evict).await
             }
         }
     }
@@ -10387,6 +10882,7 @@ impl HypodjHandler {
         &self,
         dur: Duration,
         idx: usize,
+        evict: Option<QueueId>,
         play: ResolvedPlay,
         resume_spec: FadeSpec,
         resume_vol: u8,
@@ -10418,6 +10914,7 @@ impl HypodjHandler {
                         FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)?;
                     let terminal = Terminal::SkipLoad {
                         idx,
+                        evict,
                         play,
                         resume_spec,
                         resume_vol,
@@ -10588,6 +11085,50 @@ impl HypodjHandler {
         // Song that will drain next into an armed, configured continuation station.
         self.reschedule_continuation_warm().await;
         Ok(())
+    }
+
+    /// Commit a queue index that mpv ALREADY advanced into, with no load.
+    ///
+    /// The gapless twin of [`Self::play_index_inner`]: byte-for-byte the same state
+    /// commit - the skip pin release, the store remoteness publish, `current`, the
+    /// `fresh_enqueue_anchor` clear, the spent-history trim and its ledger rows, the
+    /// notify, and the re-arm of the next warm - MINUS the `play_url` that is the whole
+    /// point of not being here. mpv never stopped, so loading would restart the track
+    /// that is already audible.
+    ///
+    /// Kept as a sibling rather than a flag on `play_index_inner` because the two differ
+    /// in exactly one statement, and a bool parameter threaded through that function's
+    /// fade-resync logic is how a future edit accidentally loads on the gapless path.
+    async fn commit_landed_advance(&self, idx: usize) {
+        let item = {
+            let st = self.state.lock().unwrap();
+            st.queue.get(idx).cloned()
+        };
+        let Some(item) = item else { return };
+        // A track is becoming current, so no skip target is pending: release the
+        // single-slot eviction pin, exactly as the loading path does.
+        self.set_store_skip_pin(None);
+        // Remoteness is published from the SAME resolution the warm used, so the store
+        // sees the identical verdict it would have on a cold load.
+        if let Ok(play) = self.resolve_play(&item) {
+            self.set_store_playback_remote(!play.local);
+        }
+        let trimmed = {
+            let mut st = self.state.lock().unwrap();
+            st.current = Some(idx);
+            st.pending_pause = false;
+            st.fresh_enqueue_anchor = None;
+            st.trim_spent()
+        };
+        for it in &trimmed {
+            if let Some(row) = spent_heard_row(it) {
+                self.append_heard(row);
+            }
+        }
+        self.notify_change();
+        // Re-arm the warm behind the freshly-current entry, so a run of tracks stays
+        // gapless rather than only the first boundary.
+        self.reschedule_continuation_warm().await;
     }
 
     /// Add an entry by uri. A `song/<id>` uri resolves Subsonic metadata; an
@@ -11833,21 +12374,10 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::Delete(spec) => {
-                {
-                    let mut st = self.state.lock().unwrap();
-                    if let Some(pos) = spec.and_then(|s| s.split(':').next().and_then(|p| p.parse::<usize>().ok())) {
-                        if pos < st.queue.len() {
-                            st.queue.remove(pos);
-                            st.playlist_version += 1;
-                            if let Some(c) = st.current {
-                                if c == pos {
-                                    st.current = None;
-                                } else if c > pos {
-                                    st.current = Some(c - 1);
-                                }
-                            }
-                        }
-                    }
+                let pos = spec
+                    .and_then(|s| s.split(':').next().and_then(|p| p.parse::<usize>().ok()));
+                if let Some(pos) = pos {
+                    self.delete_at(pos).await;
                 }
                 self.notify_change();
                 // A delete changes drain_is_next (deleting the tail can make the current
@@ -14598,6 +15128,29 @@ mod tests {
         Some((h, probe, fire_rx))
     }
 
+    /// A landed EOF: mpv auto-advanced into the parked entry at this natural end.
+    fn landed_eof() -> EofSignal {
+        EofSignal { continuation_landed: true, ..EofSignal::default() }
+    }
+
+    /// Install a WARMED QUEUE slot naming `qid` at `idx`, bypassing the LEAD timer -
+    /// these tests exercise the landed commit and its guard, not timer arithmetic.
+    fn install_warmed_queue_slot(h: &HypodjHandler, qid: u64, idx: usize) {
+        let (fire_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::event::TimerId>();
+        std::mem::forget(rx);
+        let timers = crate::timer::spawn_timer_source(crate::clock::TokioClock, fire_tx);
+        let (timer_id, guard) = timers.arm(Instant::now() + Duration::from_secs(9_999));
+        h.state.lock().unwrap().pending_continuation_warm = Some(ContinuationWarm {
+            timer_id,
+            guard,
+            warmed: true,
+            qid,
+            url: "http://example.invalid/warm".to_string(),
+            title: String::new(),
+            target: WarmTarget::QueueNext { idx },
+        });
+    }
+
     // Directly install a WARMED slot (bypassing the LEAD timer) for the landed-commit /
     // disarm tests: they exercise the attribution + disarm, not the timer arithmetic.
     // Needs a real TimerGuard, so an idle throwaway timer is armed far in the future.
@@ -14613,6 +15166,7 @@ mod tests {
             qid,
             url: url.to_string(),
             title: "Station".to_string(),
+            target: WarmTarget::Station,
         });
     }
 
@@ -15534,9 +16088,98 @@ mod tests {
         );
     }
 
-    // DECLINE without a true drain: a track still queued after the current, or a cycling
-    // mode (repeat), or no current -> no warm arms (the SAME true-drain boundary slice-1
-    // fires on, so a warm can never arm where the drain edge would not).
+    #[tokio::test]
+    async fn a_queue_warm_never_arms_where_the_next_row_is_not_knowable() {
+        // THE ONE THING THAT MAKES THIS SAFE. mpv AUTO-ADVANCES into whatever is parked,
+        // so a warm is a commitment about which row plays next. Where that row is not
+        // knowable without side effects, the only correct answer is to arm nothing and
+        // let the cold path decide - slower, and right.
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        h.play_for_test(0).await;
+
+        let target = |h: &HypodjHandler| {
+            h.state.lock().unwrap().pending_continuation_warm.as_ref().map(|w| w.target.clone())
+        };
+        h.reschedule_continuation_warm().await;
+        assert_eq!(target(&h), Some(WarmTarget::QueueNext { idx: 1 }), "ordinary order warms");
+
+        // RANDOM: the next index does not exist until the advance DRAWS it, and asking
+        // would consume the draw - so the warm would park one track while plan_next later
+        // chose another. Refused outright rather than approximated.
+        h.state.lock().unwrap().random = true;
+        h.reschedule_continuation_warm().await;
+        assert_eq!(target(&h), None, "random is not warmable - the next row is undrawn");
+        h.state.lock().unwrap().random = false;
+
+        // SINGLE: stops after the current, or replays it. Neither is a handoff.
+        h.state.lock().unwrap().single = true;
+        h.reschedule_continuation_warm().await;
+        assert_eq!(target(&h), None, "single does not hand off to a next row");
+        h.state.lock().unwrap().single = false;
+
+        // A row can never be warmed behind ITSELF: repeat over a one-entry queue makes
+        // the current its own next, and the landed check matches on queue id, so a replay
+        // and a real advance would be indistinguishable.
+        h.delete_for_test(1);
+        h.state.lock().unwrap().repeat = true;
+        h.reschedule_continuation_warm().await;
+        assert_eq!(target(&h), None, "a row is never warmed behind itself");
+    }
+
+    #[tokio::test]
+    async fn a_landed_queue_warm_commits_the_advance_without_reloading_it() {
+        // THE POINT OF THE WHOLE CHANGE: mpv already auto-advanced, so the advance must
+        // commit the index and NOT load. Loading would restart the track that is already
+        // audible - the very silence this removes, reintroduced at the other end.
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s0")).await;
+        let qid1 = h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        h.play_for_test(0).await;
+        let loads_before = probe.load.load(std::sync::atomic::Ordering::Relaxed);
+
+        // A warmed slot naming the row plan_next will independently choose.
+        install_warmed_queue_slot(&h, qid1, 1);
+        h.advance_on_eof(landed_eof()).await;
+
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "the advance committed");
+        assert_eq!(probe.load.load(std::sync::atomic::Ordering::Relaxed), loads_before, "and loaded NOTHING - mpv was already there");
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none()
+                || matches!(
+                    h.state.lock().unwrap().pending_continuation_warm.as_ref().map(|w| w.target.clone()),
+                    Some(WarmTarget::Station) | Some(WarmTarget::QueueNext { .. })
+                ),
+            "the consumed slot is gone (a fresh re-arm behind the new current is fine)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_landed_warm_for_the_wrong_row_falls_back_to_the_cold_load() {
+        // THE GUARD THAT MAKES A MISSED DISARM SURVIVABLE. If a queue edit slipped past
+        // every supersede, the warmed qid no longer matches the row plan_next chose. The
+        // commit must then REFUSE and cold-load, which is correct and merely not gapless
+        // - never commit a row the queue does not believe is next.
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        h.play_for_test(0).await;
+        let loads_before = probe.load.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Warmed slot naming a qid that is NOT the row at index 1.
+        install_warmed_queue_slot(&h, 99_999, 1);
+        h.advance_on_eof(landed_eof()).await;
+
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "it still advances");
+        assert!(
+            probe.load.load(std::sync::atomic::Ordering::Relaxed) > loads_before,
+            "but by LOADING - a mismatched warm is never committed blind"
+        );
+    }
+
+    // The STATION warm still arms only at the true-drain boundary; everywhere else the
+    // slot now holds the ordinary next TRACK instead of standing empty.
     #[tokio::test(start_paused = true)]
     async fn continuation_warm_declines_without_true_drain() {
         let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
@@ -15547,23 +16190,41 @@ mod tests {
         // Genuinely play s0 so the deck is Playing (the arm predicate gates on it).
         h.play_for_test(0).await;
         h.reschedule_continuation_warm().await;
-        assert!(
-            h.state.lock().unwrap().pending_continuation_warm.is_none(),
-            "a track still follows the current -> not a drain -> no warm"
+        // A track still follows the current, so this is NOT the drain boundary and the
+        // STATION must not be warmed - but the slot is no longer empty here, because the
+        // ordinary next track is warmed instead. Assert the TARGET, which is the thing
+        // that actually decides what plays.
+        assert_eq!(
+            h.state
+                .lock()
+                .unwrap()
+                .pending_continuation_warm
+                .as_ref()
+                .map(|w| w.target.clone()),
+            Some(WarmTarget::QueueNext { idx: 1 }),
+            "a track still follows -> warm the TRACK, never the station"
         );
-        // Delete the tail so the current becomes the last entry: now it drains -> arms.
+        // Delete the tail so the current becomes the last entry: now it drains -> station.
         h.delete_for_test(1);
         h.reschedule_continuation_warm().await;
-        assert!(
-            h.state.lock().unwrap().pending_continuation_warm.is_some(),
-            "the sole remaining finite Song drains next -> a warm arms"
+        assert_eq!(
+            h.state
+                .lock()
+                .unwrap()
+                .pending_continuation_warm
+                .as_ref()
+                .map(|w| w.target.clone()),
+            Some(WarmTarget::Station),
+            "the sole remaining finite Song drains next -> the STATION warms"
         );
-        // repeat cycles the queue forever: never a drain -> disarms.
+        // repeat cycles the queue forever: never a drain, so never the station. With one
+        // entry left, repeat makes that entry its own next - and a track cannot be warmed
+        // behind itself (mpv is already playing those bytes), so nothing arms.
         h.state.lock().unwrap().repeat = true;
         h.reschedule_continuation_warm().await;
         assert!(
             h.state.lock().unwrap().pending_continuation_warm.is_none(),
-            "repeat cycles -> not a drain -> no warm"
+            "repeat cycles -> not a drain -> no station warm"
         );
     }
 
@@ -23130,6 +23791,257 @@ mod tests {
         assert!(pair(&resp, "X-hypodj-wake-at").is_some(), "wake-at epoch present");
     }
 
+
+    // ── queue delete (`d` in dj-gui, MPD `delete`) ───────────────────────────
+    //
+    // THE RULE UNDER TEST: a delete is a plan edit unless it removes the track you
+    // are HEARING, and then it is a transport gesture that takes the startle-safe
+    // path - never a hard cut, and never a queue that disagrees with the deck.
+
+    // Deleting a NON-playing row is a pure queue mutation: the queue shrinks, the
+    // playlist version bumps, `current` is remapped over the shrink, and NO fade and
+    // no player transition happen at all (the audio is untouched).
+    #[tokio::test(start_paused = true)]
+    async fn delete_other_row_is_a_silent_plan_edit() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..3 {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(2))).await;
+        let ver = h.state.lock().unwrap().playlist_version;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+
+        assert!(!h.fade_active().await, "a plan edit installs no fade");
+        assert_eq!(h.player.state(), PlayState::Playing, "audio untouched");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 2);
+        assert!(st.playlist_version > ver, "version bumped");
+        // The playing row slid down one; playback did NOT silently repoint.
+        assert_eq!(st.current, Some(1), "current remapped over the shrink");
+    }
+
+    // Deleting the PLAYING row while a successor exists is the SKIP gesture: it
+    // installs a dip (never a cut), the old track keeps playing audibly through it,
+    // and the eviction lands in the SAME commit as the successor - so the queue and
+    // the deck are never out of step.
+    #[tokio::test(start_paused = true)]
+    async fn delete_playing_row_dips_and_evicts_with_the_successor_commit() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..2 {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        let successor_qid = h.state.lock().unwrap().queue[1].id;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+
+        // Mid-dip: NOT a cut. The deck still plays, and - the invariant - the entry
+        // is STILL QUEUED, because the eviction has not committed yet.
+        assert!(h.fade_active().await, "delete of the playing row installs a dip");
+        assert_eq!(h.player.state(), PlayState::Playing, "old track not cut");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "not evicted before the commit");
+
+        // Drive the dip to its terminal: the successor commits and the deleted entry
+        // leaves the queue together, and `current` names the successor by identity.
+        h.wait_for_fade().await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 1, "evicted at the commit");
+        assert_eq!(st.queue[0].id, successor_qid, "the successor is what remains");
+        assert_eq!(st.current, Some(0), "current re-derived over the shrink");
+        assert_eq!(st.pending_skip, None);
+        drop(st);
+        assert_eq!(h.player.state(), PlayState::Playing);
+    }
+
+    // Deleting the playing row when NOTHING follows must not end on an abrupt chord:
+    // it ramps to silence and THEN stops, evicting at the stop. Mid-fade the deck is
+    // still playing and the entry is still queued - all-or-nothing, as above.
+    #[tokio::test(start_paused = true)]
+    async fn delete_last_playing_row_fades_to_silence_then_stops() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+
+        assert!(h.fade_active().await, "ramps to silence rather than cutting");
+        assert_eq!(h.player.state(), PlayState::Playing, "still audible mid-ramp");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 1, "not evicted mid-ramp");
+
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Stopped, "stops at silence");
+        let st = h.state.lock().unwrap();
+        assert!(st.queue.is_empty(), "evicted at the stop");
+        assert_eq!(st.current, None);
+    }
+
+    // Deleting the loaded row while PAUSED needs no ramp (nothing is audible), but it
+    // must still stop the deck: a paused deck holding an entry the queue no longer has
+    // would report a track that cannot be resumed.
+    #[tokio::test(start_paused = true)]
+    async fn delete_loaded_row_while_paused_stops_the_deck() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        h.wait_for_fade().await; // the PauseOut ramp lands the real pause
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+
+        assert_eq!(h.player.state(), PlayState::Stopped, "deck released");
+        let st = h.state.lock().unwrap();
+        assert!(st.queue.is_empty());
+        assert_eq!(st.current, None);
+    }
+
+
+    // REPEAT + one entry left: plan_next wraps to index 0 - the very row being deleted.
+    // Skipping to it would commit a track the terminal then evicts, leaving the deck on
+    // an entry the queue no longer has. It must take the fade-to-silence-and-stop path
+    // instead, and end with an empty queue and a stopped deck.
+    #[tokio::test(start_paused = true)]
+    async fn delete_last_playing_row_under_repeat_does_not_skip_to_itself() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.handle(MpdCommand::Repeat(true)).await;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+        h.wait_for_fade().await;
+
+        assert_eq!(h.player.state(), PlayState::Stopped, "stopped, not looped onto itself");
+        let st = h.state.lock().unwrap();
+        assert!(st.queue.is_empty(), "the entry is gone");
+        assert_eq!(st.current, None);
+    }
+
+
+    // REGRESSION (adversarial review, blocker 1): deleting the row a live skip dip is
+    // about to LOAD must supersede the dip, not plan-edit it away underneath. The old
+    // code classified on `current` alone, so this row took the pure-mutation path, the
+    // dip survived, and its terminal loaded and played an entry the queue no longer had
+    // while committing `current` to whatever slid into the freed slot.
+    #[tokio::test(start_paused = true)]
+    async fn delete_of_the_skip_target_mid_dip_supersedes_the_dip() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..3 {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        let a_qid = h.state.lock().unwrap().queue[0].id;
+        let c_qid = h.state.lock().unwrap().queue[2].id;
+
+        // A user Next installs the dip toward index 1 (B), which is NOT `current`.
+        h.handle(MpdCommand::Next).await;
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "dip targets B");
+
+        // Delete B mid-dip: the skip is abandoned and B leaves the queue.
+        h.handle(MpdCommand::Delete(Some("1".into()))).await;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.pending_skip, None, "the abandoned skip reports nothing");
+            assert_eq!(st.queue.len(), 2, "B evicted");
+            assert_eq!(st.queue[0].id, a_qid, "A still queued");
+            assert_eq!(st.queue[1].id, c_qid, "C still queued");
+            // The deck never left the track it was playing.
+            assert_eq!(st.current, Some(0), "stays on A");
+        }
+        // Let every follow-on fade settle, then the deck is still on A, audible, at the
+        // baseline - never ducked at the abandoned dip's floor, never playing B.
+        h.wait_for_fade().await;
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Playing, "A still playing");
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "still A, never the deleted B");
+        assert!(
+            h.live_gain_db() > h.fade_cfg.synth_floor_db + 5.0,
+            "risen back out of the dip duck, not left quiet"
+        );
+    }
+
+    // REGRESSION (adversarial review, blocker 2): the SkipLoad terminal must derive the
+    // committed index from the target's QueueId, never from the index captured at
+    // install time. An ordinary delete of an UNRELATED row above the target shrinks the
+    // queue under the live dip; the old `None => idx` arm then committed the pre-shrink
+    // index - the wrong entry, or one past the end (which reports Stopped over audible
+    // playback and drains the queue at the next EOF).
+    #[tokio::test(start_paused = true)]
+    async fn skip_commits_the_target_by_id_when_the_queue_shrinks_under_the_dip() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..4 {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(2))).await;
+        let d_qid = h.state.lock().unwrap().queue[3].id;
+
+        // Dip toward D (index 3).
+        h.handle(MpdCommand::Next).await;
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(3), "dip targets D");
+
+        // Delete row 0 - unrelated, not current, not the target. Everything shifts down.
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(2), "target index remapped");
+
+        h.wait_for_fade().await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 3);
+        // D is at index 2 after the shrink; the commit must name D, not the stale 3.
+        assert_eq!(st.current, Some(2), "committed the remapped index");
+        assert_eq!(st.queue[st.current.unwrap()].id, d_qid, "and it really is D");
+    }
+
+    // REGRESSION (adversarial review, finding 3): the successor probe must not ADVANCE.
+    // `plan_next` performs the consume eviction itself, so using it as a probe made one
+    // `delete` under `consume` remove TWO entries.
+    /// A GUARD, not a regression: the old `plan_next` probe happened to remove only one
+    /// entry here too (its consume eviction ate the same row the terminal would have),
+    /// and the review's worse mid-dip variant proved unreachable - under `consume` a
+    /// manual `next` already consumes at `plan_next` time, so a dip toward a LATER index
+    /// never exists to delete underneath. What this pins is that the successor probe
+    /// stays non-mutating, so `peek_next_from` cannot silently become an advance again.
+    #[tokio::test(start_paused = true)]
+    async fn delete_under_consume_removes_exactly_one_entry() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..3 {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.handle(MpdCommand::Consume(true)).await;
+        let b_qid = h.state.lock().unwrap().queue[1].id;
+        let c_qid = h.state.lock().unwrap().queue[2].id;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+        h.wait_for_fade().await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 2, "exactly one entry removed, not two");
+        assert_eq!(st.queue[0].id, b_qid, "B survived and is the successor");
+        assert_eq!(st.queue[1].id, c_qid, "C untouched");
+        assert_eq!(st.current, Some(0), "playing B");
+    }
+
+    // REGRESSION (adversarial review, finding 3A): under `consume` with a single entry,
+    // the old probe removed it at request time and returned None, so the fade-to-stop
+    // ran with `current` left dangling at Some(0) over an empty queue - permanently,
+    // since the terminal's eviction then found nothing to remap.
+    #[tokio::test(start_paused = true)]
+    async fn delete_last_entry_under_consume_leaves_no_dangling_current() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.handle(MpdCommand::Consume(true)).await;
+
+        h.handle(MpdCommand::Delete(Some("0".into()))).await;
+        // Still audible through the ramp, and still queued until the stop commits.
+        assert_eq!(h.player.state(), PlayState::Playing, "ramps rather than cutting");
+        h.wait_for_fade().await;
+
+        assert_eq!(h.player.state(), PlayState::Stopped);
+        let st = h.state.lock().unwrap();
+        assert!(st.queue.is_empty(), "the entry is gone");
+        assert_eq!(st.current, None, "no dangling index over an empty queue");
+    }
+
     // ── skip-fade (single-mpv dip-through-silence on a USER Next/Previous) ────
 
     // A user Next while PLAYING dips to silence, loads the target FROM silence in
@@ -24546,8 +25458,11 @@ mod tests {
             .find(|(k, _)| k == "X-Store")
             .map(|(_, v)| v.clone())
             .expect("the badge is present once a pass published");
-        assert!(badge.starts_with("0/1 tracks"), "cached/resident tracks lead: {badge}");
-        assert!(badge.ends_with("1 deferred"), "and the shortfall is counted: {badge}");
+        assert!(badge.starts_with("0 of 1 tracks"), "cached/resident tracks lead: {badge}");
+        assert!(
+            badge.ends_with("1 album would not fit"),
+            "and the shortfall is counted, SINGULAR, in the noun a person pins: {badge}"
+        );
 
         // The verb: the same facts, plus the shortfall BY NAME, which is the whole
         // reason the old integer-only overflow warn was not good enough.

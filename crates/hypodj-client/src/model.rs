@@ -73,8 +73,8 @@ pub struct NowPlaying {
     /// renders nothing, keeping a lean status silent exactly like the armed/hint HUD.
     pub continuation: Option<String>,
     /// The OFFLINE STORE in one already-rendered sentence, from the daemon's `X-Store`
-    /// status pair - e.g. `318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote)` or
-    /// `complete, 347 tracks, 9.8 GiB`.
+    /// status pair - e.g. `318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming`
+    /// or `all 347 tracks, 9.8 GiB`.
     ///
     /// Rendered daemon-side on purpose: the numbers and the reasons live there, and one
     /// formatter means `dj status` and the dj-gui badge can never disagree about the
@@ -285,30 +285,52 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
     }
 }
 
-/// The offline-store line as a COMPACT badge: everything up to the first comma, plus
-/// any of the trailing clauses that report something is wrong or held ("waiting",
-/// "deferred", "given up"). So a healthy mirror reads `318/347 tracks` or `complete`
-/// and a held one reads `318/347 tracks, waiting (playback-remote)` - the size and
-/// budget figures, which only matter when he is actually asking, stay in the full
-/// `dj status` line.
+/// The offline-store line as a COMPACT badge: the daemon's sentence minus the SIZE
+/// clause. So a healthy mirror reads `318 of 347 tracks`, a held one
+/// `318 of 347 tracks, paused while streaming`, and a finished one `all 347 tracks` -
+/// while the bytes-against-budget figures, which only matter when he is actually
+/// asking, stay in the full `dj status` line.
 ///
-/// Split on the daemon's own comma-joined shape rather than re-deriving anything, so
-/// the two renders cannot drift apart. `None` when there is no store line at all.
+/// Subtractive on purpose. The old version kept an ALLOWLIST of clause shapes
+/// ("waiting", "deferred", "given up"), so rewording any of them - or adding a fourth
+/// reason the store is held - silently dropped it from the one surface that is always
+/// on screen. Dropping the single clause that is known to be noise instead means a new
+/// clause arrives in the badge by default, which is the safe direction: a badge that
+/// says too much is read, a badge that quietly omits the reason is trusted and wrong.
+///
+/// `None` when there is no store line at all.
 pub fn store_badge(line: &str) -> Option<String> {
-    let mut parts = line.split(", ");
-    let head = parts.next()?.trim();
-    if head.is_empty() {
+    let kept: Vec<&str> = line
+        .split(", ")
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !p.contains("GiB"))
+        .collect();
+    if kept.is_empty() {
         return None;
     }
-    let mut out = head.to_string();
-    for p in parts {
-        let p = p.trim();
-        if p.starts_with("waiting") || p.ends_with("deferred") || p.ends_with("given up") {
-            out.push_str(", ");
-            out.push_str(p);
-        }
-    }
-    Some(out)
+    Some(kept.join(", "))
+}
+
+/// The store line as a SHORT badge for a bar too narrow for [`store_badge`]: the
+/// headline clause, plus `(held)` when the daemon gave any reason at all.
+///
+/// The narrow terminal used to drop the badge entirely, which is the one outcome that
+/// misleads: a mirror held for days and a mirror finished last week both rendered as an
+/// empty bar. This keeps the count and the single bit that matters - is something
+/// stopping it - and defers the reason itself to `dj status`, which always carries the
+/// full sentence.
+///
+/// Derived from the same split as [`store_badge`], so "there is a reason" here can
+/// never disagree with the reason shown there.
+pub fn store_badge_short(line: &str) -> Option<String> {
+    let full = store_badge(line)?;
+    let mut clauses = full.split(", ");
+    let head = clauses.next()?.to_string();
+    Some(if clauses.next().is_some() {
+        format!("{head} (held)")
+    } else {
+        head
+    })
 }
 
 /// Format a `secs` remaining as a compact human-readable string: `Hh MMm`, `MMm`,
@@ -778,8 +800,8 @@ mod tests {
         // not in the `commands` advertisement. This is that wire, and a status without
         // the pair (no store, or no full pass yet) must stay None rather than invent a
         // row of zeros.
-        let np = now_playing(&p(&[("X-Store", "318/347 tracks, 12.1/16.0 GiB")]), &[]);
-        assert_eq!(np.store.as_deref(), Some("318/347 tracks, 12.1/16.0 GiB"));
+        let np = now_playing(&p(&[("X-Store", "318 of 347 tracks, 12.1 of 16.0 GiB")]), &[]);
+        assert_eq!(np.store.as_deref(), Some("318 of 347 tracks, 12.1 of 16.0 GiB"));
         assert_eq!(now_playing(&[], &[]).store, None);
     }
 
@@ -790,14 +812,39 @@ mod tests {
         // identical is the exact failure the status surface exists to eliminate. The size
         // and budget figures only matter when he is asking, so they stay in `dj status`.
         assert_eq!(
-            store_badge("318/347 tracks, 12.1/16.0 GiB").as_deref(),
-            Some("318/347 tracks"),
+            store_badge("318 of 347 tracks, 12.1 of 16.0 GiB").as_deref(),
+            Some("318 of 347 tracks"),
         );
-        assert_eq!(store_badge("complete, 347 tracks, 9.8 GiB").as_deref(), Some("complete"));
         assert_eq!(
-            store_badge("318/347 tracks, 12.1/16.0 GiB, waiting (playback-remote), 3 deferred, 2 given up")
+            store_badge("all 347 tracks, 9.8 GiB").as_deref(),
+            Some("all 347 tracks"),
+        );
+        assert_eq!(
+            store_badge(
+                "318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming, \
+                 3 albums would not fit, 2 tracks failed to download"
+            )
+            .as_deref(),
+            Some(
+                "318 of 347 tracks, paused while streaming, 3 albums would not fit, \
+                 2 tracks failed to download"
+            ),
+        );
+        // SUBTRACTIVE, so a clause the daemon grows later reaches the badge without a
+        // matching edit here - only the size clause is ever dropped.
+        assert_eq!(
+            store_badge("318 of 347 tracks, 12.1 of 16.0 GiB, some new reason it is held")
                 .as_deref(),
-            Some("318/347 tracks, waiting (playback-remote), 3 deferred, 2 given up"),
+            Some("318 of 347 tracks, some new reason it is held"),
+        );
+        // DEPLOY LAG IS REAL: the running daemon can be several merges behind these
+        // clients, so an OLD line must still yield a correct badge - not the reworded
+        // one, but every clause of what that daemon actually said. Verbatim from the
+        // live daemon on 127.0.0.1:6600 while this was written.
+        assert_eq!(
+            store_badge("80/360 tracks, 3.5/16.0 GiB, waiting (playback-remote), 4 given up")
+                .as_deref(),
+            Some("80/360 tracks, waiting (playback-remote), 4 given up"),
         );
         // Total over anything the daemon might say, including nothing.
         assert_eq!(store_badge(""), None);

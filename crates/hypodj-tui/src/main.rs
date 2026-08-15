@@ -106,7 +106,24 @@ fn run() -> Result<(), MpdError> {
     // Ask whether this terminal can draw images, AFTER the background probe and never
     // batched with it: two outstanding replies could interleave and neither would parse.
     // A terminal that stays silent costs us the deadline and nothing else.
-    state.sixel_cell_px = sixel_geometry(&mut terminal);
+    // Two SEPARATE questions, and only one of them is racy.
+    //
+    // DA1 is stable: the terminal either decodes sixel or it does not, and it
+    // answers immediately. TIOCGWINSZ is not: a freshly mapped window reports
+    // correct CHARACTER dimensions straight away but takes 20 to 100 ms to
+    // report PIXEL dimensions, because the widget is not allocated yet.
+    // Measured over cold launches, 4 in 6 reported 0x0 at first.
+    //
+    // Asking both once and storing only the combined answer meant a startup
+    // that landed inside that window concluded the terminal could not draw
+    // images, and - because the re-query below was gated on already having a
+    // geometry - never reconsidered. One lost race disabled images for the
+    // whole session. That is the "sometimes it does not render" report.
+    state.sixel_supported = sixel_supported(&mut terminal);
+    state.sixel_cell_px = state
+        .sixel_supported
+        .then(|| cell_px(&mut terminal))
+        .flatten();
 
     // Prime the panes before the first draw: request the initial snapshot (the
     // response lands within the first few poll cycles).
@@ -166,6 +183,16 @@ fn event_loop(
             if size != last_size {
                 last_size = size;
                 state.sixel_cell_px = cell_px(terminal);
+                let _ = terminal.clear();
+            }
+        } else if state.sixel_supported {
+            // The terminal said it can draw images but had not published a
+            // pixel geometry yet. Keep asking until it does. This is a
+            // TIOCGWINSZ ioctl, no escape handshake and no possibility of
+            // hanging, so retrying it per frame costs nothing worth measuring.
+            if let Some(px) = cell_px(terminal) {
+                state.sixel_cell_px = Some(px);
+                last_size = terminal.size().ok();
                 let _ = terminal.clear();
             }
         }
@@ -265,8 +292,13 @@ fn update_viz(state: &mut TuiState, workers: &Workers, dt: f64) {
             // "play" as not-playing. This is a belt against a daemon that stops
             // emitting frames on pause/stop without a trailing resting frame (older
             // builds): without it the stale playing=true slot freezes the field lit.
+            // UNKNOWN transport is NOT playing. `unwrap_or(true)` defaulted to motion
+            // in exactly the window where the TUI has no status to disagree with a
+            // stale `playing: true` slot - a reconnect, a dropped socket, the moment
+            // before the first status lands - and a lit, bobbing field under a deck
+            // that is not playing is the one reading this row must never produce.
             let transport_playing =
-                state.now.state.as_deref().map(|st| st == "play").unwrap_or(true);
+                state.now.state.as_deref().map(|st| st == "play").unwrap_or(false);
             let playing = s.playing && transport_playing;
             let target = state::normalize_level(s.post_gain_db());
             // Only drive up toward the target while playing; a paused/stopped daemon
@@ -793,12 +825,9 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 ///
 /// `HYPODJ_ART_CELLS=sixel` forces it, so a terminal that draws sixel but answers DA1
 /// badly is still usable without a rebuild.
-fn sixel_geometry(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Option<(u16, u16)> {
-    let forced = crate::art::art_mode() == crate::art::ArtMode::Sixel;
-    if !forced && !album_color::probe_sixel(terminal.backend_mut(), Duration::from_millis(150)) {
-        return None;
-    }
-    cell_px(terminal)
+fn sixel_supported(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> bool {
+    crate::art::art_mode() == crate::art::ArtMode::Sixel
+        || album_color::probe_sixel(terminal.backend_mut(), Duration::from_millis(150))
 }
 
 /// Pixel size of one cell, from TIOCGWINSZ. No escape handshake, so this cannot hang.

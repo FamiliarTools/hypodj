@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -18,6 +19,16 @@ use crate::menu::{classify, ArtistRef, Avail, Menu, MenuAction, Origin, PlayHow,
 
 /// Vim-style scrolloff: keep this many rows of context above/below the cursor.
 const SCROLLOFF: usize = 3;
+
+/// Space enqueues and advances, so holding it walks the list adding as it goes -
+/// until the cursor hits the LAST row, where it can advance no further and a held
+/// key would pile that one row into the queue dozens of times. Past the tail an
+/// enqueue is therefore suppressed when the previous one landed within this window:
+/// autorepeat fires far faster than a hand can tap, so a deliberate tap on the last
+/// row still adds it (duplicate and all), which is the whole point of tapping it
+/// twice. Comfortably above any terminal's repeat INTERVAL, below its initial delay
+/// (a hold adds the tail row once, then stops).
+const ENQUEUE_REPEAT_WINDOW: Duration = Duration::from_millis(600);
 
 /// Scrub step in seconds for ctrl+f (forward) / ctrl+b (back).
 const SCRUB_STEP: i32 = 5;
@@ -466,6 +477,10 @@ pub struct TuiState {
     pub input: String,
     pub pending: Option<Pending>,
     pub status_msg: Option<String>,
+    /// When Space last enqueued the LAST row of a list (`None` anywhere else) -
+    /// only ever read to tell a held Space from a deliberate tap once the cursor
+    /// can advance no further. See [`ENQUEUE_REPEAT_WINDOW`].
+    pub last_enqueue: Option<Instant>,
     pub connected: bool,
     /// The MPD queue version (`playlist:` in `status`) of the currently-held
     /// `queue`. A refresh re-fetches the (expensive) full `playlistinfo` ONLY when
@@ -544,6 +559,12 @@ pub struct TuiState {
     /// is taller than the terminal; nav keys scroll it and the renderer clamps it to the
     /// real max so a short terminal can still reach every binding. Reset when help opens.
     pub help_scroll: u16,
+    /// The last max scroll offset the renderer measured for the help overlay (content
+    /// rows minus the visible inner height). Written every frame the overlay is drawn and
+    /// read by the scroll keys so `j` CANNOT run past the end: without it the offset kept
+    /// incrementing invisibly and `k` had to walk all that phantom distance back before
+    /// the view moved at all.
+    pub help_max_scroll: Cell<u16>,
     /// The daemon's `heard` read-back, one entry per rendered line, or empty when the
     /// overlay has never been asked for. THE TAPE'S ONLY WINDOW in this process: `mark`
     /// keeps audio, and the segment outlives by weeks the one-line banner that announced
@@ -559,6 +580,9 @@ pub struct TuiState {
     /// The overlay's vertical scroll offset (rows), clamped by the renderer against the
     /// real content so a short terminal can still reach the last row. Reset on open.
     pub heard_scroll: u16,
+    /// The heard overlay's measured max scroll, in the exact shape of
+    /// [`Self::help_max_scroll`] and for the same reason.
+    pub heard_max_scroll: Cell<u16>,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -573,6 +597,14 @@ pub struct TuiState {
     /// answers without parameter 4, or reports a zero-sized cell keeps the sextant
     /// renderer without any special casing. It is also why the existing TestBackend
     /// tests still exercise the cell path unchanged.
+
+    /// Whether the terminal ANSWERED that it can draw sixel.
+    ///
+    /// Kept apart from [`sixel_cell_px`] because only the geometry is racy: a
+    /// freshly mapped window answers DA1 at once but can take 20 to 100 ms to
+    /// publish a pixel size. Storing only the combined answer meant a startup
+    /// inside that window disabled images for the whole session.
+    pub sixel_supported: bool,
     pub sixel_cell_px: Option<(u16, u16)>,
     /// Whether an overlay (menu, help, heard, confirm) was painted on the PREVIOUS
     /// frame. A sixel image is cell-anchored: a popup drawn over the cover prints text
@@ -654,6 +686,7 @@ impl Default for TuiState {
             input: String::new(),
             pending: None,
             status_msg: None,
+            last_enqueue: None,
             connected: true,
             queue_version: None,
             art: None,
@@ -674,11 +707,14 @@ impl Default for TuiState {
             menu: None,
             help_open: false,
             help_scroll: 0,
+            help_max_scroll: Cell::new(0),
             heard_lines: Vec::new(),
             heard_open: false,
             heard_scroll: 0,
+            heard_max_scroll: Cell::new(0),
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
+            sixel_supported: false,
             sixel_cell_px: None,
             sixel_covered: Cell::new(false),
             sixel_gen: Cell::new(false),
@@ -843,22 +879,23 @@ impl TuiState {
         if self.help_open {
             // A true modal: `?`/Esc/q close it; j/k/arrows/PgUp/PgDn scroll it (so a
             // short terminal that cannot show the whole table can still reach every
-            // binding); everything else is swallowed. The offset is clamped against the
-            // real content/viewport in the renderer, so an over-scroll just pins to the
-            // last page.
+            // binding); everything else is swallowed. The offset is clamped HERE against
+            // the max the renderer last measured, so `j` at the bottom is a no-op rather
+            // than silently inflating an offset `k` would then have to unwind.
+            let help_max = self.help_max_scroll.get();
             match key.code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.help_open = false;
                     self.help_scroll = 0;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.help_scroll = self.help_scroll.saturating_add(1);
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(help_max);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                    self.help_scroll = self.help_scroll.min(help_max).saturating_sub(1);
                 }
                 KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.help_scroll = self.help_scroll.saturating_add(10);
+                    self.help_scroll = self.help_scroll.saturating_add(10).min(help_max);
                 }
                 KeyCode::PageUp => {
                     self.help_scroll = self.help_scroll.saturating_sub(10);
@@ -872,19 +909,21 @@ impl TuiState {
         // to read than the next keypress, so it must NOT be dismissed by any key the way
         // a one-line banner is.
         if self.heard_open {
+            // Offsets clamped against the renderer's measured max, same as help.
+            let heard_max = self.heard_max_scroll.get();
             match key.code {
                 KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.heard_open = false;
                     self.heard_scroll = 0;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.heard_scroll = self.heard_scroll.saturating_add(1);
+                    self.heard_scroll = self.heard_scroll.saturating_add(1).min(heard_max);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.heard_scroll = self.heard_scroll.saturating_sub(1);
+                    self.heard_scroll = self.heard_scroll.min(heard_max).saturating_sub(1);
                 }
                 KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.heard_scroll = self.heard_scroll.saturating_add(10);
+                    self.heard_scroll = self.heard_scroll.saturating_add(10).min(heard_max);
                 }
                 KeyCode::PageUp => {
                     self.heard_scroll = self.heard_scroll.saturating_sub(10);
@@ -1021,6 +1060,17 @@ impl TuiState {
             // have yet.
             Act::Heard => Some(Intent::Command("heard marks".into())),
             Act::PlaySel => self.enter_action(),
+            // `d` / Delete removes the selected QUEUE row (elsewhere a deliberate no-op:
+            // a browse row is not IN the queue, so there is nothing to remove). The
+            // daemon owns the audio side - deleting the playing row is routed through
+            // the same startle-safe dip a skip uses - so this is just the gesture.
+            Act::RemoveSel => match self.screen {
+                Screen::Queue => self
+                    .queue
+                    .get(self.selected)
+                    .map(|it| Intent::Command(format!("delete {}", it.pos))),
+                _ => None,
+            },
             // Space ADDS the selected browse row to the queue (Queue: no-op).
             Act::Enqueue => self.enqueue_selected(),
             // `l` / Right DRILLS into the selected browse directory - the body `o` ran
@@ -1406,24 +1456,43 @@ impl TuiState {
     /// Albums/dir/song row enqueues with `add <uri>`. Queue has nothing to add ->
     /// no-op.
     fn enqueue_selected(&mut self) -> Option<Intent> {
+        self.enqueue_selected_at(Instant::now())
+    }
+
+    /// [`enqueue_selected`](Self::enqueue_selected) with an injected clock, so the
+    /// held-key suppression is testable without sleeping.
+    fn enqueue_selected_at(&mut self, now: Instant) -> Option<Intent> {
         // The Find HIT list is not a `Browse`, so it must be claimed BEFORE the
         // active_browse() consultation below (which returns None off-drill).
-        if self.screen == Screen::Find && !self.find.drilling {
-            let uri = self.find.current_row()?.uri.clone();
-            self.find.move_selection(1);
-            return Some(Intent::Enqueue { uri, play: false });
-        }
-        let intent = match self.active_browse() {
-            Some(b) => {
-                let uri = b.rows.get(b.selected).map(|r| r.uri.clone())?;
-                match self.screen {
-                    Screen::Playlists => Intent::LoadPlaylist(uri),
-                    _ => Intent::Enqueue { uri, play: false },
-                }
-            }
-            None => return None,
+        let (uri, at_tail) = if self.screen == Screen::Find && !self.find.drilling {
+            let rows = self.find.hits.rows.len();
+            (self.find.current_row()?.uri.clone(), self.find.selected + 1 >= rows)
+        } else {
+            let b = self.active_browse()?;
+            (b.rows.get(b.selected)?.uri.clone(), b.selected + 1 >= b.rows.len())
         };
-        self.move_selection(1);
+        // Only the tail needs the guard: anywhere else the cursor advances, so a
+        // held Space adds a DIFFERENT row each repeat, which is what it is for.
+        // The mark is set only by a tail add, so sweeping INTO the last row still
+        // adds it (its predecessor was a different row) - only the repeats after it
+        // are dropped.
+        if at_tail && self.last_enqueue.is_some_and(|t| now.duration_since(t) < ENQUEUE_REPEAT_WINDOW)
+        {
+            // Refresh the mark so an unbroken hold stays suppressed rather than
+            // slipping one add through every window.
+            self.last_enqueue = Some(now);
+            return None;
+        }
+        self.last_enqueue = at_tail.then_some(now);
+        let intent = match self.screen {
+            Screen::Playlists => Intent::LoadPlaylist(uri),
+            _ => Intent::Enqueue { uri, play: false },
+        };
+        if self.screen == Screen::Find && !self.find.drilling {
+            self.find.move_selection(1);
+        } else {
+            self.move_selection(1);
+        }
         Some(intent)
     }
 
@@ -2871,6 +2940,43 @@ mod tests {
     }
 
     #[test]
+    fn a_held_space_stops_adding_at_the_last_row_but_a_tap_still_duplicates() {
+        // Holding Space to add a whole album used to keep firing on the LAST row
+        // once the cursor could advance no further - one long press, twenty copies
+        // of the final track. Autorepeat is suppressed there; a tap is not.
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        s.albums.rows = vec![
+            BrowseRow { label: "one".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
+            BrowseRow { label: "two".into(), uri: "song/2".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
+        ];
+        let t0 = Instant::now();
+        assert_eq!(
+            s.enqueue_selected_at(t0),
+            Some(Intent::Enqueue { uri: "song/1".into(), play: false }),
+        );
+        // Repeat off the tail still adds - the cursor advanced, so it is a NEW row.
+        let t1 = t0 + Duration::from_millis(40);
+        assert_eq!(
+            s.enqueue_selected_at(t1),
+            Some(Intent::Enqueue { uri: "song/2".into(), play: false }),
+        );
+        assert_eq!(s.albums.selected, 1, "the cursor is parked on the last row");
+        // Still held: repeats land far inside the window and add nothing.
+        let mut t = t1;
+        for _ in 0..10 {
+            t += Duration::from_millis(40);
+            assert_eq!(s.enqueue_selected_at(t), None, "a held Space never piles up the tail row");
+        }
+        // A deliberate tap, long after the repeats, adds the duplicate on purpose.
+        assert_eq!(
+            s.enqueue_selected_at(t + ENQUEUE_REPEAT_WINDOW + Duration::from_millis(1)),
+            Some(Intent::Enqueue { uri: "song/2".into(), play: false }),
+            "tapping the last row again is how you deliberately queue it twice"
+        );
+    }
+
+    #[test]
     fn enter_on_a_result_plays_it_and_space_enqueues_without_playing() {
         use crate::find::{FindKind, FindRow, Focus};
         let mut s = TuiState::new();
@@ -2968,12 +3074,53 @@ mod tests {
     }
 
     #[test]
+    fn help_scroll_stops_at_the_measured_end_so_k_moves_immediately() {
+        // The bug: `j` past the bottom kept incrementing an offset only the RENDERER
+        // clamped, so the view sat still while the number ran away - and `k` then had to
+        // unwind all that phantom distance before the overlay appeared to move at all.
+        let mut s = TuiState::new();
+        s.handle_key(ch('?'));
+        s.help_max_scroll.set(3);
+        for _ in 0..20 {
+            s.handle_key(ch('j'));
+        }
+        assert_eq!(s.help_scroll, 3, "j pins at the last page instead of running past it");
+        // One `k` moves one row up - immediately.
+        s.handle_key(ch('k'));
+        assert_eq!(s.help_scroll, 2);
+        // PgDn is bounded the same way, and a stale offset from a taller terminal (the
+        // window was resized shorter, shrinking the max) is pulled back on the first key.
+        s.handle_key(key(KeyCode::PageDown));
+        assert_eq!(s.help_scroll, 3);
+        s.help_scroll = 50;
+        s.handle_key(ch('k'));
+        assert_eq!(s.help_scroll, 2, "an over-large offset resolves against the real max");
+    }
+
+    #[test]
+    fn heard_scroll_stops_at_the_measured_end() {
+        // Same contract as help: the tape overlay cannot over-scroll either.
+        let mut s = TuiState::new();
+        s.open_heard(vec!["a".into(), "b".into(), "c".into()]);
+        s.heard_max_scroll.set(1);
+        for _ in 0..10 {
+            s.handle_key(ch('j'));
+        }
+        assert_eq!(s.heard_scroll, 1);
+        s.handle_key(ch('k'));
+        assert_eq!(s.heard_scroll, 0);
+    }
+
+    #[test]
     fn help_overlay_scrolls_and_resets() {
         let mut s = TuiState::new();
         // `?` opens help at the top.
         assert_eq!(s.handle_key(ch('?')), None);
         assert!(s.help_open);
         assert_eq!(s.help_scroll, 0);
+        // Stand in for a frame having been drawn: the keys clamp against the max the
+        // renderer measured, and a tall-enough viewport leaves plenty of room here.
+        s.help_max_scroll.set(100);
         // j / Down scroll down; k / Up scroll up (clamped at 0). PageDown jumps.
         s.handle_key(ch('j'));
         s.handle_key(key(KeyCode::Down));
@@ -3305,6 +3452,7 @@ mod tests {
         s.open_heard(vec!["3 marks, oldest first".into(), "23:17  * NTS 2  [tape 2: 5m, window]".into()]);
         assert!(s.heard_open);
         assert_eq!(s.heard_scroll, 0);
+        s.heard_max_scroll.set(100);
         // Scrolls.
         assert_eq!(s.handle_key(ch('j')), None);
         assert_eq!(s.heard_scroll, 1);
