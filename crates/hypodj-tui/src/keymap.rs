@@ -51,6 +51,10 @@ pub enum Act {
     FavSelected,
     FavCurrent,
     Heard,
+    /// Retract the newest thing the daemon can still put back.
+    Undo,
+    /// Show the undo ring: what ran, in the daemon's own words.
+    Journal,
     PlaySel,
     Enqueue,
     /// Open the row CONTEXT MENU for the thing under the cursor. Renamed from `Open`
@@ -200,6 +204,11 @@ pub const KEYMAP: &[Binding] = &[
     // outlives the one-line banner that announced it - so the gesture needs a read-back
     // that is not "go run another program". The daemon renders it; this key asks for it.
     Binding { matchers: &[Char('t')], keys: "t", group: Favorites, scope: Scope::Global, act: Heard, help: "what you marked, and the audio kept" },
+    // Retraction. `u` acts, `U` shows - the same shift-pair shape as `o`/`O`. In
+    // General rather than Playback because it is not a transport gesture: it puts the
+    // world back the way it was, whatever the last plan action did to it.
+    Binding { matchers: &[Char('u')], keys: "u", group: General, scope: Scope::Global, act: Undo, help: "undo the last thing the daemon did" },
+    Binding { matchers: &[Char('U')], keys: "U", group: General, scope: Scope::Global, act: Journal, help: "what ran, and what can still be undone" },
     // General.
     Binding { matchers: &[Char('?')], keys: "?", group: General, scope: Scope::Global, act: HelpToggle, help: "toggle this help" },
     Binding { matchers: &[Char('q')], keys: "q", group: General, scope: Scope::Global, act: Quit, help: "quit" },

@@ -38,12 +38,18 @@ rustPlatform.buildRustPackage {
   # libmpv.so (DT_NEEDED at link/runtime).
   buildInputs = [ mpv-unwrapped ];
 
-  cargoBuildFlags = [ "--bin" "dj" "--bin" "dj-gui" ];
+  # dj-mcp rides along here rather than in its own derivation: it is a CLIENT (pure
+  # MPD/TCP, no libmpv - `ldd` on it shows only libc and libgcc_s) and it shares the
+  # one lock and the one source tree with the other two. Building it beside them
+  # costs one extra link.
+  cargoBuildFlags = [ "--bin" "dj" "--bin" "dj-gui" "--bin" "dj-mcp" ];
 
   # Test only the client crates (offline, no network). The cc tests are pure - a
   # missing `claude` just means cc_available() is false, never a live call.
+  # hypodj-mcp's integration test drives the real binary over a pipe against a
+  # loopback stand-in daemon; both are inside the sandbox, so it needs no network.
   doCheck = true;
-  cargoTestFlags = [ "-p" "hypodj-client" "-p" "hypodj-cli" "-p" "dj-gui" ];
+  cargoTestFlags = [ "-p" "hypodj-client" "-p" "hypodj-cli" "-p" "dj-gui" "-p" "hypodj-mcp" ];
 
   # libmpv2-sys uses pkg-config to find mpv at build time.
   PKG_CONFIG_PATH = "${mpv-unwrapped.dev}/lib/pkgconfig";
@@ -54,6 +60,10 @@ rustPlatform.buildRustPackage {
   # hard DT_NEEDED must still resolve).
   # --set-default so an explicit runtime HYPODJ_BUILD_INFO still wins; the baked
   # value is what makes `--version` show the hash on a nix build (no .git here).
+  # dj-mcp is deliberately NOT in this loop: it has no libmpv DT_NEEDED to resolve
+  # (it never pulls hypodj-core) and no `--version` enrichment to bake, and harn
+  # spawns it as a child with a cleared environment - so a shell wrapper would be a
+  # process and an indirection bought for nothing.
   postInstall = ''
     for b in dj dj-gui; do
       wrapProgram $out/bin/$b \
@@ -63,7 +73,7 @@ rustPlatform.buildRustPackage {
   '';
 
   meta = {
-    description = "HypoDJ clients: the dj jukebox CLI + dj-gui interactive TUI";
+    description = "HypoDJ clients: the dj jukebox CLI, the dj-gui TUI, and the dj-mcp agent surface";
     mainProgram = "dj";
     license = with lib.licenses; [ mit asl20 ];
   };

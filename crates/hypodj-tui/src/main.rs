@@ -617,7 +617,10 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
                 Err(reason) => state.find.phase = crate::find::Phase::Failed(reason),
             }
         }
-        RespKind::Snapshot { now, queue, version } => {
+        RespKind::Snapshot { now, queue, version, undo } => {
+            // The footer offer rides the snapshot, so it can never be older than the
+            // frame it is drawn on.
+            state.undo_offer = undo;
             match queue {
                 Some(q) => {
                     // An open context menu is a SNAPSHOT of one row, and a
@@ -657,6 +660,12 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             // flight, and it does NOT touch the refresh gate: reading is not a mutation
             // and `heard` cannot move the queue.
             state.open_heard(lines);
+        }
+        RespKind::Journal(lines) => {
+            // The undo ring, in the same full-frame overlay the ledger uses. Opens ON
+            // ARRIVAL for the same reason: a panel that stood empty around an answer
+            // still in flight reads as a broken key.
+            state.open_journal(lines);
         }
         RespKind::KnobUnknown(line) => {
             // Graceful knob -> setvol fallback: an OLD daemon ACKs `unknown command

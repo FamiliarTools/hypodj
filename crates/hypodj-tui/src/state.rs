@@ -349,6 +349,36 @@ impl Browse {
     }
 }
 
+/// Which read-back the full-frame overlay is currently showing. One overlay, two
+/// contents: a ledger and a journal are the same shape (many rows, read at leisure,
+/// dismissed by their own letter), and a second popup with its own scroll state and
+/// its own close-key pair is a second thing to keep in lockstep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    /// The `heard` ledger + tape read-back, opened with `t`.
+    Marks,
+    /// The undo ring, opened with `U`.
+    Journal,
+}
+
+impl Panel {
+    /// The overlay's heading word.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Panel::Marks => "Marks",
+            Panel::Journal => "Journal",
+        }
+    }
+
+    /// The letter that opened it, and so the letter that closes it.
+    pub fn close_key(&self) -> char {
+        match self {
+            Panel::Marks => 't',
+            Panel::Journal => 'U',
+        }
+    }
+}
+
 /// The side-effecting request handle_key emits for the event loop to run. IO lives
 /// entirely in the loop; the state machine only ever returns one of these.
 #[derive(Debug, PartialEq, Eq)]
@@ -583,6 +613,15 @@ pub struct TuiState {
     /// The heard overlay's measured max scroll, in the exact shape of
     /// [`Self::help_max_scroll`] and for the same reason.
     pub heard_max_scroll: Cell<u16>,
+    /// Which read-back [`Self::heard_lines`] currently holds, which decides the
+    /// overlay's title and the letter that closes it.
+    pub panel: Panel,
+    /// The retraction currently on offer, already rendered by the SHARED badge
+    /// formatter from the daemon's own `PlanOutcome::render()` and its own live
+    /// undoability - so nothing an agent said reaches a character of it, and the
+    /// footer never offers an undo the daemon would refuse. `None` when there is
+    /// nothing to retract (or the daemon is too old to keep a journal).
+    pub undo_offer: Option<String>,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -697,6 +736,8 @@ impl Default for TuiState {
             heard_open: false,
             heard_scroll: 0,
             heard_max_scroll: Cell::new(0),
+            panel: Panel::Marks,
+            undo_offer: None,
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             sixel_supported: false,
@@ -827,10 +868,20 @@ impl TuiState {
     }
 
     pub fn open_heard(&mut self, lines: Vec<String>) {
+        self.open_panel(Panel::Marks, lines);
+    }
+
+    /// The undo ring, in the same overlay under its own title. Opened by `U`.
+    pub fn open_journal(&mut self, lines: Vec<String>) {
+        self.open_panel(Panel::Journal, lines);
+    }
+
+    fn open_panel(&mut self, panel: Panel, lines: Vec<String>) {
         if lines.is_empty() {
             return;
         }
         self.take_screen();
+        self.panel = panel;
         self.heard_lines = lines;
         self.heard_open = true;
         self.heard_scroll = 0;
@@ -896,7 +947,13 @@ impl TuiState {
             // Offsets clamped against the renderer's measured max, same as help.
             let heard_max = self.heard_max_scroll.get();
             match key.code {
-                KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => {
+                // Its OWN letter closes it, so `t` and `U` each toggle the panel
+                // they opened and neither silently closes the other's.
+                KeyCode::Char(c) if c == self.panel.close_key() => {
+                    self.heard_open = false;
+                    self.heard_scroll = 0;
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.heard_open = false;
                     self.heard_scroll = 0;
                 }
@@ -1043,6 +1100,12 @@ impl TuiState {
             // empty panel and then filled it would be claiming an answer it does not
             // have yet.
             Act::Heard => Some(Intent::Command("heard marks".into())),
+            // `u` retracts, `U` shows what there is to retract. Both go straight to
+            // the daemon: the refusal is the daemon's to make (it checks the world
+            // key), and every refusal it makes is loud, so a stale offer answers with
+            // a sentence rather than with silence.
+            Act::Undo => Some(Intent::Command("undo".into())),
+            Act::Journal => Some(Intent::Command("journal".into())),
             Act::PlaySel => self.enter_action(),
             // Space ADDS the selected browse row to the queue (Queue: no-op).
             Act::Enqueue => self.enqueue_selected(),
@@ -2299,6 +2362,40 @@ mod tests {
 
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn u_and_shift_u_go_straight_to_the_daemon() {
+        // Neither is interpreted here. The daemon owns the refusal (it checks the
+        // world key), and every refusal it makes is loud - so a stale offer answers
+        // with a sentence rather than with a key that quietly did nothing.
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ch('u')), Some(Intent::Command("undo".into())));
+        assert_eq!(s.handle_key(ch('U')), Some(Intent::Command("journal".into())));
+    }
+
+    #[test]
+    fn each_read_back_panel_is_closed_by_its_own_letter() {
+        let mut s = TuiState::new();
+        s.open_journal(vec!["[ 12]  4s  mpd  added 3".to_string()]);
+        assert_eq!(s.panel, Panel::Journal);
+        // `t` is the LEDGER's letter; it must not close the journal, and it must not
+        // leak through to the daemon either.
+        assert_eq!(s.handle_key(ch('t')), None);
+        assert!(s.heard_open, "the wrong letter neither closes nor acts");
+        assert_eq!(s.handle_key(ch('U')), None);
+        assert!(!s.heard_open);
+        // And symmetrically for the ledger.
+        s.open_heard(vec!["3 marks, oldest first".to_string()]);
+        assert_eq!(s.panel, Panel::Marks);
+        assert_eq!(s.handle_key(ch('U')), None);
+        assert!(s.heard_open);
+        assert_eq!(s.handle_key(ch('t')), None);
+        assert!(!s.heard_open);
+        // Esc and q still close either one.
+        s.open_journal(vec!["x".to_string()]);
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), None);
+        assert!(!s.heard_open);
     }
 
     #[test]

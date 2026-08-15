@@ -303,10 +303,13 @@ fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     // appears stuck at the bottom while it unwinds the phantom distance.
     state.heard_max_scroll.set(max_scroll);
     let scroll = state.heard_scroll.min(max_scroll);
+    // Title and close key both come from the panel kind, so the overlay can never
+    // tell the human to press a letter that does not close what they are looking at.
+    let (name, key) = (state.panel.title(), state.panel.close_key());
     let title = if max_scroll > 0 {
-        format!("Marks ({}/{})  j/k scroll  t closes", scroll + 1, max_scroll + 1)
+        format!("{name} ({}/{})  j/k scroll  {key} closes", scroll + 1, max_scroll + 1)
     } else {
-        "Marks  t closes".to_string()
+        format!("{name}  {key} closes")
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1517,6 +1520,75 @@ mod tests {
             !out.contains("paused while streaming"),
             "the reason itself defers to `dj status` at this width:\n{out}"
         );
+    }
+
+    #[test]
+    fn the_footer_offers_the_retraction_in_the_daemons_own_words() {
+        // The badge text is produced by the SHARED formatter from the daemon's own
+        // `PlanOutcome::render()`; the TUI only places it. Nothing a model said can
+        // reach a character of this row.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.undo_offer = Some("agent removed 3 - u to undo (12s)".into());
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("agent removed 3 - u to undo (12s)"), "{out}");
+        // Nothing to retract -> no offer at all, rather than a dead one.
+        let mut s2 = TuiState::new();
+        s2.now.state = Some("play".into());
+        let out2 = render_to_lines(&s2).join("\n");
+        assert!(!out2.contains("to undo"), "{out2}");
+    }
+
+    #[test]
+    fn the_offer_takes_the_badge_slot_ahead_of_the_store_line() {
+        // Both want the one badge slot. The offer wins because it EXPIRES: the store
+        // numbers will still be true in a minute and this will not.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.store = Some("318 of 347 tracks, 12.1 of 16.0 GiB".into());
+        s.undo_offer = Some("agent cleared 7 - u to undo (4s)".into());
+        let out = render_to_lines_sized(&s, 80, 30).join("\n");
+        assert!(out.contains("agent cleared 7 - u to undo (4s)"), "{out}");
+        assert!(!out.contains("offline:"), "the store badge yields the slot:\n{out}");
+        // And it hands the slot straight back once there is nothing to retract.
+        s.undo_offer = None;
+        let out = render_to_lines_sized(&s, 80, 30).join("\n");
+        assert!(out.contains("offline: 318 of 347 tracks"), "{out}");
+    }
+
+    #[test]
+    fn a_narrow_bar_steps_the_offer_down_to_the_key_instead_of_dropping_it() {
+        // A retraction the human never learns about is the whole failure this badge
+        // exists to prevent, so the last thing shed is the sentence, never the offer.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.undo_offer = Some("agent removed The Man Machine - u to undo (12s)".into());
+        let out = render_to_lines_sized(&s, 44, 24).join("\n");
+        assert!(!out.contains("The Man Machine"), "the sentence does not fit:\n{out}");
+        assert!(out.contains("u to undo"), "but the offer survives:\n{out}");
+    }
+
+    #[test]
+    fn the_journal_overlay_says_its_own_name_and_its_own_close_key() {
+        // One overlay, two contents - so the title and the close key must both come
+        // from the panel kind, or it tells the human to press a letter that does not
+        // close what they are looking at.
+        let mut s = TuiState::new();
+        s.open_journal(vec![
+            "[ 12]    4s  agent sess-3f2a19bc     cleared 7  <- u".to_string(),
+            "[ 11]    2m  mpd                     added 3".to_string(),
+        ]);
+        let out = render_to_lines_sized(&s, 80, 24).join("\n");
+        assert!(out.contains("Journal"), "{out}");
+        assert!(out.contains("U closes"), "{out}");
+        assert!(out.contains("cleared 7"), "the daemon's own sentence renders:\n{out}");
+        assert!(!out.contains("Marks"), "it is not the ledger:\n{out}");
+        // The ledger still says its own name and key.
+        let mut s = TuiState::new();
+        s.open_heard(vec!["3 marks, oldest first".to_string(), "18:02  something".to_string()]);
+        let out = render_to_lines_sized(&s, 80, 24).join("\n");
+        assert!(out.contains("Marks"), "{out}");
+        assert!(out.contains("t closes"), "{out}");
     }
 
     fn render_to_lines(state: &TuiState) -> Vec<String> {
@@ -3079,10 +3151,27 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 // from the wave.
                 let fits = |b: &String| full > hint_len + b.chars().count() + MIN_WAVE_CELLS;
                 let store = state.now.store.as_deref();
-                let badge = store
-                    .and_then(store_badge)
-                    .map(|b| format!("  offline: {b}"))
+                // THE RETRACTION OFFER takes the badge slot whenever there is one,
+                // ahead of the store badge. It is the only badge here that EXPIRES -
+                // the store's numbers will still be true in a minute, this offer will
+                // not - and it is the one surface where the human decides whether to
+                // keep what an agent just did. Its text is the daemon's own sentence,
+                // rendered by the shared formatter, so nothing a model said can reach
+                // it. When it does not fit it steps down to the bare key hint rather
+                // than vanishing: a retraction the human never learns about is the
+                // whole failure this badge exists to prevent.
+                let badge = state
+                    .undo_offer
+                    .as_ref()
+                    .map(|b| format!("  {b}"))
                     .filter(fits)
+                    .or_else(|| Some("  u to undo".to_string()).filter(|_| state.undo_offer.is_some()).filter(fits))
+                    .or_else(|| {
+                        store
+                            .and_then(store_badge)
+                            .map(|b| format!("  offline: {b}"))
+                            .filter(fits)
+                    })
                     .or_else(|| {
                         store
                             .and_then(store_badge_short)

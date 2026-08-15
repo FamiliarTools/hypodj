@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use hypodj_client::mpd::{MpdConn, MpdError};
 use hypodj_client::viz::{VizConn, VizSample};
-use hypodj_client::model::{now_playing, parse_queue, NowPlaying, QueueItem};
+use hypodj_client::model::{
+    journal_lines, now_playing, parse_journal, parse_queue, undo_badge, NowPlaying, QueueItem,
+};
 use hypodj_client::nl::{
     armed_line, echo_from_pairs, map_ack_reason, nl_request, quote_arg, result_line_from_pairs,
     split_echo, token_from_pairs,
@@ -115,13 +117,24 @@ pub enum Inbound {
 /// The parsed payload of a command-worker response. The worker parses via the pure
 /// hypodj-client fns so the render thread only folds into TuiState (no shared state).
 pub enum RespKind {
-    Snapshot { now: NowPlaying, queue: Option<Vec<QueueItem>>, version: Option<u64> },
+    Snapshot {
+        now: NowPlaying,
+        queue: Option<Vec<QueueItem>>,
+        version: Option<u64>,
+        /// The retraction on offer as of THIS snapshot, already rendered by the
+        /// shared badge formatter, or None when there is none. It rides the refresh
+        /// rather than a poll of its own because it expires on world drift - the
+        /// same events that make the snapshot stale make the offer stale.
+        undo: Option<String>,
+    },
     Confirm(Pending),
     Banner(String),
     /// The daemon's `heard` render, one entry per line, for the scrollable overlay.
     /// Multi-line by construction (a one-line reply is a Banner), so it always has
     /// something the bottom bar could not have carried.
     Heard(Vec<String>),
+    /// The undo ring as listing rows, for the same overlay under its own title.
+    Journal(Vec<String>),
     /// An old daemon ACKed `unknown command "knob"`; render computes a setvol
     /// fallback from the last-known volume.
     KnobUnknown(String),
@@ -411,6 +424,9 @@ pub enum Reply {
     /// The daemon's whole `heard` render, one entry per line, for the scrollable
     /// overlay. A ledger takes longer to read than the next keypress.
     Heard(Vec<String>),
+    /// The undo ring as listing rows, for the same overlay. Same reason: thirty-two
+    /// entries do not fit a one-line banner.
+    Journal(Vec<String>),
 }
 
 /// The reply a SUCCESSFUL command deserves, or None when the verb had nothing to say
@@ -436,6 +452,18 @@ pub enum Reply {
 pub fn command_reply(line: &str, pairs: &[(String, String)]) -> Option<Reply> {
     if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "mark_result") {
         return Some(Reply::Banner(v.clone()));
+    }
+    // `journal` answers with `jid`-keyed records, and an EMPTY ring is a real answer
+    // rather than nothing to say - a panel that never opened would read as "the key
+    // is broken", which is the same silent-success hole `mark` shipped with.
+    if line.split_whitespace().next() == Some("journal") {
+        let entries = parse_journal(pairs);
+        if entries.is_empty() {
+            return Some(Reply::Banner(
+                "nothing to retract - the journal records plan actions, and none have run".into(),
+            ));
+        }
+        return Some(Reply::Journal(journal_lines(&entries, "  <- u")));
     }
     let heard: Vec<String> = pairs
         .iter()
@@ -483,6 +511,9 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                     }
                     Some(Reply::Heard(lines)) => {
                         send(RespKind::Heard(lines));
+                    }
+                    Some(Reply::Journal(lines)) => {
+                        send(RespKind::Journal(lines));
                     }
                     None => {}
                 }
@@ -692,11 +723,27 @@ fn do_refresh(conn: &mut MpdConn, known_version: Option<u64>) -> Result<RespKind
         .iter()
         .find(|(k, _)| k == "playlist")
         .and_then(|(_, v)| v.parse::<u64>().ok());
+    // Read on the version-gated fast path TOO: the offer expires on a volume change
+    // or a transport move, neither of which bumps the playlist version, so gating the
+    // badge on the queue version would leave a dead offer on screen.
+    let undo = undo_offer(conn)?;
     if version.is_some() && version == known_version {
-        return Ok(RespKind::Snapshot { now, queue: None, version });
+        return Ok(RespKind::Snapshot { now, queue: None, version, undo });
     }
     let queue = cmd(conn, "playlistinfo")?;
-    Ok(RespKind::Snapshot { now, queue: Some(parse_queue(&queue)), version })
+    Ok(RespKind::Snapshot { now, queue: Some(parse_queue(&queue)), version, undo })
+}
+
+/// The footer's retraction offer, or None. An ACK is swallowed on purpose - an older
+/// daemon has no `journal` verb, and a missing badge must never cost the now-playing
+/// frame - but a TRANSPORT error still propagates, because a half-read frame leaves
+/// the socket desynchronised and the worker must reconnect rather than read on.
+fn undo_offer(conn: &mut MpdConn) -> Result<Option<String>, Fail> {
+    match conn.command("journal") {
+        Ok(pairs) => Ok(undo_badge(&parse_journal(&pairs), 'u')),
+        Err(MpdError::Ack(_)) => Ok(None),
+        Err(_) => Err(Fail::Down),
+    }
 }
 
 /// The idle worker: park in `idle` on the dedicated socket, pushing a Wake on every
@@ -1030,6 +1077,35 @@ mod tests {
             ))
         );
         assert!(matches!(command_reply("heard keep 2", &[]), Some(Reply::Banner(_))));
+    }
+
+    #[test]
+    fn a_journal_reply_reaches_the_panel_and_an_empty_ring_is_still_an_answer() {
+        use super::{command_reply, Reply};
+        let ring = pairs(&[
+            ("jid", "12"),
+            ("jage", "4"),
+            ("jorigin", "mcp:sess-3f2a19bc"),
+            ("jact", "clear"),
+            ("jdid", "cleared 7"),
+            ("jundoable", "1"),
+        ]);
+        match command_reply("journal", &ring) {
+            Some(Reply::Journal(lines)) => {
+                assert_eq!(lines.len(), 1);
+                // The daemon's own sentence, and the key that would retract it.
+                assert!(lines[0].contains("cleared 7"), "{lines:?}");
+                assert!(lines[0].contains("agent sess-3f2a19bc"), "{lines:?}");
+                assert!(lines[0].contains("<- u"), "{lines:?}");
+            }
+            other => panic!("expected the journal panel, got {other:?}"),
+        }
+        // An EMPTY ring is a real answer. A key that opened nothing would read as
+        // broken - the same silent-success hole `mark` shipped with.
+        match command_reply("journal", &[]) {
+            Some(Reply::Banner(b)) => assert!(b.contains("nothing to retract"), "{b}"),
+            other => panic!("an empty ring must still say something, got {other:?}"),
+        }
     }
 
     #[test]

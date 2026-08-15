@@ -4,6 +4,7 @@
 //! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
 
 mod heard;
+mod journal;
 mod pls;
 mod render;
 mod stations;
@@ -54,6 +55,10 @@ USAGE:
   dj store frontier       the whole ranked order, best to worst
   dj store now | pause | resume
                           reconcile now / suspend bulk mirroring / resume it
+  dj journal              what the daemon did, newest first - each line is the
+                           daemon's OWN words for what happened, not a guess
+  dj undo                 retract the newest thing that can still be retracted
+                           (it expires the moment anything else touches the world)
   dj <anything else>      natural language: e.g. \"fade out\", \"stop after this
                            album\", \"wake me at 7 with jazz\" - echoed + confirmed
 
@@ -190,6 +195,30 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         if !store::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `journal` / `undo` are intercepted BEFORE route() for the fourth time and the
+    // same stated reason: route knows neither verb, so both would be handed to the
+    // NL translator, which has no journal action - and "undo" is the last phrase
+    // that should reach a model.
+    if parsed.words.first().is_some_and(|w| w == "journal" || w == "undo") {
+        let env = Env { get: &|k| std::env::var(k).ok() };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        let ok = if parsed.words[0] == "journal" {
+            journal::run(&mut conn, &parsed.words[1..])?
+        } else if parsed.words.len() == 1 {
+            journal::undo(&mut conn)?
+        } else {
+            // `undo` takes no argument here on purpose: naming an entry that is not
+            // the top is a refusal, and the CLI has no listing open to name from.
+            println!("usage: dj undo (no arguments - it retracts the newest one)");
+            false
+        };
+        if !ok {
             std::process::exit(1);
         }
         return Ok(());
@@ -535,6 +564,21 @@ mod tests {
         // The bare views DO route, which is what makes `:heard` work in the TUI.
         assert_eq!(route::route(&v(&["heard"])), Action::Command("heard".into()));
         assert_eq!(route::route(&v(&["heard", "all"])), Action::Command("heard all".into()));
+    }
+
+    #[test]
+    fn undo_must_be_intercepted_because_route_would_hand_it_to_a_model() {
+        // WHY `journal`/`undo` are claimed before route(): route knows neither verb,
+        // so both fall through to the NL translator. "undo" is the single last
+        // phrase that should reach a model - a retraction that got re-interpreted as
+        // an intent is worse than no retraction at all.
+        assert_eq!(route::route(&v(&["undo"])), Action::Nl("undo".into()));
+        assert_eq!(route::route(&v(&["journal"])), Action::Nl("journal".into()));
+        // And the tokens survive parse_args intact, so the interception sees them.
+        let p = parse_args(v(&["--port", "6699", "undo"])).unwrap();
+        assert_eq!(p.port, Some(6699));
+        assert_eq!(p.words, v(&["undo"]));
+        assert_eq!(p.words.first().map(String::as_str), Some("undo"));
     }
 
     #[test]
