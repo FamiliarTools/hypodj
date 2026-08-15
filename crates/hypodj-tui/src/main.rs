@@ -713,20 +713,52 @@ fn art_want(now: &hypodj_client::model::NowPlaying) -> Option<(String, Option<St
     now.cover.as_ref().map(|c| (uri.clone(), Some(c.clone())))
 }
 
-/// On an art-KEY change, ask the art worker to fetch the new cover once. Clears the
-/// stale cover immediately so the old art never lingers during the fetch; a coverless
-/// stream / nothing-playing clears art. The art worker posts the decoded cover back
-/// as an [`Inbound::Art`] carrying the key so a late response for a since-changed key
-/// is rejected.
+/// On an art-KEY change, ask the art worker to fetch the new cover once. The art worker
+/// posts the decoded cover back as an [`Inbound::Art`] carrying the key, so a late
+/// response for a since-changed key is rejected.
+///
+/// The OUTGOING cover is held until the replacement lands, rather than cleared here.
+/// Clearing on the key change was a guaranteed blank frame: the fetch is a round trip
+/// through the worker, so the pane fell back to the placeholder or sigil for at least
+/// one frame on every track change, and the eye reads that flash to empty and back as
+/// the art breaking rather than as the art loading. Holding the previous cover for that
+/// window is what every music player does, and it is the smaller lie - the pane is
+/// briefly one track behind instead of briefly empty.
+///
+/// It also stops a TRANSIENT key from wiping the pane. `art_want` is `None` whenever
+/// `currentsong` arrives without a `file` (a seek, a reconnect, a refresh that races
+/// the daemon mid-change), so the old code cleared the cover and refetched it on every
+/// one of those, which is the blink seen while seeking a track that never changed.
+///
+/// Two cases still clear, and both are honest: nothing is playing (or a coverless
+/// stream) has no cover to hold FOR, and a fetch that resolves to `None` adopts that
+/// `None` in the [`Inbound::Art`] arm, which drops the held cover.
 fn request_art(art_tx: &Sender<(String, Option<String>)>, state: &mut TuiState) {
     let want = art_want(&state.now);
     if state.art_req_key == want {
         return;
     }
     state.art_req_key = want.clone();
-    state.art = None; // clear stale art on any key change
-    if let Some(key) = want {
-        let _ = art_tx.send(key);
+    match want {
+        Some(key) => {
+            let _ = art_tx.send(key);
+        }
+        // No key wanted. Two very different situations share that shape, and only one
+        // of them should clear:
+        //
+        // - `file` IS present, so this is a stream with no recognized cover. Genuinely
+        //   coverless: holding the last album's art would leave a library cover sitting
+        //   over an internet radio station indefinitely. Clear.
+        // - `file` is ABSENT. Either nothing is playing, or `currentsong` raced the
+        //   daemon mid-change and came back without one. Those are indistinguishable
+        //   here, so hold the cover and let the next refresh settle it - a held cover
+        //   costs a moment of staleness, while clearing costs the blink to empty and
+        //   back that a seek should never produce.
+        None => {
+            if state.now.file.is_some() {
+                state.art = None;
+            }
+        }
     }
 }
 
@@ -907,6 +939,65 @@ mod tests {
     }
 
     #[test]
+    fn a_track_change_holds_the_outgoing_cover_instead_of_blinking_to_empty() {
+        // The reported symptom: the pane shows the empty placeholder and then the real
+        // cover on every switch. Clearing on the key change guaranteed it, because the
+        // replacement only arrives after a round trip through the art worker.
+        let (tx, rx) = mpsc::channel::<(String, Option<String>)>();
+        let mut state = TuiState::new();
+        state.now = np(Some("song/1"), None);
+        request_art(&tx, &mut state);
+        let _ = rx.try_iter().count();
+        state.art = Some(crate::art::AlbumArt::for_test(pal()));
+
+        // Next track: the request goes out and the OLD cover stays on screen.
+        state.now = np(Some("song/2"), None);
+        request_art(&tx, &mut state);
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![("song/2".into(), None)]);
+        assert!(state.art.is_some(), "no blank frame while the new cover is fetched");
+    }
+
+    #[test]
+    fn a_currentsong_without_a_file_does_not_wipe_the_cover() {
+        // A seek does not change the track, but a `currentsong` that races the daemon
+        // mid-change comes back with no `file`, which flips the art key to None. Wiping
+        // on that is the blink seen while seeking a track that never changed.
+        let (tx, rx) = mpsc::channel::<(String, Option<String>)>();
+        let mut state = TuiState::new();
+        state.now = np(Some("song/1"), None);
+        request_art(&tx, &mut state);
+        let _ = rx.try_iter().count();
+        state.art = Some(crate::art::AlbumArt::for_test(pal()));
+
+        state.now = np(None, None); // the transient
+        request_art(&tx, &mut state);
+        assert!(state.art.is_some(), "a transient missing file holds the cover");
+        assert!(rx.try_iter().next().is_none(), "and asks for nothing");
+
+        // It settles back to the same track: still no refetch, still the same cover.
+        state.now = np(Some("song/1"), None);
+        request_art(&tx, &mut state);
+        assert!(state.art.is_some());
+    }
+
+    #[test]
+    fn a_genuinely_coverless_stream_does_clear_the_held_cover() {
+        // The other half: `file` IS present and has no cover, so there is nothing
+        // incoming. Holding would leave a library cover sitting over a radio station.
+        let (tx, rx) = mpsc::channel::<(String, Option<String>)>();
+        let mut state = TuiState::new();
+        state.now = np(Some("song/1"), None);
+        request_art(&tx, &mut state);
+        let _ = rx.try_iter().count();
+        state.art = Some(crate::art::AlbumArt::for_test(pal()));
+
+        state.now = np(Some("https://s/live"), None);
+        request_art(&tx, &mut state);
+        assert!(state.art.is_none(), "a coverless stream clears the held cover");
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    #[test]
     fn art_want_keys_library_stream_and_coverless() {
         // A library song wants its Subsonic cover keyed (uri, None) - unchanged.
         assert_eq!(art_want(&np(Some("song/42"), None)), Some(("song/42".into(), None)));
@@ -942,7 +1033,11 @@ mod tests {
         request_art(&tx, &mut state);
         let sent: Vec<_> = rx.try_iter().collect();
         assert_eq!(sent, vec![("https://s/live".into(), Some("https://x/a.jpg".into()))]);
-        assert!(state.art.is_none(), "art is cleared on a key change");
+        // The cover is HELD across a key change now, not cleared: clearing here was a
+        // guaranteed blank frame on every track change. It is dropped when the fetch
+        // resolves (the Inbound::Art arm adopts None) or when the new track is a
+        // genuinely coverless stream, both covered below.
+        assert!(state.art.is_some(), "the outgoing cover is held until the new one lands");
 
         // The same key again fires no new request (never per frame).
         request_art(&tx, &mut state);
