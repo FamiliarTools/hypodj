@@ -452,18 +452,43 @@ struct ContinuationWarm {
     #[allow(dead_code)]
     guard: TimerGuard,
     /// Whether the background prefetch actually reached the actor (the
-    /// `PrefetchContinuation` Ok). Only when `true` do the fields below carry the
-    /// resolved station identity, and only then may the landed-commit append it.
+    /// `PrefetchContinuation` Ok). Only when `true` does `target` carry a resolved
+    /// identity, and only then may the landed-commit attribute it.
     warmed: bool,
-    /// The queue id minted for the station at prefetch time (attributed on the landed
-    /// handoff). Meaningful only when `warmed`.
+    /// The queue id minted (station) or carried (queue entry) at prefetch time, and
+    /// attributed on the landed handoff. Meaningful only when `warmed`.
     qid: u64,
-    /// The resolved station stream URL. Meaningful only when `warmed`.
-    url: String,
-    /// The station label (the configured station string), used as the appended
-    /// [`QueueEntry::Stream`] title exactly like the cold-start. Meaningful only when
+    /// The resolved stream URL parked behind the current entry. Meaningful only when
     /// `warmed`.
+    url: String,
+    /// The station label, used as the appended [`QueueEntry::Stream`] title exactly
+    /// like the cold-start. Empty and unused for a [`WarmTarget::QueueNext`].
     title: String,
+    /// WHAT is parked - the one field that makes this slot serve both handoffs.
+    target: WarmTarget,
+}
+
+/// What the ONE warm slot is holding.
+///
+/// WHY ONE SLOT AND NOT TWO, which is the load-bearing structural call here: the slot
+/// is disarmed or rescheduled from a dozen call sites (skip, pause, stop, setvol, seek,
+/// both fade paths, every fresh play, and queue edits), and EVERY one of those
+/// supersedes must also kill a queue warm. Carrying both handoffs in one slot means all
+/// of that plumbing covers the new case for free. A second parallel slot would mean
+/// re-auditing every site, and a single missed one leaves an entry parked that mpv
+/// AUTO-ADVANCES into - silent wrong-track audio, which is the worst failure available
+/// on this path and the one no test the user runs would catch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WarmTarget {
+    /// The end-of-queue continuation STATION, warmed at a true-drain boundary so the
+    /// current track's natural EOF flows gaplessly into radio.
+    Station,
+    /// The NEXT QUEUE ENTRY, warmed behind a finite current track so an ORDINARY
+    /// end-of-track advance is gapless instead of paying a cold loadfile as real
+    /// silence. `idx` is the queue index the warm was armed for, re-validated at the
+    /// landed commit so a queue edit that slipped past a disarm can still not commit
+    /// the wrong row.
+    QueueNext { idx: usize },
 }
 
 /// An ICY title that has been superseded on the SAME stream entry (see
@@ -1475,6 +1500,103 @@ fn drain_is_next(st: &State) -> bool {
 /// the auto-advance instead of swallowing it - so this predicate omits that guard on
 /// purpose.
 fn continuation_warm_ready(st: &State, station_ok: bool, playing: bool) -> Option<f64> {
+    warm_ready(st, station_ok, playing).map(|(d, _)| d)
+}
+
+/// The warm predicate, now answering BOTH handoffs: returns the current finite Song's
+/// duration plus WHICH target should be parked behind it.
+///
+/// The shared guards are the ones the station warm already carried and they are not
+/// negotiable for either target: a GENUINELY PLAYING deck (never behind a stopped -
+/// `stop_playback` keeps `current` - paused, or fading-out deck), NO in-flight skip (a
+/// skip owns the warm slot and supersedes), NO live continuation stream (never warm
+/// behind the station itself), and a current entry that is a FINITE Song with a known
+/// duration, because a stream has no natural EOF to warm ahead of and an unknown
+/// duration cannot bound the LEAD.
+///
+/// The two targets are then selected by the SAME boundary test the cold paths use, so a
+/// warm can never arm for a boundary the advance would treat differently:
+/// - `drain_is_next` -> [`WarmTarget::Station`], gated additionally on the armed
+///   continuation toggle and a configured station in Radio mode.
+/// - otherwise, the next entry -> [`WarmTarget::QueueNext`], and ONLY when that entry is
+///   itself a library Song. A raw Stream is deliberately never queue-warmed: it has no
+///   duration, an ICY connection parked through the whole of the current track is stale
+///   by the time it lands, and the drain-edge station path already covers the case that
+///   matters.
+/// The next index a NON-random, NON-single auto-advance will take, computed WITHOUT
+/// touching a byte of state.
+///
+/// WHY THIS EXISTS RATHER THAN A CALL TO `peek_next_from`: that method is `&mut self`,
+/// and not incidentally - under `random` it DRAWS the next index through
+/// `random_next_index`, advancing the shuffle history. Asking it from a predicate would
+/// consume a draw the real advance then never sees, so the warm would park one track
+/// while `plan_next` later chose a different one - mpv auto-advancing into an entry the
+/// queue does not believe is next, which is exactly the silent wrong-track failure this
+/// whole design is arranged to make unrepresentable.
+///
+/// So random is simply NOT WARMABLE, and says so here rather than being worked around:
+/// its next entry is not knowable until the advance draws it. `single` is excluded for
+/// the same honesty - it either stops or replays the current entry, neither of which is
+/// a handoff to warm. Both fall back to today's cold load, which is correct and merely
+/// not gapless.
+fn peek_next_deterministic(st: &State, cur: usize) -> Option<usize> {
+    if st.random || st.single {
+        return None;
+    }
+    let len = st.queue.len();
+    if len == 0 {
+        return None;
+    }
+    if cur + 1 < len {
+        Some(cur + 1)
+    } else if st.repeat {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+fn warm_ready(st: &State, station_ok: bool, playing: bool) -> Option<(f64, WarmTarget)> {
+    if !(playing && st.pending_skip.is_none() && st.continuation_active.is_none()) {
+        return None;
+    }
+    let cur = st.current?;
+    // The current entry must be a finite Song with a usable duration for EITHER target.
+    let dur = match st.queue.get(cur).map(|it| &it.entry) {
+        Some(QueueEntry::Song(s)) => match s.duration_secs {
+            Some(d) if d > 0 => d as f64,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if drain_is_next(st) {
+        // The drain edge: the station handoff, unchanged.
+        if st.continuation && station_ok {
+            return Some((dur, WarmTarget::Station));
+        }
+        return None;
+    }
+    // Not draining, so an ORDINARY advance is next. Warm it when the target is a
+    // finite library Song - `peek_next_from` is the same planner `plan_next` uses, so
+    // the warm and the advance can never disagree about which row comes next.
+    let next = peek_next_deterministic(st, cur)?;
+    // NEVER warm an entry behind ITSELF. `repeat` over a single-entry queue makes the
+    // current row its own next, and parking it would append a second copy of the URL
+    // mpv is already playing - while the landed check (which matches on queue id) could
+    // not tell the replay from a real advance, because they ARE the same row. The cold
+    // replay path handles this correctly today and is left to.
+    if next == cur {
+        return None;
+    }
+    match st.queue.get(next).map(|it| &it.entry) {
+        Some(QueueEntry::Song(_)) => Some((dur, WarmTarget::QueueNext { idx: next })),
+        _ => None,
+    }
+}
+
+/// The ORIGINAL station-only predicate, kept verbatim for the drain-edge callers.
+#[allow(dead_code)]
+fn continuation_warm_ready_station(st: &State, station_ok: bool, playing: bool) -> Option<f64> {
     // The deck GENUINELY PLAYING (never arm behind a stopped/paused/fading-out deck -
     // stop_playback keeps `current`, so this play-state gate, not `current`, is what
     // refuses a warm on a stopped deck), the armed toggle ON, a station configured, NO
@@ -9619,6 +9741,34 @@ impl HypodjHandler {
         let next = self.plan_next(true);
         match next {
             Some(idx) => {
+                // THE GAPLESS ARM. A queue warm parked behind this track means mpv has
+                // ALREADY auto-advanced into the next entry at this very EOF - it never
+                // stopped, so there is no loadfile to pay for and no silence to hear.
+                // Commit the index without loading. Every leg is required: the actor must
+                // have reported the landing, the slot must have survived every disarm
+                // still warmed, its target must be a queue warm, and its qid must match
+                // the row `plan_next` independently chose. That last check is what makes
+                // a queue edit which slipped past a disarm unable to commit the wrong
+                // row - it can only fall through to the cold path, which is correct and
+                // merely not gapless.
+                let landed_next = continuation_landed && {
+                    let mut st = self.state.lock().unwrap();
+                    let ok = matches!(
+                        &st.pending_continuation_warm,
+                        Some(w) if w.warmed
+                            && matches!(w.target, WarmTarget::QueueNext { .. })
+                            && st.queue.get(idx).map(|it| it.id) == Some(w.qid)
+                    );
+                    if ok {
+                        st.pending_continuation_warm = None;
+                    }
+                    ok
+                };
+                if landed_next {
+                    self.commit_landed_advance(idx).await;
+                    self.top_up_lookahead().await;
+                    return;
+                }
                 // A natural EOF advance is NOT a user gesture: it must NOT cancel an
                 // in-flight fade or snap mpv's gain back to the baseline. A slow ramp
                 // (winddown/sleep) has to survive across the track boundary (mpv
@@ -10124,10 +10274,10 @@ impl HypodjHandler {
         // is what makes this reschedule idempotent-correct from every funnel.
         let playing = self.reported_play_state() == PlayState::Playing;
         // (2) Predicate + finite-Song duration under one short lock.
-        let dur = {
+        let (dur, target) = {
             let st = self.state.lock().unwrap();
-            match continuation_warm_ready(&st, station_ok, playing) {
-                Some(d) => d,
+            match warm_ready(&st, station_ok, playing) {
+                Some(pair) => pair,
                 None => return,
             }
         };
@@ -10144,6 +10294,7 @@ impl HypodjHandler {
             qid: 0,
             url: String::new(),
             title: String::new(),
+            target,
         });
     }
 
@@ -10184,7 +10335,7 @@ impl HypodjHandler {
         // (b) Re-check the predicate + still-ours under one short lock; capture a DECISION
         // (never hold the std guard across the disarm await - the Send invariant).
         enum FireDecision {
-            Prefetch(f64),
+            Prefetch(f64, WarmTarget),
             Disarm,
             Bail,
         }
@@ -10193,19 +10344,23 @@ impl HypodjHandler {
             if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
                 FireDecision::Bail
             } else {
-                match continuation_warm_ready(&st, station_ok, playing) {
-                    Some(d) => FireDecision::Prefetch(d),
+                // Re-derive the target rather than trusting the one the arm stored: a
+                // queue edit between arm and fire can have changed which row is next,
+                // and the freshly derived target is what the landed commit will be
+                // re-validated against.
+                match warm_ready(&st, station_ok, playing) {
+                    Some((d, t)) => FireDecision::Prefetch(d, t),
                     None => FireDecision::Disarm,
                 }
             }
         };
-        let dur = match decision {
+        let (dur, target) = match decision {
             FireDecision::Bail => return,
             FireDecision::Disarm => {
                 self.disarm_continuation_warm().await;
                 return;
             }
-            FireDecision::Prefetch(d) => d,
+            FireDecision::Prefetch(d, t) => (d, t),
         };
         // The remaining moved OUT past the LEAD (pause-resumed or a backward seek):
         // cancel-then-rearm ONE fresh timer at the new deadline, never a polling loop.
@@ -10214,30 +10369,69 @@ impl HypodjHandler {
             self.reschedule_continuation_warm().await;
             return;
         }
-        // (c) Resolve the station URL with NO lock held, then mint a qid + prefetch.
-        let Some(station) = station else {
-            self.disarm_continuation_warm().await;
-            return;
-        };
-        let Some(url) = self.resolve_continuation_url(&station).await else {
-            self.disarm_continuation_warm().await;
-            return;
-        };
-        let qid = {
-            let mut st = self.state.lock().unwrap();
-            if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
-                return;
+        // (c) Resolve what to park, with NO lock held across an await.
+        //
+        // The two targets differ ONLY here. A station is resolved from configuration and
+        // gets a FRESHLY MINTED qid, because the row does not exist until the landed
+        // commit appends it. A queue entry already IS a row: it carries its own qid, and
+        // minting a second one would attribute the landed advance to an identity nothing
+        // in the queue holds.
+        let (url, qid, station_title, warm_song, warm_local) = match &target {
+            WarmTarget::Station => {
+                let Some(station) = station else {
+                    self.disarm_continuation_warm().await;
+                    return;
+                };
+                let Some(url) = self.resolve_continuation_url(&station).await else {
+                    self.disarm_continuation_warm().await;
+                    return;
+                };
+                let minted = {
+                    let mut st = self.state.lock().unwrap();
+                    if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
+                        return;
+                    }
+                    // A skip owns the warm slot in both directions: refuse while pending_skip.
+                    if st.pending_skip.is_some() {
+                        return;
+                    }
+                    let minted = st.next_id;
+                    st.next_id += 1;
+                    minted
+                };
+                // A station is id-less by design: it must never scrobble.
+                (url, minted, station, None, false)
             }
-            // A skip owns the warm slot in both directions: refuse while pending_skip.
-            if st.pending_skip.is_some() {
-                return;
+            WarmTarget::QueueNext { idx } => {
+                let item = {
+                    let st = self.state.lock().unwrap();
+                    if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
+                        return;
+                    }
+                    if st.pending_skip.is_some() {
+                        return;
+                    }
+                    st.queue.get(*idx).cloned()
+                };
+                let Some(item) = item else {
+                    self.disarm_continuation_warm().await;
+                    return;
+                };
+                // Same resolution the cold advance performs, so the warmed URL and the
+                // one play_index_inner would have loaded cannot diverge.
+                let Ok(play) = self.resolve_play(&item) else {
+                    self.disarm_continuation_warm().await;
+                    return;
+                };
+                (play.url, item.id, String::new(), play.song_id, play.local)
             }
-            let minted = st.next_id;
-            st.next_id += 1;
-            minted
         };
         // Background prefetch (best-effort). No std lock across the await.
-        let ok = self.player.prefetch_continuation(&url, QueueId(qid)).await.is_ok();
+        let ok = self
+            .player
+            .prefetch_continuation(&url, QueueId(qid), warm_song, warm_local)
+            .await
+            .is_ok();
         // Decide under a short lock whether to KEEP (flip warmed) or DISCARD the slot.
         let discard_landed_prefetch = {
             let mut st = self.state.lock().unwrap();
@@ -10248,7 +10442,8 @@ impl HypodjHandler {
                     w.warmed = true;
                     w.qid = qid;
                     w.url = url;
-                    w.title = station;
+                    w.title = station_title;
+                    w.target = target;
                 }
                 false
             } else {
@@ -10890,6 +11085,50 @@ impl HypodjHandler {
         // Song that will drain next into an armed, configured continuation station.
         self.reschedule_continuation_warm().await;
         Ok(())
+    }
+
+    /// Commit a queue index that mpv ALREADY advanced into, with no load.
+    ///
+    /// The gapless twin of [`Self::play_index_inner`]: byte-for-byte the same state
+    /// commit - the skip pin release, the store remoteness publish, `current`, the
+    /// `fresh_enqueue_anchor` clear, the spent-history trim and its ledger rows, the
+    /// notify, and the re-arm of the next warm - MINUS the `play_url` that is the whole
+    /// point of not being here. mpv never stopped, so loading would restart the track
+    /// that is already audible.
+    ///
+    /// Kept as a sibling rather than a flag on `play_index_inner` because the two differ
+    /// in exactly one statement, and a bool parameter threaded through that function's
+    /// fade-resync logic is how a future edit accidentally loads on the gapless path.
+    async fn commit_landed_advance(&self, idx: usize) {
+        let item = {
+            let st = self.state.lock().unwrap();
+            st.queue.get(idx).cloned()
+        };
+        let Some(item) = item else { return };
+        // A track is becoming current, so no skip target is pending: release the
+        // single-slot eviction pin, exactly as the loading path does.
+        self.set_store_skip_pin(None);
+        // Remoteness is published from the SAME resolution the warm used, so the store
+        // sees the identical verdict it would have on a cold load.
+        if let Ok(play) = self.resolve_play(&item) {
+            self.set_store_playback_remote(!play.local);
+        }
+        let trimmed = {
+            let mut st = self.state.lock().unwrap();
+            st.current = Some(idx);
+            st.pending_pause = false;
+            st.fresh_enqueue_anchor = None;
+            st.trim_spent()
+        };
+        for it in &trimmed {
+            if let Some(row) = spent_heard_row(it) {
+                self.append_heard(row);
+            }
+        }
+        self.notify_change();
+        // Re-arm the warm behind the freshly-current entry, so a run of tracks stays
+        // gapless rather than only the first boundary.
+        self.reschedule_continuation_warm().await;
     }
 
     /// Add an entry by uri. A `song/<id>` uri resolves Subsonic metadata; an
@@ -14889,6 +15128,29 @@ mod tests {
         Some((h, probe, fire_rx))
     }
 
+    /// A landed EOF: mpv auto-advanced into the parked entry at this natural end.
+    fn landed_eof() -> EofSignal {
+        EofSignal { continuation_landed: true, ..EofSignal::default() }
+    }
+
+    /// Install a WARMED QUEUE slot naming `qid` at `idx`, bypassing the LEAD timer -
+    /// these tests exercise the landed commit and its guard, not timer arithmetic.
+    fn install_warmed_queue_slot(h: &HypodjHandler, qid: u64, idx: usize) {
+        let (fire_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::event::TimerId>();
+        std::mem::forget(rx);
+        let timers = crate::timer::spawn_timer_source(crate::clock::TokioClock, fire_tx);
+        let (timer_id, guard) = timers.arm(Instant::now() + Duration::from_secs(9_999));
+        h.state.lock().unwrap().pending_continuation_warm = Some(ContinuationWarm {
+            timer_id,
+            guard,
+            warmed: true,
+            qid,
+            url: "http://example.invalid/warm".to_string(),
+            title: String::new(),
+            target: WarmTarget::QueueNext { idx },
+        });
+    }
+
     // Directly install a WARMED slot (bypassing the LEAD timer) for the landed-commit /
     // disarm tests: they exercise the attribution + disarm, not the timer arithmetic.
     // Needs a real TimerGuard, so an idle throwaway timer is armed far in the future.
@@ -14904,6 +15166,7 @@ mod tests {
             qid,
             url: url.to_string(),
             title: "Station".to_string(),
+            target: WarmTarget::Station,
         });
     }
 
@@ -15825,9 +16088,98 @@ mod tests {
         );
     }
 
-    // DECLINE without a true drain: a track still queued after the current, or a cycling
-    // mode (repeat), or no current -> no warm arms (the SAME true-drain boundary slice-1
-    // fires on, so a warm can never arm where the drain edge would not).
+    #[tokio::test]
+    async fn a_queue_warm_never_arms_where_the_next_row_is_not_knowable() {
+        // THE ONE THING THAT MAKES THIS SAFE. mpv AUTO-ADVANCES into whatever is parked,
+        // so a warm is a commitment about which row plays next. Where that row is not
+        // knowable without side effects, the only correct answer is to arm nothing and
+        // let the cold path decide - slower, and right.
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        h.play_for_test(0).await;
+
+        let target = |h: &HypodjHandler| {
+            h.state.lock().unwrap().pending_continuation_warm.as_ref().map(|w| w.target.clone())
+        };
+        h.reschedule_continuation_warm().await;
+        assert_eq!(target(&h), Some(WarmTarget::QueueNext { idx: 1 }), "ordinary order warms");
+
+        // RANDOM: the next index does not exist until the advance DRAWS it, and asking
+        // would consume the draw - so the warm would park one track while plan_next later
+        // chose another. Refused outright rather than approximated.
+        h.state.lock().unwrap().random = true;
+        h.reschedule_continuation_warm().await;
+        assert_eq!(target(&h), None, "random is not warmable - the next row is undrawn");
+        h.state.lock().unwrap().random = false;
+
+        // SINGLE: stops after the current, or replays it. Neither is a handoff.
+        h.state.lock().unwrap().single = true;
+        h.reschedule_continuation_warm().await;
+        assert_eq!(target(&h), None, "single does not hand off to a next row");
+        h.state.lock().unwrap().single = false;
+
+        // A row can never be warmed behind ITSELF: repeat over a one-entry queue makes
+        // the current its own next, and the landed check matches on queue id, so a replay
+        // and a real advance would be indistinguishable.
+        h.delete_for_test(1);
+        h.state.lock().unwrap().repeat = true;
+        h.reschedule_continuation_warm().await;
+        assert_eq!(target(&h), None, "a row is never warmed behind itself");
+    }
+
+    #[tokio::test]
+    async fn a_landed_queue_warm_commits_the_advance_without_reloading_it() {
+        // THE POINT OF THE WHOLE CHANGE: mpv already auto-advanced, so the advance must
+        // commit the index and NOT load. Loading would restart the track that is already
+        // audible - the very silence this removes, reintroduced at the other end.
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s0")).await;
+        let qid1 = h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        h.play_for_test(0).await;
+        let loads_before = probe.load.load(std::sync::atomic::Ordering::Relaxed);
+
+        // A warmed slot naming the row plan_next will independently choose.
+        install_warmed_queue_slot(&h, qid1, 1);
+        h.advance_on_eof(landed_eof()).await;
+
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "the advance committed");
+        assert_eq!(probe.load.load(std::sync::atomic::Ordering::Relaxed), loads_before, "and loaded NOTHING - mpv was already there");
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none()
+                || matches!(
+                    h.state.lock().unwrap().pending_continuation_warm.as_ref().map(|w| w.target.clone()),
+                    Some(WarmTarget::Station) | Some(WarmTarget::QueueNext { .. })
+                ),
+            "the consumed slot is gone (a fresh re-arm behind the new current is fine)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_landed_warm_for_the_wrong_row_falls_back_to_the_cold_load() {
+        // THE GUARD THAT MAKES A MISSED DISARM SURVIVABLE. If a queue edit slipped past
+        // every supersede, the warmed qid no longer matches the row plan_next chose. The
+        // commit must then REFUSE and cold-load, which is correct and merely not gapless
+        // - never commit a row the queue does not believe is next.
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        h.play_for_test(0).await;
+        let loads_before = probe.load.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Warmed slot naming a qid that is NOT the row at index 1.
+        install_warmed_queue_slot(&h, 99_999, 1);
+        h.advance_on_eof(landed_eof()).await;
+
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "it still advances");
+        assert!(
+            probe.load.load(std::sync::atomic::Ordering::Relaxed) > loads_before,
+            "but by LOADING - a mismatched warm is never committed blind"
+        );
+    }
+
+    // The STATION warm still arms only at the true-drain boundary; everywhere else the
+    // slot now holds the ordinary next TRACK instead of standing empty.
     #[tokio::test(start_paused = true)]
     async fn continuation_warm_declines_without_true_drain() {
         let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
@@ -15838,23 +16190,41 @@ mod tests {
         // Genuinely play s0 so the deck is Playing (the arm predicate gates on it).
         h.play_for_test(0).await;
         h.reschedule_continuation_warm().await;
-        assert!(
-            h.state.lock().unwrap().pending_continuation_warm.is_none(),
-            "a track still follows the current -> not a drain -> no warm"
+        // A track still follows the current, so this is NOT the drain boundary and the
+        // STATION must not be warmed - but the slot is no longer empty here, because the
+        // ordinary next track is warmed instead. Assert the TARGET, which is the thing
+        // that actually decides what plays.
+        assert_eq!(
+            h.state
+                .lock()
+                .unwrap()
+                .pending_continuation_warm
+                .as_ref()
+                .map(|w| w.target.clone()),
+            Some(WarmTarget::QueueNext { idx: 1 }),
+            "a track still follows -> warm the TRACK, never the station"
         );
-        // Delete the tail so the current becomes the last entry: now it drains -> arms.
+        // Delete the tail so the current becomes the last entry: now it drains -> station.
         h.delete_for_test(1);
         h.reschedule_continuation_warm().await;
-        assert!(
-            h.state.lock().unwrap().pending_continuation_warm.is_some(),
-            "the sole remaining finite Song drains next -> a warm arms"
+        assert_eq!(
+            h.state
+                .lock()
+                .unwrap()
+                .pending_continuation_warm
+                .as_ref()
+                .map(|w| w.target.clone()),
+            Some(WarmTarget::Station),
+            "the sole remaining finite Song drains next -> the STATION warms"
         );
-        // repeat cycles the queue forever: never a drain -> disarms.
+        // repeat cycles the queue forever: never a drain, so never the station. With one
+        // entry left, repeat makes that entry its own next - and a track cannot be warmed
+        // behind itself (mpv is already playing those bytes), so nothing arms.
         h.state.lock().unwrap().repeat = true;
         h.reschedule_continuation_warm().await;
         assert!(
             h.state.lock().unwrap().pending_continuation_warm.is_none(),
-            "repeat cycles -> not a drain -> no warm"
+            "repeat cycles -> not a drain -> no station warm"
         );
     }
 

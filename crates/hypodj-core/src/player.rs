@@ -326,6 +326,18 @@ enum PlayerCommand {
     PrefetchContinuation {
         url: String,
         queue_id: QueueId,
+        /// The warm target's SONG identity, `None` for a station.
+        ///
+        /// Load-bearing rather than cosmetic: the attribution below latches this as the
+        /// actor's `current`, and `current` is what every downstream TrackEnd and
+        /// SCROBBLE is attributed to. A station is deliberately id-less (it must never
+        /// scrobble), but a warmed QUEUE TRACK is an ordinary library song, and dropping
+        /// its id here would make every gapless advance silently unscrobbled - the
+        /// listening history quietly losing exactly the tracks that played best.
+        song: Option<SongId>,
+        /// Whether the warmed target resolves to bytes already on disk, so the local
+        /// latch travels with the entry across the gapless handoff.
+        local: bool,
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
     /// Dump a BOUNDED PAST window of the current entry's demuxer cache to `path` as a
@@ -513,10 +525,14 @@ impl PlayerHandle {
         &self,
         url: &str,
         queue_id: QueueId,
+        song: Option<SongId>,
+        local: bool,
     ) -> Result<(), PlayerError> {
         self.request(|reply| PlayerCommand::PrefetchContinuation {
             url: url.to_string(),
             queue_id,
+            song: song.clone(),
+            local,
             reply,
         })
         .await
@@ -663,6 +679,9 @@ pub(crate) struct WarmProbe {
     /// [`DumpFailure::NoEntry`]. It never answers `Ok` - a headless actor has no cache, and
     /// fabricating a byte count would let a test go green about a file that does not exist.
     pub dump: std::sync::atomic::AtomicUsize,
+    /// Counts `PlayUrl` commands - i.e. actual LOADS. The gapless advance is defined by
+    /// what it does NOT do, so proving it needs a counter that stays still.
+    pub load: std::sync::atomic::AtomicUsize,
 }
 
 /// How much audio the scripted first headless dump claims to hold. Below every caller's
@@ -723,6 +742,10 @@ impl NullPlayer {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     PlayerCommand::PlayUrl { song, queue_id, url: _, local, reply } => {
+                        #[cfg(test)]
+                        if let Some(p) = probe.as_ref() {
+                            p.load.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         // A scripted load failure: nothing becomes current, no state
                         // change, no event - exactly what a dead file / 404 looks like
                         // to the handler, which is what the rollback legs react to.
@@ -779,7 +802,13 @@ impl NullPlayer {
                         }
                         let _ = reply.send(Ok(()));
                     }
-                    PlayerCommand::PrefetchContinuation { url: _, queue_id: _, reply } => {
+                    PlayerCommand::PrefetchContinuation {
+                        url: _,
+                        queue_id: _,
+                        song: _,
+                        local: _,
+                        reply,
+                    } => {
                         // Headless: no mpv to warm. A no-op keeps the command total; the
                         // handler still flips its slot warmed=true on this Ok, and a
                         // fake-clock test drives the landed attribution via advance_on_eof
@@ -1204,7 +1233,7 @@ enum WarmKind {
     /// keep-open=no, so mpv auto-advances into it at the current's natural EOF. Carries
     /// the station's queue identity + url so the `EndFile(Eof)` arm can attribute the
     /// landed advance and repoint the actor's own latches onto the station.
-    Continuation { queue_id: QueueId, url: String },
+    Continuation { queue_id: QueueId, url: String, song: Option<SongId>, local: bool },
 }
 
 /// The mpv actor body, running on its own OS thread. Owns the `Mpv` handle and
@@ -1387,7 +1416,12 @@ fn mpv_actor(
                     // advances into - a disarm (DropWarm / playlist-clear) removed it, so
                     // the re-check fails and we take the honest-stop body -> the handler's
                     // slice-1 cold-start is the belt-and-braces.
-                    WarmKind::Continuation { queue_id: station_qid, url: station_url } => {
+                    WarmKind::Continuation {
+                        queue_id: station_qid,
+                        url: station_url,
+                        song: warm_song,
+                        local: warm_local,
+                    } => {
                         let is_eof = matches!(end_reason(reason), EndReason::Eof);
                         let landed = is_eof && {
                             let count: i64 = mpv.get_property("playlist-count").unwrap_or(0);
@@ -1408,9 +1442,13 @@ fn mpv_actor(
                             // again) and reaches the slice-1 honest loud stop.
                             let finishing_song = current.take();
                             let finishing_qid = current_qid.take();
-                            // The station is a network stream, so the local latch moves
-                            // off with the finishing track rather than carrying over.
-                            let finishing_local = std::mem::replace(&mut current_local, false);
+                            // The latch moves onto whatever landed. A station carries no
+                            // song and no locality (`None` / `false`, the old behaviour
+                            // verbatim); a warmed QUEUE TRACK carries both, so it
+                            // scrobbles and reports its bytes' origin exactly as it would
+                            // have on a cold load.
+                            let finishing_local = std::mem::replace(&mut current_local, warm_local);
+                            current = warm_song;
                             current_qid = Some(station_qid);
                             // playing stays true: mpv never stopped across the gapless
                             // advance. The Eof rides the guaranteed blocking_send.
@@ -1614,7 +1652,7 @@ fn handle_cmd(
             }
             let _ = reply.send(res);
         }
-        PlayerCommand::PrefetchContinuation { url, queue_id, reply } => {
+        PlayerCommand::PrefetchContinuation { url, queue_id, song, local, reply } => {
             // Same warm chain as PrefetchWarm but keep-open stays `no`: the auto-advance
             // into the appended station at the current track's natural EOF IS the gapless
             // continuation handoff (attributed by the EndFile arm), not a hazard to guard.
@@ -1628,7 +1666,14 @@ fn handle_cmd(
                 .and_then(|_| mpv.command("loadfile", &[&quote(&url), "append"]))
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             match &res {
-                Ok(()) => *warm = WarmKind::Continuation { queue_id, url: url.clone() },
+                Ok(()) => {
+                    *warm = WarmKind::Continuation {
+                        queue_id,
+                        url: url.clone(),
+                        song: song.clone(),
+                        local,
+                    }
+                }
                 Err(e) => {
                     *warm = WarmKind::None;
                     tracing::warn!(error = %e, "mpv prefetch-continuation failed; continuation falls back to the cold-start");
@@ -2720,6 +2765,116 @@ mod tests {
     // absent in the link-isolated Nix build sandbox); run with:
     //   cargo test -p hypodj-core -- --ignored live_warm_skip_no_bleed_and_switches
     #[test]
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the gapless queue handoff"]
+    fn live_warmed_queue_entry_auto_advances_gaplessly_at_natural_eof() {
+        // THE CLAIM A NULL-PLAYER TEST CANNOT MAKE. Everything else about this change is
+        // unit-testable, but the ONE fact the whole design rests on - that mpv, with a
+        // second entry parked and keep-open=no, flows from the first entry's natural EOF
+        // into the second WITHOUT going idle - is a property of libmpv, not of our code.
+        // Asserting it against NullPlayer would be asserting our own mock.
+        use libmpv2::Mpv;
+        use std::io::Write;
+
+        fn write_tone(path: &std::path::Path, freq: f64, secs: f64) {
+            let sr = 44100u32;
+            let n = (sr as f64 * secs) as usize;
+            let mut pcm: Vec<u8> = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let t = i as f64 / sr as f64;
+                let s = (2.0 * std::f64::consts::PI * freq * t).sin() * 0.5;
+                pcm.extend_from_slice(&((s * i16::MAX as f64) as i16).to_le_bytes());
+            }
+            let data_len = pcm.len() as u32;
+            let mut wav: Vec<u8> = Vec::with_capacity(44 + pcm.len());
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVE");
+            wav.extend_from_slice(b"fmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&sr.to_le_bytes());
+            wav.extend_from_slice(&(sr * 2).to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            wav.extend_from_slice(&pcm);
+            std::fs::File::create(path)
+                .and_then(|mut f| f.write_all(&wav))
+                .expect("write tone wav");
+        }
+
+        let dir = std::env::temp_dir();
+        let a = dir.join("hypodj_gapless_a.wav");
+        let b = dir.join("hypodj_gapless_b.wav");
+        write_tone(&a, 220.0, 2.0);
+        write_tone(&b, 660.0, 3.0);
+
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vid", "no")?;
+            init.set_property("ao", "null")?;
+            init.set_property("terminal", "no")?;
+            init.set_property("prefetch-playlist", "yes")?;
+            Ok(())
+        })
+        .expect("construct mpv");
+
+        // keep-open=no is the WHOLE difference from the skip warm, which sets
+        // keep-open=always precisely to PREVENT this auto-advance. Here it is the feature.
+        mpv.set_property("keep-open", "no").expect("keep-open=no");
+        mpv.command("loadfile", &[&quote(&a.to_string_lossy()), "replace"])
+            .expect("loadfile A");
+        mpv.set_property("pause", false).expect("unpause");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(
+            mpv.get_property::<i64>("playlist-pos").unwrap_or(-1),
+            0,
+            "playing entry 0 before the warm"
+        );
+
+        // PARK the next entry, exactly as PrefetchContinuation does.
+        mpv.command("loadfile", &[&quote(&b.to_string_lossy()), "append"])
+            .expect("append B");
+
+        // Sample across A's natural end. `core-idle` true would mean the audio pipeline
+        // genuinely stalled - which is the ~440ms of silence this change exists to remove.
+        let mut idle_samples = 0usize;
+        let mut advanced_at: Option<std::time::Instant> = None;
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(4) {
+            let pos: i64 = mpv.get_property("playlist-pos").unwrap_or(-1);
+            let idle: bool = mpv.get_property("core-idle").unwrap_or(false);
+            if idle {
+                idle_samples += 1;
+            }
+            if pos == 1 && advanced_at.is_none() {
+                advanced_at = Some(std::time::Instant::now());
+            }
+            if advanced_at.map(|t| t.elapsed() > std::time::Duration::from_millis(600)).unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            advanced_at.is_some(),
+            "mpv AUTO-ADVANCED into the parked entry at the natural EOF - if this fails the \
+             whole gapless design is void and the cold load is the only correct path"
+        );
+        // A handful of idle samples can occur at the very first frame; a real cold load
+        // would show tens of them (~440ms at a 10ms sample = ~44).
+        assert!(
+            idle_samples <= 5,
+            "the handoff never stalled the pipeline, got {idle_samples} idle samples \
+             (a cold loadfile shows roughly 44 at this sample rate)"
+        );
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
     #[ignore = "needs a real libmpv runtime; run manually to confirm the warm-skip prefetch"]
     fn live_warm_skip_no_bleed_and_switches() {
         use libmpv2::Mpv;
@@ -3228,7 +3383,7 @@ mod tests {
             // WARM the station well before the finite file's ~4s EOF.
             let t_prefetch = t_start.elapsed();
             player
-                .prefetch_continuation(&station_url, QueueId(2))
+                .prefetch_continuation(&station_url, QueueId(2), None, false)
                 .await
                 .expect("prefetch the continuation station");
 
@@ -3287,7 +3442,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             // Warm the station behind it (keep-open=no, so mpv auto-advances at EOF).
             player
-                .prefetch_continuation(&station.to_string_lossy(), QueueId(2))
+                .prefetch_continuation(&station.to_string_lossy(), QueueId(2), None, false)
                 .await
                 .expect("warm the station");
 
@@ -3347,7 +3502,7 @@ mod tests {
                 .expect("play the finite current");
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             player
-                .prefetch_continuation(dead, QueueId(2))
+                .prefetch_continuation(dead, QueueId(2), None, false)
                 .await
                 .expect("warm the (dead) station");
 
