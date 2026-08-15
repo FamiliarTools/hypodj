@@ -453,6 +453,15 @@ pub fn command_reply(line: &str, pairs: &[(String, String)]) -> Option<Reply> {
     if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "mark_result") {
         return Some(Reply::Banner(v.clone()));
     }
+    // A SUCCESSFUL `undo` answers with the `jdid` of what it put back, and saying it
+    // is the whole point: the queue may look identical to a human who was not
+    // watching, so a silent success is indistinguishable from a key that did nothing.
+    // The words are the daemon's own.
+    if line.split_whitespace().next() == Some("undo") {
+        if let Some((_, did)) = pairs.iter().find(|(k, _)| k == "jdid") {
+            return Some(Reply::Banner(format!("undone: {did}")));
+        }
+    }
     // `journal` answers with `jid`-keyed records, and an EMPTY ring is a real answer
     // rather than nothing to say - a panel that never opened would read as "the key
     // is broken", which is the same silent-success hole `mark` shipped with.
@@ -1106,6 +1115,26 @@ mod tests {
             Some(Reply::Banner(b)) => assert!(b.contains("nothing to retract"), "{b}"),
             other => panic!("an empty ring must still say something, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_successful_undo_says_what_it_put_back() {
+        use super::{command_reply, Reply};
+        // The queue can look identical to a human who was not watching the moment it
+        // changed, so `u` succeeding in silence is indistinguishable from `u` doing
+        // nothing. The sentence is the daemon's `jdid`, verbatim.
+        let done = pairs(&[("jid", "12"), ("jdid", "cleared 7")]);
+        assert_eq!(
+            command_reply("undo", &done),
+            Some(Reply::Banner("undone: cleared 7".into()))
+        );
+        // A REFUSAL is an ACK and never reaches here - it is mapped to a banner on
+        // the error path - so this rule cannot dress a refusal up as a success.
+        assert_eq!(command_reply("undo", &[]), None);
+        // And the rule keys off the VERB, not off the pair: every `journal` row
+        // carries a `jdid` too, and that reply belongs in the panel.
+        let ring = pairs(&[("jid", "1"), ("jdid", "cleared 7"), ("jundoable", "1")]);
+        assert!(matches!(command_reply("journal", &ring), Some(Reply::Journal(_))));
     }
 
     #[test]
