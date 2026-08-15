@@ -21,6 +21,12 @@ usage - this file is only what you need to work in the repo.
 - `crates/hypodj-cli` - the `dj` jukebox CLI (pure MPD/TCP, no libmpv).
 - `crates/hypodj-tui` - the `dj-gui` interactive TUI (product name HypoDJ; ratatui
   over `hypodj-client`, no libmpv).
+- `crates/hypodj-dsl` - the plan-DSL quoting rule (`dsl_value`), zero deps. The
+  SINGLE source of quoting truth for the daemon and for `dj-mcp`, so the two
+  cannot diverge.
+- `crates/hypodj-mcp` - the `dj-mcp` stdio MCP server: the agent's whole reach
+  into hypodj. Depends on `hypodj-client` + `hypodj-dsl` and must NEVER depend on
+  `hypodj-core`, which hard-links libmpv.
 
 Build or test one crate with `-p <crate>`.
 
@@ -122,6 +128,35 @@ Hard-won from the player/fade work; they apply to all player/state code:
   they are explicit `MpdCommand` variants so dispatch cannot forget them.
 - `ADVERTISED_MPD_VERSION` tracks the surface actually implemented; bump it in
   lockstep, never ahead.
+- **Agent-caused effects are bounded by RETRACTABILITY, not by permission.** The
+  MPD socket is unauthenticated (`password` is not a verb) and any local client
+  can arm `plan add trigger immediate action clear all`; there is no gate on that
+  and there never was. What bounds the AGENT is that its only write channel is
+  `plan add ... origin mcp:<sess>`, i.e. the `plan::Action` layer, and every
+  `Action` runs through `run_action_outcome`, which snapshots queue + qids +
+  playhead + transport + volume and records the real `PlanOutcome::render()`.
+  **Never add an `Action` execution path that bypasses `run_action_outcome`, and
+  never surface to an agent an operation the journal cannot retract** - the 12
+  direct Navidrome writes (star, rating, playlist, station) sit outside the
+  `Action` layer and stay outside the agent surface for exactly that reason.
+  Human-facing text is always `PlanOutcome::render`, never `echo::render_dsl` (a
+  partial, non-injective renderer, not an inverse of the parser).
+  Two rules keep the retraction honest, and they are one idea - **an undo may put
+  back only what THIS action alone took away**: (a) an action is not atomic (it
+  awaits the network while every other connection is still being served), so a
+  post-world the action alone does not explain carries NO snapshot
+  (`journal::QueueEffect`) - recorded, attributable, not undoable; (b) a
+  retraction touches only the dimensions the action disturbed - the rows always,
+  the deck only if it moved, the level only if the action moved the level, and
+  then as a RAMP through the one fade slot, never a step.
+  **What this does NOT promise:** it is not a security boundary. Wire verbs,
+  MPRIS and every autonomous loop (EOF advance, autofill, resume, store
+  reconciler, scrobbler) are ungated and unjournaled; the journal is in memory
+  only and dies with the daemon; an undo expires on any world-key drift; it
+  cannot retract a scrobble or the seconds already heard; and the whole claim
+  holds only while the harn persona's tool list is exactly `["mcp:dj"]`, because
+  harn ships `bash` with no OS sandbox and `nc 127.0.0.1 6600` bypasses all of
+  it.
 
 ## Conventions
 

@@ -63,6 +63,15 @@ pub(crate) struct Snapshot {
     /// The user-facing baseline volume - what a manual `setvol` sets, not the live
     /// mid-fade gain.
     pub(crate) target_volume: u8,
+    /// May the retraction reach for the KNOB?
+    ///
+    /// True only for an action that moved the level itself (a fade, a setvol, a
+    /// wake). An undo is a REPAIR, not a reset: a queue edit never touched the
+    /// volume, so putting "the volume as it was" back would revert whatever the
+    /// human did to the knob in between - and would have to cancel the envelope
+    /// driving it, killing (say) a sleep fade whose terminal is the thing that
+    /// stops the music.
+    pub(crate) restores_volume: bool,
 }
 
 /// The DRIFT DETECTOR: the coarse shape of the world, compared before an undo is
@@ -96,6 +105,178 @@ pub(crate) struct WorldKey {
     pub(crate) current_qid: Option<u64>,
     pub(crate) state: PlayState,
     pub(crate) target_volume: u8,
+}
+
+/// What the action ITSELF is allowed to have done, so that a CONCURRENT writer's
+/// edit cannot be mistaken for it.
+///
+/// ## The window
+///
+/// An [`Action`] is not atomic. `plan_enqueue` awaits a `search3` over the
+/// network, a jump awaits an mpv load, and the daemon keeps serving every other
+/// connection meanwhile (a task per connection; the executor fires each action as
+/// its own detached task). So the world read AFTER the action contains whatever
+/// the HUMAN did DURING it - his `add` from ncmpcpp, his knob - and a key read
+/// there would swear that world was ours. An undo would then restore the
+/// pre-action queue OVER his row: undo would be doing the exact thing it exists to
+/// protect him from.
+///
+/// The window cannot be closed - holding the state lock across a network fetch
+/// would freeze ncmpcpp for seconds - so it is DETECTED instead: the post-world
+/// must be exactly what THIS action alone would have produced from the pre-world.
+/// When it is not, the entry is still recorded (attributable, in the daemon's own
+/// words) but carries NO snapshot, so `undo` never offers to put back a world that
+/// was not only ours.
+///
+/// Fail-closed by construction: an effect nobody can model is [`Opaque`], which
+/// holds for nothing.
+///
+/// [`Opaque`]: QueueEffect::Opaque
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueueEffect {
+    /// Not one row added, removed or reordered.
+    Untouched,
+    /// Exactly `n` rows appended at the END, everything before them untouched. The
+    /// count is the REAL one off the outcome, which is what catches a concurrent
+    /// human `add`: it also lands at the end, so only the COUNT tells the two
+    /// apart.
+    Appended(usize),
+    /// Exactly `n` rows dropped; every surviving row keeps its order.
+    Removed(usize),
+    /// The same rows in a different order.
+    Reordered,
+    /// Not knowable. A failure that may have applied part of itself is the whole
+    /// membership: after an error the daemon cannot say which of the new rows were
+    /// its own, so the entry is recorded and NOT undoable.
+    Opaque,
+}
+
+/// The full shape of one action's own effect, against which the post-world is
+/// checked. Every field is a claim about what the action DOES, and every claim it
+/// declines to make (`moves_deck`) is a drift class it cannot detect - named here
+/// rather than left implicit.
+pub(crate) struct ActionShape {
+    pub(crate) queue: QueueEffect,
+    /// The action passes the current-commit choke, where `State::trim_spent`
+    /// retires a prefix of SPENT rows underneath it. Only the deck-moving actions
+    /// do, and only for them is a missing prefix accepted.
+    pub(crate) trims: bool,
+    /// The action moves the deck itself (current row / transport), so a foreign
+    /// move inside its window is INDISTINGUISHABLE from its own and is not
+    /// checked. False for the long-running append, which is where an EOF advance
+    /// or a human pause is most likely to land.
+    pub(crate) moves_deck: bool,
+    /// The baseline volume this action COMMITS synchronously (the `setvol` glide
+    /// commits at install, within one of the ask because of the sub-JND dither).
+    /// `None` means the action must leave the baseline exactly where it found it -
+    /// a plan fade included, which commits only at its terminal.
+    pub(crate) commits_volume: Option<u8>,
+}
+
+impl ActionShape {
+    fn queue_only(queue: QueueEffect) -> Self {
+        Self { queue, trims: false, moves_deck: false, commits_volume: None }
+    }
+
+    fn deck(queue: QueueEffect) -> Self {
+        Self { queue, trims: true, moves_deck: true, commits_volume: None }
+    }
+}
+
+/// The shape of an action's own effect, read off the action AND its REAL outcome
+/// (the resolved count, never the asked-for one).
+pub(crate) fn action_shape(action: &Action, outcome: &PlanOutcome) -> ActionShape {
+    use QueueEffect::*;
+    match action {
+        // The level, never the rows. A plan fade is non-committing (its terminal
+        // assigns the baseline later), so it commits nothing HERE.
+        Action::Fade(_) => ActionShape::queue_only(Untouched),
+        Action::SetVolume(v) => {
+            ActionShape { commits_volume: Some(*v), ..ActionShape::queue_only(Untouched) }
+        }
+        // Transport only: the rows stand, the deck moves.
+        Action::Stop | Action::Pause => {
+            ActionShape { trims: false, ..ActionShape::deck(Untouched) }
+        }
+        // Append-only, and the ONLY action that runs a network fetch with the deck
+        // untouched - so its window is both the longest and the strictest.
+        Action::Enqueue { .. } => match outcome {
+            PlanOutcome::Added { n, .. } => ActionShape::queue_only(Appended(*n)),
+            _ => ActionShape::queue_only(Opaque),
+        },
+        Action::PlayNow { .. } => match outcome {
+            PlanOutcome::Played { n, .. } => ActionShape::deck(Appended(*n)),
+            _ => ActionShape::deck(Opaque),
+        },
+        // A wake enqueues and then ramps, and `wake_now` reports no count, so the
+        // append is unknowable here. Recorded, never undoable: an alarm is not an
+        // agent-reachable action and nothing retracts the morning.
+        Action::Wake { .. } => ActionShape::deck(Opaque),
+        Action::Remove { .. } => match outcome {
+            PlanOutcome::Removed(n) => ActionShape::deck(Removed(*n)),
+            _ => ActionShape::deck(Opaque),
+        },
+        Action::Clear { .. } => match outcome {
+            PlanOutcome::Cleared(n) => ActionShape::deck(Removed(*n)),
+            _ => ActionShape::deck(Opaque),
+        },
+        Action::Move { .. } => match outcome {
+            PlanOutcome::Moved(_) => ActionShape::queue_only(Reordered),
+            _ => ActionShape::queue_only(Opaque),
+        },
+        Action::Play { .. } => match outcome {
+            PlanOutcome::Jumped(_) => ActionShape::deck(Untouched),
+            _ => ActionShape::deck(Opaque),
+        },
+        Action::Noop => ActionShape::queue_only(Untouched),
+        // EXHAUSTIVE on purpose, like `action_verb`: a new variant must fail to
+        // compile HERE rather than default to a shape that lets an undo clobber.
+    }
+}
+
+/// Is `post` exactly `pre` plus this action's own queue effect?
+pub(crate) fn queue_effect_holds(shape: &ActionShape, pre: &[u64], post: &[u64]) -> bool {
+    if shape.trims {
+        // The current-commit choke may have retired a prefix of spent rows under
+        // the action. Any prefix is accepted for those actions, which is the one
+        // place a human `delete` off the FRONT could pass as the trim - a resurrect
+        // (his deleted row comes back) rather than a destroy, and the alternative
+        // is refusing every jump undo on a queue longer than SPENT_KEEP.
+        (0..=pre.len()).any(|k| effect_holds(shape.queue, &pre[k..], post))
+    } else {
+        effect_holds(shape.queue, pre, post)
+    }
+}
+
+fn effect_holds(effect: QueueEffect, pre: &[u64], post: &[u64]) -> bool {
+    match effect {
+        QueueEffect::Untouched => post == pre,
+        QueueEffect::Appended(n) => {
+            post.len() == pre.len() + n && &post[..pre.len()] == pre
+        }
+        QueueEffect::Removed(n) => pre.len() == post.len() + n && is_subsequence(post, pre),
+        QueueEffect::Reordered => {
+            let (mut a, mut b) = (pre.to_vec(), post.to_vec());
+            a.sort_unstable();
+            b.sort_unstable();
+            a == b
+        }
+        QueueEffect::Opaque => false,
+    }
+}
+
+/// Does `small` appear inside `big` in order (not necessarily contiguously)? A
+/// removal leaves the survivors in their original order, so this is what "only rows
+/// were dropped" means; a row that appeared from somewhere else breaks it.
+fn is_subsequence(small: &[u64], big: &[u64]) -> bool {
+    let mut it = big.iter();
+    small.iter().all(|want| it.any(|have| have == want))
+}
+
+/// Does this action move the level itself, and therefore may its retraction?
+/// See [`Snapshot::restores_volume`].
+pub(crate) fn restores_volume(action: &Action) -> bool {
+    matches!(action, Action::Fade(_) | Action::SetVolume(_) | Action::Wake { .. })
 }
 
 /// One thing that happened: attributable, and (while its key holds) retractable.
@@ -348,7 +529,7 @@ pub(crate) fn changed_anything(outcome: &PlanOutcome) -> bool {
 mod tests {
     use super::*;
     use crate::model::QueueEntry;
-    use crate::plan::{ClearScope, QueueSelector};
+    use crate::plan::{ClearScope, QueueSelector, Selector};
 
     fn key(version: u64, qid: Option<u64>, state: PlayState, vol: u8) -> WorldKey {
         WorldKey { playlist_version: version, current_qid: qid, state, target_volume: vol }
@@ -365,6 +546,7 @@ mod tests {
             elapsed_ms: 1_000,
             state: PlayState::Playing,
             target_volume: vol,
+            restores_volume: true,
         }
     }
 
@@ -495,5 +677,101 @@ mod tests {
         assert_eq!(action_verb(&Action::Clear { scope: ClearScope::All }), "clear");
         assert_eq!(action_verb(&Action::Remove { sel: QueueSelector::Qid(3) }), "remove");
         assert_eq!(action_verb(&Action::Noop), "noop");
+    }
+
+    fn enqueued(n: usize) -> ActionShape {
+        action_shape(
+            &Action::Enqueue { selector: Selector::Query("x".into()), count: n as u32 },
+            &PlanOutcome::Added { n, selector: "\"x\"".into() },
+        )
+    }
+
+    // THE WINDOW. An enqueue that appended 3 while the human added 1 of his own
+    // leaves 4 new rows at the end - and the count, not the shape, is what tells
+    // them apart. Accepting it would mean an undo deletes HIS row.
+    #[test]
+    fn a_concurrent_append_inside_the_window_is_not_our_effect() {
+        let pre = [1u64, 2, 3];
+        assert!(
+            queue_effect_holds(&enqueued(3), &pre, &[1, 2, 3, 4, 5, 6]),
+            "our own three appends ARE our effect"
+        );
+        assert!(
+            !queue_effect_holds(&enqueued(3), &pre, &[1, 2, 3, 4, 5, 6, 7]),
+            "a fourth row appeared: somebody else appended inside our window"
+        );
+        // And his row need not be last - an interleaved append is caught by the
+        // same count.
+        assert!(!queue_effect_holds(&enqueued(3), &pre, &[1, 2, 3, 9, 4, 5, 6]));
+        // A human DELETE inside the window is the mirror case.
+        assert!(!queue_effect_holds(&enqueued(3), &pre, &[1, 3, 4, 5, 6]));
+    }
+
+    // A removal may only DROP rows. Anything that appeared, or a second row that
+    // vanished, is not ours.
+    #[test]
+    fn a_removal_admits_only_the_rows_it_removed() {
+        let shape = action_shape(
+            &Action::Remove { sel: QueueSelector::Qid(2) },
+            &PlanOutcome::Removed(1),
+        );
+        let pre = [1u64, 2, 3, 4];
+        assert!(queue_effect_holds(&shape, &pre, &[1, 3, 4]));
+        assert!(!queue_effect_holds(&shape, &pre, &[1, 3, 4, 9]), "a row appeared");
+        assert!(!queue_effect_holds(&shape, &pre, &[1, 4]), "a second row vanished");
+        assert!(!queue_effect_holds(&shape, &pre, &[3, 1, 4]), "the survivors were reordered");
+    }
+
+    // A clear of everything, with a human `add` landing inside the window: the
+    // queue is not empty afterwards, so the snapshot is not ours to put back.
+    #[test]
+    fn a_clear_that_did_not_end_empty_is_not_our_effect() {
+        let shape =
+            action_shape(&Action::Clear { scope: ClearScope::All }, &PlanOutcome::Cleared(3));
+        assert!(queue_effect_holds(&shape, &[1, 2, 3], &[]));
+        assert!(!queue_effect_holds(&shape, &[1, 2, 3], &[9]));
+    }
+
+    // A jump leaves the rows alone - except for the spent-row trim it passes
+    // through, which retires a PREFIX. Both are its own effect; a new row is not.
+    #[test]
+    fn a_jump_admits_the_spent_trim_and_nothing_else() {
+        let shape =
+            action_shape(&Action::Play { sel: QueueSelector::Qid(3) }, &PlanOutcome::Jumped(1));
+        assert!(queue_effect_holds(&shape, &[1, 2, 3, 4], &[1, 2, 3, 4]));
+        assert!(queue_effect_holds(&shape, &[1, 2, 3, 4], &[3, 4]), "the trim retired a prefix");
+        assert!(!queue_effect_holds(&shape, &[1, 2, 3, 4], &[1, 2, 3, 4, 5]));
+        assert!(!queue_effect_holds(&shape, &[1, 2, 3, 4], &[1, 2, 4]), "a middle row vanished");
+    }
+
+    // A move is a permutation: same rows, any order. And a FAILURE is opaque -
+    // after an error nothing can say which rows were ours, so nothing is undoable.
+    #[test]
+    fn a_move_is_a_permutation_and_a_failure_is_opaque() {
+        let shape = action_shape(
+            &Action::Move { sel: QueueSelector::Qid(4), dest: crate::plan::MoveDest::Position(0) },
+            &PlanOutcome::Moved(1),
+        );
+        assert!(queue_effect_holds(&shape, &[1, 2, 3, 4], &[4, 1, 2, 3]));
+        assert!(!queue_effect_holds(&shape, &[1, 2, 3, 4], &[4, 1, 2, 3, 5]));
+
+        let failed = action_shape(
+            &Action::Enqueue { selector: Selector::Query("x".into()), count: 3 },
+            &PlanOutcome::Failed("the server went away".into()),
+        );
+        assert!(
+            !queue_effect_holds(&failed, &[1, 2], &[1, 2, 3]),
+            "a partly-applied failure is recorded, never undoable"
+        );
+    }
+
+    // Only the actions that move the LEVEL may have their level put back.
+    #[test]
+    fn only_a_level_action_restores_the_level() {
+        assert!(restores_volume(&Action::SetVolume(30)));
+        assert!(restores_volume(&Action::Fade(crate::plan::FadeIntentIr::Out { secs: 10.0 })));
+        assert!(!restores_volume(&Action::Clear { scope: ClearScope::All }));
+        assert!(!restores_volume(&Action::Remove { sel: QueueSelector::Qid(1) }));
+        assert!(!restores_volume(&Action::Pause));
     }
 }

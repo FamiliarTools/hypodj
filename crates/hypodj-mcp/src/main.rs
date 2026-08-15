@@ -16,6 +16,12 @@
 //! Navidrome writes (star, rating, playlist, station) are reachable only from wire
 //! verbs, so no tool here can reach them.
 //!
+//! Retractable is not unconditional, and the tools say so rather than implying
+//! otherwise: `undoable` in every write's result is the DAEMON's answer, and it is
+//! false whenever the world moved under the entry or the action's own execution
+//! window was shared with somebody else's edit. An action is always recorded; it is
+//! undoable only while the world it acted on is still the world it left.
+//!
 //! Two operational facts shape the whole file. harn spawns an MCP child ONCE, at
 //! startup, and never restarts it - so this process must start with no daemon
 //! listening and must never exit on socket loss, or it is absent for harn's entire

@@ -42,7 +42,8 @@ use crate::fade::{
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot, TimerId};
 use crate::journal::{
-    action_verb, changed_anything, Journal, Snapshot, UndoRefusal, WorldKey,
+    action_shape, action_verb, changed_anything, queue_effect_holds, restores_volume, Journal,
+    Snapshot, UndoRefusal, WorldKey,
 };
 use crate::intelligence::{
     lexicon_pull, pull_reweight, FeatureStore, MetadataStore, Pull, PullField, TrackFeatures,
@@ -3231,6 +3232,8 @@ impl HypodjHandler {
             elapsed_ms,
             state,
             target_volume,
+            // Assigned by `journal_record`, which is the one that knows the action.
+            restores_volume: false,
         };
         let key = WorldKey {
             playlist_version: st.playlist_version,
@@ -3239,6 +3242,23 @@ impl HypodjHandler {
             target_volume,
         };
         (snap, key)
+    }
+
+    /// The queue's qid vector beside the live [`WorldKey`], read under ONE lock so
+    /// the two can never describe different samples. The vector is what the WINDOW
+    /// check (see [`crate::journal::QueueEffect`]) compares against the pre-world:
+    /// `playlist_version` counts that something changed, only the ids say WHAT.
+    fn world_rows(&self) -> (Vec<u64>, WorldKey) {
+        let state = self.reported_play_state();
+        let st = self.state.lock().unwrap();
+        let ids: Vec<u64> = st.queue.iter().map(|it| it.id).collect();
+        let key = WorldKey {
+            playlist_version: st.playlist_version,
+            current_qid: st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
+            state,
+            target_volume: st.target_volume,
+        };
+        (ids, key)
     }
 
     /// The live [`WorldKey`]: the drift detector `undo` compares against. Same read
@@ -3255,22 +3275,62 @@ impl HypodjHandler {
     }
 
     /// Push one [`crate::journal::JournalEntry`] for an action that actually did
-    /// something, with the daemon's OWN outcome text.
+    /// something, with the daemon's OWN outcome text - and decide whether that entry
+    /// may carry a snapshot at all.
     ///
-    /// Two independent tests for "something happened", because neither alone is
-    /// sufficient: the REAL outcome (a `fade` moved the level even though the key
-    /// cannot see it until its terminal lands) OR a moved world key (an enqueue that
-    /// appended three tracks and THEN errored reports `Failed`, and losing that
-    /// snapshot would leave the appended rows unretractable).
+    /// Two questions, in order.
+    ///
+    /// **Did anything happen?** The world moved (its rows or its key), OR the action
+    /// runs an ENVELOPE whose effect the key cannot see yet (a plan fade commits its
+    /// baseline only at its terminal). Neither alone is sufficient, and the pair is
+    /// what keeps a nothing-action out of the ring: an entry that restores nothing
+    /// must never sit on top offering "u to undo", because a human who presses it and
+    /// sees nothing happen presses it again.
+    ///
+    /// **Was it OURS?** See [`crate::journal::QueueEffect`]. The action ran with the
+    /// daemon still serving every other connection, so the world after it contains
+    /// whatever the human did DURING it. Only a post-world that this action ALONE
+    /// explains may be retracted; anything else is recorded (attributable, in the
+    /// daemon's own words) with NO snapshot, so `undo` never offers to put back a
+    /// world that was not only ours. A partly-applied FAILURE lands here by design:
+    /// after an error nothing can say which of the new rows were the daemon's.
     fn journal_record(
         &self,
         action: &Action,
         origin: &str,
-        snap: Snapshot,
+        mut snap: Snapshot,
         pre_key: WorldKey,
         outcome: &PlanOutcome,
     ) {
-        let mut post_key = self.world_key();
+        let pre_ids: Vec<u64> = snap.queue.iter().map(|it| it.id).collect();
+        let (post_ids, raw_post_key) = self.world_rows();
+        let moved = post_ids != pre_ids || raw_post_key != pre_key;
+        // The only effect a world key cannot see: an envelope in flight.
+        let in_flight = matches!(action, Action::Fade(_) | Action::Wake { .. })
+            && changed_anything(outcome);
+        if !moved && !in_flight {
+            return;
+        }
+        let shape = action_shape(action, outcome);
+        let ours = queue_effect_holds(&shape, &pre_ids, &post_ids)
+            // A level the action does not drive must be exactly where it was found.
+            // The `setvol` glide commits at INSTALL and the sub-JND dither lands it
+            // within one of the ask, so that one is the width of the window.
+            && match shape.commits_volume {
+                None => raw_post_key.target_volume == pre_key.target_volume,
+                Some(v) => {
+                    raw_post_key.target_volume == pre_key.target_volume
+                        || raw_post_key.target_volume.abs_diff(v) <= 1
+                }
+            }
+            // An action that does not move the deck itself must find it where it
+            // left it - this is what catches an EOF advance or a human pause landing
+            // inside the long network window of an append.
+            && (shape.moves_deck
+                || (raw_post_key.current_qid == pre_key.current_qid
+                    && raw_post_key.state == pre_key.state));
+        snap.restores_volume = restores_volume(action);
+        let mut post_key = raw_post_key;
         // A plan fade is NON-committing: `target_volume` stays at the pre level for
         // the whole ramp and is committed only by `Terminal::SetBaseline`. Record the
         // level the envelope is DRIVING to, so the entry does not go stale the
@@ -3279,15 +3339,12 @@ impl HypodjHandler {
         if let Some(v) = fade_lands_at(action) {
             post_key.target_volume = v;
         }
-        if !changed_anything(outcome) && post_key == pre_key {
-            return;
-        }
         self.journal.push(
             Instant::now(),
             origin,
             action_verb(action),
             outcome.render(),
-            Some(snap),
+            ours.then_some(snap),
             post_key,
         );
     }
@@ -4358,6 +4415,20 @@ impl HypodjHandler {
                 let (texts, qids, current) = self.queue_texts();
                 let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
                 match idxs.first() {
+                    // ALREADY ON IT. "play the track that matches X" names the track
+                    // he wants under the needle, and it already is - so loading it
+                    // would restart from zero the music he is in the middle of, which
+                    // is the one thing a jump onto the current row must never do.
+                    // `play_index` has no already-current guard on purpose (a wire
+                    // `play <pos>` deliberately restarts), so the guard sits here, on
+                    // the plan arm. Nothing changes, so nothing is journaled and no
+                    // banner offers to undo a jump that never happened.
+                    Some(&idx)
+                        if current == Some(idx)
+                            && self.reported_play_state() == PlayState::Playing =>
+                    {
+                        Ok(1)
+                    }
                     Some(&idx) => {
                         self.play_index(idx).await?;
                         Ok(1)
@@ -9403,8 +9474,8 @@ impl HypodjHandler {
         Ok(())
     }
 
-    /// THE RETRACTION PRIMITIVE: put a [`Snapshot`] back - queue + qids + playhead
-    /// + transport + volume.
+    /// THE RETRACTION PRIMITIVE: put a [`Snapshot`] back - the rows, and only as much
+    /// of the deck and the level as the action being retracted actually disturbed.
     ///
     /// Deliberately NOT a reuse of [`Self::restore`], which is wrong for undo in
     /// three ways: it re-resolves song ids over the network (an undo must work with
@@ -9414,35 +9485,53 @@ impl HypodjHandler {
     /// decrease so ncmpcpp and dj-gui skip the re-read and keep showing the wiped
     /// queue.
     ///
-    /// The deck is touched ONLY when it has to be: if the current row (by qid) and
-    /// the transport already match the snapshot, undoing (say) the removal of a row
-    /// that is not playing must not reload the track being listened to. When it does
-    /// have to move, the load runs from SILENCE and ramps back up, exactly like the
-    /// smooth-restart path - never a hard cut.
+    /// An undo lands on a world the human is living in, so it touches as LITTLE as it
+    /// can, in three widening steps:
+    ///
+    /// 1. the ROWS, always - that is what an undo is;
+    /// 2. the DECK only when the current row (by qid) or the transport no longer
+    ///    matches the snapshot. Undoing the removal of a row that is not playing must
+    ///    not reload the track being listened to. When it does have to move, the load
+    ///    runs from SILENCE and ramps back up, exactly like the smooth-restart path -
+    ///    never a hard cut;
+    /// 3. the LEVEL only when the action moved the level itself
+    ///    ([`Snapshot::restores_volume`]). A queue edit's retraction never reaches for
+    ///    the knob and never cancels the envelope holding it, so a sleep fade running
+    ///    underneath an agent's `dj_remove` still reaches its own terminal - which is
+    ///    the thing that stops the music.
+    ///
+    /// And when the level does come back, it comes back as a RAMP through the single
+    /// fade slot, never a step: mid-wind-down the live gain sits tens of dB under the
+    /// baseline, and a step there is exactly the startle the fade machinery exists to
+    /// prevent.
     pub(crate) async fn install_snapshot(&self, snap: &Snapshot) -> Result<(), String> {
         // Read what the deck holds NOW, before anything is mutated.
-        let live_qid = {
+        let (live_qid, dipping, live_vol) = {
             let st = self.state.lock().unwrap();
-            st.current.and_then(|i| st.queue.get(i)).map(|it| it.id)
+            (
+                st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
+                st.pending_skip.is_some(),
+                st.target_volume,
+            )
         };
         let live_state = self.reported_play_state();
         let snap_qid = snap.current.and_then(|i| snap.queue.get(i)).map(|it| it.id);
         let deck_ok = live_qid == snap_qid && live_state == snap.state;
 
         let synth_floor = self.fade_cfg.synth_floor_db;
-        let vol = snap.target_volume;
+        // The level to land on: the snapshot's only when this action owned the knob,
+        // otherwise the LIVE one - a reload still has to ramp back up to something.
+        let vol = if snap.restores_volume { snap.target_volume } else { live_vol };
         let queue = snap.queue.clone();
         let next_qid = snap.next_qid;
         let current = snap.current;
 
-        // ONE fade-slot lock: CANCEL any in-flight fade and apply the whole state
-        // mutation indivisibly (the manual-volume invariant - releasing between the
-        // cancel and the mutation lets a concurrent fade from another connection slip
-        // in). The abort+join also kills a pending `Terminal::SkipLoad` /
-        // `Terminal::Pause`, which would otherwise land on the RESTORED queue and
-        // load a row nobody asked for.
-        self.fade
-            .cancel_with(|| {
+        if deck_ok && !dipping {
+            // THE QUIET PATH, and the common one: the rows go back and nothing else
+            // is disturbed. No fade-slot lock, because nothing here is a manual volume
+            // change - whatever envelope is in flight belongs to whoever started it and
+            // keeps running.
+            {
                 let mut st = self.state.lock().unwrap();
                 st.queue = queue;
                 // FORWARD only: an id minted after the snapshot must never be
@@ -9453,31 +9542,59 @@ impl HypodjHandler {
                 // re-reads the queue when `playlist:` GROWS, so rolling it back would
                 // leave every client showing the world this call just replaced.
                 st.playlist_version = st.playlist_version.wrapping_add(1);
+            }
+            self.notify_change();
+            if snap.restores_volume {
+                self.restore_baseline_volume(vol).await;
+            }
+            // What drains next just changed, so any warm parked behind the current
+            // track was derived from the world this call replaced. The shared funnel
+            // disarms it and re-arms only if the RESTORED queue really drains into one.
+            self.reschedule_continuation_warm().await;
+            return Ok(());
+        }
+
+        // ONE fade-slot lock: CANCEL the in-flight fade and apply the whole state
+        // mutation indivisibly (the manual-volume invariant - releasing between the
+        // cancel and the mutation lets a concurrent fade from another connection slip
+        // in). The abort+join also kills a pending `Terminal::SkipLoad` /
+        // `Terminal::Pause`, which would otherwise land on the RESTORED queue and
+        // load a row nobody asked for. The cost is named rather than hidden: an
+        // UNRELATED envelope dies here too, and with it any terminal it was carrying.
+        // It is unavoidable once the deck itself has to be taken over, and the quiet
+        // path above is what keeps it off the common case.
+        self.fade
+            .cancel_with(|| {
+                let mut st = self.state.lock().unwrap();
+                st.queue = queue;
+                st.next_id = next_qid.max(st.next_id);
+                st.current = current;
+                st.playlist_version = st.playlist_version.wrapping_add(1);
                 // Any in-flight skip target belongs to the world being replaced.
                 st.pending_skip = None;
                 st.target_volume = vol;
                 st.logical_gain_db = mpv_volume_to_db(vol as f64);
                 st.baseline_committed = true;
                 st.fading = false;
-                if deck_ok {
-                    // The deck is already where the snapshot wants it: settle the live
-                    // gain onto the baseline and leave the transport intent alone (a
-                    // pending pause here IS the snapshot's state).
-                    st.live_gain_db = mpv_volume_to_db(vol as f64);
-                } else {
+                if !deck_ok {
                     // A load follows: start SILENT so the first buffer is inaudible and
                     // the ramp below owns the rise.
                     st.live_gain_db = synth_floor;
                     st.pending_pause = false;
                 }
+                // deck_ok here means only the dip died; the live gain stays where the
+                // dip left it and the ramp below carries it back to the baseline.
             })
             .await;
         self.notify_change();
 
         if deck_ok {
-            // Re-assert the real mpv gain: an undone fade / setvol left it elsewhere,
-            // and mpv volume persists across a load.
-            let _ = self.player.set_volume(vol).await;
+            // The superseded dip's `Terminal::SkipLoad` will never run, so its
+            // prefetched warm is stale - drop it, else the still-playing current
+            // track's natural EOF auto-advances into it.
+            let _ = self.player.drop_warm().await;
+            self.restore_baseline_volume(vol).await;
+            self.reschedule_continuation_warm().await;
             return Ok(());
         }
 
@@ -9545,7 +9662,42 @@ impl HypodjHandler {
             }
         }
         self.notify_change();
+        // The restored world has to derive its OWN warm: the one parked behind the
+        // deck was computed against the queue this call just replaced.
+        self.reschedule_continuation_warm().await;
         Ok(())
+    }
+
+    /// Put a baseline volume back the way every other level change in this daemon
+    /// moves: as a RAMP through the single fade slot. An undo can land on a deck
+    /// whose live gain is tens of dB under the baseline (mid wind-down, mid sleep
+    /// fade), and a bare `set_volume` there is a step of exactly the size the fade
+    /// machinery exists to prevent.
+    ///
+    /// No dither, unlike [`Self::glide_to_volume`]: the knob's sub-JND jitter is
+    /// there to humanize a deliberate drag, while a retraction must land on the
+    /// level that was RECORDED, not within one of it.
+    async fn restore_baseline_volume(&self, vol: u8) {
+        let target_db = mpv_volume_to_db(vol as f64);
+        let req = FadeRequest {
+            intent: FadeIntent::Glide { target_db, vol },
+            dur: self.glide_fade_dur(),
+            commit_logical: Some((target_db, vol)),
+        };
+        if self.start_fade_spec(req).await.is_err() {
+            // Defensive, mirroring `glide_to_volume`: a rejected spec must never turn
+            // the retraction into a silent no-op. Cancel-then-mutate atomically under
+            // one slot lock (the manual-volume invariant), and drop the warm target a
+            // superseded skip dip left parked.
+            self.fade
+                .cancel_with(|| {
+                    self.state.lock().unwrap().set_manual_volume(vol, self.deck_loaded())
+                })
+                .await;
+            let _ = self.player.drop_warm().await;
+            let _ = self.player.set_volume(vol).await;
+        }
+        self.notify_change();
     }
 
     /// Build the exact wake ramp-in [`FadeSpec`] the restore path spawns via
@@ -26677,6 +26829,196 @@ mod tests {
         assert_eq!(h2.state.lock().unwrap().current, Some(0));
     }
 
+
+    // THE WINDOW, on the rows. `plan_enqueue` awaits a network fetch and the daemon
+    // keeps serving ncmpcpp meanwhile, so the world AFTER the action holds his row
+    // too. Reading the key there and calling it ours is what made an undo restore the
+    // pre-action queue OVER the row he had just added - undo doing the one thing it
+    // exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn a_row_he_added_while_the_action_ran_is_not_ours_to_retract() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 2).await;
+        let (snap, key) = h.capture_world();
+        // The action's own three appends ...
+        seed_queue(&h, 3).await;
+        // ... and HIS, from another connection, inside the same window.
+        h.enqueue_song_for_test(playlist_test_song("his-own")).await;
+        h.journal_record(
+            &Action::Enqueue { selector: Selector::Radio, count: 3 },
+            "mcp:sess-1",
+            snap,
+            key,
+            &PlanOutcome::Added { n: 3, selector: "\"calm\"".into() },
+        );
+
+        // Recorded - it happened, it is attributable, and it says so in the daemon's
+        // own words ...
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j, "jorigin").as_deref(), Some("mcp:sess-1"));
+        assert_eq!(newest(&j, "jdid").as_deref(), Some("added 3 tracks"));
+        // ... and NOT undoable, because four rows appeared where three were ours.
+        assert_eq!(newest(&j, "jundoable").as_deref(), Some("0"));
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert_eq!(rows(&h).len(), 6, "his row stands");
+    }
+
+    // The same window, on the KNOB. A queue edit does not move the level, so a level
+    // that moved while it ran moved under somebody else's hand.
+    #[tokio::test(start_paused = true)]
+    async fn a_knob_he_turned_while_the_action_ran_is_not_ours_to_retract() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().set_manual_volume(70, true);
+        let (snap, key) = h.capture_world();
+        let victim = qid_at(&h, 2);
+        let sel = crate::plan::QueueSelector::Qid(victim);
+        let n = h
+            .plan_queue_edit(&Action::Remove { sel: sel.clone() })
+            .await
+            .expect("the remove itself ran");
+        assert_eq!(n, 1);
+        // His hand on the knob, inside the same window.
+        h.state.lock().unwrap().set_manual_volume(25, true);
+        h.journal_record(&Action::Remove { sel }, "mcp:s", snap, key, &PlanOutcome::Removed(1));
+
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j, "jdid").as_deref(), Some("removed 1 track"));
+        assert_eq!(newest(&j, "jundoable").as_deref(), Some("0"));
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert_eq!(h.state.lock().unwrap().target_volume, 25, "his level stands");
+    }
+
+    // His sleep is fading the room out. An agent removes a row he is not listening to
+    // and he retracts it - and the fade has to still be running afterwards, because
+    // its terminal is the thing that stops the music. A queue edit's retraction never
+    // touches the fade slot and never reaches for the knob.
+    #[tokio::test(start_paused = true)]
+    async fn undoing_a_queue_edit_leaves_his_fade_running_and_his_level_alone() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 4).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().set_manual_volume(70, true);
+        h.start_fade(fade_args(FadeKind::Out, 600)).await.expect("his wind-down");
+        assert!(h.fade_active_for_test().await, "his envelope is running");
+
+        let victim = qid_at(&h, 3);
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Removed(1)
+        );
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(rows(&h).len(), 4, "the row is back");
+        assert!(h.fade_active_for_test().await, "the undo killed his sleep fade");
+        assert_eq!(h.state.lock().unwrap().target_volume, 70, "and it left his level alone");
+    }
+
+    // When the level IS the action's to put back, it comes back as a ramp. The
+    // retraction used to assert the baseline straight onto the sink from wherever the
+    // envelope had got to - measured at 24 dB in one sample, with music playing.
+    #[tokio::test(start_paused = true)]
+    async fn undoing_a_level_action_ramps_back_and_never_steps() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 2).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().set_manual_volume(60, true);
+        assert_eq!(
+            h.run_action_outcome(&Action::Fade(FadeIntentIr::To { vol: 9, secs: 60.0 }), "mcp:s")
+                .await,
+            PlanOutcome::Effect("fading".into())
+        );
+        // The envelope has carried the live gain most of the way down.
+        h.state.lock().unwrap().live_gain_db = mpv_volume_to_db(9.0);
+
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h.state.lock().unwrap().target_volume, 60, "the baseline is back at once");
+        let live = h.state.lock().unwrap().live_gain_db;
+        assert!(
+            live < mpv_volume_to_db(20.0),
+            "the retraction stepped the audible level to the baseline in one sample ({live} dB)"
+        );
+        // And the ramp it started really lands there.
+        h.wait_for_fade().await;
+        let landed = h.state.lock().unwrap().live_gain_db;
+        assert!(
+            (landed - mpv_volume_to_db(60.0)).abs() < 0.5,
+            "the restore ramp settled at {landed} dB, not the restored baseline"
+        );
+    }
+
+    // The retraction used to return early on an untouched deck without re-deriving the
+    // WARM - the target parked behind the current track, computed against the queue the
+    // undo just replaced. mpv auto-advances into that target at the natural EOF, so a
+    // stale one is an advance into a row that no longer drains next.
+    #[tokio::test(start_paused = true)]
+    async fn undoing_a_remove_re_derives_the_warm_it_left_parked() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("a")).await;
+        h.enqueue_song_for_test(playlist_test_song("b")).await;
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.play_for_test(0).await;
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "row b drains next, so there is nothing to continue INTO yet"
+        );
+
+        let victim = h.state.lock().unwrap().queue[1].id;
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Removed(1)
+        );
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "the current row is the last one now: a station warm arms behind it"
+        );
+
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "row b is back");
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "the restored queue drains into row b, so the station warm had to go with it"
+        );
+    }
+
+    // "Play the track that matches X" when X is the track under the needle: it is
+    // already playing, so there is nothing to jump to. Loading it would restart from
+    // zero the music he is in the middle of, and the entry it left behind offered to
+    // retract a jump that never happened.
+    #[tokio::test(start_paused = true)]
+    async fn a_jump_onto_the_track_already_playing_never_reloads_it() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+        h.play_for_test(1).await;
+        h.note_elapsed_ms(30_000);
+        let here = qid_at(&h, 1);
+        drain_events(&h, &mut events).await;
+
+        assert_eq!(
+            h.run_action_outcome(&Action::Play { sel: crate::plan::QueueSelector::Qid(here) }, "mcp:s")
+                .await,
+            PlanOutcome::Jumped(1)
+        );
+        let evs = drain_events(&h, &mut events).await;
+        assert!(evs.is_empty(), "it reloaded the track he was listening to: {evs:?}");
+        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.last_elapsed_ms.load(Ordering::Relaxed), 30_000, "the playhead never moved");
+        // Nothing moved, so nothing sits on the ring offering to put back a world he
+        // never left.
+        assert!(pairs_of(h.handle(MpdCommand::Journal).await).is_empty());
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+    }
+
     // A plan fade is NON-committing: `target_volume` stays at the pre level for the
     // whole ramp and lands only at the terminal. Both halves of that lifetime must
     // be undoable, and the undo must kill the envelope rather than race it.
@@ -26697,7 +27039,17 @@ mod tests {
         assert_eq!(h.state.lock().unwrap().target_volume, 55, "not committed until the terminal");
         assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
         assert_eq!(h.state.lock().unwrap().target_volume, 55);
-        assert!(!h.fade_active_for_test().await, "the undo cancelled the envelope");
+        // The retraction SUPERSEDED the fade to 20 and put the baseline back as a
+        // ramp of its own, so an envelope is still running - the restore glide. What
+        // proves the old one is dead is where the level RESTS: had it survived, its
+        // terminal would commit 20.
+        assert!(h.fade_active_for_test().await, "the retraction ramps back, never steps");
+        h.wait_for_fade().await;
+        assert_eq!(
+            h.state.lock().unwrap().target_volume,
+            55,
+            "the superseded fade to 20 never landed"
+        );
 
         // LANDED: the same retraction still works once the terminal committed 20 -
         // the entry recorded the level its own fade was driving to, so the fade
@@ -26836,6 +27188,10 @@ mod tests {
             &PlanOutcome::Added { n: 0, selector: "\"calm\"".into() },
         );
         assert!(pairs_of(h.handle(MpdCommand::Journal).await).is_empty(), "added 0 takes no slot");
+        // The three rows the enqueue really appended. They have to BE there: an
+        // `Added { n: 3 }` over an untouched queue is not a world this action
+        // produced, and the window check refuses to call it ours.
+        seed_queue(&h, 3).await;
         h.journal_record(
             &act,
             "mcp:s",
