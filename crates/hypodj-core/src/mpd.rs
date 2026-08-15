@@ -957,10 +957,14 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
 }
 
 /// Parse a queue selector off the leading tokens: `current` | `pos <n>` |
-/// `last <n>` | `range <start> <end>` | `match <query>`. Positions are 1-based.
+/// `last <n>` | `range <start> <end>` | `match <query>` | `id <qid>`. Positions
+/// are 1-based; `id` is the STABLE queue id (`Id:` on the wire), which is the
+/// only form that still names the row a caller read earlier - trimming and
+/// autofill shift every position.
 fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
     match toks.first()?.to_lowercase().as_str() {
         "current" => Some(QueueSelector::Current),
+        "id" => Some(QueueSelector::Qid(toks.get(1)?.parse().ok()?)),
         "pos" => Some(QueueSelector::Position(toks.get(1)?.parse().ok()?)),
         "last" => Some(QueueSelector::Last(toks.get(1)?.parse().ok()?)),
         "range" => Some(QueueSelector::Range {
@@ -2224,6 +2228,37 @@ mod parse_tests {
         // A malformed plan is a fail-loud Unsupported, never a panic.
         assert!(matches!(parse("plan add trigger track"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("plan frobnicate"), MpdCommand::Unsupported(_)));
+    }
+
+    // `id <qid>` parses to the stable-id selector: the only queue target that
+    // still names the row a caller read earlier, after a front trim shifted every
+    // position. A missing or non-numeric id is a fail-loud Unsupported.
+    #[test]
+    fn parses_qid_queue_selector() {
+        match parse("plan add trigger immediate action remove id 88") {
+            MpdCommand::Plan(PlanCmd::Add(raw)) => {
+                assert!(matches!(raw.action, Action::Remove { sel: QueueSelector::Qid(88) }));
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("plan add trigger immediate action play id 4294967296") {
+            MpdCommand::Plan(PlanCmd::Add(raw)) => {
+                assert!(matches!(raw.action, Action::Play { sel: QueueSelector::Qid(4294967296) }));
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id"),
+            MpdCommand::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id -1"),
+            MpdCommand::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id nine"),
+            MpdCommand::Unsupported(_)
+        ));
     }
 
     #[test]

@@ -4169,13 +4169,17 @@ impl HypodjHandler {
         }
     }
 
-    /// Snapshot the per-entry search text + current index under the lock, so the
-    /// pure [`crate::plan::resolve_selector`] can resolve a selector without holding
-    /// the lock across the match.
-    fn queue_texts(&self) -> (Vec<String>, Option<usize>) {
+    /// Snapshot the per-entry search text + stable queue id + current index under
+    /// ONE lock, so the pure [`crate::plan::resolve_selector`] can resolve a
+    /// selector without holding the lock across the match. The two vecs are
+    /// parallel by construction, from the same instant of the same queue - a
+    /// [`crate::plan::QueueSelector::Qid`] resolved against a text vec from a
+    /// different sample would name the wrong row.
+    fn queue_texts(&self) -> (Vec<String>, Vec<u64>, Option<usize>) {
         let st = self.state.lock().unwrap();
         let texts = st.queue.iter().map(|it| Self::item_search_text(&it.entry)).collect();
-        (texts, st.current)
+        let qids = st.queue.iter().map(|it| it.id).collect();
+        (texts, qids, st.current)
     }
 
     /// DETERMINISTIC queue-edit executor for the confirmed [`Action::Remove`] /
@@ -4187,8 +4191,8 @@ impl HypodjHandler {
     pub async fn plan_queue_edit(&self, action: &Action) -> Result<usize, String> {
         match action {
             Action::Remove { sel } => {
-                let (texts, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                let (texts, qids, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
                 Ok(self.remove_indices(&idxs).await)
             }
             Action::Clear { scope } => match scope {
@@ -4210,23 +4214,24 @@ impl HypodjHandler {
                     Ok(self.remove_indices(&idxs).await)
                 }
                 crate::plan::ClearScope::Range { start, end } => {
-                    let (texts, current) = self.queue_texts();
+                    let (texts, qids, current) = self.queue_texts();
                     let idxs = crate::plan::resolve_selector(
                         &crate::plan::QueueSelector::Range { start: *start, end: *end },
                         &texts,
+                        &qids,
                         current,
                     );
                     Ok(self.remove_indices(&idxs).await)
                 }
             },
             Action::Move { sel, dest } => {
-                let (texts, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                let (texts, qids, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
                 Ok(self.move_indices(&idxs, *dest).await)
             }
             Action::Play { sel } => {
-                let (texts, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                let (texts, qids, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
                 match idxs.first() {
                     Some(&idx) => {
                         self.play_index(idx).await?;

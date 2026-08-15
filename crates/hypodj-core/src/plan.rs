@@ -208,6 +208,13 @@ pub enum QueueSelector {
     Current,
     /// The last `n` entries in the queue.
     Last(usize),
+    /// The one entry carrying this STABLE queue id, whatever position it now sits
+    /// at. The only selector safe to aim from a reading taken earlier: every
+    /// position-based variant is invalidated by `State::trim_spent` draining spent
+    /// rows off the FRONT of the queue (and by autofill appending), which shifts
+    /// every index while the ids stay put. A gone id resolves to the empty set -
+    /// a clean no-op, never the row that inherited the position.
+    Qid(u64),
 }
 
 /// Where an [`Action::Move`] places the selected entries.
@@ -237,10 +244,18 @@ pub enum ClearScope {
 }
 
 /// PURE. Resolve a [`QueueSelector`] to a sorted set of 0-based queue indices
-/// against a queue described by its per-entry searchable text and current index.
-/// A no-match returns an EMPTY vec (the caller treats that as a clean no-op).
-/// Unit-testable with fabricated text - no queue, no player.
-pub fn resolve_selector(sel: &QueueSelector, texts: &[String], current: Option<usize>) -> Vec<usize> {
+/// against a queue described by its per-entry searchable text, per-entry stable
+/// queue id, and current index. `texts` and `qids` are parallel, taken from the
+/// SAME snapshot of the queue; a shorter `qids` simply makes those rows
+/// unaddressable by id (never mis-addressable). A no-match returns an EMPTY vec
+/// (the caller treats that as a clean no-op). Unit-testable with fabricated text -
+/// no queue, no player.
+pub fn resolve_selector(
+    sel: &QueueSelector,
+    texts: &[String],
+    qids: &[u64],
+    current: Option<usize>,
+) -> Vec<usize> {
     let n = texts.len();
     let idx1 = |p: usize| -> Option<usize> {
         if p >= 1 && p <= n { Some(p - 1) } else { None }
@@ -271,6 +286,12 @@ pub fn resolve_selector(sel: &QueueSelector, texts: &[String], current: Option<u
             let k = (*k).min(n);
             (n - k..n).collect()
         }
+        QueueSelector::Qid(id) => qids
+            .iter()
+            .enumerate()
+            .filter(|(i, q)| *i < n && **q == *id)
+            .map(|(i, _)| i)
+            .collect(),
     }
 }
 
@@ -1183,50 +1204,101 @@ mod tests {
             "Miles Davis - Blue in Green".into(),
             "Aphex Twin - Rhubarb".into(),
         ];
+        // Stable queue ids, parallel to `texts`, deliberately NOT 1..=4 and not in
+        // position order - a Qid must resolve by identity, never by arithmetic.
+        let qids: Vec<u64> = vec![41, 7, 900, 42];
         let cur = Some(1usize);
 
         // Position (1-based) -> single index; out-of-range -> empty.
-        assert_eq!(resolve_selector(&QueueSelector::Position(1), &texts, cur), vec![0]);
-        assert_eq!(resolve_selector(&QueueSelector::Position(4), &texts, cur), vec![3]);
-        assert!(resolve_selector(&QueueSelector::Position(9), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::Position(0), &texts, cur).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Position(1), &texts, &qids, cur), vec![0]);
+        assert_eq!(resolve_selector(&QueueSelector::Position(4), &texts, &qids, cur), vec![3]);
+        assert!(resolve_selector(&QueueSelector::Position(9), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Position(0), &texts, &qids, cur).is_empty());
 
         // Range inclusive, order-normalized, clamped to the queue.
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 2, end: 3 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 2, end: 3 }, &texts, &qids, cur),
             vec![1, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 3, end: 2 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 3, end: 2 }, &texts, &qids, cur),
             vec![1, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 3, end: 99 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 3, end: 99 }, &texts, &qids, cur),
             vec![2, 3]
         );
 
         // QueryMatch: case-insensitive substring across all matching entries.
         assert_eq!(
-            resolve_selector(&QueueSelector::QueryMatch("miles".into()), &texts, cur),
+            resolve_selector(&QueueSelector::QueryMatch("miles".into()), &texts, &qids, cur),
             vec![0, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::QueryMatch("rhubarb".into()), &texts, cur),
+            resolve_selector(&QueueSelector::QueryMatch("rhubarb".into()), &texts, &qids, cur),
             vec![3]
         );
         // No match / blank query -> clean empty set (the no-op).
-        assert!(resolve_selector(&QueueSelector::QueryMatch("nonesuch".into()), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::QueryMatch("   ".into()), &texts, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::QueryMatch("nonesuch".into()), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::QueryMatch("   ".into()), &texts, &qids, cur).is_empty());
 
         // Current -> the cursor index; guarded against a stale out-of-range cursor.
-        assert_eq!(resolve_selector(&QueueSelector::Current, &texts, cur), vec![1]);
-        assert!(resolve_selector(&QueueSelector::Current, &texts, None).is_empty());
-        assert!(resolve_selector(&QueueSelector::Current, &texts, Some(99)).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Current, &texts, &qids, cur), vec![1]);
+        assert!(resolve_selector(&QueueSelector::Current, &texts, &qids, None).is_empty());
+        assert!(resolve_selector(&QueueSelector::Current, &texts, &qids, Some(99)).is_empty());
 
         // Last(n) -> the tail; clamped to the queue length; 0 / empty -> empty.
-        assert_eq!(resolve_selector(&QueueSelector::Last(2), &texts, cur), vec![2, 3]);
-        assert_eq!(resolve_selector(&QueueSelector::Last(99), &texts, cur), vec![0, 1, 2, 3]);
-        assert!(resolve_selector(&QueueSelector::Last(0), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::Position(1), &[], None).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Last(2), &texts, &qids, cur), vec![2, 3]);
+        assert_eq!(resolve_selector(&QueueSelector::Last(99), &texts, &qids, cur), vec![0, 1, 2, 3]);
+        assert!(resolve_selector(&QueueSelector::Last(0), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Position(1), &[], &[], None).is_empty());
+
+        // Qid -> the row carrying that id, wherever it sits; an id that is gone is
+        // the clean EMPTY set, never the row that inherited its position.
+        assert_eq!(resolve_selector(&QueueSelector::Qid(41), &texts, &qids, cur), vec![0]);
+        assert_eq!(resolve_selector(&QueueSelector::Qid(900), &texts, &qids, cur), vec![2]);
+        assert_eq!(resolve_selector(&QueueSelector::Qid(42), &texts, &qids, cur), vec![3]);
+        assert!(resolve_selector(&QueueSelector::Qid(1), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Qid(0), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Qid(41), &[], &[], None).is_empty());
+        // A short qids slice makes those rows unaddressable, never mis-addressable.
+        assert!(resolve_selector(&QueueSelector::Qid(900), &texts, &qids[..2], cur).is_empty());
+    }
+
+    // THE point of Qid: a position read earlier names a DIFFERENT row after
+    // `trim_spent` drains spent rows off the FRONT, while the id still names the
+    // row that was read. This is the whole reason an agent-facing target is an id.
+    #[test]
+    fn qid_survives_a_front_trim_that_invalidates_positions() {
+        let before_texts: Vec<String> = vec![
+            "spent one".into(),
+            "spent two".into(),
+            "Miles Davis - So What".into(),
+            "Aphex Twin - Rhubarb".into(),
+        ];
+        let before_qids: Vec<u64> = vec![10, 11, 12, 13];
+        // The caller reads "So What": position 3 (1-based), id 12.
+        assert_eq!(
+            resolve_selector(&QueueSelector::Position(3), &before_texts, &before_qids, Some(2)),
+            vec![2]
+        );
+        assert_eq!(
+            resolve_selector(&QueueSelector::Qid(12), &before_texts, &before_qids, Some(2)),
+            vec![2]
+        );
+
+        // The two spent rows are trimmed off the front; ids do not renumber.
+        let after_texts: Vec<String> = before_texts[2..].to_vec();
+        let after_qids: Vec<u64> = before_qids[2..].to_vec();
+
+        // Position 3 is now out of the queue entirely (and position 1 is a
+        // different row than it named before) - the id still lands on "So What".
+        assert!(
+            resolve_selector(&QueueSelector::Position(3), &after_texts, &after_qids, Some(0))
+                .is_empty()
+        );
+        let by_id = resolve_selector(&QueueSelector::Qid(12), &after_texts, &after_qids, Some(0));
+        assert_eq!(by_id, vec![0]);
+        assert_eq!(after_texts[by_id[0]], "Miles Davis - So What");
     }
 }

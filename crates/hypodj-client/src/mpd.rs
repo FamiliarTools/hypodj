@@ -27,6 +27,12 @@ pub enum MpdError {
     /// Greeting was not "OK MPD ...": something other than a hypodj/MPD daemon.
     #[error("not an MPD/hypodj server at {0} (unexpected greeting)")]
     BadGreeting(String),
+    /// The caller handed [`MpdConn::command`] a line carrying a newline or CR, so
+    /// it was REFUSED before any byte reached the socket. Distinct from [`Self::Io`]
+    /// on purpose: nothing was sent, so the caller knows the command definitely did
+    /// NOT happen and must not reconnect or report an unknown outcome.
+    #[error("refused to send a command line containing a newline or carriage return")]
+    BadCommand,
 }
 
 pub struct MpdConn {
@@ -78,7 +84,19 @@ impl MpdConn {
 
     /// Send one command line and read the response frame until an exact "OK" or an
     /// "ACK " line. Returns the parsed key/value pairs on success.
+    ///
+    /// REFUSES a `line` containing `\n` or `\r` ([`MpdError::BadCommand`], nothing
+    /// written). The wire frames one command per `\n`, so an embedded newline does
+    /// not travel as data: it splits into a SECOND command the caller never meant
+    /// to send, and its extra response frame desynchronises every later
+    /// request/response pair on this socket permanently. This is the one choke
+    /// point every client crate sends through, so the check belongs here rather
+    /// than in each caller - a value built from search text, a station name or a
+    /// tool argument reaches it from three crates.
     pub fn command(&mut self, line: &str) -> Result<Vec<(String, String)>, MpdError> {
+        if line.contains('\n') || line.contains('\r') {
+            return Err(MpdError::BadCommand);
+        }
         self.stream
             .write_all(format!("{line}\n").as_bytes())
             .map_err(|e| MpdError::Io(e.to_string()))?;
@@ -107,6 +125,20 @@ impl MpdConn {
     /// freezing the UI past 5s).
     pub fn clear_read_timeout(&self) -> std::io::Result<()> {
         self.stream.set_read_timeout(None)
+    }
+
+    /// Set (or clear, with `None`) the read timeout on this socket.
+    ///
+    /// For a NON-INTERACTIVE consumer only. The 5s [`IO_TIMEOUT`] default is what
+    /// keeps a wedged daemon from freezing the interactive UI, so the TUI and the
+    /// CLI must leave it alone. A consumer with no human waiting on a frame - a
+    /// stdio server driving `plan add`, whose immediate action runs INLINE in the
+    /// daemon (a Subsonic fetch plus an mpv load) before the `OK` comes back -
+    /// legitimately needs longer than 5s, and a spurious timeout there is worse
+    /// than waiting: `command` returns without draining the frame, so the socket is
+    /// desynchronised and the action may well have happened anyway.
+    pub fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.stream.set_read_timeout(d)
     }
 
     /// A cloned handle on the underlying stream, for `TcpStream::shutdown(Both)` from
@@ -174,9 +206,92 @@ pub fn parse_pairs(lines: &[String]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     fn v(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A loopback stand-in for the daemon: greets like MPD, answers every line it
+    /// receives with a bare `OK`, and hands back the lines it actually received.
+    /// Those lines are the observation - what reached the wire, not what the
+    /// client believes it sent. No timeout anywhere: the fake always answers, so
+    /// the test never waits on a clock.
+    fn fake_daemon() -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.write_all(b"OK MPD 0.24.0\n").expect("greet");
+            sock.flush().expect("flush greeting");
+            let mut rx = BufReader::new(sock.try_clone().expect("clone"));
+            let mut got = Vec::new();
+            loop {
+                let mut line = String::new();
+                match rx.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                got.push(line);
+                if sock.write_all(b"OK\n").is_err() {
+                    break;
+                }
+            }
+            got
+        });
+        (port, handle)
+    }
+
+    // A newline or CR in a command line is REFUSED before any byte is written:
+    // on the wire it would be a SECOND command the caller never sent, plus an
+    // extra response frame that desynchronises the socket for good.
+    #[test]
+    fn command_refuses_a_line_carrying_a_newline_or_cr() {
+        let (port, server) = fake_daemon();
+        let mut conn = MpdConn::connect("127.0.0.1", port).expect("connect");
+        for line in [
+            "status\nsetvol 100",
+            "status\rsetvol 100",
+            "plan add trigger immediate action enqueue query \"a\nclear\" 1",
+        ] {
+            let err = conn.command(line).expect_err("should have been refused");
+            assert!(matches!(err, MpdError::BadCommand), "got {err:?} for {line:?}");
+        }
+        drop(conn);
+        let sent = server.join().expect("server thread");
+        assert!(sent.is_empty(), "bytes reached the wire: {sent:?}");
+    }
+
+    // A clean line still goes out verbatim, framed by exactly one newline - the
+    // refusal must not have cost the ordinary path anything.
+    #[test]
+    fn command_writes_a_clean_line_framed_by_one_newline() {
+        let (port, server) = fake_daemon();
+        let mut conn = MpdConn::connect("127.0.0.1", port).expect("connect");
+        let line = r#"plan add trigger immediate action enqueue query "good vibes" 3"#;
+        conn.command(line).expect("clean line accepted");
+        drop(conn);
+        let sent = server.join().expect("server thread");
+        assert_eq!(sent, vec![format!("{line}\n")]);
+    }
+
+    // set_read_timeout installs the value on the real socket (read back through a
+    // cloned handle on the same fd), and None clears it - what a non-interactive
+    // consumer needs when an inline `plan add` outruns the 5s default.
+    #[test]
+    fn set_read_timeout_installs_and_clears_on_the_socket() {
+        let (port, server) = fake_daemon();
+        let conn = MpdConn::connect("127.0.0.1", port).expect("connect");
+        let peek = conn.shutdown_handle().expect("clone handle");
+        // The default the constructor installed.
+        assert_eq!(peek.read_timeout().expect("get"), Some(IO_TIMEOUT));
+        conn.set_read_timeout(Some(Duration::from_secs(30))).expect("set 30s");
+        assert_eq!(peek.read_timeout().expect("get"), Some(Duration::from_secs(30)));
+        conn.set_read_timeout(None).expect("clear");
+        assert_eq!(peek.read_timeout().expect("get"), None);
+        drop(peek);
+        drop(conn);
+        let _ = server.join();
     }
 
     #[test]

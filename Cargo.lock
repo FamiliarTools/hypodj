@@ -978,6 +978,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hypodj-dsl",
  "libc",
  "libmpv2",
  "mpris-server",
@@ -1007,6 +1008,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "hypodj-dsl"
+version = "0.2.0"
 
 [[package]]
 name = "hypodj-nl"

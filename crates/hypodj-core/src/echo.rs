@@ -18,37 +18,14 @@ fn secs(s: f64) -> String {
     }
 }
 
-/// Quote + escape a selector value so a multi-word value ("good vibes", "drum
-/// and bass") survives the `plan add` tokenizer as ONE token (it splits on
-/// unquoted whitespace and unescapes `\"`/`\\` inside quotes). A single bare word
-/// is emitted verbatim; anything with whitespace/quote/backslash is quoted.
+/// Quote + escape a DSL value so a multi-word value survives the `plan add`
+/// tokenizer as ONE token, refusing (`None`) anything carrying a control char.
 ///
-/// Returns `None` when the value contains a control character (newline, CR, tab,
-/// etc.). The `plan add <dsl>` line is framed on the wire by a literal `\n`, and
-/// the tokenizer's `\`-escape only unescapes the NEXT char (never re-encodes a
-/// literal newline), so a value carrying a newline would smuggle EXTRA command
-/// lines past the single-owner confirm gate. Refusing to render it makes the
-/// caller fall back to direct arming (or a loud "cannot express" miss) - a
-/// control char is nonsense in a music selector anyway.
-fn dsl_value(s: &str) -> Option<String> {
-    if s.chars().any(|c| c.is_control()) {
-        return None;
-    }
-    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
-        let mut out = String::with_capacity(s.len() + 2);
-        out.push('"');
-        for c in s.chars() {
-            if c == '"' || c == '\\' {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-        out.push('"');
-        Some(out)
-    } else {
-        Some(s.to_string())
-    }
-}
+/// RE-EXPORTED, not implemented here: the rule lives in [`hypodj_dsl`] so the
+/// daemon's echo and an out-of-process producer of a `plan add` line (which
+/// cannot link `libmpv`, so cannot depend on this crate) share one implementation
+/// and cannot drift. See that crate for the full why.
+pub use hypodj_dsl::dsl_value;
 
 /// Render the trigger portion of the `plan add` DSL.
 fn trigger_dsl(t: &RawTrigger) -> Option<String> {
@@ -132,6 +109,7 @@ fn qselector_dsl(sel: &QueueSelector) -> Option<String> {
         QueueSelector::Last(n) => format!("last {n}"),
         QueueSelector::Range { start, end } => format!("range {start} {end}"),
         QueueSelector::QueryMatch(q) => format!("match {}", dsl_value(q)?),
+        QueueSelector::Qid(id) => format!("id {id}"),
     })
 }
 
@@ -279,6 +257,7 @@ fn describe_qselector(sel: &QueueSelector) -> String {
         }
         QueueSelector::Range { start, end } => format!("tracks {start} through {end}"),
         QueueSelector::QueryMatch(q) => format!("tracks matching \"{q}\""),
+        QueueSelector::Qid(id) => format!("the track with id {id}"),
     }
 }
 
@@ -382,6 +361,27 @@ mod tests {
         });
     }
 
+    // The Qid selector renders as `id <n>` in the DSL and names the id in the
+    // human sentence - the agent-facing target the human reads back.
+    #[test]
+    fn qid_selector_renders_dsl_and_human_text() {
+        use crate::plan::QueueSelector;
+        assert_eq!(qselector_dsl(&QueueSelector::Qid(88)).as_deref(), Some("id 88"));
+        assert_eq!(describe_qselector(&QueueSelector::Qid(88)), "the track with id 88");
+        let raw = RawPlan {
+            version: 1,
+            trigger: RawTrigger::Immediate,
+            action: Action::Remove { sel: QueueSelector::Qid(88) },
+            once: false,
+            origin: String::new(),
+        };
+        assert_eq!(
+            render_dsl(&raw).as_deref(),
+            Some("trigger immediate action remove id 88")
+        );
+        assert!(describe_plan(&raw).contains("the track with id 88"), "{}", describe_plan(&raw));
+    }
+
     #[test]
     fn render_dsl_round_trips_queue_edit_actions() {
         use crate::plan::{ClearScope, MoveDest, QueueSelector};
@@ -399,6 +399,7 @@ mod tests {
             QueueSelector::Last(2),
             QueueSelector::Range { start: 2, end: 5 },
             QueueSelector::QueryMatch("blue in green".into()),
+            QueueSelector::Qid(88),
         ] {
             assert_round_trip(&imm(Action::Remove { sel }));
         }
