@@ -3651,7 +3651,7 @@ mod sixel_render_tests {
         terminal
             .draw(|f| {
                 assert!(
-                    !render_sixel_art(f, rect, &a, None, false),
+                    !render_sixel_art(f, rect, &a, None, false, &std::cell::RefCell::new(None), false),
                     "must refuse while the geometry is unknown"
                 );
             })
@@ -3662,7 +3662,7 @@ mod sixel_render_tests {
         terminal
             .draw(|f| {
                 assert!(
-                    render_sixel_art(f, rect, &a, Some((8, 17)), false),
+                    render_sixel_art(f, rect, &a, Some((8, 17)), false, &std::cell::RefCell::new(None), false),
                     "must draw once the geometry arrives"
                 );
                 assert!(f.buffer_mut()[(0, 0)].symbol().starts_with("\x1bP"));
