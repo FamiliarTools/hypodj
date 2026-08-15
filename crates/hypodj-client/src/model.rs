@@ -253,7 +253,10 @@ fn parse_continuation(status: &[(String, String)]) -> Option<String> {
     }
 }
 
-fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+/// The FIRST value for `key` in a flat pair list. Public because every client that
+/// reads an MPD frame needs exactly this and nothing more - a second copy in another
+/// crate is a second place a key name can drift.
+pub fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
@@ -368,7 +371,7 @@ pub struct QueueItem {
 /// Parse the flat `playlistinfo` pair list into structured queue items. Each entry
 /// begins at a `file` key; group by that boundary and pull Pos/Title/Artist.
 pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
-    group_blocks(pairs)
+    group_blocks_on(pairs, "file")
         .iter()
         .enumerate()
         .map(|(i, b)| QueueItem {
@@ -381,11 +384,13 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
         .collect()
 }
 
-/// Split a flat pair list into per-song blocks, each beginning at a `file` key.
-fn group_blocks(pairs: &[(String, String)]) -> Vec<Vec<(String, String)>> {
+/// Split a flat pair list into records, each beginning at the `start` key. The MPD
+/// wire carries no record separator; the first key of a record IS the separator.
+/// `file` for a song list, `jid` for the journal.
+pub fn group_blocks_on(pairs: &[(String, String)], start: &str) -> Vec<Vec<(String, String)>> {
     let mut blocks: Vec<Vec<(String, String)>> = Vec::new();
     for (k, v) in pairs {
-        if k == "file" {
+        if k == start {
             blocks.push(Vec::new());
         }
         if let Some(cur) = blocks.last_mut() {
@@ -393,6 +398,105 @@ fn group_blocks(pairs: &[(String, String)]) -> Vec<Vec<(String, String)>> {
         }
     }
     blocks
+}
+
+/// One `journal` entry as the daemon reported it, newest first on the wire.
+///
+/// `did` is the daemon's own `PlanOutcome::render()`. It is the ONLY string any
+/// surface may show as what happened - never a DSL echo (which is a partial,
+/// non-injective renderer and not an inverse of the parser) and never a caller's
+/// claim about its own action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalEntry {
+    pub id: u64,
+    pub age_s: u64,
+    /// Who armed the plan: `mpd` for a hand-typed one, `mcp:sess-<hex>` for an
+    /// agent, a feature name for a daemon singleton.
+    pub origin: String,
+    pub act: String,
+    pub did: String,
+    /// Computed by the daemon against the LIVE world at read time, so a surface
+    /// that offers "u to undo" is only ever offering one that would be accepted.
+    pub undoable: bool,
+}
+
+impl JournalEntry {
+    /// True when this entry was caused by an agent (any session), which is what a
+    /// badge means by "agent". Derived from the origin string alone.
+    pub fn from_agent(&self) -> bool {
+        self.origin.starts_with("mcp:")
+    }
+}
+
+/// Parse a `journal` response. A record starts at `jid`; a record with a missing or
+/// unparseable id is DROPPED rather than defaulted, because a defaulted id is what
+/// `undo <jid>` would then aim at.
+pub fn parse_journal(pairs: &[(String, String)]) -> Vec<JournalEntry> {
+    group_blocks_on(pairs, "jid")
+        .iter()
+        .filter_map(|b| {
+            Some(JournalEntry {
+                id: find(b, "jid")?.parse().ok()?,
+                age_s: find(b, "jage").and_then(|v| v.parse().ok()).unwrap_or(0),
+                origin: find(b, "jorigin").unwrap_or("").to_string(),
+                act: find(b, "jact").unwrap_or("").to_string(),
+                did: find(b, "jdid").unwrap_or("").to_string(),
+                undoable: find(b, "jundoable") == Some("1"),
+            })
+        })
+        .collect()
+}
+
+/// Who caused a journal entry, from the origin string alone.
+///
+/// An agent session is named as one; every other origin is shown VERBATIM rather
+/// than translated into "you", because `mpd`, `sleep` and `winddown` are three
+/// different things and guessing which of them was a human is exactly the drift
+/// this surface exists to remove.
+pub fn journal_who(e: &JournalEntry) -> String {
+    match e.origin.strip_prefix("mcp:") {
+        Some(sess) => format!("agent {sess}"),
+        None if e.origin.trim().is_empty() => "(no origin)".to_string(),
+        None => e.origin.clone(),
+    }
+}
+
+/// The journal as listing rows, newest first, one line per entry.
+///
+/// Exactly ONE row is marked retractable, and it is the newest whose `undoable` is
+/// live: the ring is a stack, so `undo` takes the top and refuses anything under it.
+/// A listing that offered the mark on four rows would be advertising three refusals.
+/// `mark` is the suffix the caller's own surface uses to say how ("<- dj undo",
+/// "<- u").
+pub fn journal_lines(entries: &[JournalEntry], mark: &str) -> Vec<String> {
+    let top = entries.iter().position(|e| e.undoable);
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let suffix = if Some(i) == top { mark } else { "" };
+            format!(
+                "[{:>3}] {:>5}  {:<22}  {}{}",
+                e.id,
+                fmt_remaining(e.age_s),
+                journal_who(e),
+                e.did,
+                suffix
+            )
+        })
+        .collect()
+}
+
+/// The one-line footer badge for the retraction currently on offer, or `None` when
+/// there is none. Drawn from the daemon's own `did` and its own live undoability, so
+/// no surface can offer an undo that would be refused, and nothing an agent said
+/// reaches a character of it.
+pub fn undo_badge(entries: &[JournalEntry], key: char) -> Option<String> {
+    let e = entries.iter().find(|e| e.undoable)?;
+    let who = if e.from_agent() { "agent" } else { e.origin.as_str() };
+    let who = if who.trim().is_empty() { "" } else { who };
+    let lead = if who.is_empty() { String::new() } else { format!("{who} ") };
+    Some(format!("{lead}{} - {key} to undo ({})", e.did, fmt_remaining(e.age_s)))
 }
 
 #[cfg(test)]
@@ -849,5 +953,112 @@ mod tests {
         // Total over anything the daemon might say, including nothing.
         assert_eq!(store_badge(""), None);
         assert_eq!(store_badge("starting").as_deref(), Some("starting"));
+    }
+
+    #[test]
+    fn the_journal_parses_newest_first_and_keeps_the_daemons_own_words() {
+        let pairs = p(&[
+            ("jid", "9"),
+            ("jage", "4"),
+            ("jorigin", "mcp:sess-aabbccdd"),
+            ("jact", "clear"),
+            ("jdid", "cleared 7"),
+            ("jundoable", "1"),
+            ("jid", "8"),
+            ("jage", "61"),
+            ("jorigin", "mpd"),
+            ("jact", "enqueue"),
+            ("jdid", "added 3"),
+            ("jundoable", "0"),
+        ]);
+        let js = parse_journal(&pairs);
+        assert_eq!(js.len(), 2);
+        assert_eq!(js[0].id, 9);
+        assert_eq!(js[0].did, "cleared 7");
+        assert!(js[0].undoable);
+        assert!(js[0].from_agent(), "an mcp: origin is an agent");
+        assert_eq!(js[1].origin, "mpd");
+        // `jundoable` is 1-or-nothing on the wire, never truthy-ish.
+        assert!(!js[1].undoable);
+        assert!(!js[1].from_agent(), "a hand-typed plan is not an agent");
+    }
+
+    #[test]
+    fn a_journal_record_without_a_usable_id_is_dropped_not_defaulted() {
+        // A defaulted 0 would make `undo 0` a plausible-looking aim at nothing.
+        let pairs = p(&[("jid", "x"), ("jdid", "who knows"), ("jid", "3"), ("jdid", "removed 1")]);
+        let js = parse_journal(&pairs);
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0].id, 3);
+        // The absent pairs read as empty/false rather than as a phantom claim.
+        assert_eq!(js[0].origin, "");
+        assert!(!js[0].undoable);
+    }
+
+    #[test]
+    fn an_empty_journal_is_an_empty_vec() {
+        assert!(parse_journal(&[]).is_empty());
+        assert!(parse_journal(&p(&[("OK", "")])).is_empty());
+    }
+
+    fn jentry(id: u64, age: u64, origin: &str, did: &str, undoable: bool) -> JournalEntry {
+        JournalEntry {
+            id,
+            age_s: age,
+            origin: origin.to_string(),
+            act: "clear".to_string(),
+            did: did.to_string(),
+            undoable,
+        }
+    }
+
+    #[test]
+    fn exactly_one_row_is_marked_retractable_because_undo_is_a_stack() {
+        let rows = [
+            jentry(12, 4, "mcp:sess-3f2a19bc", "cleared 7", true),
+            jentry(11, 130, "mpd", "added 3", true),
+            jentry(10, 400, "sleep", "faded out", false),
+        ];
+        let lines = journal_lines(&rows, " <- undo");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.iter().filter(|l| l.contains("<- undo")).count(), 1);
+        assert!(lines[0].contains("<- undo"), "the NEWEST undoable one: {lines:?}");
+        // A stale top hands the mark to the newest one that is not stale.
+        let rows = [
+            jentry(12, 4, "mcp:sess-1", "cleared 7", false),
+            jentry(11, 130, "mpd", "added 3", true),
+        ];
+        let lines = journal_lines(&rows, " <- undo");
+        assert!(!lines[0].contains("<- undo"));
+        assert!(lines[1].contains("<- undo"), "{lines:?}");
+        // Nothing undoable offers nothing.
+        assert!(journal_lines(&[jentry(1, 1, "mpd", "x", false)], " <- undo")
+            .iter()
+            .all(|l| !l.contains("<- undo")));
+    }
+
+    #[test]
+    fn the_origin_is_never_relabelled_into_a_guess_about_who() {
+        assert_eq!(journal_who(&jentry(1, 0, "mcp:sess-ab", "x", false)), "agent sess-ab");
+        // `sleep` is a daemon feature, not "you" - and an absent origin says so.
+        assert_eq!(journal_who(&jentry(1, 0, "sleep", "x", false)), "sleep");
+        assert_eq!(journal_who(&jentry(1, 0, "", "x", false)), "(no origin)");
+    }
+
+    #[test]
+    fn the_badge_offers_only_what_the_daemon_says_is_still_live() {
+        // Nothing undoable -> no badge at all, rather than a dead offer.
+        assert_eq!(undo_badge(&[], 'u'), None);
+        assert_eq!(undo_badge(&[jentry(1, 3, "mcp:sess-1", "cleared 7", false)], 'u'), None);
+        // The badge carries the daemon's OWN sentence and its age, and names the key.
+        let b = undo_badge(&[jentry(9, 12, "mcp:sess-1", "removed 3", true)], 'u').unwrap();
+        assert_eq!(b, "agent removed 3 - u to undo (12s)");
+        // A stale top still lets the live one under it be offered - that is the entry
+        // `undo` would actually take.
+        let rows = [
+            jentry(9, 3, "mcp:sess-1", "cleared 7", false),
+            jentry(8, 130, "winddown", "faded out", true),
+        ];
+        assert_eq!(undo_badge(&rows, 'u').unwrap(), "winddown faded out - u to undo (2m)");
     }
 }

@@ -7,6 +7,7 @@ members = [
     "crates/hypodj-daemon",
     "crates/hypodj-cli",
     "crates/hypodj-client",
+    "crates/hypodj-mcp",
     "crates/hypodj-tui",
     "crates/hypodj-build-info",
 ]
