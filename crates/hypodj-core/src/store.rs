@@ -2720,6 +2720,9 @@ pub struct AudioStore {
     /// nothing more than "spawn my refresh now". Absent in every test and in a
     /// store-less build.
     server_back_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// TEST-ONLY free-space seam - see [`measured_space`](Self::measured_space).
+    #[cfg(test)]
+    space_override: Mutex<Option<(u64, u64)>>,
 }
 
 impl AudioStore {
@@ -2794,6 +2797,8 @@ impl AudioStore {
             paused: AtomicBool::new(false),
             status: Mutex::new(StoreStatus::default()),
             server_back_hook: Mutex::new(None),
+            #[cfg(test)]
+            space_override: Mutex::new(None),
         })
     }
 
@@ -2803,6 +2808,35 @@ impl AudioStore {
 
     pub fn config(&self) -> &StoreConfig {
         &self.cfg
+    }
+
+    /// The `(avail, total)` a pass budgets against. Blocking: called from the
+    /// blocking pool, never on a runtime worker.
+    #[cfg(not(test))]
+    fn measured_space(&self) -> Option<(u64, u64)> {
+        statvfs_space(&self.root)
+    }
+
+    /// As above, with a TEST SEAM in front of the `statvfs` - the same kind of seam
+    /// [`crate::clock::Clock`] already gives time-based logic, and for the same
+    /// reason. A store test that lives under `std::env::temp_dir()` otherwise
+    /// budgets against THIS MACHINE'S real root filesystem, so nine loop tests
+    /// silently flip to "the reserve is breached, write nothing" the moment the
+    /// developer's disk fills - an ambient, uncontrolled input. Unset by default,
+    /// so a test that wants the real disk still measures it.
+    #[cfg(test)]
+    fn measured_space(&self) -> Option<(u64, u64)> {
+        match *self.space_override.lock().expect("store space lock") {
+            Some(pinned) => Some(pinned),
+            None => statvfs_space(&self.root),
+        }
+    }
+
+    /// TEST-ONLY: pin the `(avail, total)` every pass will observe, making the
+    /// derived budget a property of the test rather than of the machine.
+    #[cfg(test)]
+    pub fn set_space_for_test(&self, avail: u64, total: u64) {
+        *self.space_override.lock().expect("store space lock") = Some((avail, total));
     }
 
     /// The audio file for `id` with `suffix` (already sanitized).
@@ -4079,8 +4113,8 @@ async fn run_pass<C: Clock, P: PinSource>(
             .entries()
             .iter()
             .fold(0u64, |a, e| a.saturating_add(e.size));
-        let root = store.root().to_path_buf();
-        let space = tokio::task::spawn_blocking(move || statvfs_space(&root))
+        let s = Arc::clone(store);
+        let space = tokio::task::spawn_blocking(move || s.measured_space())
             .await
             .ok()
             .flatten();
@@ -8265,12 +8299,30 @@ title = "Minimal"
         }
     }
 
+    /// A roomy filesystem: well clear of the reserve on both the floor and the 5
+    /// percent rule, so every loop test below budgets against its configured cap.
+    const LOOP_FS_AVAIL: u64 = 100 * 1024 * 1024 * 1024;
+    const LOOP_FS_TOTAL: u64 = 200 * 1024 * 1024 * 1024;
+
+    /// A store for the loop tests, with the DISK PINNED ROOMY.
+    ///
+    /// These tests assert what a pass fetches, and every pass derives its budget from
+    /// observed free space. Left unpinned they measure whatever filesystem
+    /// `std::env::temp_dir()` happens to sit on, so a developer's full `/` breaches
+    /// the reserve, `plan_pass` suppresses every download, and nine of them fail
+    /// having proven nothing about the code under test. Free space is an ambient
+    /// input exactly like wall-clock time, and gets the same treatment: pinned here,
+    /// so the budget is a property of the test. The breach regime itself is proved
+    /// against pinned numbers too - see
+    /// [`a_breached_reserve_writes_nothing_at_all_and_only_deletes`].
     fn loop_store(dir: &Path, max_bytes: u64, interval: u64) -> Arc<AudioStore> {
         let mut cfg = StoreConfig::default();
         cfg.max_bytes = max_bytes;
         cfg.sync_interval_secs = interval;
         cfg.queue_ahead = 3;
-        Arc::new(AudioStore::open(dir.to_path_buf(), cfg).expect("open store"))
+        let store = Arc::new(AudioStore::open(dir.to_path_buf(), cfg).expect("open store"));
+        store.set_space_for_test(LOOP_FS_AVAIL, LOOP_FS_TOTAL);
+        store
     }
 
     /// Let the spawned reconciler run to a quiet point WITHOUT advancing the
