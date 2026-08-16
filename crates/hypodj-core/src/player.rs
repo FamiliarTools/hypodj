@@ -184,6 +184,16 @@ pub enum PlayerEvent {
         /// processing time: the handler's `st.current` is repointed after the `play_url`
         /// await, so an interleaved play would misattribute a re-read.
         was_local: bool,
+        /// True ONLY when this track ended because a CROSSFADE replaced it: the deck was
+        /// silenced a beat before its own natural EOF, so the finish would otherwise be
+        /// invisible - no TrackEnd edge, and no scrobble for a track that played through.
+        ///
+        /// It is a SUPPRESSION flag, and that is the load-bearing part. The crossfade has
+        /// ALREADY moved the queue (its commit is the advance), so a consumer must
+        /// publish the end and scrobble it but must NOT run `advance_on_eof` - doing both
+        /// is the phantom double-advance that skips a track. False on every other Eof,
+        /// where the advance is exactly what should happen.
+        crossfaded: bool,
     },
     /// Play state changed (e.g. paused, stopped). Carries the id of the song the
     /// state applies to so the scrobbler is self-describing: it can start a
@@ -272,6 +282,18 @@ enum PlayerCommand {
         /// a later [`PlayerEvent::Eof`] can report `was_local` without anyone re-reading
         /// mutable handler state (see the event's doc).
         local: bool,
+        reply: oneshot::Sender<Result<(), PlayerError>>,
+    },
+    /// Emit this deck's entry's [`PlayerEvent::Eof`] with `crossfaded: true`, then
+    /// forget the latch - the "this track was replaced by a crossfade" report.
+    ///
+    /// A crossfaded-out track ENDS but is not stopped by the listener and never reaches
+    /// its own natural EOF (the promotion silences the deck a beat before it would), so
+    /// without this the finish is invisible: no TrackEnd edge, and no scrobble for a
+    /// track that played to the end. The flag is what keeps that from becoming a
+    /// double-advance - the crossfade already moved the queue, so the director publishes
+    /// and scrobbles the finish WITHOUT running the advance.
+    EmitCrossfadedEof {
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
     /// Warm (prefetch) a target stream in the background WITHOUT switching the
@@ -546,11 +568,23 @@ impl PlayerHandle {
     /// a deck nothing is reading as current. The incoming deck is already at the
     /// baseline (the envelope's last step put it there), so nothing is re-asserted and
     /// there is no seam to hear.
-    pub async fn crossfade_commit(&self) -> Result<(), PlayerError> {
+    /// `attribute_finish` says whether the outgoing track PLAYED OUT rather than being
+    /// abandoned. A boundary crossfade replaces a track a beat before its natural end, so
+    /// that track finished and must be published and scrobbled - which only happens if
+    /// the deck says so, because the stop below yields `EndFile(Stop)` and a Stop is
+    /// deliberately not an Eof. A SKIP crossfade passes `false`: the outgoing track was
+    /// abandoned mid-play, exactly as it is on today's dip path, and inventing a finish
+    /// for it would scrobble music he skipped.
+    pub async fn crossfade_commit(&self, attribute_finish: bool) -> Result<(), PlayerError> {
         if self.decks.len() < 2 {
             return Err(PlayerError::Backend("no second deck to promote".into()));
         }
         let outgoing = self.deck().clone();
+        if attribute_finish {
+            let _ =
+                Self::request_on(&outgoing, |reply| PlayerCommand::EmitCrossfadedEof { reply })
+                    .await;
+        }
         self.active.fetch_add(1, Ordering::AcqRel);
         Self::request_on(&outgoing, PlayerCommand::Stop).await
     }
@@ -975,6 +1009,26 @@ impl NullPlayer {
                             .send(PlayerEvent::StateChanged(PlayState::Playing, song, queue_id))
                             .await;
                     }
+                    PlayerCommand::EmitCrossfadedEof { reply } => {
+                        // Same shape as the mpv arm: report the entry this deck was
+                        // carrying as FINISHED-by-crossfade, then forget it.
+                        let song = current.take();
+                        let qid = current_qid.take();
+                        let was_local = std::mem::take(&mut current_local);
+                        if qid.is_some() {
+                            let _ = evt_tx
+                                .send(PlayerEvent::Eof {
+                                    song,
+                                    queue_id: qid,
+                                    continuation_landed: false,
+                                    errored: false,
+                                    was_local,
+                                    crossfaded: true,
+                                })
+                                .await;
+                        }
+                        let _ = reply.send(Ok(()));
+                    }
                     PlayerCommand::DropWarm { reply } => {
                         // Headless: no mpv playlist to prune. A no-op keeps the command
                         // total; no warm entry ever exists here (PrefetchWarm is a no-op).
@@ -1100,6 +1154,7 @@ impl NullPlayer {
                                     // A synthesized NATURAL end: never an error.
                                     errored: false,
                                     was_local,
+                                    crossfaded: false,
                                 })
                                 .await;
                         }
@@ -1423,6 +1478,7 @@ fn emit_honest_stop(
             continuation_landed: false,
             errored,
             was_local,
+            crossfaded: false,
         });
     }
     let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
@@ -1676,6 +1732,7 @@ fn mpv_actor(
                                 continuation_landed: true,
                                 errored: false,
                                 was_local: finishing_local,
+                                crossfaded: false,
                             });
                             // The station's own Playing edge: the director's on_playing
                             // surfaces its TrackStart AND clears any suppress_next_stopped
@@ -1966,6 +2023,31 @@ fn handle_cmd(
                 Err(e) => tracing::error!(error = %e, "mpv switch-warmed failed"),
             }
             let _ = reply.send(res);
+        }
+        PlayerCommand::EmitCrossfadedEof { reply } => {
+            // The crossfade is promoting the other deck, so THIS deck's entry is
+            // finished. Report it before the stop that follows: a Stop yields
+            // `EndFile(Stop)`, which is deliberately not an Eof, so without this the
+            // track would end with no TrackEnd edge and no scrobble. `crossfaded: true`
+            // tells the director to publish and scrobble WITHOUT advancing - the
+            // crossfade's own commit already did that.
+            let song = current.take();
+            let qid = current_qid.take();
+            let was_local = std::mem::take(current_local);
+            if qid.is_some() {
+                let _ = evt_tx.blocking_send(PlayerEvent::Eof {
+                    song,
+                    queue_id: qid,
+                    continuation_landed: false,
+                    // A crossfade replaces a track that was playing fine; nothing here
+                    // is evidence against the bytes, so local media is never made
+                    // suspect by this path.
+                    errored: false,
+                    was_local,
+                    crossfaded: true,
+                });
+            }
+            let _ = reply.send(Ok(()));
         }
         PlayerCommand::DropWarm { reply } => {
             // A superseded skip dip: drop the parked warm target (playlist-clear keeps
@@ -3273,7 +3355,7 @@ mod tests {
             }
 
             // Promote: the incoming deck keeps playing, the outgoing one goes.
-            player.crossfade_commit().await.expect("promote");
+            player.crossfade_commit(false).await.expect("promote");
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(player.state(), PlayState::Playing, "the promoted deck plays on");
             assert_eq!(

@@ -233,6 +233,12 @@ struct State {
     /// settled crossfade that promoted the incoming track but forgot to remove the
     /// outgoing one would leave the queue holding a row nothing plays.
     pending_crossfade_evict: Option<QueueId>,
+    /// Whether the in-flight crossfade's OUTGOING track is playing out (a natural
+    /// boundary) rather than being abandoned (a skip). Decides whether the promotion
+    /// reports a finish for it - see [`PlayerHandle::crossfade_commit`]. Held in state
+    /// for the same reason as the eviction: `settle_crossfade` finishes crossfades the
+    /// task never will, and it has to make the same call.
+    pending_crossfade_finish: bool,
     /// Does `logical_gain_db` currently reflect a COMMITTED baseline the knob can
     /// step from directly? `true` at rest and while a knob/glide fade animates (its
     /// baseline is committed synchronously at install, so N rapid presses = N
@@ -1243,6 +1249,7 @@ impl Default for State {
             pending_skip: None,
             crossfading: false,
             pending_crossfade_evict: None,
+            pending_crossfade_finish: false,
             // At rest the committed logical target IS the current baseline.
             baseline_committed: true,
             playlist_version: 0,
@@ -2389,6 +2396,35 @@ fn fade_task(
     })
 }
 
+/// Are queue positions `a` and `b` CONSECUTIVE TRACKS OF THE SAME ALBUM - a sequence
+/// whose boundary must be left alone?
+///
+/// Narrow on purpose, in both clauses. Same `album_id` alone would suppress the
+/// crossfade across an entire shuffled album, which is the case the feature is FOR;
+/// ascending track numbers alone would suppress unrelated tracks that happen to be
+/// numbered 3 then 4. Together they name what actually needs protecting: a record being
+/// played in its own order, where the artist may have written the transition.
+///
+/// Anything without both an album id and a track number - a stream, a loose song, a
+/// server that omits the tags - is NOT a run, so the crossfade happens. That direction
+/// is the right default: a missed suppression is one blended segue, while a wrong
+/// suppression silently turns the feature off with no way to tell.
+fn same_album_run(st: &State, a: usize, b: usize) -> bool {
+    let song_at = |i: usize| match st.queue.get(i).map(|it| &it.entry) {
+        Some(QueueEntry::Song(s)) => Some(s),
+        _ => None,
+    };
+    let (Some(x), Some(y)) = (song_at(a), song_at(b)) else { return false };
+    let (Some(ax), Some(ay)) = (x.album_id.as_ref(), y.album_id.as_ref()) else { return false };
+    if ax != ay {
+        return false;
+    }
+    match (x.track, y.track) {
+        (Some(tx), Some(ty)) => ty == tx + 1,
+        _ => false,
+    }
+}
+
 /// What a finished crossfade has to land, carried into the task so its terminal does no
 /// handler-side work under the slot lock.
 struct CrossfadeCommit {
@@ -2401,6 +2437,9 @@ struct CrossfadeCommit {
     evict: Option<QueueId>,
     /// The baseline both legs were measured against, re-asserted on the promoted deck.
     baseline: u8,
+    /// Whether the outgoing track PLAYED OUT (a boundary crossfade) and so must be
+    /// published and scrobbled as finished, rather than having been skipped away from.
+    attribute_finish: bool,
 }
 
 /// Drive a crossfade to completion, then promote the incoming deck - the two-deck
@@ -2446,7 +2485,7 @@ fn crossfade_task(
             // Promote FIRST, then write the state. crossfade_commit flips the active
             // deck before it stops the outgoing one, so from here on every ordinary
             // command addresses the track the queue is about to call current.
-            let _ = sink.crossfade_commit().await;
+            let _ = sink.crossfade_commit(commit.attribute_finish).await;
             // Re-assert the baseline on the promoted deck. The envelope's last step
             // already put it there, so this is inaudible - it exists so the u8 seam and
             // the fractional gain agree for whatever comes next.
@@ -10719,14 +10758,19 @@ impl HypodjHandler {
         }
         // Bump the epoch under this lock so the aborted task's last straggling report
         // (if it is mid-`report` right now) is already stale and cannot write a gain.
-        let (qid, evict, baseline) = {
+        let (qid, evict, baseline, attribute_finish) = {
             let mut st = self.state.lock().unwrap();
             st.fade_epoch += 1;
             let target = st.pending_skip.and_then(|i| st.queue.get(i).map(|it| it.id));
-            (target, st.pending_crossfade_evict.take(), st.target_volume)
+            (
+                target,
+                st.pending_crossfade_evict.take(),
+                st.target_volume,
+                std::mem::take(&mut st.pending_crossfade_finish),
+            )
         };
         if promote {
-            let _ = self.player.crossfade_commit().await;
+            let _ = self.player.crossfade_commit(attribute_finish).await;
         } else {
             // Silence the incoming deck and leave the outgoing one owning the identity
             // it never gave up (`active` was never flipped, which is exactly why this
@@ -10755,6 +10799,77 @@ impl HypodjHandler {
         self.changed.notify_waiters();
     }
 
+    /// Start the BOUNDARY crossfade when the current track is within `crossfade_secs`
+    /// of its natural end. Asked on every position tick; almost always a cheap `false`.
+    ///
+    /// The gate order matters more than any individual gate: everything that can be
+    /// answered from state is answered before anything is resolved or armed, because
+    /// this runs ~20 times a second and must cost nothing in the overwhelmingly common
+    /// case of "not near the end".
+    ///
+    /// SAME-ALBUM CONSECUTIVE TRACKS ARE NEVER CROSSFADED. Two tracks that were
+    /// sequenced to run together already flow through the existing gapless advance
+    /// exactly as their makers intended, and blending them is the one place this feature
+    /// makes a record WORSE - a live album's applause, a segue, a fade the artist wrote.
+    /// The rule is deliberately narrow (same album id AND ascending track numbers) so it
+    /// protects real sequences without silently disabling the feature for anyone whose
+    /// queue happens to be one album on shuffle.
+    pub(crate) async fn maybe_boundary_crossfade(&self, remaining: Duration) {
+        let secs = self.fade_cfg.crossfade_secs;
+        if secs <= 0.0 || !self.player.can_crossfade() {
+            return;
+        }
+        let Ok(dur) = Duration::try_from_secs_f64(secs) else { return };
+        if remaining > dur {
+            return;
+        }
+        // Everything below reads or mutates the transition, so one state look decides
+        // whether this tick has anything to do at all.
+        let (from_idx, next_idx) = {
+            let mut st = self.state.lock().unwrap();
+            // Already transitioning (this tick is one of many inside the window), or a
+            // skip dip is mid-flight: either way something already owns the handoff.
+            if st.crossfading || st.fading || st.pending_skip.is_some() {
+                return;
+            }
+            let Some(cur) = st.current else { return };
+            // A NON-mutating peek, like delete_at's: this is a prediction, not an
+            // advance, and the real advance is the crossfade's own commit.
+            let Some(next) = st.peek_next_from(cur, false) else { return };
+            if next == cur {
+                return; // repeat-one: there is no boundary to cross.
+            }
+            if same_album_run(&st, cur, next) {
+                return;
+            }
+            (cur, next)
+        };
+        let item = {
+            let st = self.state.lock().unwrap();
+            st.queue.get(next_idx).cloned()
+        };
+        let Some(item) = item else { return };
+        let Ok(play) = self.resolve_play(&item) else { return };
+        if let Some(id) = play.song_id.clone() {
+            self.set_store_skip_pin(Some(id));
+        }
+        self.set_store_playback_remote(!play.local);
+        // The warm belongs to the OUTGOING deck and would auto-advance behind it during
+        // the overlap; the crossfade replaces that mechanism entirely.
+        self.disarm_continuation_warm().await;
+        let _ = self.player.drop_warm().await;
+        // `true`: this track is PLAYING OUT, so its finish is real and must be published
+        // and scrobbled - the one thing that distinguishes a boundary crossfade from a
+        // skip, and the reason the outgoing deck reports an Eof before it is stopped.
+        if self.start_crossfade(next_idx, &play, None, dur, true).await.is_err() {
+            // Nothing audible changed: the current track simply plays on to its own
+            // natural EOF and the ordinary gapless advance takes it, which is precisely
+            // the behaviour with the feature turned off.
+            let _ = from_idx;
+            self.reschedule_continuation_warm().await;
+        }
+    }
+
     /// Install a crossfade into the ONE fade slot: arm the incoming deck silent, report
     /// the target immediately, then hand both gains to a single envelope.
     ///
@@ -10767,6 +10882,7 @@ impl HypodjHandler {
         play: &ResolvedPlay,
         evict: Option<QueueId>,
         dur: Duration,
+        attribute_finish: bool,
     ) -> Result<(), FadeError> {
         let baseline = self.state.lock().unwrap().target_volume;
         let baseline_db = mpv_volume_to_db(baseline as f64);
@@ -10792,7 +10908,8 @@ impl HypodjHandler {
         let changed = self.changed.clone();
         let sink = self.player.clone();
         let slot_for_task = self.fade.clone();
-        let commit = CrossfadeCommit { qid: play.qid.0, evict, baseline };
+        let commit =
+            CrossfadeCommit { qid: play.qid.0, evict, baseline, attribute_finish };
 
         let mut slot = self.fade.inner.lock().await;
         // Nothing to validate-before-abort here the way `supersede` does: the spec was
@@ -10814,6 +10931,7 @@ impl HypodjHandler {
             // would be the surface lagging the room.
             st.pending_skip = Some(idx);
             st.pending_crossfade_evict = evict;
+            st.pending_crossfade_finish = attribute_finish;
             // A non-committing envelope: `logical_gain_db` stays where it was, so a knob
             // press during the crossfade steps from the live level like any other.
             st.baseline_committed = false;
@@ -11159,7 +11277,9 @@ impl HypodjHandler {
             // deck, which is about to be stopped, and a parked entry there could still
             // auto-advance during the overlap.
             let _ = self.player.drop_warm().await;
-            if self.start_crossfade(idx, &play, evict, xdur).await.is_ok() {
+            // `false`: a SKIP abandons the outgoing track mid-play, exactly as the dip
+            // does, so it must not be reported as a finish and must not scrobble.
+            if self.start_crossfade(idx, &play, evict, xdur, false).await.is_ok() {
                 self.reschedule_continuation_warm().await;
                 return Ok(());
             }
@@ -14891,6 +15011,110 @@ mod tests {
         assert_eq!(st.current, Some(0), "the deck kept the track it was already playing");
         assert_eq!(st.pending_skip, None, "and stopped reporting a target that is gone");
         assert_eq!(st.queue.len(), 1, "the delete itself landed");
+    }
+
+    // The OTHER half of "going forward on the music": the natural boundary. Off by
+    // default (a gapless advance is already right for a sequenced record), so this asks
+    // for it explicitly and then checks the transition is owned end to end by the
+    // crossfade - the queue moves because the crossfade committed, not because an EOF
+    // advanced it afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn a_track_near_its_end_crossfades_into_the_next_one() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        let mut cfg = FadeConfig::default();
+        cfg.crossfade_secs = 2.0;
+        let h = HypodjHandler::with_fade_config(h.client.clone(), h.player.clone(), cfg);
+        h.enqueue_song_for_test(playlist_test_song("s-0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        // Plenty left: nothing happens, and it must cost nothing to ask.
+        h.maybe_boundary_crossfade(Duration::from_secs(30)).await;
+        assert!(!h.state.lock().unwrap().crossfading, "not near the end yet");
+
+        // Inside the window: the handoff starts.
+        h.maybe_boundary_crossfade(Duration::from_millis(1500)).await;
+        assert!(h.state.lock().unwrap().crossfading, "the boundary crossfade armed");
+        // Asking again mid-transition must not start a second one.
+        h.maybe_boundary_crossfade(Duration::from_millis(900)).await;
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "still the one handoff");
+
+        h.wait_for_fade().await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, Some(1), "the crossfade IS the advance");
+        assert!(!st.crossfading);
+    }
+
+    // A record played in its own order keeps its gapless advance. Blending a segue the
+    // artist wrote is the one place this feature makes music worse, so the suppression is
+    // not a preference - it is part of the feature being correct.
+    #[test]
+    fn consecutive_tracks_of_one_album_are_a_run_and_loose_songs_are_not() {
+        let mut st = State::default();
+        let mut next_id = 1u64;
+        let mut mk = |st: &mut State, id: &str, album: Option<&str>, track: Option<u32>| {
+            let mut s = playlist_test_song(id);
+            s.album_id = album.map(|a| crate::model::AlbumId(a.to_string()));
+            s.track = track;
+            st.queue.push(QueueItem::queued(next_id, QueueEntry::Song(s)));
+            next_id += 1;
+        };
+        mk(&mut st, "a1", Some("al"), Some(1)); // 0
+        mk(&mut st, "a2", Some("al"), Some(2)); // 1  - consecutive, same album
+        mk(&mut st, "a5", Some("al"), Some(5)); // 2  - same album, NOT consecutive (shuffled)
+        mk(&mut st, "b1", Some("other"), Some(1)); // 3 - different album
+        mk(&mut st, "loose", None, None); // 4 - no tags at all
+
+        assert!(same_album_run(&st, 0, 1), "1 -> 2 of the same record is a sequence");
+        assert!(
+            !same_album_run(&st, 1, 2),
+            "2 -> 5 is the same album SHUFFLED, which is exactly what the crossfade is for"
+        );
+        assert!(!same_album_run(&st, 1, 3), "a different album is a real boundary");
+        assert!(
+            !same_album_run(&st, 3, 4),
+            "missing tags are NOT a run - a missed suppression is one blended segue, a \
+             wrong one silently disables the feature"
+        );
+        assert!(!same_album_run(&st, 4, 0), "and neither side may be untagged");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sequenced_album_boundary_is_left_gapless() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        let mut cfg = FadeConfig::default();
+        cfg.crossfade_secs = 2.0;
+        let h = HypodjHandler::with_fade_config(h.client.clone(), h.player.clone(), cfg);
+        for (id, track) in [("s-0", 1u32), ("s-1", 2u32)] {
+            let mut song = playlist_test_song(id);
+            song.album_id = Some(crate::model::AlbumId("one-record".to_string()));
+            song.track = Some(track);
+            h.enqueue_song_for_test(song).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.maybe_boundary_crossfade(Duration::from_millis(1500)).await;
+        assert!(
+            !h.state.lock().unwrap().crossfading,
+            "a segue keeps the gapless advance the record was made for"
+        );
+    }
+
+    // The default is OFF, and it has to be: an ordinary track change is already gapless,
+    // which is the better answer for anything sequenced. Nobody gets a blended album
+    // because they upgraded.
+    #[tokio::test(start_paused = true)]
+    async fn the_boundary_crossfade_is_off_unless_asked_for() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        assert_eq!(
+            h.fade_cfg.crossfade_secs, 0.0,
+            "shipping this on by default would change every album he owns"
+        );
+        h.enqueue_song_for_test(playlist_test_song("s-0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.maybe_boundary_crossfade(Duration::from_millis(200)).await;
+        assert!(!h.state.lock().unwrap().crossfading);
     }
 
     // With ONE deck nothing changes: no crossfade is attempted and the skip takes the
