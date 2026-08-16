@@ -73,8 +73,8 @@ pub struct NowPlaying {
     /// renders nothing, keeping a lean status silent exactly like the armed/hint HUD.
     pub continuation: Option<String>,
     /// The OFFLINE STORE in one already-rendered sentence, from the daemon's `X-Store`
-    /// status pair - e.g. `318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming`
-    /// or `all 347 tracks, 9.8 GiB`.
+    /// status pair - e.g. `318 of 347 songs, 12.1 of 16.0 GiB, paused while streaming`
+    /// or `all 347 songs, 9.8 GiB`.
     ///
     /// Rendered daemon-side on purpose: the numbers and the reasons live there, and one
     /// formatter means `dj status` and the dj-gui badge can never disagree about the
@@ -286,8 +286,8 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
 }
 
 /// The offline-store line as a COMPACT badge: the daemon's sentence minus the SIZE
-/// clause. So a healthy mirror reads `318 of 347 tracks`, a held one
-/// `318 of 347 tracks, paused while streaming`, and a finished one `all 347 tracks` -
+/// clause. So a healthy mirror reads `318 of 347 songs`, a held one
+/// `318 of 347 songs, paused while streaming`, and a finished one `all 347 songs` -
 /// while the bytes-against-budget figures, which only matter when he is actually
 /// asking, stay in the full `dj status` line.
 ///
@@ -298,12 +298,22 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
 /// clause arrives in the badge by default, which is the safe direction: a badge that
 /// says too much is read, a badge that quietly omits the reason is trusted and wrong.
 ///
+/// Positional, not a pattern match on "GiB". The size clause is ALWAYS the second one:
+/// the daemon builds the head as a count clause followed by an optional size clause and
+/// only then appends its reasons. Filtering every clause containing "GiB" was the same
+/// allowlist mistake in negative: it dropped whatever a later clause said in bytes, and
+/// the moment the shortfall clause learned to say how much music is waiting, the one
+/// number worth reading vanished from the always-on-screen surface. Only the size clause
+/// is noise; a reason that happens to quantify itself is not.
+///
 /// `None` when there is no store line at all.
 pub fn store_badge(line: &str) -> Option<String> {
     let kept: Vec<&str> = line
         .split(", ")
         .map(str::trim)
-        .filter(|p| !p.is_empty() && !p.contains("GiB"))
+        .enumerate()
+        .filter(|(i, p)| !p.is_empty() && !(*i == 1 && p.contains("GiB")))
+        .map(|(_, p)| p)
         .collect();
     if kept.is_empty() {
         return None;
@@ -836,6 +846,27 @@ mod tests {
             store_badge("318 of 347 tracks, 12.1 of 16.0 GiB, some new reason it is held")
                 .as_deref(),
             Some("318 of 347 tracks, some new reason it is held"),
+        );
+        // POSITIONAL, not "contains GiB". A reason that quantifies ITSELF must survive:
+        // matching on the unit dropped the shortfall's size and the reserve's shortfall
+        // the moment those clauses learned to say how much, which is the single number
+        // worth reading on a bar that is always on screen.
+        assert_eq!(
+            store_badge(
+                "318 of 347 songs, 12.1 of 16.0 GiB, stopped - the disk is almost full \
+                 (6.8 GiB short), 380 songs (13.9 GiB) would not fit"
+            )
+            .as_deref(),
+            Some(
+                "318 of 347 songs, stopped - the disk is almost full (6.8 GiB short), \
+                 380 songs (13.9 GiB) would not fit"
+            ),
+        );
+        // And a head with NO size clause (nothing admitted at all) keeps everything.
+        assert_eq!(
+            store_badge("nothing being mirrored, 0.9 GiB held, 380 songs (13.9 GiB) would not fit")
+                .as_deref(),
+            Some("nothing being mirrored, 380 songs (13.9 GiB) would not fit"),
         );
         // DEPLOY LAG IS REAL: the running daemon can be several merges behind these
         // clients, so an OLD line must still yield a correct badge - not the reworded

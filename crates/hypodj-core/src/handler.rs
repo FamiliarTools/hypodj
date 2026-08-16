@@ -73,7 +73,7 @@ use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
     RESUME_SCHEMA_VERSION,
 };
-use crate::store::AudioStore;
+use crate::store::{AudioStore, StoreWaiting};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
 use crate::timer::{TimerGuard, TimerHandle};
 
@@ -5729,42 +5729,80 @@ impl HypodjHandler {
             return Vec::new();
         }
         // The HEAD is the one thing every surface keeps, so it has to stand alone as a
-        // sentence: "80 of 360 tracks", not "80/360". A bare ratio next to the deck's
+        // sentence: "80 of 360 songs", not "80/360". A bare ratio next to the deck's
         // own "track 1 of 5" reads as a second position counter.
-        let mut line = if st.complete() {
-            format!(
-                "all {} tracks, {} GiB",
-                st.cached_tracks,
-                Self::gib(st.bytes)
+        //
+        // SONGS, not "tracks": every count on this line is now the same unit a person
+        // listens in, so the head, the shortfall and `store frontier` can be read
+        // against each other without translating.
+        //
+        // Built as COUNT clause then SIZE clause, in that order and never interleaved -
+        // the clients drop clause index 1 to make the narrow badge (`store_badge`), so
+        // the position is a contract, not a coincidence. Every reason clause comes after
+        // and is free to quantify itself.
+        let (mut line, size): (String, Option<String>) = if st.resident_tracks == 0 {
+            // NOTHING was admitted, which is a different sentence from "the mirror holds
+            // everything". `complete()` is true here (pending is trivially zero), so the
+            // ordinary head rendered "all 0 tracks" - all of nothing, which reads as a
+            // broken counter rather than as the real state. Say what is on disk instead:
+            // those bytes still play offline even though the budget that would admit
+            // more has collapsed to zero.
+            (
+                "nothing being mirrored".to_string(),
+                (st.bytes > 0).then(|| format!("{} GiB held", Self::gib(st.bytes))),
+            )
+        } else if st.complete() {
+            (
+                format!("all {} songs", st.cached_tracks),
+                Some(format!("{} GiB", Self::gib(st.bytes))),
             )
         } else {
-            format!(
-                "{} of {} tracks, {} of {} GiB",
-                st.cached_tracks,
-                st.resident_tracks,
-                Self::gib(st.bytes),
-                Self::gib(st.effective_max)
+            (
+                format!("{} of {} songs", st.cached_tracks, st.resident_tracks),
+                Some(format!(
+                    "{} of {} GiB",
+                    Self::gib(st.bytes),
+                    Self::gib(st.effective_max)
+                )),
             )
         };
+        if let Some(size) = size {
+            line.push_str(", ");
+            line.push_str(&size);
+        }
         // Why it is not moving, in words - otherwise a CORRECT deferral is
         // indistinguishable from a stuck reconciler. The words are the store's own
         // (`StoreWaiting::phrase`), so the enum and the sentence cannot drift.
         if let Some(why) = st.waiting.phrase() {
             line.push_str(", ");
             line.push_str(why);
+            // The one reason that is ACTIONABLE gets its arithmetic, in parentheses so
+            // the clause does not split itself in two on the client's `", "` join. "The
+            // disk is almost full" leaves him guessing how much to delete; the shortfall
+            // against the reserve is exactly that number. It lives here rather than in
+            // `phrase()` because the enum is a static label and these are live figures.
+            if st.waiting == StoreWaiting::ReserveBreached {
+                let short = st.reserve.saturating_sub(st.avail);
+                line.push_str(&format!(" ({} GiB short)", Self::gib(short)));
+            }
         }
-        let deferred = st.deferred_count();
-        if deferred > 0 {
-            // A deferred entry is a PIN GROUP, which is an album to the person reading
-            // it; "3 deferred" named a verb nobody applied to anything.
+        // The shortfall as SONGS - the unit he asked in, and the only summable one. This
+        // said "N albums would not fit" and counted PIN GROUPS: on a real library "90
+        // albums" was 38 starred albums, 47 loose starred songs and 5 starred artists,
+        // so the noun was false and the number answered a question nobody had. The
+        // group-by-group breakdown, which is where the album names actually belong,
+        // is one `store frontier` away and unchanged.
+        let (short_tracks, short_bytes) = st.deferred_unique();
+        if short_tracks > 0 {
             line.push_str(&format!(
-                ", {deferred} album{} would not fit",
-                if deferred == 1 { "" } else { "s" }
+                ", {short_tracks} song{} ({} GiB) would not fit",
+                if short_tracks == 1 { "" } else { "s" },
+                Self::gib(short_bytes)
             ));
         }
         if st.given_up > 0 {
             line.push_str(&format!(
-                ", {} track{} failed to download",
+                ", {} song{} failed to download",
                 st.given_up,
                 if st.given_up == 1 { "" } else { "s" }
             ));
@@ -25458,10 +25496,12 @@ mod tests {
             .find(|(k, _)| k == "X-Store")
             .map(|(_, v)| v.clone())
             .expect("the badge is present once a pass published");
-        assert!(badge.starts_with("0 of 1 tracks"), "cached/resident tracks lead: {badge}");
+        assert!(badge.starts_with("0 of 1 songs"), "cached/resident songs lead: {badge}");
         assert!(
-            badge.ends_with("1 album would not fit"),
-            "and the shortfall is counted, SINGULAR, in the noun a person pins: {badge}"
+            badge.ends_with("1 song (0.0 GiB) would not fit"),
+            "and the shortfall is counted, SINGULAR, in SONGS - the unit he listens in \
+             and the only one that adds up (the pin GROUP count called them 'albums' \
+             while counting starred songs and artists too): {badge}"
         );
 
         // The verb: the same facts, plus the shortfall BY NAME, which is the whole
