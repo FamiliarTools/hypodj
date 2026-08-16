@@ -490,6 +490,13 @@ impl PlayerHandle {
         Some(&self.decks[(self.active.load(Ordering::Acquire) + 1) % self.decks.len()])
     }
 
+    /// TEST-ONLY: every deck's play state, so a test can observe the ONE thing a single
+    /// deck cannot do - two sources playing at the same instant.
+    #[cfg(test)]
+    pub(crate) fn deck_states(&self) -> Vec<PlayState> {
+        self.decks.iter().map(|d| *d.state_rx.borrow()).collect()
+    }
+
     /// Whether this handle can actually overlap two sources - i.e. whether a
     /// crossfade is available at all. The handler asks BEFORE it commits to the
     /// crossfade shape, so a single-deck player takes the duck-swap path rather than
@@ -861,6 +868,20 @@ impl NullPlayer {
             #[cfg(test)]
             false,
         )
+    }
+
+    /// TEST-ONLY: spawn a headless PAIR, so the handler's crossfade path is drivable
+    /// under a fake clock with no audio device. Both decks accept commands and publish
+    /// their own play state, which is what the crossfade actually exercises.
+    #[cfg(test)]
+    pub(crate) fn spawn_pair() -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
+        let (a, a_rx) = Self::spawn_inner(None, false);
+        let (b, _b_rx) = Self::spawn_inner(None, false);
+        // The second actor's event stream is dropped: the null actor synthesizes its
+        // events per command and the handler only ever reads one stream. What the
+        // crossfade needs from deck B is that it takes loads and volume writes.
+        let links = vec![a.decks[0].clone(), b.decks[0].clone()];
+        (PlayerHandle::pair(links), a_rx)
     }
 
     /// TEST-ONLY: spawn an actor whose LOADS always fail, so a handler test can drive
@@ -2958,7 +2979,6 @@ mod tests {
     // absent in the link-isolated Nix build sandbox); run with:
     //   cargo test -p hypodj-core -- --ignored live_warm_skip_no_bleed_and_switches
     #[test]
-    #[test]
     #[ignore = "needs a real libmpv runtime; run manually to confirm the gapless queue handoff"]
     fn live_warmed_queue_entry_auto_advances_gaplessly_at_natural_eof() {
         // THE CLAIM A NULL-PLAYER TEST CANNOT MAKE. Everything else about this change is
@@ -3068,6 +3088,11 @@ mod tests {
         let _ = std::fs::remove_file(&b);
     }
 
+    // Was DEAD: a stray duplicated `#[test]` above the previous test swallowed this
+    // one's, so `cargo test --ignored` never ran it and the compiler filed it as an
+    // unused function. A live proof that cannot be invoked is worse than no proof - the
+    // gate reads as covered.
+    #[test]
     #[ignore = "needs a real libmpv runtime; run manually to confirm the warm-skip prefetch"]
     fn live_warm_skip_no_bleed_and_switches() {
         use libmpv2::Mpv;
@@ -3170,6 +3195,94 @@ mod tests {
         eprintln!("warm switch settled in ~{switch_ms} ms (target reset onto its own timeline)");
         assert!(switched, "the warmed target became the sole playing entry after the switch");
 
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    // THE live proof, and the only one that can exist: two real mpv contexts decoding at
+    // the SAME INSTANT. Every unit test above runs over headless actors that would report
+    // exactly the same thing whether or not libmpv can actually hold two streams open, so
+    // none of them can establish the premise the whole feature rests on. This one loads a
+    // real tone on each deck, walks the real equal-power envelope, and checks that BOTH
+    // decks are Playing in the middle of it - which is precisely what one mpv context
+    // cannot do at any volume, and therefore precisely what the second deck bought.
+    //
+    // ao=null throughout: this decodes, it never reaches a device, so it leaves no sound
+    // in the room. Ignored by default (needs a real libmpv runtime, absent in the
+    // link-isolated Nix build sandbox); run with:
+    //   cargo test -p hypodj-core -- --ignored live_two_decks_overlap
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm two decks overlap"]
+    fn live_two_decks_overlap_through_an_equal_power_crossfade() {
+        use crate::fade::{crossfade_gains, CrossfadeSink};
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join("hypodj-xfade-live");
+        let _ = std::fs::create_dir_all(&dir);
+        let a = dir.join("a.wav");
+        let b = dir.join("b.wav");
+        write_tone_wav(&a, 440.0, 6.0);
+        write_tone_wav(&b, 660.0, 6.0);
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn_pair(AudioOut::Null);
+            // DRAIN, always. Two decks feed one 64-slot event channel and the low-rate
+            // events (StateChanged, Eof) ride a BLOCKING send, so a test that merely
+            // holds the receiver wedges an actor thread the moment the cosmetic
+            // TimePos/Viz traffic fills the buffer - which two playing decks do about
+            // twice as fast as one. The daemon's spine drains continuously; a test that
+            // does not is testing a condition the daemon never has.
+            tokio::spawn(async move { while events.recv().await.is_some() {} });
+            assert!(
+                player.can_crossfade(),
+                "libmpv refused a second context - the crossfade cannot exist here"
+            );
+
+            // Deck A alone, at the baseline.
+            player
+                .play_url(None, Some(QueueId(1)), a.to_str().unwrap(), true)
+                .await
+                .expect("deck A loads");
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            assert_eq!(player.state(), PlayState::Playing, "deck A is playing");
+            assert_eq!(
+                player.deck_states().iter().filter(|s| **s == PlayState::Playing).count(),
+                1,
+                "and it is the ONLY one - the spare deck is genuinely idle until armed"
+            );
+
+            // Arm deck B silent and walk the envelope by hand, checking the overlap at
+            // the midpoint rather than trusting the driver to have happened.
+            player
+                .crossfade_arm(None, Some(QueueId(2)), b.to_str().unwrap(), true)
+                .await
+                .expect("deck B arms");
+            for k in 0..=20 {
+                let (out_db, in_db) = crossfade_gains(k as f64 / 20.0, 0.0);
+                player.set_pair_db(out_db, in_db).await.expect("both gains take");
+                if k == 10 {
+                    let playing =
+                        player.deck_states().iter().filter(|s| **s == PlayState::Playing).count();
+                    assert_eq!(
+                        playing, 2,
+                        "MIDWAY BOTH DECKS MUST BE PLAYING - this is the overlap, and the \
+                         single reason the pair exists"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+
+            // Promote: the incoming deck keeps playing, the outgoing one goes.
+            player.crossfade_commit().await.expect("promote");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(player.state(), PlayState::Playing, "the promoted deck plays on");
+            assert_eq!(
+                player.deck_states().iter().filter(|s| **s == PlayState::Playing).count(),
+                1,
+                "and exactly one deck is left - a crossfade that does not put the outgoing \
+                 deck away is a leak the listener eventually hears"
+            );
+        });
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }

@@ -37,8 +37,8 @@ use crate::clock::TokioClock;
 use crate::config::{ContinuationMode, FadeConfig};
 use crate::executor::PendingPlan;
 use crate::fade::{
-    min_deliberate_dur, run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget,
-    StartleBounds,
+    min_deliberate_dur, run_crossfade, run_fade, CrossfadeSpec, Curve, FadeError, FadeOutcome,
+    FadeProgress, FadeSpec, FadeTarget, StartleBounds,
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot, TimerId};
 use crate::intelligence::{
@@ -219,6 +219,20 @@ struct State {
     /// so a superseded skip never leaves the reported current pointing at a track
     /// that never loaded.
     pending_skip: Option<usize>,
+    /// A CROSSFADE is in flight: two decks are audible and the envelope owns both
+    /// gains. Distinct from `fading` (which is true as well) because the settlement is
+    /// different in kind - a superseded ordinary fade just stops writing, while a
+    /// superseded crossfade has left a second deck playing that somebody must promote
+    /// or silence. Read by [`MpdHandler::settle_crossfade`], which every path that
+    /// takes over the gain runs FIRST.
+    crossfading: bool,
+    /// The queue entry an in-flight crossfade will DROP when it commits (the "remove
+    /// the playing track" gesture). Held in state rather than only inside the task
+    /// because [`MpdHandler::settle_crossfade`] finishes a crossfade the task will never
+    /// finish itself, and the eviction has to land with the promotion either way - a
+    /// settled crossfade that promoted the incoming track but forgot to remove the
+    /// outgoing one would leave the queue holding a row nothing plays.
+    pending_crossfade_evict: Option<QueueId>,
     /// Does `logical_gain_db` currently reflect a COMMITTED baseline the knob can
     /// step from directly? `true` at rest and while a knob/glide fade animates (its
     /// baseline is committed synchronously at install, so N rapid presses = N
@@ -1227,6 +1241,8 @@ impl Default for State {
             fading: false,
             pending_pause: false,
             pending_skip: None,
+            crossfading: false,
+            pending_crossfade_evict: None,
             // At rest the committed logical target IS the current baseline.
             baseline_committed: true,
             playlist_version: 0,
@@ -2370,6 +2386,93 @@ fn fade_task(
         }
     }
     outcome
+    })
+}
+
+/// What a finished crossfade has to land, carried into the task so its terminal does no
+/// handler-side work under the slot lock.
+struct CrossfadeCommit {
+    /// The incoming entry's STABLE queue identity. Never an index: an index captured at
+    /// install is exactly as wrong here as it is in [`Terminal::SkipLoad`], and for the
+    /// same reason - the queue can shrink from any connection while the envelope runs.
+    qid: u64,
+    /// The outgoing entry to drop from the queue as the incoming one commits (the
+    /// "remove the playing track" gesture). `None` for an ordinary crossfade.
+    evict: Option<QueueId>,
+    /// The baseline both legs were measured against, re-asserted on the promoted deck.
+    baseline: u8,
+}
+
+/// Drive a crossfade to completion, then promote the incoming deck - the two-deck
+/// counterpart of [`fade_task`], sharing its slot, its epoch and its abort discipline.
+///
+/// The terminal runs UNDER the slot lock for exactly the reason `fade_task`'s does: so
+/// its check-and-act is atomic against supersede. The difference is what a supersede
+/// MEANS here. An ordinary superseded fade simply stops writing; a superseded crossfade
+/// has left a SECOND DECK PLAYING, and abandoning that is the one outcome worse than
+/// either track alone. So this task never cleans up after itself - whoever supersedes it
+/// runs [`MpdHandler::settle_crossfade`] FIRST, which finishes the promotion before the
+/// new gesture touches a gain.
+fn crossfade_task(
+    sink: PlayerHandle,
+    spec: CrossfadeSpec,
+    state: Arc<Mutex<State>>,
+    changed: Arc<Notify>,
+    epoch: u64,
+    commit: CrossfadeCommit,
+    fade_slot: Arc<FadeSlot>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = FadeOutcome> + Send>> {
+    Box::pin(async move {
+        let clock = TokioClock;
+        let outcome = {
+            let state_r = state.clone();
+            let mut report = move |p: FadeProgress| {
+                let mut st = state_r.lock().unwrap();
+                if st.fade_epoch != epoch {
+                    return; // a superseded straggler: no-op, exactly like fade_task.
+                }
+                // The driver hands back the CONSTANT baseline, so the status never
+                // animates a dip the listener cannot hear. No per-step change
+                // notification either, for the same reason: nothing a client renders is
+                // moving.
+                st.live_gain_db = p.gain_db;
+            };
+            run_crossfade(&sink, &spec, &clock, &mut report).await
+        };
+
+        let mut slot_guard = fade_slot.inner.lock().await;
+        let still_current = state.lock().unwrap().fade_epoch == epoch;
+        if still_current {
+            // Promote FIRST, then write the state. crossfade_commit flips the active
+            // deck before it stops the outgoing one, so from here on every ordinary
+            // command addresses the track the queue is about to call current.
+            let _ = sink.crossfade_commit().await;
+            // Re-assert the baseline on the promoted deck. The envelope's last step
+            // already put it there, so this is inaudible - it exists so the u8 seam and
+            // the fractional gain agree for whatever comes next.
+            let _ = sink.set_volume(commit.baseline).await;
+            {
+                let mut st = state.lock().unwrap();
+                if let Some(gone) = commit.evict {
+                    st.evict_qid(gone);
+                }
+                // Re-derived from the QueueId, never the install-time index (see
+                // Terminal::SkipLoad). A target that left the queue commits NOTHING
+                // rather than a phantom index.
+                st.current = st.queue.iter().position(|it| it.id == commit.qid);
+                st.pending_skip = None;
+                st.fresh_enqueue_anchor = None;
+                st.crossfading = false;
+                st.fading = false;
+                // The deck is loaded and playing by construction - the incoming deck has
+                // been audible for the whole transition - so this baseline commit may
+                // retire a pending pause exactly as a manual one would.
+                st.set_manual_volume(commit.baseline, true);
+            }
+            *slot_guard = None;
+            changed.notify_waiters();
+        }
+        outcome
     })
 }
 
@@ -6879,6 +6982,14 @@ impl HypodjHandler {
         // unconditionally and the warm is dropped after the abort+join below - both
         // idempotent no-ops when nothing was skipping/warmed.
 
+        // A running CROSSFADE cannot simply be superseded the way a fade can. Aborting a
+        // fade leaves one deck at a known level; aborting a crossfade strands a SECOND
+        // audible deck with nobody driving it, and leaves the pair's real gains disagreeing
+        // with the `live_gain_db` the build closure below is about to read as `from_db`.
+        // Settling first makes both true again - one deck, at the baseline the live gain
+        // already claims - so everything downstream is correct unchanged.
+        self.settle_crossfade(true).await;
+
         let cfg = self.fade_cfg.clone();
         let state_read = self.state.clone();
         let state_task = self.state.clone();
@@ -7447,6 +7558,10 @@ impl HypodjHandler {
     /// baseline gain, then notify. Shared by the MPD `stop` command and MPRIS Stop
     /// (so an MPRIS-initiated stop also refreshes the desktop widget).
     pub async fn stop_playback(&self) {
+        // A stop takes over the gain, so any crossfade finishes first (see
+        // settle_crossfade) - otherwise the stop silences one deck and leaves the other
+        // playing into a room that was told everything stopped.
+        self.settle_crossfade(true).await;
         self.fade
             .cancel_with(|| {
                 let mut st = self.state.lock().unwrap();
@@ -10546,6 +10661,179 @@ impl HypodjHandler {
         }
     }
 
+    /// The crossfade length for a USER SKIP, or `None` when the skip must take the
+    /// dip instead.
+    ///
+    /// Every reason to decline is a capability question asked BEFORE the gesture
+    /// commits to a shape, never a failure discovered at the trough: no second deck
+    /// (single-deck mpv, the null player, the encode probe), or the knob turned off.
+    fn crossfade_skip_dur(&self) -> Option<Duration> {
+        if !self.player.can_crossfade() {
+            return None;
+        }
+        let secs = self.fade_cfg.crossfade_skip_secs;
+        if secs <= 0.0 {
+            return None;
+        }
+        Duration::try_from_secs_f64(secs).ok()
+    }
+
+    /// Finish an in-flight crossfade NOW, before something else takes the gain.
+    ///
+    /// The asymmetry with an ordinary superseded fade is the whole reason this exists.
+    /// Aborting a fade leaves one deck at a known level; aborting a crossfade leaves TWO
+    /// decks audible with nobody driving either. So every path that takes over the gain
+    /// runs this first, and it always resolves the transition the SAME way: COMMIT it.
+    ///
+    /// Commit, never abort back, because the reported current already moved. `pending_skip`
+    /// names the incoming track from the instant the crossfade starts, so status, MPRIS
+    /// and `currentsong` have been saying "this one" for the whole overlap - rolling back
+    /// to the outgoing track would make the surfaces retract a track change the listener
+    /// has already half-heard. It also keeps the arithmetic honest: `live_gain_db` holds
+    /// the constant baseline throughout, which is TRUE of the promoted deck at full and
+    /// false of a half-faded pair, so the superseding fade reads a `from_db` that matches
+    /// the deck it is about to drive.
+    ///
+    /// The one caller that passes `promote: false` is the gesture that DELETES the
+    /// incoming track mid-crossfade. Committing there would promote a row that is about
+    /// to leave the queue, landing the deck on an entry the queue no longer has - the
+    /// orphaned deck this design promises is unreachable. "Not that one" means the deck
+    /// stays on what it is already playing, so that path stops the incoming deck, puts
+    /// the outgoing one back at the baseline, and drops the reported target.
+    ///
+    /// Idempotent and a no-op when nothing is crossfading, so callers need no condition.
+    async fn settle_crossfade(&self, promote: bool) {
+        // The slot lock is taken for the WHOLE settlement, not once per step: releasing
+        // between the abort and the promotion is exactly the window that lets a
+        // concurrent fade from another connection install against a pair of decks
+        // nobody owns.
+        let mut slot = self.fade.inner.lock().await;
+        if !self.state.lock().unwrap().crossfading {
+            return;
+        }
+        if let Some(mut h) = slot.take() {
+            h.abort.abort();
+            if let Some(join) = h.join.take() {
+                let _ = join.await;
+            }
+        }
+        // Bump the epoch under this lock so the aborted task's last straggling report
+        // (if it is mid-`report` right now) is already stale and cannot write a gain.
+        let (qid, evict, baseline) = {
+            let mut st = self.state.lock().unwrap();
+            st.fade_epoch += 1;
+            let target = st.pending_skip.and_then(|i| st.queue.get(i).map(|it| it.id));
+            (target, st.pending_crossfade_evict.take(), st.target_volume)
+        };
+        if promote {
+            let _ = self.player.crossfade_commit().await;
+        } else {
+            // Silence the incoming deck and leave the outgoing one owning the identity
+            // it never gave up (`active` was never flipped, which is exactly why this
+            // direction is available at all).
+            let _ = self.player.crossfade_abort().await;
+        }
+        let _ = self.player.set_volume(baseline).await;
+        {
+            let mut st = self.state.lock().unwrap();
+            if promote {
+                if let Some(gone) = evict {
+                    st.evict_qid(gone);
+                }
+                if let Some(qid) = qid {
+                    st.current = st.queue.iter().position(|it| it.id == qid);
+                }
+                st.fresh_enqueue_anchor = None;
+            }
+            // Either way the reported target is retired: promoted into `current` above,
+            // or abandoned back to the track that never stopped playing.
+            st.pending_skip = None;
+            st.crossfading = false;
+            st.fading = false;
+            st.set_manual_volume(baseline, true);
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Install a crossfade into the ONE fade slot: arm the incoming deck silent, report
+    /// the target immediately, then hand both gains to a single envelope.
+    ///
+    /// Returns `Err` without having touched anything when the incoming deck refuses to
+    /// load, so the caller can fall back to the dip - a crossfade that cannot start must
+    /// never turn a skip into a no-op.
+    async fn start_crossfade(
+        &self,
+        idx: usize,
+        play: &ResolvedPlay,
+        evict: Option<QueueId>,
+        dur: Duration,
+    ) -> Result<(), FadeError> {
+        let baseline = self.state.lock().unwrap().target_volume;
+        let baseline_db = mpv_volume_to_db(baseline as f64);
+        let tick = Duration::from_millis(self.fade_cfg.crossfade_tick_ms);
+        let spec = CrossfadeSpec::new(baseline_db, dur, tick)?;
+
+        // ARM the incoming deck: silent, loaded, playing. Silent FIRST (inside
+        // crossfade_arm) so it is never audible for even one buffer before the envelope
+        // owns it. A load failure here is the ONE thing that must abandon the crossfade
+        // shape entirely, and it does so having changed nothing the listener can hear:
+        // the outgoing deck is still at the baseline and still the reported current.
+        if self
+            .player
+            .crossfade_arm(play.song_id.clone(), Some(play.qid), &play.url, play.local)
+            .await
+            .is_err()
+        {
+            let _ = self.player.crossfade_abort().await;
+            return Err(FadeError::NonFinite);
+        }
+
+        let state_task = self.state.clone();
+        let changed = self.changed.clone();
+        let sink = self.player.clone();
+        let slot_for_task = self.fade.clone();
+        let commit = CrossfadeCommit { qid: play.qid.0, evict, baseline };
+
+        let mut slot = self.fade.inner.lock().await;
+        // Nothing to validate-before-abort here the way `supersede` does: the spec was
+        // built above and the incoming deck is already armed, so the replacement is in
+        // hand before the outgoing envelope is touched.
+        if let Some(mut h) = slot.take() {
+            h.abort.abort();
+            if let Some(join) = h.join.take() {
+                let _ = join.await;
+            }
+        }
+        let epoch = {
+            let mut st = state_task.lock().unwrap();
+            st.fade_epoch += 1;
+            st.fading = true;
+            st.crossfading = true;
+            // Report the TARGET at once, exactly as the dip does - the listener can
+            // already hear it arriving, so a status that still named the outgoing track
+            // would be the surface lagging the room.
+            st.pending_skip = Some(idx);
+            st.pending_crossfade_evict = evict;
+            // A non-committing envelope: `logical_gain_db` stays where it was, so a knob
+            // press during the crossfade steps from the live level like any other.
+            st.baseline_committed = false;
+            st.fade_epoch
+        };
+        let join = tokio::spawn(crossfade_task(
+            sink,
+            spec,
+            state_task,
+            changed,
+            epoch,
+            commit,
+            slot_for_task,
+        ));
+        *slot = Some(FadeHandle { abort: join.abort_handle(), join: Some(join) });
+        drop(slot);
+        self.notify_change();
+        Ok(())
+    }
+
     /// The clamped skip-dip fade duration (`skip_fade_secs` into `[min_slew,
     /// max_dur]`). Mirrors [`Self::pause_fade_dur`]; saturating parse so a
     /// pathological float never panics.
@@ -10695,6 +10983,10 @@ impl HypodjHandler {
         // it the delete would leave the room quietly at -18 dB with nothing to explain
         // why. This is the same cancel-under-one-slot-lock shape `stop_playback` uses.
         if is_skip_target {
+            // ABANDON, never promote: the row being deleted is the one an in-flight
+            // transition is arriving at, so committing it would land the deck on an
+            // entry that is about to leave the queue.
+            self.settle_crossfade(false).await;
             let baseline = self.state.lock().unwrap().target_volume;
             self.fade
                 .cancel_with(|| {
@@ -10736,6 +11028,7 @@ impl HypodjHandler {
             // intent is set when that ramp STARTS), and stopping out from under a live
             // fade would leave it ticking set_volume against a dead deck and its
             // terminal running on nothing. One slot lock, cancel and settle together.
+            self.settle_crossfade(true).await;
             self.fade
                 .cancel_with(|| {
                     let mut st = self.state.lock().unwrap();
@@ -10848,6 +11141,33 @@ impl HypodjHandler {
         // What the trough is about to load: local bytes or the network.
         self.set_store_playback_remote(!play.local);
 
+        // (a2) CROSSFADE, when the deck can actually overlap two sources and the knob
+        // asks for it. This is the shape the dip below was always approximating: the dip
+        // ducks, swaps and rises, which is one song at a time however short the gap gets,
+        // while a crossfade keeps both audible so the room never has a seam. It is tried
+        // FIRST and falls through on any refusal - a crossfade that cannot start must
+        // never turn a skip into a no-op, and today's dip is a fully proven floor.
+        //
+        // A crossfade needs NONE of the warm-skip machinery below: the incoming deck is a
+        // real deck, opened and buffered on its own while the outgoing one keeps playing,
+        // so there is no trough to hide a load in and nothing parked in the outgoing
+        // deck's playlist. That also makes the near-EOF guard irrelevant here - the hazard
+        // it exists for (mpv auto-advancing into an entry parked behind the current track)
+        // cannot arise when the target is not in that playlist at all.
+        if let Some(xdur) = self.crossfade_skip_dur() {
+            // Any warm a previous gesture parked must go: it belongs to the OUTGOING
+            // deck, which is about to be stopped, and a parked entry there could still
+            // auto-advance during the overlap.
+            let _ = self.player.drop_warm().await;
+            if self.start_crossfade(idx, &play, evict, xdur).await.is_ok() {
+                self.reschedule_continuation_warm().await;
+                return Ok(());
+            }
+            // The incoming deck refused to load. Nothing audible changed - the outgoing
+            // deck is still at the baseline and still the reported current - so the dip
+            // below starts from exactly the state it expects.
+        }
+
         // (b) Baseline + the resume target dB.
         let baseline = self.state.lock().unwrap().target_volume;
         let resume_db = mpv_volume_to_db(baseline as f64);
@@ -10934,6 +11254,13 @@ impl HypodjHandler {
         let changed = self.changed.clone();
         let sink = self.player.clone();
         let slot_for_task = self.fade.clone();
+
+        // EVERY fade install supersedes whatever is running, and a running CROSSFADE
+        // cannot simply be superseded: aborting it strands a second audible deck, and
+        // its half-faded pair does not match the `from_db` this fade is about to read.
+        // Settling first makes both true again - one deck, at the baseline the live gain
+        // already claims - so the ordinary supersede below is correct unchanged.
+        self.settle_crossfade(true).await;
 
         self.fade
             .supersede(
@@ -11061,6 +11388,7 @@ impl HypodjHandler {
             // persists across loadfile), so without this the new track would play
             // inaudible while getvol/MPRIS report the baseline. Mirrors the stop
             // path (`stop_playback`).
+            self.settle_crossfade(true).await;
             self.fade
                 .cancel_with(|| {
                     let mut st = self.state.lock().unwrap();
@@ -12383,6 +12711,7 @@ impl MpdHandler for HypodjHandler {
                 // Manual wins ATOMICALLY: cancel any fade AND clear the queue +
                 // reset the volume to the baseline under the SAME slot lock (see
                 // SetVol/Stop), so no concurrent `fade` can interleave.
+                self.settle_crossfade(true).await;
                 self.fade
                     .cancel_with(|| {
                         let mut st = self.state.lock().unwrap();
@@ -14419,6 +14748,178 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    /// A handler over a TWO-DECK headless player, so the crossfade path is drivable
+    /// under a fake clock with no audio device. Same sandbox `None` guard as
+    /// [`handler_with_null_player`].
+    fn handler_with_deck_pair(
+    ) -> Option<(HypodjHandler, tokio::sync::mpsc::Receiver<PlayerEvent>)> {
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1/never-called".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            client_name: "test".to_string(),
+        };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => Arc::new(c),
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return None;
+            }
+        };
+        let (player, events) = NullPlayer::spawn_pair();
+        Some((HypodjHandler::new(client, player), events))
+    }
+
+    // A skip over a two-deck player takes the CROSSFADE, not the dip - and the whole
+    // difference is what the deck does in between. The dip's promise was "never a hard
+    // cut"; the crossfade's is stronger and is what he actually asked for: the outgoing
+    // track is still audible while the incoming one comes up, so there is no seam at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_skip_on_a_deck_pair_crossfades_instead_of_ducking() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        assert!(h.player.can_crossfade(), "the pair spawned");
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await;
+        // The target is reported IMMEDIATELY, before a single step has run: the listener
+        // can already hear it arriving, so a status still naming the outgoing track would
+        // be the surface lagging the room.
+        {
+            let st = h.state.lock().unwrap();
+            assert!(st.crossfading, "a crossfade is in flight, not a dip");
+            assert_eq!(st.pending_skip, Some(1), "and it already reports the target");
+            assert_eq!(st.current, Some(0), "while `current` still names what is playing");
+        }
+        h.wait_for_fade().await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, Some(1), "the target committed");
+        assert!(!st.crossfading, "and the transition is over");
+        assert_eq!(st.pending_skip, None);
+    }
+
+    // The crossfade must NOT animate the reported volume. Nothing about the room's level
+    // changed - that is the entire point of equal power - so a status that drew a dip
+    // would have the clients render a hole nobody can hear.
+    #[tokio::test(start_paused = true)]
+    async fn a_crossfade_never_moves_the_reported_volume() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        let before = h.state.lock().unwrap().reported_volume();
+
+        h.handle(MpdCommand::Next).await;
+        tokio::time::advance(Duration::from_millis(700)).await;
+        assert_eq!(
+            h.state.lock().unwrap().reported_volume(),
+            before,
+            "mid-crossfade the reported level is unchanged"
+        );
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), before, "and after it");
+    }
+
+    // THE hazard a second deck introduces: a superseded ordinary fade just stops writing,
+    // but a superseded crossfade has left a SECOND DECK PLAYING. A setvol mid-crossfade
+    // must therefore SETTLE the transition (promote the incoming deck) before it takes
+    // the gain - never abort it and strand two audible decks, and never leave the new
+    // fade reading a `from_db` that belongs to a half-faded pair.
+    #[tokio::test(start_paused = true)]
+    async fn a_setvol_during_a_crossfade_settles_it_instead_of_stranding_a_deck() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        assert!(h.state.lock().unwrap().crossfading, "caught mid-transition");
+
+        h.handle(MpdCommand::SetVol(40)).await;
+        {
+            let st = h.state.lock().unwrap();
+            assert!(!st.crossfading, "the crossfade was settled, not merely superseded");
+            assert_eq!(st.current, Some(1), "and settling PROMOTED the incoming track");
+            assert_eq!(st.pending_skip, None, "so nothing is still reported as pending");
+        }
+        h.wait_for_fade().await;
+        // Within the glide's documented +/-1 dither window, not exactly 40: setvol
+        // humanizes the landing on purpose (see glide_to_volume). What matters here is
+        // that the gesture LANDED rather than being eaten by the settlement.
+        let landed = h.state.lock().unwrap().target_volume;
+        assert!((39..=41).contains(&landed), "the setvol still landed: {landed}");
+    }
+
+    // A stop mid-crossfade must not silence one deck and leave the other playing into a
+    // room that was just told everything stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_crossfade_leaves_no_deck_playing() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        h.stop_playback().await;
+        assert!(!h.state.lock().unwrap().crossfading);
+        assert_eq!(h.player.state(), PlayState::Stopped, "the promoted deck stopped too");
+    }
+
+    // DELETING the track a crossfade is arriving at is the one supersede that must NOT
+    // promote: committing a row that is about to leave the queue lands the deck on an
+    // entry the queue no longer has - the orphaned deck the design promises is
+    // unreachable. The gesture reads "not that one", so the deck stays where it is.
+    #[tokio::test(start_paused = true)]
+    async fn deleting_the_crossfade_target_abandons_it_and_keeps_playing_what_it_had() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1));
+
+        h.handle(MpdCommand::Delete(Some("1".to_string()))).await;
+        let st = h.state.lock().unwrap();
+        assert!(!st.crossfading, "the transition is resolved, not left running");
+        assert_eq!(st.current, Some(0), "the deck kept the track it was already playing");
+        assert_eq!(st.pending_skip, None, "and stopped reporting a target that is gone");
+        assert_eq!(st.queue.len(), 1, "the delete itself landed");
+    }
+
+    // With ONE deck nothing changes: no crossfade is attempted and the skip takes the
+    // proven dip. The feature is additive or it is not trustworthy.
+    #[tokio::test(start_paused = true)]
+    async fn a_single_deck_player_still_takes_the_dip() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        assert!(!h.player.can_crossfade(), "one deck cannot overlap");
+        assert!(h.crossfade_skip_dur().is_none(), "so no crossfade is even offered");
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.handle(MpdCommand::Next).await;
+        assert!(!h.state.lock().unwrap().crossfading);
+        h.wait_for_fade().await;
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "the dip still lands the skip");
+    }
+
+    // The knob turned off is the same answer as no second deck, and must be, or the
+    // escape hatch is not one.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_crossfade_length_hands_the_skip_back_to_the_dip() {
+        let Some((h, _events)) = handler_with_deck_pair() else { return };
+        let mut cfg = FadeConfig::default();
+        cfg.crossfade_skip_secs = 0.0;
+        let h = HypodjHandler::with_fade_config(h.client.clone(), h.player.clone(), cfg);
+        assert!(h.player.can_crossfade(), "the deck COULD crossfade");
+        assert!(h.crossfade_skip_dur().is_none(), "but the knob says do not");
     }
 
     /// Like [`handler_with_null_player`] but wires a NullPlayer whose LOADS always

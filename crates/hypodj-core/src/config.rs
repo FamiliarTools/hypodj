@@ -707,6 +707,40 @@ pub struct FadeConfig {
     /// Normalized into `[min_slew_s, max_dur_secs]`.
     #[serde(default = "d_glide_fade_s")]
     pub glide_fade_secs: f64,
+    /// Length of the CROSSFADE on a user skip (Next/Previous/play-another), SECONDS.
+    ///
+    /// A crossfade is a different thing from `skip_fade_secs`, not a longer one: that
+    /// knob times a DIP - down, swap, up - which is one song at a time however short it
+    /// gets, while this one overlaps the two songs so the room never has a seam at all.
+    /// Where both could apply the crossfade wins, and `0` turns it off and hands the
+    /// skip back to the dip (which also happens with no second deck available).
+    ///
+    /// NOT clamped into `[min_slew, max_dur]` like the single-gain fades. Those bounds
+    /// exist to keep the perceived LEVEL from moving too fast; an equal-power crossfade
+    /// holds the level constant, so what governs here is musical taste - long enough to
+    /// blend, short enough that a skip still feels like an answer.
+    #[serde(default = "d_crossfade_skip_s")]
+    pub crossfade_skip_secs: f64,
+    /// Length of the crossfade at a NATURAL track boundary, SECONDS. `0` (the default)
+    /// leaves ordinary track changes exactly as they are - gapless, and for two tracks
+    /// that were recorded to run together that is strictly better than any blend. Opt in
+    /// for the radio-style continuous feel.
+    ///
+    /// Consecutive tracks of the SAME ALBUM are never crossfaded whatever this says: the
+    /// existing gapless advance already carries a segue across untouched, and blending
+    /// one would be the one place this feature makes a record worse.
+    #[serde(default = "d_crossfade_s")]
+    pub crossfade_secs: f64,
+    /// Step interval for a crossfade, MILLISECONDS - deliberately far finer than
+    /// `tick_ms`.
+    ///
+    /// The coarse tick is a startle measure: it keeps the perceived level from lurching.
+    /// A crossfade's perceived level does not move, so a coarse tick buys nothing there
+    /// and costs the one artifact this envelope actually has - a ZIPPER, the audible
+    /// staircase of the balance stepping between two sources. Two property writes per
+    /// tick is cheap; audible stepping is not.
+    #[serde(default = "d_crossfade_tick_ms")]
+    pub crossfade_tick_ms: u64,
 }
 
 // Research-backed defaults (memory 01kxhjqr). Exposed as `pub const` so the fade
@@ -726,6 +760,13 @@ pub const DEFAULT_RESTART_FADE_SECS: u64 = 5;
 pub const DEFAULT_PAUSE_FADE_SECS: f64 = 0.5;
 pub const DEFAULT_SKIP_FADE_SECS: f64 = 0.35;
 pub const DEFAULT_GLIDE_FADE_SECS: f64 = 0.4;
+/// Long enough for two songs to genuinely overlap rather than butt-splice, short
+/// enough that a skip still answers the press. Symfonium's own default sits here.
+pub const DEFAULT_CROSSFADE_SKIP_SECS: f64 = 1.5;
+/// OFF. A natural boundary is already gapless, and for an album that was sequenced to
+/// run together gapless is the right answer - so this is a taste people opt into.
+pub const DEFAULT_CROSSFADE_SECS: f64 = 0.0;
+pub const DEFAULT_CROSSFADE_TICK_MS: u64 = 25;
 
 /// Positive minimum for `step_size_db`. A `0` (or negative) step would divide by
 /// zero in [`crate::fade::FadeSpec::new`]'s sub-JND path (`range / step_size` ->
@@ -755,6 +796,9 @@ fn d_restart_fade_s() -> u64 { DEFAULT_RESTART_FADE_SECS }
 fn d_pause_fade_s() -> f64 { DEFAULT_PAUSE_FADE_SECS }
 fn d_skip_fade_s() -> f64 { DEFAULT_SKIP_FADE_SECS }
 fn d_glide_fade_s() -> f64 { DEFAULT_GLIDE_FADE_SECS }
+fn d_crossfade_skip_s() -> f64 { DEFAULT_CROSSFADE_SKIP_SECS }
+fn d_crossfade_s() -> f64 { DEFAULT_CROSSFADE_SECS }
+fn d_crossfade_tick_ms() -> u64 { DEFAULT_CROSSFADE_TICK_MS }
 
 impl FadeConfig {
     /// Clamp every knob into its safe range at LOAD time, logging any correction,
@@ -904,6 +948,23 @@ impl FadeConfig {
             self.glide_fade_secs = DEFAULT_GLIDE_FADE_SECS;
         }
         self.glide_fade_secs = self.glide_fade_secs.clamp(pause_lo, self.max_dur_secs as f64);
+        // The crossfade knobs are NOT clamped into the startle envelope. `pause_lo` is
+        // there to stop a single gain moving faster than the ear forgives; an
+        // equal-power crossfade does not move the level at all, so the only bounds it
+        // needs are sanity ones - non-negative, finite, and inside the same absolute
+        // ceiling every other duration answers to. Zero is MEANINGFUL here (it turns the
+        // trigger off), which is exactly why the shared `pause_lo` floor would be wrong.
+        if !self.crossfade_skip_secs.is_finite() || self.crossfade_skip_secs < 0.0 {
+            self.crossfade_skip_secs = DEFAULT_CROSSFADE_SKIP_SECS;
+        }
+        self.crossfade_skip_secs = self.crossfade_skip_secs.min(self.max_dur_secs as f64);
+        if !self.crossfade_secs.is_finite() || self.crossfade_secs < 0.0 {
+            self.crossfade_secs = DEFAULT_CROSSFADE_SECS;
+        }
+        self.crossfade_secs = self.crossfade_secs.min(self.max_dur_secs as f64);
+        if self.crossfade_tick_ms == 0 {
+            self.crossfade_tick_ms = DEFAULT_CROSSFADE_TICK_MS;
+        }
     }
 }
 
@@ -925,6 +986,9 @@ impl Default for FadeConfig {
             pause_fade_secs: DEFAULT_PAUSE_FADE_SECS,
             skip_fade_secs: DEFAULT_SKIP_FADE_SECS,
             glide_fade_secs: DEFAULT_GLIDE_FADE_SECS,
+            crossfade_skip_secs: DEFAULT_CROSSFADE_SKIP_SECS,
+            crossfade_secs: DEFAULT_CROSSFADE_SECS,
+            crossfade_tick_ms: DEFAULT_CROSSFADE_TICK_MS,
         }
     }
 }

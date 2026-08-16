@@ -100,7 +100,12 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => AudioOut::Null,
     };
-    let (player, player_events) = MpvPlayer::spawn(audio);
+    // A PAIR of decks, so a skip can actually overlap the two songs instead of ducking
+    // between them. Costs a second idle mpv context; buys the only thing one context
+    // cannot do at any volume. Degrades to a single deck on its own if the second
+    // context will not build, and the handler then takes the dip path - so asking for
+    // the pair is never a risk to playback.
+    let (player, player_events) = MpvPlayer::spawn_pair(audio);
 
     let handler = Arc::new(HypodjHandler::with_fade_config(
         client.clone(),
