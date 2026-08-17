@@ -24,6 +24,10 @@ MPD client ──MPD text/TCP──▶ hypodj daemon ──OpenSubsonic REST─�
 
 *The Queue View: the playing row marked, a favorited now-playing card with dithered cover art, up-next, the level meter, and the offline mirror reporting how much of the queue is on disk.*
 
+![HypoDJ (dj-gui) in the Search View - an incremental find> query over the library, one result list mixing artists, albums and songs with the matched substring underlined in each row, and a header counting the hits by kind](Screenshots/search-view.png)
+
+*The Search View: an incremental `find>` query, artists / albums / songs in one list with the matched substring underlined, counted by kind in the header.*
+
 ## Ethos
 
 Driving music should be human-native and **natural-language-first**: say what you
