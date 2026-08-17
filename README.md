@@ -20,6 +20,10 @@ MPD client ──MPD text/TCP──▶ hypodj daemon ──OpenSubsonic REST─�
 
 *HypoDJ (`dj-gui`), the DJ View: the queue beside the natural-language DJ, with the now-playing card, up-next, and a live level meter.*
 
+![HypoDJ (dj-gui) in the Queue View - the queue with the playing row marked, the now-playing card with dithered cover art and a favorite heart, the up-next preview, a live level meter, and the offline-mirror status line](Screenshots/queue-view.png)
+
+*The Queue View: the playing row marked, a favorited now-playing card with dithered cover art, up-next, the level meter, and the offline mirror reporting how much of the queue is on disk.*
+
 ## Ethos
 
 Driving music should be human-native and **natural-language-first**: say what you
@@ -38,8 +42,8 @@ daemon's idle-push socket with worker-thread IO so the UI never blocks on networ
 
 - Now-playing card with dithered album-art cover, up-next preview, and a physical
   volume fader
-- Four screens (`F1`-`F4`): Queue / Albums / Playlists / DJ - the DJ screen is a
-  natural-language Claude Code DJ pane beside the queue (shown above)
+- Five screens (`F1`-`F5`): Queue / Albums / Playlists / DJ / Search - the DJ
+  screen is a natural-language Claude Code DJ pane beside the queue (shown above)
 - Vim-like navigation: `j`/`k`, `g`/`G`, scrolloff; `Shift`+`P` jumps the Queue
   cursor to the currently-playing song
 - `r` starts an endless radio from the row under the cursor - a song, an album, an
