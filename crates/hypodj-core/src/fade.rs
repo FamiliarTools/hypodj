@@ -357,6 +357,166 @@ impl VolumeSink for PlayerHandle {
     }
 }
 
+// ── the cross-track crossfade: ONE envelope, TWO gains ──────────────────────
+
+/// Hard floor on a crossfade step interval. Far below [`STARTLE_HARD_MIN_SLEW`] on
+/// purpose, and the reason is the whole design (see [`crossfade_gains`]): the 250 ms
+/// slew and the 3 dB/step cap bound how fast the PERCEIVED LEVEL may move, and under
+/// an equal-power crossfade the perceived level does not move at all. What is moving
+/// is the balance between two sources whose sum is constant. Stepping that balance
+/// coarsely is not a startle, it is a ZIPPER - an audible staircase in the pan - so
+/// the crossfade wants the opposite of a slow tick. This floor exists only so a
+/// pathological config cannot ask for a step every microsecond.
+const CROSSFADE_MIN_TICK: Duration = Duration::from_millis(5);
+
+/// The EQUAL-POWER pair at position `t01` in `[0, 1]`: `(outgoing_db, incoming_db)`,
+/// both relative to `baseline_db`.
+///
+/// Equal power, NOT equal amplitude. Two linear ramps crossing at half amplitude sum
+/// to -6 dB at the midpoint for UNCORRELATED material (which two different songs
+/// always are: their powers add, not their amplitudes), so a linear crossfade has an
+/// audible hole in the middle - the very seam the crossfade exists to hide. The
+/// sin/cos pair holds `out^2 + in^2 == 1` for every `t`, so the total power - and
+/// therefore the loudness in the room - is FLAT across the whole transition.
+///
+/// That flatness is what licenses the fast tick and the steep per-leg steps. The
+/// startle rules (min_slew, the 3 dB/step deliberate cap) govern the SUM, and here
+/// the sum is constant by construction; applying them per leg would be reading the
+/// invariant's letter against its purpose, and would stretch every crossfade to
+/// tens of seconds for nothing.
+///
+/// The ends are TRUE silence (`-inf`), not the synth floor: at `t = 0` the incoming
+/// is not yet audible and at `t = 1` the outgoing is gone, and each leg reaches its
+/// end continuously - so neither end is a click even though neither is slewed.
+pub fn crossfade_gains(t01: f64, baseline_db: f64) -> (f64, f64) {
+    let t = t01.clamp(0.0, 1.0);
+    // The ends are snapped, not computed. `cos(PI/2)` is 6.1e-17 rather than 0 in
+    // binary floating point, which renders as -324 dB: inaudible, but it is not the
+    // silence the contract promises, and "the outgoing is gone" is a claim the caller
+    // gets to rely on rather than round off.
+    if t <= 0.0 {
+        return (baseline_db, f64::NEG_INFINITY);
+    }
+    if t >= 1.0 {
+        return (f64::NEG_INFINITY, baseline_db);
+    }
+    let theta = t * std::f64::consts::FRAC_PI_2;
+    // 20*log10 of the linear leg. A leg of exactly 0 maps to -inf, which the sink
+    // renders as mpv volume 0 - true silence, and the correct value at each end.
+    let db = |lin: f64| {
+        if lin <= 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            baseline_db + 20.0 * lin.log10()
+        }
+    };
+    (db(theta.cos()), db(theta.sin()))
+}
+
+/// One scheduled crossfade step: be at balance `t01` at offset `at` from the start.
+#[derive(Clone, Copy, Debug)]
+struct XStep {
+    at: Duration,
+    t01: f64,
+}
+
+/// A validated crossfade schedule - the two-gain counterpart of [`FadeSpec`].
+///
+/// Deliberately NOT a [`FadeSpec`] variant. `FadeSpec::new` is the thing that makes a
+/// startle-unsafe single-gain envelope unrepresentable, and threading a "the caps do
+/// not apply to me" flag through it would put a bypass inside the one constructor
+/// whose whole value is that it has none. A crossfade is a different primitive with a
+/// different safety argument (the sum is flat), so it gets its own type, and the
+/// single-gain guarantees stay exactly as absolute as they were.
+#[derive(Clone, Debug)]
+pub struct CrossfadeSpec {
+    steps: Vec<XStep>,
+    /// The level both legs are measured against - the deck's committed baseline, and
+    /// the constant the perceived loudness holds at throughout.
+    baseline_db: f64,
+}
+
+impl CrossfadeSpec {
+    /// Build the schedule: `n = ceil(dur / tick)` evenly spaced positions ending at
+    /// exactly `t01 == 1`, so the last step lands the incoming at the baseline and the
+    /// outgoing at true silence.
+    ///
+    /// `baseline_db` must be finite (it is the live committed gain). `tick` is clamped
+    /// UP to [`CROSSFADE_MIN_TICK`] and the step count is capped like every other
+    /// schedule here.
+    pub fn new(baseline_db: f64, dur: Duration, tick: Duration) -> Result<CrossfadeSpec, FadeError> {
+        if !baseline_db.is_finite() {
+            return Err(FadeError::NonFinite);
+        }
+        let t_eff = tick.max(CROSSFADE_MIN_TICK);
+        let n = ((dur.as_secs_f64() / t_eff.as_secs_f64()).ceil() as u64)
+            .max(1)
+            .min(MAX_SCHEDULE_STEPS);
+        let steps = (1..=n)
+            .map(|k| XStep {
+                at: t_eff.saturating_mul(k as u32),
+                t01: (k as f64) / (n as f64),
+            })
+            .collect();
+        Ok(CrossfadeSpec { steps, baseline_db })
+    }
+
+    pub fn step_count(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// The pair the FIRST step applies - i.e. where the two decks stand the moment the
+    /// crossfade starts moving. Exposed so the caller can pre-arm the incoming deck at
+    /// its true starting gain before it is unpaused, instead of letting it be briefly
+    /// audible at whatever the deck happened to hold.
+    pub fn opening_pair(&self) -> (f64, f64) {
+        crossfade_gains(0.0, self.baseline_db)
+    }
+}
+
+/// A TWO-gain sink: the crossfade's counterpart to [`VolumeSink`]. One call carries
+/// both legs so the driver cannot leave them momentarily inconsistent, which for an
+/// equal-power pair is exactly the audible hole it exists to prevent.
+pub trait CrossfadeSink {
+    fn set_pair_db(
+        &self,
+        outgoing_db: f64,
+        incoming_db: f64,
+    ) -> impl std::future::Future<Output = Result<(), PlayerError>> + Send;
+}
+
+/// The pure crossfade driver: replay `spec` against `sink` on `clock`'s timeline.
+///
+/// Same absolute-deadline discipline as [`run_fade`] (`t0 + k*tick` self-corrects
+/// jitter), same abort semantics (dropping the future stops it mid-transition), and
+/// the same `report` shape - but every report carries the CONSTANT baseline, because
+/// that is what the room hears. A crossfade must not animate the reported volume: the
+/// listener's level never changed, and a status that says otherwise would have the
+/// clients draw a dip that does not exist.
+pub async fn run_crossfade<S: CrossfadeSink, C: Clock>(
+    sink: &S,
+    spec: &CrossfadeSpec,
+    clock: &C,
+    report: &mut (dyn FnMut(FadeProgress) + Send),
+) -> FadeOutcome {
+    let steps = &spec.steps;
+    if steps.is_empty() {
+        report(FadeProgress { gain_db: spec.baseline_db, done: true });
+        return FadeOutcome::Completed;
+    }
+    let t0 = clock.now();
+    let n = steps.len();
+    for (i, step) in steps.iter().enumerate() {
+        clock.sleep_until(t0 + step.at).await;
+        let (out_db, in_db) = crossfade_gains(step.t01, spec.baseline_db);
+        if let Err(e) = sink.set_pair_db(out_db, in_db).await {
+            return FadeOutcome::SinkError(e);
+        }
+        report(FadeProgress { gain_db: spec.baseline_db, done: i + 1 == n });
+    }
+    FadeOutcome::Completed
+}
+
 /// One reported step of progress. `done` is true on the final step (or the single
 /// degenerate report). Used by the handler to write the live gain + coalesce
 /// change notifications.
@@ -428,6 +588,122 @@ mod tests {
             synth_floor_db: SYNTH_FLOOR_DB,
             sub_jnd,
         }
+    }
+
+    /// A two-gain recorder: the crossfade counterpart of [`RecordingSink`].
+    #[derive(Clone)]
+    struct PairSink {
+        pairs: Arc<Mutex<Vec<(f64, f64)>>>,
+    }
+
+    impl PairSink {
+        fn new() -> Self {
+            Self { pairs: Arc::new(Mutex::new(Vec::new())) }
+        }
+        fn pairs(&self) -> Vec<(f64, f64)> {
+            self.pairs.lock().unwrap().clone()
+        }
+    }
+
+    impl CrossfadeSink for PairSink {
+        fn set_pair_db(
+            &self,
+            outgoing_db: f64,
+            incoming_db: f64,
+        ) -> impl std::future::Future<Output = Result<(), PlayerError>> + Send {
+            let pairs = self.pairs.clone();
+            async move {
+                pairs.lock().unwrap().push((outgoing_db, incoming_db));
+                Ok(())
+            }
+        }
+    }
+
+    /// Linear power (0..=1) of one leg, relative to the baseline.
+    fn power(db: f64, baseline_db: f64) -> f64 {
+        if db.is_infinite() {
+            0.0
+        } else {
+            10f64.powf((db - baseline_db) / 10.0)
+        }
+    }
+
+    // THE claim the whole crossfade rests on, and the reason it is sin/cos rather than
+    // two straight lines: the total POWER is flat. Two songs are uncorrelated, so their
+    // powers add - and a pair that crossed at half AMPLITUDE would sum to -6 dB in the
+    // middle, digging exactly the hole in the loudness that the crossfade exists to
+    // hide. Checked across the whole span, not just at the midpoint.
+    #[test]
+    fn the_equal_power_pair_holds_the_loudness_flat_across_the_whole_transition() {
+        for baseline_db in [0.0, -6.0, -20.0] {
+            for k in 0..=100 {
+                let t = k as f64 / 100.0;
+                let (out, inc) = crossfade_gains(t, baseline_db);
+                let total = power(out, baseline_db) + power(inc, baseline_db);
+                assert!(
+                    (total - 1.0).abs() < 1e-9,
+                    "t={t} baseline={baseline_db}: total power {total}, not 1"
+                );
+            }
+        }
+        // And the midpoint sits at -3 dB per leg, which is what "equal power" MEANS.
+        // A linear pair would sit at -6 dB here; that difference is the audible dip.
+        let (out, inc) = crossfade_gains(0.5, 0.0);
+        assert!((out - -3.0103).abs() < 1e-3, "outgoing midpoint {out}");
+        assert!((inc - -3.0103).abs() < 1e-3, "incoming midpoint {inc}");
+    }
+
+    // Both ends are TRUE silence for the leg that is not there, so nothing has to be
+    // slewed into or out of existence: the incoming is inaudible until it starts and
+    // the outgoing is gone when it ends, each reached continuously.
+    #[test]
+    fn the_crossfade_ends_are_true_silence_not_a_floor() {
+        let (out, inc) = crossfade_gains(0.0, 0.0);
+        assert_eq!(out, 0.0, "the outgoing starts at the baseline, untouched");
+        assert_eq!(inc, f64::NEG_INFINITY, "and the incoming is not there at all yet");
+        let (out, inc) = crossfade_gains(1.0, 0.0);
+        assert_eq!(out, f64::NEG_INFINITY, "the outgoing is gone");
+        assert_eq!(inc, 0.0, "and the incoming holds the baseline exactly");
+    }
+
+    // Neither leg ever doubles back. A re-brighten is the transient the whole fade
+    // design forbids, and it would be just as wrong here as in a single-gain ramp.
+    #[test]
+    fn neither_leg_ever_reverses_direction() {
+        let (mut prev_out, mut prev_in) = crossfade_gains(0.0, 0.0);
+        for k in 1..=1000 {
+            let (out, inc) = crossfade_gains(k as f64 / 1000.0, 0.0);
+            assert!(out <= prev_out + 1e-12, "outgoing rose at k={k}: {prev_out} -> {out}");
+            assert!(inc >= prev_in - 1e-12, "incoming fell at k={k}: {prev_in} -> {inc}");
+            prev_out = out;
+            prev_in = inc;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_crossfade_run_walks_both_legs_end_to_end_on_its_own_deadlines() {
+        let sink = PairSink::new();
+        let spec = CrossfadeSpec::new(0.0, Duration::from_millis(500), Duration::from_millis(50))
+            .expect("a finite baseline builds");
+        assert_eq!(spec.step_count(), 10, "500ms at a 50ms tick");
+        let clock = TokioClock;
+        let t0 = tokio::time::Instant::now();
+        let mut seen: Vec<f64> = Vec::new();
+        let outcome = {
+            let mut report = |p: FadeProgress| seen.push(p.gain_db);
+            run_crossfade(&sink, &spec, &clock, &mut report).await
+        };
+        assert!(matches!(outcome, FadeOutcome::Completed));
+        // It took the nominal wall-clock, on absolute deadlines.
+        assert_eq!(tokio::time::Instant::now() - t0, Duration::from_millis(500));
+        let pairs = sink.pairs();
+        assert_eq!(pairs.len(), 10);
+        let (last_out, last_in) = pairs[9];
+        assert_eq!(last_out, f64::NEG_INFINITY, "the outgoing lands silent");
+        assert_eq!(last_in, 0.0, "and the incoming lands on the baseline");
+        // EVERY report carries the constant baseline: the room's level never moved, so
+        // the status must not animate a dip the listener cannot hear.
+        assert!(seen.iter().all(|g| *g == 0.0), "reported gains: {seen:?}");
     }
 
     // A degenerate huge tick (from a finite-but-absurd config) must not overflow

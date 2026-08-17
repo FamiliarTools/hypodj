@@ -473,9 +473,41 @@ async fn spine<C: Clock>(
                                 time_pos: p,
                                 time_remaining: rem,
                             });
+                            // BOUNDARY CROSSFADE, armed off the POSITION rather than a
+                            // timer. A timer would have to be cancelled and re-armed on
+                            // every seek, pause, queue edit and mode toggle - the exact
+                            // bookkeeping the continuation warm needs a TimerGuard for -
+                            // whereas the remaining time simply IS the trigger: seek back
+                            // and it stops being true, seek forward into the window and
+                            // it becomes true, pause and the ticks stop arriving. The
+                            // handler decides whether to act (see maybe_boundary_crossfade);
+                            // this only asks, ~20 times a second, which is free.
+                            if let Some(rem) = rem {
+                                handler.maybe_boundary_crossfade(rem).await;
+                            }
                         }
                     }
-                    PlayerEvent::Eof { song, queue_id, continuation_landed, errored, was_local } => {
+                    // A CROSSFADED-out track: it played through, but the promotion
+                    // silenced its deck a beat before its own natural EOF. Publish the
+                    // end and let the scrobbler see it (it already did, above - the
+                    // scrobbler keys on the Eof's song id), then STOP. The crossfade's
+                    // commit was the advance; running advance_on_eof here as well is the
+                    // phantom double-advance that skips a track, and it is the whole
+                    // reason this arm exists separately rather than as a flag inside the
+                    // ordinary one.
+                    PlayerEvent::Eof { song, queue_id, crossfaded: true, .. } => {
+                        if let Some(qid) = queue_id {
+                            let finishing = pubr.track_ref(qid, song.clone());
+                            pubr.edge(DjEventKind::TrackEnd(finishing));
+                        }
+                        pubr.clear_latch();
+                        // The queue DID move (the crossfade moved it), so the trailing
+                        // transient Stopped from the outgoing deck must be swallowed just
+                        // as it is for a gapless advance - observers see End-then-Start
+                        // with no phantom stop in between.
+                        pubr.mark_advanced();
+                    }
+                    PlayerEvent::Eof { song, queue_id, continuation_landed, errored, was_local, .. } => {
                         if let Some(qid) = queue_id {
                             // (a)+(b): build the finishing ref and publish TrackEnd
                             // BEFORE advance repoints current (End before Start).

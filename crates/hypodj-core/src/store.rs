@@ -1269,6 +1269,13 @@ pub struct RankedGroup {
     /// by far.
     pub missing_tracks: usize,
     pub missing_bytes: u64,
+    /// The very ids `missing_tracks` counted, so the DEDUPED shortfall
+    /// ([`StoreStatus::deferred_unique`]) is a view over this same vector rather than a
+    /// second walk of the pin set that could disagree with the list under it. Each id
+    /// carries the byte cost the frontier charged it, so the union can total itself
+    /// without a second size table. Empty whenever `missing_tracks` is zero, which is
+    /// every `Resident` and `Covered` group.
+    pub missing_ids: Vec<(String, u64)>,
     /// THE KEY, 0..=10: how much of the space this group asks for goes to music he
     /// has not heard in [`STALE_PLAY_DAYS`] days. Bytes-weighted, so a long neglected
     /// album outweighs a short one.
@@ -1425,6 +1432,34 @@ impl StoreStatus {
     /// by construction, so the badge count can never exceed the list under it.
     pub fn deferred_count(&self) -> usize {
         self.deferred().count()
+    }
+
+    /// The shortfall as SONGS: the union of every deferred group's own unheld tracks,
+    /// and what those tracks weigh. `(tracks, bytes)`.
+    ///
+    /// This is the number a PERSON wants, and the only summable one. `deferred_count`
+    /// counts pin GROUPS, which the badge used to call "albums" - on one real library
+    /// "90 albums would not fit" was 38 starred albums, 47 loose starred songs and 5
+    /// starred artists, so the noun was simply false and the count answered a question
+    /// nobody asked. And per-group [`RankedGroup::missing_tracks`] cannot be added up:
+    /// it counts a track two deferred groups both want ONCE PER GROUP, on purpose (see
+    /// the field), so the column sums to an upper bound rather than a total.
+    ///
+    /// A UNION over the same `missing_ids` those per-group counts were read off, so the
+    /// badge total and the `store frontier` lines under it are two views of one walk and
+    /// cannot drift. Linear in the shortfall, computed on demand: the badge is rendered
+    /// per `status` poll, not per pass, and a few hundred ids is nothing.
+    pub fn deferred_unique(&self) -> (usize, u64) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut bytes = 0u64;
+        for g in self.deferred() {
+            for (id, size) in &g.missing_ids {
+                if seen.insert(id.as_str()) {
+                    bytes = bytes.saturating_add(*size);
+                }
+            }
+        }
+        (seen.len(), bytes)
     }
 
     /// The fields a one-line badge is built from. Compared between passes so the
@@ -1985,16 +2020,18 @@ impl<'a> Frontier<'a> {
             // "what did not fit?" while being on nobody's disk. A track wanted by two
             // deferred groups is therefore named by both, each honestly counting its
             // own shortfall.
-            let mut missing_tracks = 0usize;
             let mut missing_bytes = 0u64;
+            let mut missing_ids: Vec<(String, u64)> = Vec::new();
             let mut counted: HashSet<&str> = HashSet::new();
             for s in &g.songs {
                 let id = s.id.0.as_str();
                 if is_storable_id(id) && !self.claim.contains_key(id) && counted.insert(id) {
-                    missing_tracks += 1;
-                    missing_bytes = missing_bytes.saturating_add(self.size(id));
+                    let size = self.size(id);
+                    missing_ids.push((id.to_string(), size));
+                    missing_bytes = missing_bytes.saturating_add(size);
                 }
             }
+            let missing_tracks = missing_ids.len();
             let sc = &self.score[slot];
             let standing = if claimed_here[slot] > 0 {
                 GroupStanding::Resident
@@ -2021,6 +2058,7 @@ impl<'a> Frontier<'a> {
                 bytes: sc.bytes,
                 missing_tracks,
                 missing_bytes,
+                missing_ids,
                 cold_decile: sc.cold_decile,
                 held: self.held[slot],
                 cold_tracks: sc.cold_tracks,
@@ -7451,6 +7489,19 @@ title = "Minimal"
         let named: Vec<&str> = status.deferred().map(|g| g.id.as_str()).collect();
         assert_eq!(named, vec!["big", "shared-song"], "BOTH are named, in frontier order");
         assert_eq!(status.deferred_count(), 2);
+        // ...and this is exactly why the badge cannot ADD the column up. Both groups
+        // honestly count "shared", so the per-group sum is 3 tracks / 300 bytes for two
+        // real tracks weighing 200. `deferred_unique` is the union, and it is the number
+        // the badge says out loud.
+        let summed: (usize, u64) = status
+            .deferred()
+            .fold((0, 0), |(t, b), g| (t + g.missing_tracks, b + g.missing_bytes));
+        assert_eq!(summed, (3, 300), "the per-group column double-counts, on purpose");
+        assert_eq!(
+            status.deferred_unique(),
+            (2, 200),
+            "the union counts each missing song ONCE, whatever wants it"
+        );
     }
 
     #[test]

@@ -30,6 +30,8 @@
 
 use crate::event::QueueId;
 use crate::model::SongId;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -182,6 +184,16 @@ pub enum PlayerEvent {
         /// processing time: the handler's `st.current` is repointed after the `play_url`
         /// await, so an interleaved play would misattribute a re-read.
         was_local: bool,
+        /// True ONLY when this track ended because a CROSSFADE replaced it: the deck was
+        /// silenced a beat before its own natural EOF, so the finish would otherwise be
+        /// invisible - no TrackEnd edge, and no scrobble for a track that played through.
+        ///
+        /// It is a SUPPRESSION flag, and that is the load-bearing part. The crossfade has
+        /// ALREADY moved the queue (its commit is the advance), so a consumer must
+        /// publish the end and scrobble it but must NOT run `advance_on_eof` - doing both
+        /// is the phantom double-advance that skips a track. False on every other Eof,
+        /// where the advance is exactly what should happen.
+        crossfaded: bool,
     },
     /// Play state changed (e.g. paused, stopped). Carries the id of the song the
     /// state applies to so the scrobbler is self-describing: it can start a
@@ -270,6 +282,18 @@ enum PlayerCommand {
         /// a later [`PlayerEvent::Eof`] can report `was_local` without anyone re-reading
         /// mutable handler state (see the event's doc).
         local: bool,
+        reply: oneshot::Sender<Result<(), PlayerError>>,
+    },
+    /// Emit this deck's entry's [`PlayerEvent::Eof`] with `crossfaded: true`, then
+    /// forget the latch - the "this track was replaced by a crossfade" report.
+    ///
+    /// A crossfaded-out track ENDS but is not stopped by the listener and never reaches
+    /// its own natural EOF (the promotion silences the deck a beat before it would), so
+    /// without this the finish is invisible: no TrackEnd edge, and no scrobble for a
+    /// track that played to the end. The flag is what keeps that from becoming a
+    /// double-advance - the crossfade already moved the queue, so the director publishes
+    /// and scrobbles the finish WITHOUT running the advance.
+    EmitCrossfadedEof {
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
     /// Warm (prefetch) a target stream in the background WITHOUT switching the
@@ -442,12 +466,193 @@ fn resting_viz(cur_vol: f64) -> PlayerEvent {
     }
 }
 
-/// The cloneable handle every other layer holds. Cheap to clone (just channel
-/// senders + a watch receiver). This is the whole public player surface.
+/// One deck's channel ends: an actor to command, and the state it publishes.
 #[derive(Clone)]
-pub struct PlayerHandle {
+struct DeckLink {
     cmd_tx: mpsc::Sender<PlayerCommand>,
     state_rx: watch::Receiver<PlayState>,
+}
+
+/// The cloneable handle every other layer holds. Cheap to clone (just channel
+/// senders + a watch receiver). This is the whole public player surface.
+///
+/// ONE handle, one or TWO decks. A crossfade needs two sources audible at once and
+/// mpv gives one gain per context, so the pair is the only way to overlap; but every
+/// existing command still addresses exactly one deck - the ACTIVE one, the deck that
+/// owns the queue's identity - so pause, resume, seek, the glide, the sleep fade, the
+/// warm-skip prefetch and the gapless continuation all read and behave precisely as
+/// they did with a single deck. The second deck is inert except during the seconds a
+/// crossfade is actually running.
+///
+/// A single-deck handle (the null player, and mpv with crossfade off) is not a
+/// degraded pair: `crossfade_arm` refuses, the handler falls back to today's proven
+/// duck-swap skip, and nothing else in the tree can tell the difference.
+#[derive(Clone)]
+pub struct PlayerHandle {
+    /// One entry for a single-deck player, two for a crossfading pair. Never empty.
+    decks: Arc<Vec<DeckLink>>,
+    /// Index into `decks` of the deck that currently owns the queue's identity.
+    /// Flipped ONLY by [`crossfade_commit`](Self::crossfade_commit).
+    active: Arc<AtomicUsize>,
+}
+
+impl PlayerHandle {
+    /// The deck every ordinary command addresses.
+    fn deck(&self) -> &DeckLink {
+        // `active` is only ever written with an index this handle produced from
+        // `decks.len()`, so the index is in range by construction.
+        &self.decks[self.active.load(Ordering::Acquire) % self.decks.len()]
+    }
+
+    /// The other deck, when there is one: the crossfade's incoming side.
+    fn spare(&self) -> Option<&DeckLink> {
+        if self.decks.len() < 2 {
+            return None;
+        }
+        Some(&self.decks[(self.active.load(Ordering::Acquire) + 1) % self.decks.len()])
+    }
+
+    /// TEST-ONLY: every deck's play state, so a test can observe the ONE thing a single
+    /// deck cannot do - two sources playing at the same instant.
+    #[cfg(test)]
+    pub(crate) fn deck_states(&self) -> Vec<PlayState> {
+        self.decks.iter().map(|d| *d.state_rx.borrow()).collect()
+    }
+
+    /// Whether this handle can actually overlap two sources - i.e. whether a
+    /// crossfade is available at all. The handler asks BEFORE it commits to the
+    /// crossfade shape, so a single-deck player takes the duck-swap path rather than
+    /// discovering the refusal at the trough.
+    pub fn can_crossfade(&self) -> bool {
+        self.decks.len() >= 2
+    }
+
+    /// Load `url` on the IDLE deck, silent, and start it playing.
+    ///
+    /// Silent FIRST, then load, then play: the incoming deck must not be audible for
+    /// even one buffer before the envelope owns it, and mpv's softvol persists across
+    /// `loadfile`, so setting the gain before the load is what makes that airtight.
+    ///
+    /// The identity latches ride in exactly like [`play_url`](Self::play_url), so when
+    /// the deck is later promoted it already reports the right song, queue entry and
+    /// locality - the promotion is a bookkeeping flip, not a re-identification.
+    ///
+    /// Does NOT flip `active`: through the whole transition the OUTGOING deck still
+    /// owns the identity, so a supersede that aborts mid-crossfade leaves a deck that
+    /// is playing what the queue says it is playing.
+    pub async fn crossfade_arm(
+        &self,
+        song: Option<SongId>,
+        queue_id: Option<QueueId>,
+        url: &str,
+        local: bool,
+    ) -> Result<(), PlayerError> {
+        let Some(spare) = self.spare().cloned() else {
+            return Err(PlayerError::Backend("no second deck to crossfade with".into()));
+        };
+        Self::request_on(&spare, |reply| PlayerCommand::SetVolumeF64 { vol: 0.0, reply }).await?;
+        Self::request_on(&spare, |reply| PlayerCommand::PlayUrl {
+            song,
+            queue_id,
+            url: url.to_string(),
+            local,
+            reply,
+        })
+        .await
+    }
+
+    /// Promote the incoming deck and silence the outgoing one.
+    ///
+    /// Ordered flip-then-stop: `active` moves first, so from the instant the outgoing
+    /// deck is told to stop, its `EndFile(Stop)` and any late event it emits belong to
+    /// a deck nothing is reading as current. The incoming deck is already at the
+    /// baseline (the envelope's last step put it there), so nothing is re-asserted and
+    /// there is no seam to hear.
+    /// `attribute_finish` says whether the outgoing track PLAYED OUT rather than being
+    /// abandoned. A boundary crossfade replaces a track a beat before its natural end, so
+    /// that track finished and must be published and scrobbled - which only happens if
+    /// the deck says so, because the stop below yields `EndFile(Stop)` and a Stop is
+    /// deliberately not an Eof. A SKIP crossfade passes `false`: the outgoing track was
+    /// abandoned mid-play, exactly as it is on today's dip path, and inventing a finish
+    /// for it would scrobble music he skipped.
+    pub async fn crossfade_commit(&self, attribute_finish: bool) -> Result<(), PlayerError> {
+        if self.decks.len() < 2 {
+            return Err(PlayerError::Backend("no second deck to promote".into()));
+        }
+        let outgoing = self.deck().clone();
+        if attribute_finish {
+            let _ =
+                Self::request_on(&outgoing, |reply| PlayerCommand::EmitCrossfadedEof { reply })
+                    .await;
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Self::request_on(&outgoing, PlayerCommand::Stop).await
+    }
+
+    /// Abandon a crossfade WITHOUT promoting: stop the incoming deck and leave the
+    /// outgoing one exactly where it is. The caller still owns restoring the outgoing
+    /// gain to the baseline - this only guarantees the other deck goes quiet, which is
+    /// the half that must never be skipped (two decks left audible is the one outcome
+    /// worse than either alone).
+    pub async fn crossfade_abort(&self) -> Result<(), PlayerError> {
+        let Some(spare) = self.spare().cloned() else {
+            return Ok(());
+        };
+        Self::request_on(&spare, PlayerCommand::Stop).await
+    }
+
+    /// A one-deck handle: no crossfade, every command to the one actor.
+    fn single(cmd_tx: mpsc::Sender<PlayerCommand>, state_rx: watch::Receiver<PlayState>) -> Self {
+        PlayerHandle {
+            decks: Arc::new(vec![DeckLink { cmd_tx, state_rx }]),
+            active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// A two-deck handle. Deck 0 starts active; the pair alternates from there.
+    fn pair(links: Vec<DeckLink>) -> Self {
+        PlayerHandle { decks: Arc::new(links), active: Arc::new(AtomicUsize::new(0)) }
+    }
+
+    async fn request_on<F>(deck: &DeckLink, make: F) -> Result<(), PlayerError>
+    where
+        F: FnOnce(oneshot::Sender<Result<(), PlayerError>>) -> PlayerCommand,
+    {
+        let (tx, rx) = oneshot::channel();
+        deck.cmd_tx.send(make(tx)).await.map_err(|_| PlayerError::Gone)?;
+        rx.await.map_err(|_| PlayerError::Gone)?
+    }
+}
+
+impl crate::fade::CrossfadeSink for PlayerHandle {
+    fn set_pair_db(
+        &self,
+        outgoing_db: f64,
+        incoming_db: f64,
+    ) -> impl std::future::Future<Output = Result<(), PlayerError>> + Send {
+        // The cube inversion lives below the dB seam here exactly as it does for the
+        // single-gain sink; the crossfade never learns mpv's softvol curve.
+        let out = self.deck().clone();
+        let inc = self.spare().cloned();
+        let out_vol = db_to_mpv_volume(outgoing_db);
+        let in_vol = db_to_mpv_volume(incoming_db);
+        async move {
+            // The INCOMING leg first. If the pair is ever momentarily inconsistent -
+            // two property writes can never be one atom - the harmless order is the one
+            // that briefly holds the total slightly LOW, which is inaudible, rather than
+            // slightly high, which is the loudness bump the equal-power curve exists to
+            // rule out.
+            if let Some(inc_deck) = inc {
+                Self::request_on(&inc_deck, |reply| PlayerCommand::SetVolumeF64 {
+                    vol: in_vol,
+                    reply,
+                })
+                .await?;
+            }
+            Self::request_on(&out, |reply| PlayerCommand::SetVolumeF64 { vol: out_vol, reply })
+                .await
+        }
+    }
 }
 
 impl PlayerHandle {
@@ -545,7 +750,8 @@ impl PlayerHandle {
         // TestEof carries no reply; use a throwaway to keep `request` shape simple.
         drop(tx);
         drop(rx);
-        self.cmd_tx
+        self.deck()
+            .cmd_tx
             .send(PlayerCommand::TestEof)
             .await
             .map_err(|_| PlayerError::Gone)
@@ -592,12 +798,12 @@ impl PlayerHandle {
 
     /// Always-current play state snapshot (no round-trip to the actor).
     pub fn state(&self) -> PlayState {
-        *self.state_rx.borrow()
+        *self.deck().state_rx.borrow()
     }
 
     /// Subscribe to state changes (e.g. for `idle player` in the MPD layer).
     pub fn subscribe_state(&self) -> watch::Receiver<PlayState> {
-        self.state_rx.clone()
+        self.deck().state_rx.clone()
     }
 
     /// Dump the last `back` seconds (plus up to `fwd` seconds of whatever the forward
@@ -625,7 +831,8 @@ impl PlayerHandle {
         path: &std::path::Path,
     ) -> Result<DumpOutcome, DumpFailure> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
+        self.deck()
+            .cmd_tx
             .send(PlayerCommand::DumpCache {
                 back,
                 fwd,
@@ -643,12 +850,7 @@ impl PlayerHandle {
     where
         F: FnOnce(oneshot::Sender<Result<(), PlayerError>>) -> PlayerCommand,
     {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(make(tx))
-            .await
-            .map_err(|_| PlayerError::Gone)?;
-        rx.await.map_err(|_| PlayerError::Gone)?
+        Self::request_on(self.deck(), make).await
     }
 }
 
@@ -700,6 +902,20 @@ impl NullPlayer {
             #[cfg(test)]
             false,
         )
+    }
+
+    /// TEST-ONLY: spawn a headless PAIR, so the handler's crossfade path is drivable
+    /// under a fake clock with no audio device. Both decks accept commands and publish
+    /// their own play state, which is what the crossfade actually exercises.
+    #[cfg(test)]
+    pub(crate) fn spawn_pair() -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
+        let (a, a_rx) = Self::spawn_inner(None, false);
+        let (b, _b_rx) = Self::spawn_inner(None, false);
+        // The second actor's event stream is dropped: the null actor synthesizes its
+        // events per command and the handler only ever reads one stream. What the
+        // crossfade needs from deck B is that it takes loads and volume writes.
+        let links = vec![a.decks[0].clone(), b.decks[0].clone()];
+        (PlayerHandle::pair(links), a_rx)
     }
 
     /// TEST-ONLY: spawn an actor whose LOADS always fail, so a handler test can drive
@@ -792,6 +1008,26 @@ impl NullPlayer {
                         let _ = evt_tx
                             .send(PlayerEvent::StateChanged(PlayState::Playing, song, queue_id))
                             .await;
+                    }
+                    PlayerCommand::EmitCrossfadedEof { reply } => {
+                        // Same shape as the mpv arm: report the entry this deck was
+                        // carrying as FINISHED-by-crossfade, then forget it.
+                        let song = current.take();
+                        let qid = current_qid.take();
+                        let was_local = std::mem::take(&mut current_local);
+                        if qid.is_some() {
+                            let _ = evt_tx
+                                .send(PlayerEvent::Eof {
+                                    song,
+                                    queue_id: qid,
+                                    continuation_landed: false,
+                                    errored: false,
+                                    was_local,
+                                    crossfaded: true,
+                                })
+                                .await;
+                        }
+                        let _ = reply.send(Ok(()));
                     }
                     PlayerCommand::DropWarm { reply } => {
                         // Headless: no mpv playlist to prune. A no-op keeps the command
@@ -918,6 +1154,7 @@ impl NullPlayer {
                                     // A synthesized NATURAL end: never an error.
                                     errored: false,
                                     was_local,
+                                    crossfaded: false,
                                 })
                                 .await;
                         }
@@ -934,7 +1171,7 @@ impl NullPlayer {
             let _ = current_local;
         });
 
-        (PlayerHandle { cmd_tx, state_rx }, evt_rx)
+        (PlayerHandle::single(cmd_tx, state_rx), evt_rx)
     }
 }
 
@@ -973,15 +1210,63 @@ impl MpvPlayer {
     /// we log and fall back to a `NullPlayer` actor so the daemon does not
     /// panic - a playback backend failure must degrade, not crash.
     pub fn spawn(out: AudioOut) -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
-        use libmpv2::Mpv;
+        Self::spawn_decks(out, 1)
+    }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<PlayerCommand>(32);
-        let (state_tx, state_rx) = watch::channel(PlayState::Stopped);
+    /// Spawn a PAIR of mpv actors behind one handle, so the deck can crossfade (see
+    /// [`PlayerHandle::crossfade_arm`]). Two contexts means two audio streams into
+    /// PipeWire, which is precisely the point: one mpv has one gain and cannot overlap
+    /// two sources however the property is driven.
+    ///
+    /// Degrades to a single deck, never to a panic: if the SECOND context cannot be
+    /// built (a resource limit, a device that refuses a second stream) the handle comes
+    /// back single and the handler's duck-swap skip is the floor.
+    ///
+    /// [`AudioOut::File`] is deliberately refused a second deck - both would encode to
+    /// the same path and clobber each other, and the encode path exists for the probes,
+    /// which never crossfade.
+    pub fn spawn_pair(out: AudioOut) -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
+        if matches!(out, AudioOut::File(_)) {
+            tracing::info!("encode output takes a single deck; crossfade is unavailable here");
+            return Self::spawn_decks(out, 1);
+        }
+        Self::spawn_decks(out, 2)
+    }
+
+    fn spawn_decks(out: AudioOut, want: usize) -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
         let (evt_tx, evt_rx) = mpsc::channel::<PlayerEvent>(64);
+        let mut links: Vec<DeckLink> = Vec::with_capacity(want);
+        for i in 0..want {
+            let (cmd_tx, cmd_rx) = mpsc::channel::<PlayerCommand>(32);
+            let (state_tx, state_rx) = watch::channel(PlayState::Stopped);
+            let mpv = match Self::build_mpv(&out) {
+                Ok(m) => m,
+                Err(e) => {
+                    if i == 0 {
+                        tracing::error!(error = %e, "mpv init failed; falling back to NullPlayer");
+                        return NullPlayer::spawn();
+                    }
+                    // Deck 0 is alive: come back single rather than half-built.
+                    tracing::warn!(error = %e, "second mpv deck unavailable; crossfade is off");
+                    break;
+                }
+            };
+            let evt_tx = evt_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("mpv-player-{i}"))
+                .spawn(move || mpv_actor(mpv, cmd_rx, state_tx, evt_tx))
+                .expect("spawn mpv thread");
+            links.push(DeckLink { cmd_tx, state_rx });
+        }
+        // The template sender is dropped here so the receiver closes when the last
+        // ACTOR goes, not merely when this function returns.
+        drop(evt_tx);
+        (PlayerHandle::pair(links), evt_rx)
+    }
 
-        // Build the Mpv instance up front so a construction failure can fall
-        // back to NullPlayer BEFORE we hand out a broken handle.
-        let mpv = Mpv::with_initializer(|init| {
+    fn build_mpv(out: &AudioOut) -> Result<libmpv2::Mpv, libmpv2::Error> {
+        use libmpv2::Mpv;
+        Mpv::with_initializer(|init| {
             // Audio-only, no window, no terminal control.
             init.set_property("vid", "no")?;
             init.set_property("video", "no")?;
@@ -1034,7 +1319,7 @@ impl MpvPlayer {
             // writes continuously, forever, on a 91-percent-full disk and on battery, to
             // buy a bound obtainable by capping bytes.
             init.set_property("demuxer-max-bytes", "150MiB")?;
-            match &out {
+            match out {
                 AudioOut::Null => {
                     init.set_property("ao", "null")?;
                 }
@@ -1048,23 +1333,7 @@ impl MpvPlayer {
                 AudioOut::Device => {}
             }
             Ok(())
-        });
-
-        let mpv = match mpv {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(error = %e, "mpv init failed; falling back to NullPlayer");
-                drop((cmd_rx, state_tx, state_rx, evt_tx, evt_rx, cmd_tx));
-                return NullPlayer::spawn();
-            }
-        };
-
-        std::thread::Builder::new()
-            .name("mpv-player".into())
-            .spawn(move || mpv_actor(mpv, cmd_rx, state_tx, evt_tx))
-            .expect("spawn mpv thread");
-
-        (PlayerHandle { cmd_tx, state_rx }, evt_rx)
+        })
     }
 }
 
@@ -1209,6 +1478,7 @@ fn emit_honest_stop(
             continuation_landed: false,
             errored,
             was_local,
+            crossfaded: false,
         });
     }
     let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
@@ -1462,6 +1732,7 @@ fn mpv_actor(
                                 continuation_landed: true,
                                 errored: false,
                                 was_local: finishing_local,
+                                crossfaded: false,
                             });
                             // The station's own Playing edge: the director's on_playing
                             // surfaces its TrackStart AND clears any suppress_next_stopped
@@ -1752,6 +2023,31 @@ fn handle_cmd(
                 Err(e) => tracing::error!(error = %e, "mpv switch-warmed failed"),
             }
             let _ = reply.send(res);
+        }
+        PlayerCommand::EmitCrossfadedEof { reply } => {
+            // The crossfade is promoting the other deck, so THIS deck's entry is
+            // finished. Report it before the stop that follows: a Stop yields
+            // `EndFile(Stop)`, which is deliberately not an Eof, so without this the
+            // track would end with no TrackEnd edge and no scrobble. `crossfaded: true`
+            // tells the director to publish and scrobble WITHOUT advancing - the
+            // crossfade's own commit already did that.
+            let song = current.take();
+            let qid = current_qid.take();
+            let was_local = std::mem::take(current_local);
+            if qid.is_some() {
+                let _ = evt_tx.blocking_send(PlayerEvent::Eof {
+                    song,
+                    queue_id: qid,
+                    continuation_landed: false,
+                    // A crossfade replaces a track that was playing fine; nothing here
+                    // is evidence against the bytes, so local media is never made
+                    // suspect by this path.
+                    errored: false,
+                    was_local,
+                    crossfaded: true,
+                });
+            }
+            let _ = reply.send(Ok(()));
         }
         PlayerCommand::DropWarm { reply } => {
             // A superseded skip dip: drop the parked warm target (playlist-clear keeps
@@ -2765,7 +3061,6 @@ mod tests {
     // absent in the link-isolated Nix build sandbox); run with:
     //   cargo test -p hypodj-core -- --ignored live_warm_skip_no_bleed_and_switches
     #[test]
-    #[test]
     #[ignore = "needs a real libmpv runtime; run manually to confirm the gapless queue handoff"]
     fn live_warmed_queue_entry_auto_advances_gaplessly_at_natural_eof() {
         // THE CLAIM A NULL-PLAYER TEST CANNOT MAKE. Everything else about this change is
@@ -2875,6 +3170,11 @@ mod tests {
         let _ = std::fs::remove_file(&b);
     }
 
+    // Was DEAD: a stray duplicated `#[test]` above the previous test swallowed this
+    // one's, so `cargo test --ignored` never ran it and the compiler filed it as an
+    // unused function. A live proof that cannot be invoked is worse than no proof - the
+    // gate reads as covered.
+    #[test]
     #[ignore = "needs a real libmpv runtime; run manually to confirm the warm-skip prefetch"]
     fn live_warm_skip_no_bleed_and_switches() {
         use libmpv2::Mpv;
@@ -2977,6 +3277,94 @@ mod tests {
         eprintln!("warm switch settled in ~{switch_ms} ms (target reset onto its own timeline)");
         assert!(switched, "the warmed target became the sole playing entry after the switch");
 
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    // THE live proof, and the only one that can exist: two real mpv contexts decoding at
+    // the SAME INSTANT. Every unit test above runs over headless actors that would report
+    // exactly the same thing whether or not libmpv can actually hold two streams open, so
+    // none of them can establish the premise the whole feature rests on. This one loads a
+    // real tone on each deck, walks the real equal-power envelope, and checks that BOTH
+    // decks are Playing in the middle of it - which is precisely what one mpv context
+    // cannot do at any volume, and therefore precisely what the second deck bought.
+    //
+    // ao=null throughout: this decodes, it never reaches a device, so it leaves no sound
+    // in the room. Ignored by default (needs a real libmpv runtime, absent in the
+    // link-isolated Nix build sandbox); run with:
+    //   cargo test -p hypodj-core -- --ignored live_two_decks_overlap
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm two decks overlap"]
+    fn live_two_decks_overlap_through_an_equal_power_crossfade() {
+        use crate::fade::{crossfade_gains, CrossfadeSink};
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join("hypodj-xfade-live");
+        let _ = std::fs::create_dir_all(&dir);
+        let a = dir.join("a.wav");
+        let b = dir.join("b.wav");
+        write_tone_wav(&a, 440.0, 6.0);
+        write_tone_wav(&b, 660.0, 6.0);
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn_pair(AudioOut::Null);
+            // DRAIN, always. Two decks feed one 64-slot event channel and the low-rate
+            // events (StateChanged, Eof) ride a BLOCKING send, so a test that merely
+            // holds the receiver wedges an actor thread the moment the cosmetic
+            // TimePos/Viz traffic fills the buffer - which two playing decks do about
+            // twice as fast as one. The daemon's spine drains continuously; a test that
+            // does not is testing a condition the daemon never has.
+            tokio::spawn(async move { while events.recv().await.is_some() {} });
+            assert!(
+                player.can_crossfade(),
+                "libmpv refused a second context - the crossfade cannot exist here"
+            );
+
+            // Deck A alone, at the baseline.
+            player
+                .play_url(None, Some(QueueId(1)), a.to_str().unwrap(), true)
+                .await
+                .expect("deck A loads");
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            assert_eq!(player.state(), PlayState::Playing, "deck A is playing");
+            assert_eq!(
+                player.deck_states().iter().filter(|s| **s == PlayState::Playing).count(),
+                1,
+                "and it is the ONLY one - the spare deck is genuinely idle until armed"
+            );
+
+            // Arm deck B silent and walk the envelope by hand, checking the overlap at
+            // the midpoint rather than trusting the driver to have happened.
+            player
+                .crossfade_arm(None, Some(QueueId(2)), b.to_str().unwrap(), true)
+                .await
+                .expect("deck B arms");
+            for k in 0..=20 {
+                let (out_db, in_db) = crossfade_gains(k as f64 / 20.0, 0.0);
+                player.set_pair_db(out_db, in_db).await.expect("both gains take");
+                if k == 10 {
+                    let playing =
+                        player.deck_states().iter().filter(|s| **s == PlayState::Playing).count();
+                    assert_eq!(
+                        playing, 2,
+                        "MIDWAY BOTH DECKS MUST BE PLAYING - this is the overlap, and the \
+                         single reason the pair exists"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+
+            // Promote: the incoming deck keeps playing, the outgoing one goes.
+            player.crossfade_commit(false).await.expect("promote");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(player.state(), PlayState::Playing, "the promoted deck plays on");
+            assert_eq!(
+                player.deck_states().iter().filter(|s| **s == PlayState::Playing).count(),
+                1,
+                "and exactly one deck is left - a crossfade that does not put the outgoing \
+                 deck away is a leak the listener eventually hears"
+            );
+        });
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
     }
