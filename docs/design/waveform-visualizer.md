@@ -176,6 +176,35 @@ if server-side downsample or rate-cap is wanted. `ADVERTISED_MPD_VERSION`
 3. Unsubscribe = close socket (the client tears the worker down on leaving the
    HUD/DJ view).
 
+### Liveness and silence semantics (never silent longer than 2s)
+
+Frames flow only while audio decodes, so "no frames" is the normal paused state,
+not a dead peer. The wire must therefore define silence, and both ends must own
+their own liveness rather than infer it from application traffic:
+
+- Daemon side: the per-conn task keeps the socket's READ HALF in its `select!`
+  set alongside the frame receiver. A peer FIN ends the task the instant the
+  kernel delivers it, whatever the playback state. Inferring the peer's death
+  from a later failing frame write pins the fd of every dead peer for as long as
+  the deck is paused (this is exactly what produced 1002 `CLOSE-WAIT` sockets and
+  an `EMFILE` outage).
+- Wire side: an idle connection emits `PING\n` every 2s (`VIZ_HEARTBEAT`), reset
+  by any real frame. So the wire is NEVER silent for longer than 2s, and the
+  client's 5s `READ_TIMEOUT` becomes a true dead-peer signal instead of a
+  paused-daemon false positive. The heartbeat lives in the CONNECTION task, not
+  in the director/publisher: tying it to playback state restores the very
+  coupling this removes.
+- `PING` is deliberately not a resting frame. `decode_frame` returns `None` for
+  it, so every client already skips it via the "line that did not decode" arm; a
+  fake level line would instead poison the render envelope. A third-party `nc`
+  reader sees `PING` lines interleaved with frames.
+- Bytes FROM a viz client are discarded, never interpreted (an `nc` user typing
+  must not disturb the stream).
+- The listener caps concurrent viz conns at `VIZ_MAX_CONNS` (32) via a semaphore
+  and sleeps `ACCEPT_ERROR_BACKOFF` (250ms) on an accept error, so this cosmetic
+  side channel can never drain the shared fd budget the MPD listener needs, nor
+  spin the CPU when it is already saturated.
+
 ### Frame format
 
 Minimal fixed frame, ~7 bytes at ~20 fps (~220 B/s):

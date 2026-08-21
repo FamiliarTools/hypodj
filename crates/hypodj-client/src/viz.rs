@@ -149,6 +149,15 @@ mod tests {
     }
 
     #[test]
+    fn decode_skips_the_daemon_heartbeat_line() {
+        // The daemon writes `PING` on an idle connection so the wire is never
+        // silent longer than 2s (well under READ_TIMEOUT). It must decode to None
+        // so the worker's Ok(None) arm skips it - an undecodable line provably
+        // cannot poison the render envelope the way a fake resting frame would.
+        assert!(decode_frame("PING").is_none());
+    }
+
+    #[test]
     fn decode_rejects_non_finite_frames() {
         // nan/inf/-inf all parse cleanly as f32 but would poison the render
         // envelope permanently, so the whole frame must be dropped.

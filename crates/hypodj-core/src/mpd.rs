@@ -2497,6 +2497,10 @@ impl MpdServer {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "accept failed");
+                    // `EMFILE` is a persistent saturation state, not a transient:
+                    // the listener stays readable, so a bare `continue` spins this
+                    // loop at full speed and floods the log. Sleep before retrying.
+                    tokio::time::sleep(crate::viz::ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 }
             };

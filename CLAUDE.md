@@ -122,6 +122,11 @@ Hard-won from the player/fade work; they apply to all player/state code:
   they are explicit `MpdCommand` variants so dispatch cannot forget them.
 - `ADVERTISED_MPD_VERSION` tracks the surface actually implemented; bump it in
   lockstep, never ahead.
+- A socket task must always be awaiting the socket's own termination signal
+  (read-half EOF) - never only an application event stream - and a push protocol
+  must emit bounded-time idle traffic; every listener sleeps on accept error
+  (EMFILE is saturation, not a transient) and an optional side-channel listener is
+  connection-capped so it can never drain the shared fd pool.
 
 ## Conventions
 
