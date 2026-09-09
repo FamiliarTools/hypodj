@@ -1500,6 +1500,36 @@ mod tests {
         assert_eq!(square_art_rows(u16::MAX, Some((u16::MAX, 1))), u16::MAX);
     }
 
+    /// The badge does not truncate, it STEPS DOWN - so every cell the daemon adds to
+    /// the line is paid for by a reason clause vanishing entirely at some width. This
+    /// pins the REAL line against the REAL terminal (129 columns) so that trade stays
+    /// visible: the head learning to name the in-flight count cost 17 cells, which the
+    /// deferred clause's byte parenthetical paid for. Without this test the next clause
+    /// to grow would silently drop both reasons on his actual screen.
+    #[test]
+    fn the_real_mirror_line_still_shows_its_reasons_at_the_real_terminal_width() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        // Exactly what `store_status_pairs` builds for the live mirror on bubble-gum:
+        // 384 held, 58 in flight, 4 given up (384 + 58 + 4 == 446), 3 below the line.
+        s.now.store = Some(
+            "384 of 446 songs - 58 still coming, 15.1 of 16.0 GiB, 3 songs would not \
+             fit, 4 songs will not download"
+                .into(),
+        );
+        let out = render_to_lines_sized(&s, 129, 30).join("\n");
+        assert!(
+            out.contains(
+                "offline: 384 of 446 songs - 58 still coming, 3 songs would not fit, \
+                 4 songs will not download"
+            ),
+            "the FULL badge survives at 129 columns - not the `(held)` step-down, which \
+             would trade both reasons away for the size clause:\n{out}"
+        );
+        assert!(!out.contains("(held)"), "the step-down did not fire:\n{out}");
+        assert!(out.contains("? help"), "and the hint keeps its corner:\n{out}");
+    }
+
     #[test]
     fn the_narrow_bar_steps_the_badge_down_instead_of_dropping_it() {
         // Dropping it outright made a HELD mirror and a finished one look identical on a

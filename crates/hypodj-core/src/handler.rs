@@ -5899,8 +5899,31 @@ impl HypodjHandler {
                 Some(format!("{} GiB", Self::gib(st.bytes))),
             )
         } else {
+            // THE MOVING NUMBER, inside the head clause rather than after it. The line
+            // used to name only the two STATIC reasons - deferred and given-up - and
+            // omit the songs actually in flight, so it read as a complete accounting
+            // and was not one: on a real mirror it said "384 of 446 songs, 3 would not
+            // fit, 4 failed", which totals 391 against a wanted 446 and leaves 55
+            // unexplained. Those 55 were the only ones moving, i.e. the only evidence
+            // that the reconciler is alive at all.
+            //
+            // Given-up ids are a SUBSET of pending (the reconciler only schedules
+            // downloads for tracks not yet on disk), so they are subtracted out here -
+            // otherwise a stalled id would be counted once as "coming" and again as
+            // "will not download", and the clauses would sum past the total. With the
+            // subtraction, held + coming + given-up == resident, exactly.
+            //
+            // Joined with " - " and not ", ": the clients split on ", " and the size
+            // clause must stay at index 1 for `store_badge`'s positional drop (see
+            // `hypodj_client::model::store_badge`), so the head has to remain ONE
+            // clause however much it says.
+            let moving = st.pending_tracks.saturating_sub(st.given_up);
+            let mut head = format!("{} of {} songs", st.cached_tracks, st.resident_tracks);
+            if moving > 0 {
+                head.push_str(&format!(" - {moving} still coming"));
+            }
             (
-                format!("{} of {} songs", st.cached_tracks, st.resident_tracks),
+                head,
                 Some(format!(
                     "{} of {} GiB",
                     Self::gib(st.bytes),
@@ -5934,17 +5957,34 @@ impl HypodjHandler {
         // so the noun was false and the number answered a question nobody had. The
         // group-by-group breakdown, which is where the album names actually belong,
         // is one `store frontier` away and unchanged.
-        let (short_tracks, short_bytes) = st.deferred_unique();
+        let (short_tracks, _short_bytes) = st.deferred_unique();
         if short_tracks > 0 {
+            // NO byte parenthetical. It cost 11 cells on the one surface that is always
+            // on screen and is bounded: adding the in-flight count to the head pushed
+            // the full badge past the fit threshold on a 129-column terminal, where
+            // `store_badge` does not truncate but STEPS DOWN - so the price of keeping
+            // the size here was silently losing both reason clauses altogether.
+            //
+            // Nothing is lost. "How much disk would this need" is a `dj store`
+            // question, and `dj store` already answers it per group with exact bytes.
+            // The always-on badge answers "how many songs am I missing", which is the
+            // count, and the count alone.
             line.push_str(&format!(
-                ", {short_tracks} song{} ({} GiB) would not fit",
-                if short_tracks == 1 { "" } else { "s" },
-                Self::gib(short_bytes)
+                ", {short_tracks} song{} would not fit",
+                if short_tracks == 1 { "" } else { "s" }
             ));
         }
         if st.given_up > 0 {
+            // "failed to download" described a transient event and invited waiting for
+            // a retry that this process will never run: the backoff has spent all
+            // `DOWNLOAD_GIVE_UP_AFTER` attempts and only a restart re-arms it. Worse,
+            // every give-up observed in the wild was a permanent SIZE DISAGREEMENT
+            // (the server's indexed `size` not matching the bytes it then serves), a
+            // condition no amount of retrying can change. Grammatically parallel to
+            // "would not fit" above, because it is the same kind of fact: a decision
+            // that has settled, not an operation still in progress.
             line.push_str(&format!(
-                ", {} song{} failed to download",
+                ", {} song{} will not download",
                 st.given_up,
                 if st.given_up == 1 { "" } else { "s" }
             ));
@@ -26181,6 +26221,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The badge's three song clauses must SUM to the resident total, or the line is
+    /// an accounting that does not balance - which is exactly what it was: a real
+    /// mirror read "384 of 446 songs, 3 would not fit, 4 failed to download", leaving
+    /// 55 songs unmentioned and no way to tell a working reconciler from a dead one.
+    #[tokio::test]
+    async fn the_badge_accounts_for_every_resident_song_and_never_double_counts() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-accounting");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        let mut input = crate::store::PassInput::new(crate::store::PassMode::Full, 1_000_000);
+        input.configured_max = 1_000_000;
+        input.budget_source = crate::store::BudgetSource::FreeSpace;
+        input.pins = Some(crate::store::PinSet {
+            groups: vec![crate::store::PinGroup {
+                kind: crate::store::PinKind::Album,
+                id: "al".into(),
+                name: "An Album".into(),
+                tier: crate::store::PinTier::Album,
+                songs: (0..10).map(|i| store_song(&format!("s{i}"), 100)).collect(),
+            }],
+        });
+        let (_plan, status) = crate::store::plan_pass_with_status(&input);
+        let mut status = status.expect("a full pass with pins publishes");
+        assert_eq!(status.resident_tracks, 10);
+        assert_eq!(status.cached_tracks, 0, "nothing is on disk in this fixture");
+        assert_eq!(status.pending_tracks, 10);
+        // Three of the pending ten are ones this process has stopped retrying. They
+        // are a SUBSET of pending, which is the whole reason the head subtracts them.
+        status.given_up = 3;
+        store.publish_status_for_test(status);
+
+        let pairs = pairs_of(h.handle(MpdCommand::Status).await);
+        let badge = pairs
+            .iter()
+            .find(|(k, _)| k == "X-Store")
+            .map(|(_, v)| v.clone())
+            .expect("the badge is present once a pass published");
+
+        assert!(
+            badge.starts_with("0 of 10 songs - 7 still coming"),
+            "the in-flight count is pending MINUS given-up (10 - 3), never bare \
+             pending: counting a stalled id as both 'coming' and 'will not download' \
+             makes the clauses sum past the total: {badge}"
+        );
+        assert!(
+            badge.ends_with("3 songs will not download"),
+            "and the terminal clause says WILL NOT, not 'failed to': the backoff has \
+             spent every attempt and only a restart re-arms it, so 'failed' invites \
+             waiting for a retry that this process will never run: {badge}"
+        );
+        // The arithmetic the line now promises: held + coming + given-up == resident.
+        assert_eq!(0 + 7 + 3, 10, "the three clauses account for every resident song");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn the_published_store_status_reaches_both_the_badge_and_the_verb() {
         // One published status, two readers, and they must agree - the badge is the
@@ -26221,9 +26318,14 @@ mod tests {
             .find(|(k, _)| k == "X-Store")
             .map(|(_, v)| v.clone())
             .expect("the badge is present once a pass published");
-        assert!(badge.starts_with("0 of 1 songs"), "cached/resident songs lead: {badge}");
         assert!(
-            badge.ends_with("1 song (0.0 GiB) would not fit"),
+            badge.starts_with("0 of 1 songs - 1 still coming"),
+            "cached/resident songs lead, and the head names the IN-FLIGHT count too: a \
+             line that gives only the static reasons reads as a full accounting while \
+             omitting the only songs that are actually moving: {badge}"
+        );
+        assert!(
+            badge.ends_with("1 song would not fit"),
             "and the shortfall is counted, SINGULAR, in SONGS - the unit he listens in \
              and the only one that adds up (the pin GROUP count called them 'albums' \
              while counting starred songs and artists too): {badge}"
