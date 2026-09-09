@@ -27,12 +27,9 @@ USAGE:
   dj next | prev          skip / go back (also \"next song\", \"skip this\")
   dj fav | favorite       favorite the current track (also \"fav current\")
   dj mark                 mark what is playing: star it if you own it, note it if
-                           not, and KEEP THE AUDIO when audio is the only thing
-                           that can still help (a radio window off what mpv is
-                           already holding - never on a track you own). On a
-                           stream whose title JUST changed it records both
-                           candidates and stars neither - resolve it with
-                           \"mark this\" or \"mark previous\"
+                           not, keeping the audio when that is the only thing that
+                           can still help. On a stream whose title just changed,
+                           say \"mark this\" or \"mark previous\"
   dj heard [all|marks|limit <n>]
                           read the heard ledger back: last session, marks first,
                            unowned only. The first line is the coverage line; a
@@ -49,9 +46,11 @@ USAGE:
                            With no PATH, reads $HYPODJ_STATIONS_DIR
   dj stations list | rm <name>
                           list / remove saved stations
-  dj store                the offline mirror: what is held, what is budgeted, and
-                           every favourite that did not fit - each with WHY it lost
-  dj store frontier       the whole ranked order, best to worst
+  dj store                the offline mirror: what is held, what is still coming,
+                           and every favourite that did not fit
+  dj store limit <size>   how much disk the mirror may use (24G, 500M; \"default\"
+                           restores the configured cap)
+  dj store frontier       the whole ranked order, best to worst, with why
   dj store now | pause | resume
                           reconcile now / suspend bulk mirroring / resume it
   dj <anything else>      natural language: e.g. \"fade out\", \"stop after this

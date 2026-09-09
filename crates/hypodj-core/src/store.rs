@@ -87,7 +87,7 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::clock::Clock;
-use crate::config::StoreConfig;
+use crate::config::{StoreConfig, STORE_MIN_MAX_BYTES};
 use crate::model::{Album, AlbumId, ArtistId, Song, SongId};
 use crate::resume::atomic_write_bytes;
 use crate::subsonic::{Starred, SubsonicClient, SubsonicError};
@@ -121,6 +121,21 @@ pub const FALLBACK_SUFFIX: &str = "bin";
 /// `.hypodj-store`, and [`scan_dir`] excludes it from classification so the heal
 /// cannot delete the very claim it depends on.
 pub const STORE_MARKER_NAME: &str = ".hypodj-store";
+
+/// The USER'S OWN LIMIT, when they have set one: a single decimal byte count.
+///
+/// PERSISTED, and deliberately unlike [`AudioStore::paused`] one directory up in this
+/// file, which is not. The reasoning inverts: a pause is an action whose safe state is
+/// the default, so forgetting it on restart is a feature. A cache size is a SETTING -
+/// a user who shrinks the mirror to 4 GiB because the disk is tight has not asked for
+/// that to last until the next restart, and silently reverting to the configured cap
+/// would refill the disk they just cleared.
+///
+/// It lives INSIDE the store root, which is the one directory the store owns
+/// exclusively, and is therefore excluded from convergence exactly as the marker is
+/// (see [`scan_dir`]) - without that it would be an orphan and the store would delete
+/// its own setting on the next pass.
+pub const STORE_LIMIT_NAME: &str = ".hypodj-limit";
 
 /// Body of the ownership marker. Human-facing only - nothing parses it; the file's
 /// EXISTENCE is the whole claim. It says what the directory is so a person who
@@ -597,6 +612,30 @@ fn claim_ownership(root: &Path) -> io::Result<()> {
 /// its root is not ours and deleting other people's data is not converge-by-scan.
 /// The [`STORE_MARKER_NAME`] ownership file is likewise excluded from every
 /// category - it is the claim this whole destructive convergence rests on.
+/// Read the user's persisted limit, or `0` for unset.
+///
+/// TOTAL: every failure mode - absent, unreadable, not a number, zero - answers "no
+/// limit set" rather than propagating. The caller is a constructor whose contract is
+/// that an optional feature never prevents a start, and the fallback (the configured
+/// cap) is the conservative one in the only direction that matters, since free space
+/// clamps it further down regardless.
+fn read_limit(root: &Path) -> u64 {
+    let raw = match std::fs::read_to_string(root.join(STORE_LIMIT_NAME)) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => n.max(STORE_MIN_MAX_BYTES),
+        _ => {
+            tracing::warn!(
+                path = %root.join(STORE_LIMIT_NAME).display(),
+                "store: the saved limit is unreadable; using the configured cap"
+            );
+            0
+        }
+    }
+}
+
 pub fn scan_dir(root: &Path) -> io::Result<DirScan> {
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(root)? {
@@ -616,9 +655,11 @@ pub fn scan_dir(root: &Path) -> io::Result<DirScan> {
     let mut sidecar_ids: Vec<String> = Vec::new();
     let mut loose: Vec<String> = Vec::new();
     for name in names {
-        if name == STORE_MARKER_NAME {
+        if name == STORE_MARKER_NAME || name == STORE_LIMIT_NAME {
             // Our own ownership claim, never an orphan: healing it away would make
-            // the next open refuse the directory it just converged.
+            // the next open refuse the directory it just converged. The user's own
+            // limit is excluded for the same reason in a different key - convergence
+            // would delete the setting that decides how big this directory may get.
             continue;
         } else if is_tmp_name(&name) {
             scan.stale_tmps.push(root.join(&name));
@@ -2740,6 +2781,12 @@ pub struct AudioStore {
     /// a restart resumes mirroring, so the safe state is the default and a pause
     /// cannot become a forgotten config.
     paused: AtomicBool,
+    /// The user's own byte limit from [`STORE_LIMIT_NAME`], or `0` for "unset, use the
+    /// configured cap". `0` is a safe sentinel rather than an `Option` in an atomic
+    /// because a real limit of zero is meaningless here: the config floor
+    /// ([`STORE_MIN_MAX_BYTES`]) applies to anything set, so a stored value is always
+    /// well above zero.
+    limit: AtomicU64,
     /// WHAT THE STORE KNOWS ABOUT ITSELF, overwritten at the end of every full pass
     /// that had an authoritative pin set. Short-locked and clone-out; read-only for
     /// everyone but the reconciler.
@@ -2786,6 +2833,8 @@ impl AudioStore {
     pub fn open(root: PathBuf, cfg: StoreConfig) -> io::Result<Self> {
         std::fs::create_dir_all(&root)?;
         claim_ownership(&root)?;
+        // Before `root` is moved into the struct below.
+        let limit = read_limit(&root);
         let scan = scan_dir(&root)?;
         let mut swept = 0usize;
         for p in &scan.stale_tmps {
@@ -2833,6 +2882,12 @@ impl AudioStore {
             // to backfill.
             playback_remote: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            // READ AT OPEN, and a malformed or missing file is simply "unset" rather
+            // than an error that refuses to start: the store's whole posture is to run
+            // without the optional thing (see `enable`), and a corrupt limit falling
+            // back to the configured cap is the conservative direction - it can only
+            // ever be clamped further down by free space.
+            limit: AtomicU64::new(limit),
             status: Mutex::new(StoreStatus::default()),
             server_back_hook: Mutex::new(None),
             #[cfg(test)]
@@ -3287,6 +3342,64 @@ impl AudioStore {
     /// store work should defer this pass.
     pub fn playback_remote(&self) -> bool {
         self.playback_remote.load(Ordering::Relaxed)
+    }
+
+    /// The cap a pass budgets against BEFORE the free-space clamp: the user's own
+    /// limit when they have set one, else the configured `store.max_bytes`.
+    ///
+    /// This is the ONLY reader of either, so there is exactly one place where "which
+    /// number is in force" is decided and no surface can answer it differently from
+    /// the pass. The free-space clamp in [`derive_budget`] still applies on top and is
+    /// untouched: a user-set limit can only ever LOWER what is used, never let the
+    /// store outgrow the disk, so "hypodj cannot fill the disk" survives this knob.
+    pub fn budget_limit(&self) -> u64 {
+        match self.limit.load(Ordering::Relaxed) {
+            0 => self.cfg.max_bytes,
+            n => n,
+        }
+    }
+
+    /// Whether the limit in force is the USER'S rather than the configured cap. The
+    /// status surface needs this to say which number it is showing - "16.0 GiB"
+    /// without a source reads as immovable, which is the whole problem this solves.
+    pub fn budget_limit_is_users(&self) -> bool {
+        self.limit.load(Ordering::Relaxed) != 0
+    }
+
+    /// Set the user's own limit, or clear it back to the configured cap with `None`.
+    ///
+    /// Written through to disk BEFORE the in-memory value changes, so a failed write
+    /// cannot leave a limit that is in force this run and gone the next - the user
+    /// would see it take effect, and find the mirror quietly re-grown after a restart.
+    /// Kicks a full pass so the change is visible now rather than at the next tick,
+    /// exactly as `store resume` does.
+    ///
+    /// Clamped UP to [`STORE_MIN_MAX_BYTES`], never rejected: the config path takes
+    /// the same posture on the same number, and refusing a too-small value would be
+    /// the one outcome that leaves the user with no mirror and no explanation.
+    pub fn set_budget_limit(&self, bytes: Option<u64>) -> io::Result<u64> {
+        let path = self.root.join(STORE_LIMIT_NAME);
+        match bytes {
+            Some(n) => {
+                let n = n.max(STORE_MIN_MAX_BYTES);
+                std::fs::write(&path, format!("{n}\n"))?;
+                self.limit.store(n, Ordering::Relaxed);
+                self.kick_full();
+                Ok(n)
+            }
+            None => {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    // Already absent is success: clearing an unset limit is a no-op,
+                    // not a failure to report.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                self.limit.store(0, Ordering::Relaxed);
+                self.kick_full();
+                Ok(self.cfg.max_bytes)
+            }
+        }
     }
 
     /// Suspend or resume BULK store work by hand (`store pause` / `store resume`).
@@ -4122,7 +4235,9 @@ async fn run_pass<C: Clock, P: PinSource>(
     batch: usize,
 ) -> PassReport {
     let full = mode == PassMode::Full;
-    let configured = store.config().max_bytes;
+    // The user's limit when set, else the configured cap. ONE reader, so the pass and
+    // every status surface cannot disagree about which number is in force.
+    let configured = store.budget_limit();
     let mut input = PassInput::new(mode, configured);
     input.download_batch = batch;
     input.defer_bulk = store.playback_remote();

@@ -5969,9 +5969,26 @@ impl HypodjHandler {
             // question, and `dj store` already answers it per group with exact bytes.
             // The always-on badge answers "how many songs am I missing", which is the
             // count, and the count alone.
+            // NAMES THE LIMIT IT DID NOT FIT IN. "would not fit" alone has no referent
+            // on the one surface that shows it most: the thing it did not fit inside
+            // is the budget, and `store_badge` drops the size clause POSITIONALLY to
+            // build the badge, so the number the sentence points at is never on
+            // screen. Guilherme read the line and asked "fit where?", which is the
+            // whole bug. Carrying the limit in the clause makes it self-anchoring, and
+            // it is now a number he can change (`dj store limit`), which is what
+            // earns it the cells.
             line.push_str(&format!(
-                ", {short_tracks} song{} would not fit",
-                if short_tracks == 1 { "" } else { "s" }
+                ", {short_tracks} song{} did not fit in {}",
+                if short_tracks == 1 { "" } else { "s" },
+                // THE LIMIT, not the effective budget. `effective_max` is what this
+                // pass could actually use after the free-space clamp, and it collapses
+                // to zero when the reserve is breached - so naming it printed "did not
+                // fit in 0 MiB", which is absurd on its face and names a number nobody
+                // set. `configured_max` is the cap in force (the user's limit when they
+                // have one, else the config), which is the knob this clause exists to
+                // point at. A breached reserve is a different sentence and the waiting
+                // clause above already says it, with its own shortfall.
+                Self::human_bytes(st.configured_max),
             ));
         }
         if st.given_up > 0 {
@@ -5999,6 +6016,61 @@ impl HypodjHandler {
     /// later - so no two surfaces can describe the same decision differently. It
     /// reads only what [`crate::store::RankedGroup`] carries and derives nothing, which
     /// is what makes the reason unable to drift from the decision.
+    /// Bytes a person can read: MiB below a gigabyte, GiB above it.
+    ///
+    /// The store's own [`Self::gib`] is right for budgets, which are always many
+    /// gigabytes, and wrong for a shortfall, which is often a few dozen megabytes -
+    /// where it prints `0.1 GiB` and answers nothing. One album's worth of music
+    /// should read as one album's worth of music.
+    fn human_bytes(n: u64) -> String {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
+        if n >= 1024 * MIB {
+            let g = n as f64 / (1024.0 * MIB as f64);
+            // NO TRAILING ".0". It is noise on the common case (every round cap: 16,
+            // 24, 32 GiB) and those two cells are not free - the badge is width-bound
+            // at 129 columns and steps whole reason clauses off the row when it
+            // overflows, so "16.0 GiB" versus "16 GiB" is literally the difference
+            // between showing both reasons and showing neither.
+            if (g - g.round()).abs() < 0.05 {
+                format!("{} GiB", g.round() as u64)
+            } else {
+                format!("{g:.1} GiB")
+            }
+        } else if n >= MIB {
+            format!("{} MiB", n / MIB)
+        } else {
+            // TOTAL, down to zero. Integer-dividing everything by a megabyte printed
+            // "0 MiB" for any smaller value, which reads as a broken formatter rather
+            // than a small number. Production never gets here (the config floor is
+            // 64 MiB) but the fixtures do, and a formatter that can emit nonsense in a
+            // test can emit it in the one edge case nobody predicted.
+            format!("{} KiB", n / KIB)
+        }
+    }
+
+    /// Why this group did not fit, in the terms a person decides on: how much music
+    /// they are missing, and how much more room it would have taken.
+    ///
+    /// Deliberately NOT [`Self::rank_reason`]. That function prints the integers the
+    /// comparator sorted on - cold decile, play counts, never-played, the incumbency
+    /// tiebreak - which is exactly right when the question is "why this order" and
+    /// exactly wrong when the question is "what am I missing and what do I do". The
+    /// two exist separately so the default view cannot drift back into forensics.
+    fn shortfall_reason(g: &crate::store::RankedGroup) -> String {
+        let mut s = format!("{} not on disk", Self::human_bytes(g.missing_bytes));
+        if g.over_by > 0 {
+            s.push_str(&format!("; needs {} more room", Self::human_bytes(g.over_by)));
+        }
+        // WHICH bound refused it, because the answer changes what the user should do:
+        // a budget they can raise is a different problem from space deliberately held
+        // back for hand-picked favourites.
+        if g.held_back_by_floor {
+            s.push_str(" (space held for hand-picked favourites)");
+        }
+        s
+    }
+
     fn rank_reason(g: &crate::store::RankedGroup) -> String {
         let mut s = format!(
             "cold {}/10 ({} of {} tracks, {} never played)",
@@ -6053,6 +6125,16 @@ impl HypodjHandler {
                 store.set_paused(false);
             }
             StoreCmd::Now => store.kick_full(),
+            StoreCmd::Limit(bytes) => {
+                // A write that FAILED must not report the numbers as if it had taken:
+                // the user would read the new size off the very response that failed
+                // to store it, and find the old one after a restart. Say so and stop.
+                if let Err(e) = store.set_budget_limit(bytes) {
+                    return MpdResponse::pairs()
+                        .pair("X-Store", format!("could not save the limit: {e}"))
+                        .build();
+                }
+            }
             StoreCmd::Show | StoreCmd::Frontier => {}
         }
         let st = store.status();
@@ -6069,6 +6151,14 @@ impl HypodjHandler {
             .pair("X-StoreEntries", st.entries.to_string())
             .pair("X-StoreBudget", st.effective_max.to_string())
             .pair("X-StoreBudgetConfigured", st.configured_max.to_string())
+            // THE LIMIT AND WHOSE IT IS. Two pairs rather than one, because a size
+            // with no source reads as immovable - which is precisely the belief that
+            // made the shortfall clause unactionable before `store limit` existed.
+            .pair("X-StoreLimit", store.budget_limit().to_string())
+            .pair(
+                "X-StoreLimitSource",
+                if store.budget_limit_is_users() { "user" } else { "config" },
+            )
             .pair("X-StoreBudgetSource", st.budget_source.label())
             .pair("X-StoreFree", st.avail.to_string())
             .pair("X-StoreReserve", st.reserve.to_string())
@@ -6080,13 +6170,16 @@ impl HypodjHandler {
             .pair("X-StoreWaiting", st.waiting.label())
             // LOAD-BEARING: without it a pending count that will NEVER reach zero is
             // indistinguishable from one that is merely slow.
-            .pair("X-StoreGivenUp", st.given_up.to_string())
-            // THE ACTIVE RULE, in one line, next to its own outcome. Rule and result
-            // readable together is what turns "clever" into "predictable" - he can
-            // tell a good decision from a bug only if he knows what was being
-            // decided - and it makes a future rule change self-documenting on the
-            // wire instead of a silent reshuffle.
-            .pair("X-StoreRule", crate::store::frontier_rule());
+            .pair("X-StoreGivenUp", st.given_up.to_string());
+        // THE ACTIVE RULE, and ONLY for `frontier`. Rule and result readable together
+        // is still the point - it is what lets a good decision be told from a bug -
+        // but the rule is 240 characters of ranking policy with no knob for any clause
+        // in it, and the DEFAULT view was printing it unconditionally above the two
+        // facts the user can actually act on. Someone reading `store frontier` has
+        // asked about the ranking; someone reading `store` has asked what they have.
+        if cmd == StoreCmd::Frontier {
+            b = b.pair("X-StoreRule", crate::store::frontier_rule());
+        }
         for (i, tier) in [
             crate::store::PinTier::Song,
             crate::store::PinTier::Album,
@@ -6141,7 +6234,14 @@ impl HypodjHandler {
                     d.missing_tracks,
                     d.missing_bytes,
                     d.tier.label(),
-                    Self::rank_reason(d),
+                    // THE SHORT REASON, not the comparator's evidence. The full
+                    // `rank_reason` belongs to `frontier`, where the ranking is the
+                    // question: in the default view its cold decile, play counts and
+                    // raw byte shortfall are forensics for a decision already made,
+                    // and they push the one number a person can act on off the end of
+                    // the line. What stays is what they would need to decide whether
+                    // to raise the limit.
+                    Self::shortfall_reason(d),
                 ),
             );
         }
@@ -26225,6 +26325,71 @@ mod tests {
     /// an accounting that does not balance - which is exactly what it was: a real
     /// mirror read "384 of 446 songs, 3 would not fit, 4 failed to download", leaving
     /// 55 songs unmentioned and no way to tell a working reconciler from a dead one.
+    /// `store limit` must SURVIVE A RESTART, or it is not a setting - a user who
+    /// shrinks the mirror because the disk is tight has not asked for that to last
+    /// until the daemon next starts, and silently reverting would refill the disk
+    /// they just cleared.
+    #[tokio::test]
+    async fn a_user_set_limit_persists_across_a_reopen_and_clears_back_to_config() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-limit");
+        let store = open_store(&dir);
+        let configured = store.config().max_bytes;
+        h.set_audio_store(store.clone());
+
+        // Unset: the configured cap is in force and says so.
+        assert_eq!(store.budget_limit(), configured);
+        assert!(!store.budget_limit_is_users());
+
+        let four_gib = 4 * 1024 * 1024 * 1024u64;
+        h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Limit(Some(four_gib)))).await;
+        assert_eq!(store.budget_limit(), four_gib);
+        assert!(store.budget_limit_is_users(), "and the source is now the user");
+
+        // THE POINT: a fresh open of the same directory still has it. This is what
+        // separates a setting from `store pause`, which is deliberately forgotten.
+        let reopened = open_store(&dir);
+        assert_eq!(reopened.budget_limit(), four_gib, "the limit outlived the store object");
+        assert!(reopened.budget_limit_is_users());
+        drop(reopened);
+
+        // Clearing goes back to the config, and is idempotent - clearing an unset
+        // limit is a no-op, not an error.
+        h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Limit(None))).await;
+        assert_eq!(store.budget_limit(), configured);
+        assert!(!store.budget_limit_is_users());
+        h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Limit(None))).await;
+        assert_eq!(open_store(&dir).budget_limit(), configured, "still cleared after a reopen");
+
+        // A too-small value CLAMPS UP rather than being refused: refusing is the one
+        // outcome that leaves the user with no mirror and no explanation.
+        h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Limit(Some(1)))).await;
+        assert_eq!(store.budget_limit(), crate::config::STORE_MIN_MAX_BYTES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The saved limit must not be mistaken for an orphan by the store's own
+    /// destructive convergence - which would delete the setting that decides how large
+    /// the directory may get.
+    #[tokio::test]
+    async fn convergence_does_not_eat_the_saved_limit() {
+        let dir = store_tmpdir("store-limit-converge");
+        let store = open_store(&dir);
+        store.set_budget_limit(Some(8 * 1024 * 1024 * 1024)).expect("save the limit");
+        let path = dir.join(crate::store::STORE_LIMIT_NAME);
+        assert!(path.is_file(), "the limit was written");
+
+        let scan = crate::store::scan_dir(&dir).expect("scan");
+        let orphans = format!("{scan:?}");
+        assert!(
+            !orphans.contains(crate::store::STORE_LIMIT_NAME),
+            "the limit is excluded from every scan category, exactly as the ownership \
+             marker is - otherwise the next pass deletes it: {orphans}"
+        );
+        assert!(path.is_file(), "and it is still there after the scan");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn the_badge_accounts_for_every_resident_song_and_never_double_counts() {
         let Some((h, _rx)) = handler_with_null_player() else { return };
@@ -26325,7 +26490,7 @@ mod tests {
              omitting the only songs that are actually moving: {badge}"
         );
         assert!(
-            badge.ends_with("1 song would not fit"),
+            badge.ends_with("1 song did not fit in 3 KiB"),
             "and the shortfall is counted, SINGULAR, in SONGS - the unit he listens in \
              and the only one that adds up (the pin GROUP count called them 'albums' \
              while counting starred songs and artists too): {badge}"
@@ -26415,13 +26580,20 @@ mod tests {
 
         let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Show)).await);
         let get = |k: &str| pairs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
-        // THE ACTIVE RULE, in one line, beside its own outcome - and single-sourced
-        // from the store, so it cannot describe a rule the comparator is not using.
+        // THE RULE IS NOT HERE. It is 240 characters of ranking policy with no knob
+        // for any clause in it, and printing it unconditionally put unusable detail
+        // above the two facts the user can act on. Someone reading `store` asked what
+        // they have; someone reading `store frontier` asked about the ranking, and
+        // that is where it now ships (asserted below).
         assert_eq!(
-            get("X-StoreRule").as_deref(),
-            Some(crate::store::frontier_rule().as_str()),
-            "the rule ships next to the result, or the result is unreadable"
+            get("X-StoreRule"),
+            None,
+            "the default view does not lecture about the ranking"
         );
+        // THE LIMIT IS here, and says whose it is - it is the one number on this view
+        // the user can change, and the badge points at it by name.
+        assert!(get("X-StoreLimit").is_some(), "the default view names the cap in force");
+        assert_eq!(get("X-StoreLimitSource").as_deref(), Some("config"));
 
         let deferred: Vec<&String> =
             pairs.iter().filter(|(k, _)| k == "Deferred").map(|(_, v)| v).collect();
@@ -26432,14 +26604,16 @@ mod tests {
             d.starts_with("album/al-fresh \"Played Last Week\" 1 tracks 900 bytes (album)"),
             "the existing shape leads: {d}"
         );
-        // Then the reason, in the integers the comparator actually compared.
-        assert!(d.contains("cold 0/10 (0 of 1 tracks, 0 never played)"), "{d}");
-        assert!(d.contains("103 plays"), "the evidence he can check it against: {d}");
-        assert!(d.contains("last 5d ago"), "{d}");
+        // Then the SHORT reason: what is missing and how much more room it needed, in
+        // units a person reads. NOT the comparator's evidence - deciles, play counts
+        // and raw byte shortfalls are forensics for a decision already made, and they
+        // belong to `frontier`, which is asserted to still carry them.
+        assert!(d.contains("not on disk"), "how much music is missing: {d}");
         assert!(
-            d.contains("bytes short after \"Never Touched\""),
-            "and what it actually lost to: {d}"
+            !d.contains("cold 0/10") && !d.contains("103 plays") && !d.contains("last 5d ago"),
+            "the ranking forensics stay out of the default view: {d}"
         );
+        assert!(!d.contains("bytes short"), "raw bytes are not a human unit here: {d}");
         // The bare `store` view stays the SHORTFALL list: the full order is a
         // different question and a different verb.
         assert!(!pairs.iter().any(|(k, _)| k == "Frontier"), "`store` names only what lost");
@@ -26458,9 +26632,22 @@ mod tests {
         store.publish_status_for_test(ranked_status_fixture());
 
         let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Frontier)).await);
+        // THE RULE SHIPS HERE, beside its own outcome, single-sourced from the store so
+        // it cannot describe a rule the comparator is not using. Moving it off the
+        // default view must not mean losing it: this is the half of that change that
+        // proves the detail was relocated rather than deleted.
+        assert_eq!(
+            pairs.iter().find(|(k, _)| k == "X-StoreRule").map(|(_, v)| v.as_str()),
+            Some(crate::store::frontier_rule().as_str()),
+            "the ranking view states the ranking rule"
+        );
         let rows: Vec<&String> =
             pairs.iter().filter(|(k, _)| k == "Frontier").map(|(_, v)| v).collect();
         assert_eq!(rows.len(), 2, "EVERY group, won or lost - not just the shortfall");
+        // And the comparator's own integers are still here, unchanged.
+        let joined = rows.iter().map(|r| r.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(joined.contains("cold "), "deciles survive on the ranking view: {joined}");
+        assert!(joined.contains(" plays"), "and the play counts: {joined}");
         // ...and ONLY that listing. The frontier already names every deferred group
         // in place, so also emitting the shortfall list makes the surface print all
         // of its rows and then repeat most of them - 176 lines where 91 were meant,

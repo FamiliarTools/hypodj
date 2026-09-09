@@ -259,10 +259,72 @@ fn route_three(verb: &str, word: &str, arg: &str, args: &[String]) -> Action {
             Ok(n) if n > 0 => Action::Command(format!("heard {word} {n}")),
             _ => Action::Nl(args.join(" ")),
         },
+        // `store limit <size>` is the ONE store gesture the shared router knows, and
+        // it is here so dj-gui's command bar can reach it: every other `store` word is
+        // intercepted by the `dj` CLI before `route()` and is therefore CLI-only, which
+        // is fine for read-only views but not for the single setting a user is told to
+        // change. Without this the TUI hands "store limit 24G" to the NL translator,
+        // which has no store action and would answer with a shrug.
+        ("store", "limit") => match arg.to_ascii_lowercase().as_str() {
+            "default" => Action::Command("store limit default".into()),
+            s => match parse_size(s) {
+                Some(n) => Action::Command(format!("store limit {n}")),
+                // Unparseable goes to NL rather than ACKing, matching `heard` above:
+                // in a command bar a typo should get a sentence back, not an error code.
+                None => Action::Nl(args.join(" ")),
+            },
+        },
         _ => Action::Nl(args.join(" ")),
     }
 }
 
+/// Parse a human size into bytes: `24G`, `1.5g`, `500M`, `64MiB`, or plain bytes.
+///
+/// BINARY units, because every other size hypodj prints is GiB and a `24G` that set
+/// 24_000_000_000 would quietly disagree with the `22.4 GiB` the badge then showed.
+/// Returns `None` for anything unparseable so the caller can print usage rather than
+/// send a number the user did not mean.
+pub fn parse_size(s: &str) -> Option<u64> {
+    // CASE-FOLDED HERE, not by the callers. Both of them happened to lowercase first,
+    // which hid that this function matched lowercase suffixes against a raw string:
+    // `parse_size("24G")` returned None while `dj store limit 24G` worked, so the bug
+    // was invisible until something called it directly. A parser owns its own grammar.
+    let s = s.trim().to_ascii_lowercase();
+    let s = s.as_str();
+    // Longest suffix first: `mib` must win over `m`, or `64mib` parses as `64mi` bytes.
+    const UNITS: [(&str, u64); 9] = [
+        ("tib", 1 << 40),
+        ("gib", 1 << 30),
+        ("mib", 1 << 20),
+        ("kib", 1 << 10),
+        ("t", 1 << 40),
+        ("g", 1 << 30),
+        ("m", 1 << 20),
+        ("k", 1 << 10),
+        ("b", 1),
+    ];
+    for (suffix, mult) in UNITS {
+        if let Some(head) = s.strip_suffix(suffix) {
+            let head = head.trim();
+            let n: f64 = head.parse().ok()?;
+            if !n.is_finite() || n <= 0.0 {
+                return None;
+            }
+            // Via f64 so `1.5G` works, then back to an integer: the daemon's contract
+            // is bytes and a fractional byte is not a thing.
+            let bytes = n * mult as f64;
+            if bytes >= u64::MAX as f64 {
+                return None;
+            }
+            return Some(bytes as u64);
+        }
+    }
+    // No suffix at all: plain bytes, integers only. `24` meaning 24 bytes is useless
+    // but honest, and the daemon clamps it up to the 64 MiB floor rather than
+    // refusing - so a user who meant 24G and typed 24 gets the floor and can see it
+    // in the very next line of output.
+    s.parse::<u64>().ok().filter(|n| *n > 0)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +332,18 @@ mod tests {
     fn r(s: &str) -> Action {
         let args: Vec<String> = s.split_whitespace().map(str::to_string).collect();
         route(&args)
+    }
+
+    /// The TUI's only path to the one store setting a user is told to change.
+    #[test]
+    fn store_limit_routes_to_a_command_so_the_tui_can_set_the_cache_size() {
+        assert_eq!(r("store limit 24G"), Action::Command(format!("store limit {}", 24u64 << 30)));
+        assert_eq!(r("store limit default"), Action::Command("store limit default".into()));
+        // Bytes on the wire, always: the client owns the spelling so two clients
+        // cannot set two different caches from the same words.
+        assert_eq!(r("store limit 500M"), Action::Command(format!("store limit {}", 500u64 << 20)));
+        // A typo in a command bar deserves a sentence back, not an ACK.
+        assert!(matches!(r("store limit plenty"), Action::Nl(_)));
     }
 
     #[test]

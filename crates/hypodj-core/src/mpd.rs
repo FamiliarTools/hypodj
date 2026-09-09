@@ -482,6 +482,15 @@ pub enum StoreCmd {
     Resume,
     /// Kick a full pass now instead of waiting out the interval.
     Now,
+    /// Set the user's own cache size, or clear it back to the configured cap with
+    /// `None`. The payload is BYTES: human spellings like `24G` are parsed by the
+    /// client, so the protocol carries one unambiguous integer and two clients can
+    /// never disagree about whether `G` meant 10^9 or 2^30.
+    ///
+    /// There is no `Limit` READ form. Reading is what [`StoreCmd::Show`] does, and it
+    /// already reports the limit and whose it is - a second read path would be a second
+    /// place for the answer to drift.
+    Limit(Option<u64>),
 }
 
 /// Parse a `store` request: the bare form, or one of the three nudges. Anything
@@ -494,6 +503,20 @@ fn parse_store(args: &[String], line: &str) -> MpdCommand {
         Some("pause") if args.len() == 1 => MpdCommand::Store(StoreCmd::Pause),
         Some("resume") if args.len() == 1 => MpdCommand::Store(StoreCmd::Resume),
         Some("now") if args.len() == 1 => MpdCommand::Store(StoreCmd::Now),
+        // Bare `store limit` is a READ, and the read is `Show` - which already carries
+        // the limit and its source. Routing it here rather than minting a second
+        // reporting path is what keeps one answer to "how big is the cache".
+        Some("limit") if args.len() == 1 => MpdCommand::Store(StoreCmd::Show),
+        Some("limit") if args.len() == 2 => match args[1].to_ascii_lowercase().as_str() {
+            "default" => MpdCommand::Store(StoreCmd::Limit(None)),
+            // BYTES ONLY on the wire. A bad number is a loud Unsupported ACK rather
+            // than a silent no-op: setting a cache size and having nothing happen is
+            // the one outcome the user cannot tell from success.
+            n => match n.parse::<u64>() {
+                Ok(n) if n > 0 => MpdCommand::Store(StoreCmd::Limit(Some(n))),
+                _ => MpdCommand::Unsupported(line.to_string()),
+            },
+        },
         _ => MpdCommand::Unsupported(line.to_string()),
     }
 }

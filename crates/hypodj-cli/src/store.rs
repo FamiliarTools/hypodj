@@ -21,18 +21,23 @@
 
 use hypodj_client::mpd::{MpdConn, MpdError};
 use hypodj_client::model;
+use hypodj_client::route::parse_size;
 
 const USAGE: &str = "\
 usage:
-  dj store                 the mirror: what is held, what is budgeted, and every
-                            favourite that did not fit, each with WHY it lost
-  dj store frontier        the whole ranked order, best to worst - what a refused
-                            group lost to is the line above it
+  dj store                 what is held, what is still coming, and every favourite
+                            that did not fit
+  dj store limit <size>    set how much disk the mirror may use (e.g. 24G, 500M).
+                            \"dj store limit default\" goes back to the configured cap
+  dj store frontier        the whole ranked order, best to worst, with the evidence
+                            each group was ranked on - what a refused group lost to
+                            is the line above it
   dj store now             run a full reconcile pass now instead of waiting
   dj store pause           suspend bulk mirroring for this daemon process
   dj store resume          resume it (and kick a pass)
 
-pause/resume/now are ACTIONS and are words only; the two views are read-only.";
+pause/resume/now/limit are ACTIONS and are words only; the two views are read-only.
+Sizes are binary (24G is 24 GiB) and are clamped up to 64 MiB, never rejected.";
 
 /// Run the `store` gesture. `words` are the argv tokens AFTER the leading `store`.
 ///
@@ -86,6 +91,19 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
         Some(b) => println!("store: {b}"),
         None => println!("store: (no summary yet)"),
     }
+    // THE LIMIT AND WHOSE IT IS, always - it is the one number on this view the user
+    // can change, and the badge above now points at it by name ("did not fit in
+    // 16.0 GiB"). Saying which source is in force is what stops a configured cap
+    // reading as immovable.
+    if let Some(limit) = find("X-StoreLimit").and_then(|s| s.parse::<u64>().ok()) {
+        let source = match find("X-StoreLimitSource") {
+            Some("user") => "set by you - \"dj store limit default\" to undo",
+            _ => "from the config - change it with \"dj store limit <size>\"",
+        };
+        println!("limit: {} ({source})", human(limit));
+    }
+    // The RULE only comes back on the frontier view now, so this prints itself
+    // exactly where it is the question and nowhere else.
     if let Some(rule) = find("X-StoreRule") {
         println!("rule: {rule}");
     }
@@ -147,9 +165,31 @@ fn verb_line(words: &[String]) -> Option<String> {
         // every view above is safe to mistype into (you read the wrong thing and look
         // again), while these change what the daemon is doing.
         word @ ("pause" | "resume" | "now") if rest.is_empty() => Some(format!("store {word}")),
+        // THE SIZE IS PARSED HERE, not daemon-side, so the wire carries one
+        // unambiguous integer. Two clients spelling `G` differently (10^9 vs 2^30)
+        // would otherwise set two different caches and both look right.
+        "limit" if rest.len() == 1 => match rest[0].to_ascii_lowercase().as_str() {
+            "default" => Some("store limit default".to_string()),
+            s => parse_size(s).map(|n| format!("store limit {n}")),
+        },
+        // Bare `limit` is a READ and the daemon answers it with the ordinary view.
+        "limit" if rest.is_empty() => Some("store".to_string()),
         _ => None,
     }
 }
+
+/// Bytes as a person reads them, matching the daemon's own badge formatting so the
+/// `limit:` line and the "did not fit in N" clause above it cannot print the same
+/// number two ways.
+fn human(n: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if n >= 1024 * MIB {
+        format!("{:.1} GiB", n as f64 / (1024.0 * MIB as f64))
+    } else {
+        format!("{} MiB", n / MIB)
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -181,6 +221,43 @@ mod tests {
         // A flag spelling would blur an ACTION into the read-only views beside it.
         assert_eq!(line(&["--pause"]), None);
         assert_eq!(line(&["--now"]), None);
+    }
+
+    #[test]
+    fn limit_parses_human_sizes_as_binary_and_refuses_nonsense() {
+        assert_eq!(parse_size("24G"), Some(24 * (1 << 30)));
+        assert_eq!(parse_size("24g"), Some(24 * (1 << 30)));
+        // BINARY, not decimal. A `24G` that meant 24_000_000_000 would disagree with
+        // the "22.4 GiB" the badge would then print for the very same setting.
+        assert_ne!(parse_size("24G"), Some(24_000_000_000));
+        assert_eq!(parse_size("500M"), Some(500 * (1 << 20)));
+        assert_eq!(parse_size("1.5G"), Some(1536 * (1 << 20)), "fractions are allowed");
+        // Longest suffix wins, or `64mib` would parse as `64mi` bytes.
+        assert_eq!(parse_size("64MiB"), Some(64 * (1 << 20)));
+        assert_eq!(parse_size("1TiB"), Some(1 << 40));
+        // A bare integer is bytes: useless at this scale but honest, and the daemon
+        // clamps it up to its floor rather than refusing.
+        assert_eq!(parse_size("1048576"), Some(1024 * 1024));
+        // Nonsense must not become a number the user did not mean.
+        assert_eq!(parse_size("big"), None);
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("-4G"), None);
+        assert_eq!(parse_size("0"), None);
+        assert_eq!(parse_size("0G"), None);
+        assert_eq!(parse_size("G"), None);
+    }
+
+    #[test]
+    fn limit_is_a_word_action_that_sends_bytes_and_default_clears() {
+        assert_eq!(line(&["limit", "24G"]), Some(format!("store limit {}", 24u64 << 30)));
+        assert_eq!(line(&["limit", "default"]), Some("store limit default".to_string()));
+        assert_eq!(line(&["limit", "DEFAULT"]), line(&["limit", "default"]));
+        // Bare `limit` READS, and reading is the ordinary view - there is one place
+        // the current size is reported, not two that could drift.
+        assert_eq!(line(&["limit"]), Some("store".to_string()));
+        // An unparseable size is a usage error, never a silently-sent number.
+        assert_eq!(line(&["limit", "lots"]), None);
+        assert_eq!(line(&["limit", "24G", "extra"]), None);
     }
 
     #[test]
