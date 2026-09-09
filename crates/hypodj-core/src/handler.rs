@@ -6039,13 +6039,15 @@ impl HypodjHandler {
             }
         } else if n >= MIB {
             format!("{} MiB", n / MIB)
+        } else if n >= KIB {
+            format!("{} KiB", n / KIB)
         } else {
-            // TOTAL, down to zero. Integer-dividing everything by a megabyte printed
-            // "0 MiB" for any smaller value, which reads as a broken formatter rather
-            // than a small number. Production never gets here (the config floor is
+            // TOTAL, down to zero. Integer division printed "0 MiB", then "0 KiB", for
+            // any value below the unit - which reads as a broken formatter rather than
+            // a small number. Production never reaches here (the config floor is
             // 64 MiB) but the fixtures do, and a formatter that can emit nonsense in a
             // test can emit it in the one edge case nobody predicted.
-            format!("{} KiB", n / KIB)
+            format!("{n} bytes")
         }
     }
 
@@ -6058,7 +6060,12 @@ impl HypodjHandler {
     /// exactly wrong when the question is "what am I missing and what do I do". The
     /// two exist separately so the default view cannot drift back into forensics.
     fn shortfall_reason(g: &crate::store::RankedGroup) -> String {
-        let mut s = format!("{} not on disk", Self::human_bytes(g.missing_bytes));
+        let mut s = format!(
+            "{} song{}, {} not on disk",
+            g.missing_tracks,
+            if g.missing_tracks == 1 { "" } else { "s" },
+            Self::human_bytes(g.missing_bytes)
+        );
         if g.over_by > 0 {
             s.push_str(&format!("; needs {} more room", Self::human_bytes(g.over_by)));
         }
@@ -6227,13 +6234,17 @@ impl HypodjHandler {
         for d in st.deferred().into_iter().filter(|_| cmd != StoreCmd::Frontier) {
             b = b.pair(
                 "Deferred",
+                // NAME FIRST, and no raw id or raw byte count. The old head led with
+                // `album/319RIWIjTOSnjEVqY85imB ... 124583172 bytes`, which is a key
+                // and a figure a person cannot use, sitting in front of the album name
+                // they actually recognise. This DOES change the pair's shape, and that
+                // is deliberate rather than overlooked: `store frontier` still emits
+                // every group with the uri, the exact byte counts and the tier, so the
+                // machine-readable form was relocated, not deleted - and the only
+                // in-repo consumer of this pair prints it verbatim to a human.
                 format!(
-                    "{} \"{}\" {} tracks {} bytes ({}) - {}",
-                    d.uri(),
+                    "\"{}\" - {} ({})",
                     d.name,
-                    d.missing_tracks,
-                    d.missing_bytes,
-                    d.tier.label(),
                     // THE SHORT REASON, not the comparator's evidence. The full
                     // `rank_reason` belongs to `frontier`, where the ranking is the
                     // question: in the default view its cold decile, play counts and
@@ -6242,6 +6253,12 @@ impl HypodjHandler {
                     // the line. What stays is what they would need to decide whether
                     // to raise the limit.
                     Self::shortfall_reason(d),
+                    // WHY it is even a candidate, which is the question the name alone
+                    // raises: "Klangstof - Everest EP" looks like an album the user
+                    // starred, when in fact they starred the ARTIST and this is one of
+                    // their other records - which is exactly why it sorts last and
+                    // loses first.
+                    d.tier.label(),
                 ),
             );
         }
@@ -26518,8 +26535,8 @@ mod tests {
             pairs.iter().filter(|(k, _)| k == "Deferred").map(|(_, v)| v).collect();
         assert_eq!(deferred.len(), 1, "one group did not fit");
         assert!(
-            deferred[0].contains("album/al-big") && deferred[0].contains("A Big Album"),
-            "the shortfall names the album: {}",
+            deferred[0].contains("A Big Album") && !deferred[0].contains("al-big"),
+            "the shortfall names the ALBUM a person recognises, not its id: {}",
             deferred[0]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -26601,9 +26618,15 @@ mod tests {
         let d = deferred[0];
         // The unchanged head, so anything already parsing this pair keeps working.
         assert!(
-            d.starts_with("album/al-fresh \"Played Last Week\" 1 tracks 900 bytes (album)"),
-            "the existing shape leads: {d}"
+            d.starts_with("\"Played Last Week\" - 1 song,"),
+            "the NAME leads, not a raw id and a raw byte count: {d}"
         );
+        assert!(d.ends_with("(album)"), "and why it was a candidate at all: {d}");
+        assert!(!d.contains("al-fresh"), "no raw id on the human view: {d}");
+        // Sizes go through the human formatter, which on this deliberately tiny
+        // fixture prints bytes - that is the formatter being total, not raw output
+        // leaking. What must not appear is the ranking evidence, asserted below.
+        assert!(d.contains("not on disk"), "and how much music is missing: {d}");
         // Then the SHORT reason: what is missing and how much more room it needed, in
         // units a person reads. NOT the comparator's evidence - deciles, play counts
         // and raw byte shortfalls are forensics for a decision already made, and they

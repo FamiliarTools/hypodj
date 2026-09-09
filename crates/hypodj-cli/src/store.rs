@@ -182,11 +182,23 @@ fn verb_line(words: &[String]) -> Option<String> {
 /// `limit:` line and the "did not fit in N" clause above it cannot print the same
 /// number two ways.
 fn human(n: u64) -> String {
-    const MIB: u64 = 1024 * 1024;
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
     if n >= 1024 * MIB {
-        format!("{:.1} GiB", n as f64 / (1024.0 * MIB as f64))
-    } else {
+        let g = n as f64 / (1024.0 * MIB as f64);
+        // Matches the daemon's own rule, INCLUDING dropping a trailing ".0". Shipping
+        // without this printed `did not fit in 16 GiB` on the badge and
+        // `limit: 16.0 GiB` two lines below it - one number, two spellings, on the one
+        // view whose job is to make that number feel changeable.
+        if (g - g.round()).abs() < 0.05 {
+            format!("{} GiB", g.round() as u64)
+        } else {
+            format!("{g:.1} GiB")
+        }
+    } else if n >= MIB {
         format!("{} MiB", n / MIB)
+    } else {
+        format!("{} KiB", n / KIB)
     }
 }
 
