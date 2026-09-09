@@ -5922,6 +5922,19 @@ impl HypodjHandler {
             if moving > 0 {
                 head.push_str(&format!(" - {moving} still coming"));
             }
+            // THE GAUGE RIDES THE HEAD, not the size clause it describes, because the
+            // clients drop clause index 1 to build the badge - so anything put beside
+            // the gigabytes is invisible on the one surface that is always on screen.
+            // Against `configured_max`, the cap in force (the user's limit when they
+            // have set one), NOT `effective_max`. The effective budget collapses to
+            // zero when the free-space reserve is breached, which would slam the gauge
+            // to full and blame the cache size for a disk problem - a different
+            // sentence that the waiting clause already makes, with its own shortfall.
+            let gauge = Self::fill_gauge(st.bytes, st.configured_max);
+            if !gauge.is_empty() {
+                head.push(' ');
+                head.push_str(&gauge);
+            }
             (
                 head,
                 Some(format!(
@@ -5977,18 +5990,14 @@ impl HypodjHandler {
             // whole bug. Carrying the limit in the clause makes it self-anchoring, and
             // it is now a number he can change (`dj store limit`), which is what
             // earns it the cells.
+            // "LEFT OUT", a verdict, not "did not fit in 16 GiB", a physical claim
+            // needing a referent. The gauge in the head now shows the fullness the old
+            // clause was trying to name, so the words no longer have to carry the
+            // number - which is what a picture is for. Shorter too, and the badge pays
+            // for every cell.
             line.push_str(&format!(
-                ", {short_tracks} song{} did not fit in {}",
+                ", {short_tracks} song{} left out",
                 if short_tracks == 1 { "" } else { "s" },
-                // THE LIMIT, not the effective budget. `effective_max` is what this
-                // pass could actually use after the free-space clamp, and it collapses
-                // to zero when the reserve is breached - so naming it printed "did not
-                // fit in 0 MiB", which is absurd on its face and names a number nobody
-                // set. `configured_max` is the cap in force (the user's limit when they
-                // have one, else the config), which is the knob this clause exists to
-                // point at. A breached reserve is a different sentence and the waiting
-                // clause above already says it, with its own shortfall.
-                Self::human_bytes(st.configured_max),
             ));
         }
         if st.given_up > 0 {
@@ -6016,6 +6025,45 @@ impl HypodjHandler {
     /// later - so no two surfaces can describe the same decision differently. It
     /// reads only what [`crate::store::RankedGroup`] carries and derives nothing, which
     /// is what makes the reason unable to drift from the decision.
+    /// How full the cache is, as discs: `[◉◉◉◉◉◉◉◉◎◎]`.
+    ///
+    /// A GAUGE RATHER THAN A RATIO, because the question it answers is not "how many
+    /// gigabytes" but "is there room" - and that is a shape, read at a glance, not two
+    /// numbers to subtract. It also repairs the referent problem structurally: the
+    /// clause "did not fit" pointed at a budget that `store_badge` DROPS positionally,
+    /// so the number was never on screen; a gauge in the HEAD clause survives that drop
+    /// and shows the fullness the sentence is talking about.
+    ///
+    /// `◉` and `◎` both read as a disc with a centre hole, which is the object being
+    /// described. Both are single-width on any terminal that renders the bottom-bar
+    /// wave correctly - that wave is already built from East-Asian-Ambiguous block
+    /// characters, so this adds no new width assumption.
+    ///
+    /// Ten cells, fixed: a gauge whose length moved with the value would be unreadable
+    /// as a proportion, which is the only thing it is for. Rounds to the NEAREST cell
+    /// but never shows empty while any bytes are held, and never shows full below the
+    /// limit - the two lies a rounded gauge would otherwise tell at the ends.
+    fn fill_gauge(used: u64, total: u64) -> String {
+        const CELLS: u64 = 10;
+        if total == 0 {
+            return String::new();
+        }
+        let mut filled = (used.min(total) * CELLS + total / 2) / total;
+        if filled == 0 && used > 0 {
+            filled = 1;
+        }
+        if filled == CELLS && used < total {
+            filled = CELLS - 1;
+        }
+        let mut s = String::with_capacity(CELLS as usize * 3 + 2);
+        s.push('[');
+        for i in 0..CELLS {
+            s.push(if i < filled { '◉' } else { '◎' });
+        }
+        s.push(']');
+        s
+    }
+
     /// Bytes a person can read: MiB below a gigabyte, GiB above it.
     ///
     /// The store's own [`Self::gib`] is right for budgets, which are always many
@@ -26342,6 +26390,28 @@ mod tests {
     /// an accounting that does not balance - which is exactly what it was: a real
     /// mirror read "384 of 446 songs, 3 would not fit, 4 failed to download", leaving
     /// 55 songs unmentioned and no way to tell a working reconciler from a dead one.
+    #[test]
+    fn the_fill_gauge_never_reads_empty_when_held_nor_full_when_it_is_not() {
+        let g = |u, t| HypodjHandler::fill_gauge(u, t);
+        assert_eq!(g(0, 100), "[\u{25ce}\u{25ce}\u{25ce}\u{25ce}\u{25ce}\u{25ce}\u{25ce}\u{25ce}\u{25ce}\u{25ce}]");
+        assert_eq!(g(100, 100), "[\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}]");
+        assert_eq!(g(50, 100), "[\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25ce}\u{25ce}\u{25ce}\u{25ce}\u{25ce}]");
+        // THE TWO LIES A ROUNDED GAUGE TELLS AT THE ENDS. A mirror holding real music
+        // must not read as empty, and one with room left must not read as full - those
+        // are exactly the two states the user would act on.
+        let discs = |s: String| s.chars().filter(|c| *c == '\u{25c9}').count();
+        assert_eq!(discs(g(1, 100)), 1, "1% shows one disc, not none");
+        assert_eq!(discs(g(99, 100)), 9, "99% keeps one hollow, not full");
+        assert_eq!(discs(g(4, 100)), 1, "and ordinary rounding still rounds");
+        // Over the cap clamps rather than overflowing the string.
+        assert_eq!(g(500, 100), g(100, 100));
+        // No cap means no gauge at all, rather than a divide by zero or a full bar.
+        assert_eq!(g(10, 0), "");
+        for (u, t) in [(0u64, 16u64), (4, 16), (8, 16), (15, 16), (16, 16)] {
+            println!("{:>2}/{} {}", u, t, g(u * (1 << 30), t * (1 << 30)));
+        }
+    }
+
     /// `store limit` must SURVIVE A RESTART, or it is not a setting - a user who
     /// shrinks the mirror because the disk is tight has not asked for that to last
     /// until the daemon next starts, and silently reverting would refill the disk
@@ -26444,7 +26514,7 @@ mod tests {
             .expect("the badge is present once a pass published");
 
         assert!(
-            badge.starts_with("0 of 10 songs - 7 still coming"),
+            badge.starts_with("0 of 10 songs - 7 still coming ["),
             "the in-flight count is pending MINUS given-up (10 - 3), never bare \
              pending: counting a stalled id as both 'coming' and 'will not download' \
              makes the clauses sum past the total: {badge}"
@@ -26501,13 +26571,13 @@ mod tests {
             .map(|(_, v)| v.clone())
             .expect("the badge is present once a pass published");
         assert!(
-            badge.starts_with("0 of 1 songs - 1 still coming"),
+            badge.starts_with("0 of 1 songs - 1 still coming ["),
             "cached/resident songs lead, and the head names the IN-FLIGHT count too: a \
              line that gives only the static reasons reads as a full accounting while \
              omitting the only songs that are actually moving: {badge}"
         );
         assert!(
-            badge.ends_with("1 song did not fit in 3 KiB"),
+            badge.ends_with("1 song left out"),
             "and the shortfall is counted, SINGULAR, in SONGS - the unit he listens in \
              and the only one that adds up (the pin GROUP count called them 'albums' \
              while counting starred songs and artists too): {badge}"

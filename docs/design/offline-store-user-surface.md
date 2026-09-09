@@ -60,6 +60,33 @@ clause is the size. **The TUI never shows the GiB budget.** Any wording that
 refers to the budget must carry its own referent, because the number it points at
 is not on screen.
 
+## Fullness is a picture, not a ratio
+
+The cache gauge is `[◉◉◉◉◉◉◉◉◉◎]`: ten fixed cells, filled discs for
+used, hollow for free. It answers "is there room", which is a shape read at a
+glance, rather than "how many gigabytes", which is two numbers to subtract.
+
+It sits in the HEAD clause and not beside the sizes it describes. That is
+forced: `store_badge` drops clause index 1 positionally, so a gauge placed with
+the gigabytes would never appear on the TUI - the one surface it is for.
+
+It also repairs the referent problem structurally rather than verbally. The old
+clause "did not fit in 16 GiB" had to name a number precisely because the budget
+was invisible; with the gauge on screen the verdict can just be "3 songs left
+out" and the picture supplies the why. That is why the wording got shorter and
+the line did not get longer: the gauge is paid for by the words it replaced.
+
+Two rounding lies are suppressed at the ends, because they are exactly the two
+states worth acting on: a mirror holding real music never reads empty, and one
+with room left never reads full.
+
+`◉` (U+25C9 fisheye) and `◎` (U+25CE bullseye) both read as a disc with a centre
+hole. Character width is a live hazard here - most box and geometric glyphs are
+East Asian Ambiguous, and a terminal rendering them double-width would silently
+blow the 129-column budget. These are safe on any terminal that draws the
+bottom-bar wave correctly, because that wave is already built from Ambiguous
+block characters.
+
 ## The line must account for every song
 
 The badge said this for months:
@@ -78,7 +105,7 @@ are a subset of pending, so the in-flight count subtracts them; without that a
 stalled song is counted once as coming and again as terminal.
 
 ```
-384 of 446 songs - 58 still coming, 15.1 of 16.0 GiB, 3 songs did not fit in 16 GiB, 4 songs will not download
+384 of 446 songs - 62 still coming [◉◉◉◉◉◉◉◉◉◎], 15.9 of 16.0 GiB, 3 songs left out, 4 songs will not download
 ```
 
 The head is joined with ` - ` and not `, ` because the clients split on `, ` and
@@ -115,10 +142,9 @@ All four findings from the audit are fixed:
   `shortfall_reason`, which says how much music is missing and how much more room
   it needed, in MiB/GiB rather than raw bytes. Two formatters exist on purpose so
   the default view cannot drift back into forensics.
-- "would not fit" became "did not fit in 16 GiB" - self-anchoring, and now
-  pointing at a number the user can change with `dj store limit`. The trailing
-  `.0` was dropped from whole-gigabyte sizes to buy the cells this cost: at 129
-  columns the longer clause needed exactly one character to avoid stepping down.
+- "would not fit" became "left out", a verdict rather than a physical claim,
+  with a fullness gauge in the head supplying the referent the words used to
+  have to carry. See "Fullness is a picture" above.
 - `dj mark` in the top-level help is four lines instead of seven.
 
 ## Open questions

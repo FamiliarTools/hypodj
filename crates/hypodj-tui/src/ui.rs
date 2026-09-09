@@ -1513,15 +1513,16 @@ mod tests {
         // Exactly what `store_status_pairs` builds for the live mirror on bubble-gum:
         // 384 held, 58 in flight, 4 given up (384 + 58 + 4 == 446), 3 below the line.
         s.now.store = Some(
-            "384 of 446 songs - 58 still coming, 15.1 of 16.0 GiB, 3 songs did not \
-             fit in 16 GiB, 4 songs will not download"
+            "384 of 446 songs - 62 still coming [\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}], \
+             15.9 of 16.0 GiB, 3 songs left out, 4 songs will not download"
                 .into(),
         );
         let out = render_to_lines_sized(&s, 129, 30).join("\n");
         assert!(
             out.contains(
-                "offline: 384 of 446 songs - 58 still coming, 3 songs did not fit in \
-                 16 GiB, 4 songs will not download"
+                "offline: 384 of 446 songs - 62 still coming \
+                 [\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}\u{25c9}], \
+                 3 songs left out, 4 songs will not download"
             ),
             "the FULL badge survives at 129 columns - not the `(held)` step-down, which \
              would trade both reasons away for the size clause:\n{out}"
