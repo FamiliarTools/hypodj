@@ -5,6 +5,7 @@ understanding evolves, unlike the dated snapshots in `../research/`.
 
 - [hypodj offline store: final design](offline-audio-store.md) - the on-disk audio store: validity model, commit protocol, reconciler, eviction.
 - [The offline store's user-facing surface](offline-store-user-surface.md) - what the badge and `dj store` may say, and the width constraint that governs it.
+- [Attention and detail: the hint and info system](attention-and-detail.md) - dwell-driven cover peek and the `i` detail card; depth as a derived value, not an event.
 - [Audio capture from a stream: rewind, do not record](audio-capture.md) - the tape, and why it is a rewind buffer rather than a recorder.
 - [Continuous identification](continuous-identify.md) - why the always-on layer is substrate and the press is the feature.
 - [Beyond: reaching past the shelf](discovery-beyond.md) - discovery outside the owned library.
