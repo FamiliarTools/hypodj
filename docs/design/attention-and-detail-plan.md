@@ -12,6 +12,17 @@ leaves the app working.
 
 **Smallest slice that delivers value:** Steps 1-3: the `i` detail card rendered entirely from pairs the client already receives once push_song_tags stops dropping them. One daemon emission fix, one extracted scroll helper, one heard-shaped overlay + KEYMAP row. Zero new sockets, zero new fetches, zero dwell machinery - and the user already gets title/artist/album/year, play count, last played, starred, rating, format/bitrate/size, and offline residency for any row. Everything after it (dwell, verb, worker, peek) layers on without reworking it.
 
+## Progress
+
+Steps 1-3 shipped and deployed 2026-09-10 (`fc2bd96`). Live-verified: the new
+per-row pairs are on the wire (`X-Size`, `X-Suffix`, `X-Type`, `X-Added`,
+`X-CoverArt`), and absent where the server has no value.
+
+One deliberate deviation: step 1's per-row `X-Offline` was NOT built. It is
+visible to every MPD client, not only the card, which is one of the decisions
+listed at the end of this document. `AudioStore::resident()` exists and is
+ready for it. The card therefore has no offline row yet.
+
 ## Steps
 
 ### 1. Make push_song_tags whole + per-song X-Offline (daemon emission fix, no new verb)
