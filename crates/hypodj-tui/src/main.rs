@@ -254,6 +254,17 @@ fn event_loop(
         }
         // Keep album art in step: on a track-uri change, ask the art worker (once).
         request_art(&workers.art_tx, state);
+        // Stamp where the cursor is, AFTER key dispatch and after inbound responses have
+        // been applied, so it records the settled row for this frame rather than an
+        // intermediate one. This is the whole dwell mechanism: no timer, no tick, no
+        // thread - the loop already redraws unconditionally at 50ms or better, so
+        // "resting" is a comparison against this stamp.
+        // ONE clock read for the frame - `frame_now`, already taken at the top. Two
+        // separate Instant::now() calls here would let the stamp and the dwell
+        // comparison disagree inside a single frame.
+        state.note_selection(frame_now);
+        // The peek: one more want-vs-held diff in the same block, for the same reason.
+        request_peek(&workers.art_tx, state, frame_now);
         // Keep the album sigil in step: rebuild only when the album identity changes
         // (static, cached - never regenerated per frame).
         update_sigil(state);
@@ -556,11 +567,15 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
             }
         }
         Inbound::Art { key, art } => {
-            // Adopt only if it is still the art the current now-playing wants (a late
-            // fetch for a since-changed track OR a stale cover of the same stream uri
-            // is discarded).
-            if art_want(&state.now) == Some(key) {
+            // TWO SUBJECTS share one worker, so the reply is routed by which one still
+            // wants it. The now-playing gate is unchanged; the peek gate is the same
+            // want-vs-key comparison against the rested row. A reply nobody wants any
+            // more is dropped rather than cancelled - a superseded fetch completes,
+            // costs nothing, and is discarded here.
+            if art_want(&state.now) == Some(key.clone()) {
                 state.art = art;
+            } else if state.peek_req_key.as_ref() == Some(&key.0) {
+                state.peek = Some((key.0, art));
             }
         }
         Inbound::Connected { epoch } => {
@@ -759,6 +774,59 @@ fn request_art(art_tx: &Sender<(String, Option<String>)>, state: &mut TuiState) 
                 state.art = None;
             }
         }
+    }
+}
+
+/// How long the cursor must rest before a cover is worth fetching.
+///
+/// A guess, deliberately one constant so it can be tuned in one place. Long enough that
+/// scrolling a long list asks for nothing, short enough that a deliberate pause feels
+/// answered rather than delayed.
+const PEEK_REST: Duration = Duration::from_millis(350);
+
+/// Ask the art worker for the RESTED row's cover, at most once per row.
+///
+/// The third instance of `request_art`'s shape: compute what the current state wants,
+/// compare against what was last asked for, fire only on a change. Everything awkward
+/// falls out of that rather than needing its own case - a held arrow key wants nothing
+/// because the row never rests, a burst of frames on one row asks once, and a reply for
+/// a row the cursor has left is dropped at the gate.
+///
+/// GATED TO THE LIST SCREENS. The art pane is global chrome, so peeking on every screen
+/// would swap its meaning app-wide - including on the DJ view, where the pane sits beside
+/// a chat the user is typing into and a preview would be pure distraction. Where there is
+/// no list under the cursor there is nothing to preview.
+///
+/// Only `song/<id>` rows can be peeked: the daemon's albumart path rejects an
+/// `album/<id>` uri, so an Albums row has no cover to ask for through this route.
+fn request_peek(art_tx: &Sender<(String, Option<String>)>, state: &mut TuiState, now: Instant) {
+    let peekable = matches!(
+        state.screen,
+        Screen::Queue | Screen::Find | Screen::Albums | Screen::Playlists
+    );
+    let want: Option<String> = if peekable && state.attention_depth(now, PEEK_REST) >= 1 {
+        state
+            .sel_key
+            .as_ref()
+            .and_then(|t| t.uri.clone())
+            .filter(|u| u.starts_with("song/"))
+    } else {
+        None
+    };
+    if state.peek_req_key == want {
+        return;
+    }
+    state.peek_req_key = want.clone();
+    match want {
+        // The peek is CLEARED on the way out, unlike now-playing art which is held
+        // until its replacement lands. The reasons invert: holding a stale cover under
+        // a moved cursor would claim the wrong row, while a moment of no preview simply
+        // shows what is playing, which is the pane's ordinary meaning.
+        Some(uri) => {
+            state.peek = None;
+            let _ = art_tx.send((uri, None));
+        }
+        None => state.peek = None,
     }
 }
 
@@ -995,6 +1063,73 @@ mod tests {
         request_art(&tx, &mut state);
         assert!(state.art.is_none(), "a coverless stream clears the held cover");
         assert!(rx.try_iter().next().is_none());
+    }
+
+    /// The peek is a reconciler, so the two things worth pinning are what it does NOT
+    /// do: fire during a scroll, and touch the now-playing cover.
+    #[test]
+    fn the_peek_asks_once_per_rested_row_and_never_touches_now_playing_art() {
+        use std::sync::mpsc::channel;
+        let (tx, rx) = channel::<(String, Option<String>)>();
+        let mut state = TuiState::new();
+        state.screen = Screen::Queue;
+        state.queue = vec![qitem("song/1"), qitem("song/2")];
+        state.selected = 0;
+        // A cover is held for what is PLAYING. It must survive everything below.
+        state.art = Some(crate::art::AlbumArt::for_test_solid([1, 2, 3]));
+
+        let t0 = Instant::now();
+        // SCROLLING asks for nothing: the row never rests, so there is no want at all.
+        for ms in [0u64, 40, 80, 120] {
+            state.selected = (ms / 40) as usize % 2;
+            state.note_selection(t0 + Duration::from_millis(ms));
+            request_peek(&tx, &mut state, t0 + Duration::from_millis(ms));
+        }
+        assert!(rx.try_recv().is_err(), "a moving cursor generates no fetch");
+
+        // RESTING asks exactly once, however many frames pass.
+        state.selected = 0;
+        state.note_selection(t0);
+        for ms in [350u64, 400, 500, 900] {
+            state.note_selection(t0 + Duration::from_millis(ms));
+            request_peek(&tx, &mut state, t0 + Duration::from_millis(ms));
+        }
+        assert_eq!(rx.try_recv().map(|k| k.0).ok(), Some("song/1".to_string()));
+        assert!(rx.try_recv().is_err(), "one request per rested row, not one per frame");
+
+        // The now-playing cover is UNTOUCHED, which is what keeps the waveform hue and
+        // the sigil palette from flickering every time the cursor settles.
+        assert!(state.art.is_some(), "the peek never writes state.art");
+
+        // A late reply for a row the cursor has LEFT is dropped rather than shown.
+        state.selected = 1;
+        state.note_selection(t0 + Duration::from_millis(1000));
+        request_peek(&tx, &mut state, t0 + Duration::from_millis(1400));
+        let _ = rx.try_recv();
+        apply_inbound(
+            &channel().0,
+            &mut state,
+            Inbound::Art {
+                key: ("song/1".to_string(), None),
+                art: Some(crate::art::AlbumArt::for_test_solid([9, 9, 9])),
+            },
+        );
+        assert!(
+            state.peek.as_ref().is_none_or(|(u, _)| u != "song/1"),
+            "a reply for the abandoned row is not adopted"
+        );
+        assert!(state.art.is_some(), "and it still did not clobber now-playing");
+    }
+
+    fn qitem(uri: &str) -> hypodj_client::model::QueueItem {
+        hypodj_client::model::QueueItem {
+            pos: 0,
+            title: uri.to_string(),
+            artist: None,
+            uri: Some(uri.to_string()),
+            album_uri: None,
+            details: Vec::new(),
+        }
     }
 
     #[test]

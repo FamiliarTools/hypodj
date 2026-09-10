@@ -660,7 +660,13 @@ pub fn stream_headline(np: &NowPlaying) -> (String, Option<String>) {
 /// Left of Now Playing: the dithered album art with title/artist/album beneath it.
 fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     let np = &state.now;
-    let block = Block::default().borders(Borders::ALL).title("Now Playing");
+    // THE TITLE FOLLOWS THE IMAGE. A pane that silently shows a different album than
+    // the one playing is the whole risk of peeking here, and the honest fix is one word:
+    // while a preview is up the pane says so, so the cover is never read as the deck.
+    let previewing = state.peek.as_ref().is_some_and(|(_, a)| a.is_some());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if previewing { "Preview" } else { "Now Playing" });
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -749,7 +755,15 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
             _ => (art_rows * 2).min(inner.width as usize),
         };
         let art_area = Rect { x: inner.x, y: inner.y, width: art_cols as u16, height: art_h };
-        match &state.art {
+        // The PEEK wins the image slot when one is held, and nothing else. Every other
+        // consumer of the cover - the waveform hue, the sigil palette - keeps reading
+        // `state.art`, so a rested cursor changes one rectangle and does not recolour
+        // the interface.
+        let shown = match &state.peek {
+            Some((_, Some(a))) => Some(a),
+            _ => state.art.as_ref(),
+        };
+        match shown {
             // A real cover is always preferred. Sixel when the terminal can draw it,
             // else the cell renderers.
             Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px, state.sixel_gen.get(), &state.sixel_held, state.sixel_covered.get()) => {}

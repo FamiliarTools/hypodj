@@ -456,6 +456,61 @@ fn scrub_intent(secs: i32) -> Intent {
     Intent::Command(format!("seekcur {arg}"))
 }
 
+/// How long the cursor has rested on the current row, or `None` when it has not
+/// settled anywhere (no row, or the stamp has not been taken yet).
+///
+/// Takes `now` as an ARGUMENT rather than reading the clock, so every test of the
+/// depth ladder is exact and instant instead of sleeping.
+impl TuiState {
+    pub(crate) fn resting_for(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let since = self.sel_since?;
+        self.sel_key.as_ref()?;
+        Some(now.saturating_duration_since(since))
+    }
+
+    /// Record where the cursor is. Re-stamps ONLY when the row actually changed, which
+    /// is what makes a held arrow key cost one comparison per frame rather than
+    /// resetting a timer per keypress.
+    ///
+    /// Called after key dispatch and after inbound responses are applied, so it sees the
+    /// settled cursor for the frame rather than an intermediate position.
+    pub(crate) fn note_selection(&mut self, now: std::time::Instant) {
+        let want = self.cursor_target();
+        if self.sel_key.as_ref().map(|t| &t.label) == want.as_ref().map(|t| &t.label)
+            && self.sel_key.as_ref().map(|t| &t.uri) == want.as_ref().map(|t| &t.uri)
+        {
+            return;
+        }
+        self.sel_key = want;
+        self.sel_since = self.sel_key.as_ref().map(|_| now);
+    }
+
+    /// The depth of attention on the current row: how much the user has shown they want.
+    ///
+    /// A PURE FUNCTION of settled state, recomputed every frame - never an event, never
+    /// a timer callback. That is what collapses scroll bursts, reconnects, cold start
+    /// and a key pressed mid-fetch into one code path: the next frame.
+    ///
+    /// 0 - the row is merely on screen. 1 - the cursor has rested, so a cover peek is
+    /// wanted. 2 - the card is open, which is an explicit ask and needs no dwell.
+    ///
+    /// An OPEN OVERLAY pins depth to 0 for anything passive: while the help, heard or
+    /// menu overlay is up, the eye is not on the list at all, so resting there is not
+    /// evidence of interest in a row it cannot see.
+    pub(crate) fn attention_depth(&self, now: std::time::Instant, rest: std::time::Duration) -> u8 {
+        if self.card.is_some() {
+            return 2;
+        }
+        if self.help_open || self.heard_open || self.menu.is_some() {
+            return 0;
+        }
+        match self.resting_for(now) {
+            Some(d) if d >= rest => 1,
+            _ => 0,
+        }
+    }
+}
+
 /// A scrollable overlay's offset, plus the max the RENDERER last measured.
 ///
 /// The pair has to travel together or the clamp is a lie: the key handler cannot know
@@ -592,6 +647,36 @@ pub struct TuiState {
     /// swapping the cover on the same uri each fires exactly one fetch, never per
     /// frame (task kmrhj8m).
     pub art_req_key: Option<(String, Option<String>)>,
+    /// The row the cursor is on, as of the last frame, and when it arrived there.
+    ///
+    /// THE WHOLE DWELL MECHANISM. There is no timer, no tick and no thread: the render
+    /// loop already free-runs at 50ms or better with an unconditional redraw, so
+    /// "resting" is a comparison against a stamp, recomputed once per frame in the same
+    /// reconcile block as `request_art`. Worst-case latency is the rest delay plus one
+    /// frame.
+    ///
+    /// Keyed on the cursor TARGET rather than the selected index, because an index is
+    /// not identity: switching screens or drilling into a Find hit changes the row under
+    /// the eye without necessarily changing the number, and both must re-stamp.
+    ///
+    /// `Instant` and not `anim_secs`: that clock freezes when playback pauses, and a
+    /// paused deck is exactly when someone browses.
+    pub sel_key: Option<Target>,
+    pub sel_since: Option<std::time::Instant>,
+    /// The cover being PEEKED at for the rested row, keyed so a late reply for a
+    /// since-moved cursor is dropped.
+    ///
+    /// A SEPARATE FIELD, never `state.art`, and that is load-bearing twice over.
+    /// `request_art` is edge-triggered on the now-playing key, so writing a peek into
+    /// `state.art` would leave now-playing showing the wrong cover until the next track
+    /// change. And the palette consumers - the bottom-bar waveform colour, the album
+    /// sigil - read their hue from `state.art`, so the whole UI would recolour every
+    /// time the cursor came to rest. Keeping the peek beside it means the pane shows a
+    /// preview while the chrome keeps meaning what is playing.
+    pub peek: Option<(String, Option<crate::art::AlbumArt>)>,
+    /// The peek key currently requested, in the shape of `art_req_key`: the
+    /// want-vs-asked diff that makes this a reconciler rather than an event handler.
+    pub peek_req_key: Option<String>,
     /// The ambient-visualizer clock, in seconds. The render loop advances this by
     /// the wall-clock frame delta ONLY while playback is `play` (so it freezes when
     /// paused/stopped) and writes it here before each draw; the idle bottom-bar wave
@@ -774,6 +859,10 @@ impl Default for TuiState {
             refresh_dirty: false,
             epoch: 0,
             art_req_key: None,
+            sel_key: None,
+            sel_since: None,
+            peek: None,
+            peek_req_key: None,
             anim_secs: 0.0,
             spin_secs: 0.0,
             dj_input: String::new(),
@@ -1701,7 +1790,7 @@ impl TuiState {
     /// while the visible list sat still - the bug every hand-rolled copy of this match
     /// has to remember. An empty list yields `None`, so the caller can say "nothing
     /// here" rather than opening a popup over nothing.
-    fn cursor_target(&self) -> Option<Target> {
+    pub(crate) fn cursor_target(&self) -> Option<Target> {
         if self.screen == Screen::Find && !self.find.drilling {
             let row = self.find.current_row()?;
             return Some(Target {
@@ -4278,6 +4367,57 @@ mod tests {
             album_uri: None,
             artist: artist.map(str::to_string),
         }
+    }
+
+    /// Dwell with an INJECTED clock: no sleeps, exact boundaries. The ladder is a pure
+    /// function of settled state, so it must be testable without wall-clock at all.
+    #[test]
+    fn attention_depth_rises_only_on_rest_and_is_pinned_by_an_open_overlay() {
+        use std::time::{Duration, Instant};
+        const REST: Duration = Duration::from_millis(350);
+        let t0 = Instant::now();
+        let mut s = TuiState::new();
+        s.queue = vec![item(0), item(1)];
+        s.screen = Screen::Queue;
+        s.selected = 0;
+
+        // Nothing stamped yet -> not resting, depth 0.
+        assert_eq!(s.resting_for(t0), None);
+        assert_eq!(s.attention_depth(t0, REST), 0);
+
+        s.note_selection(t0);
+        assert_eq!(s.resting_for(t0), Some(Duration::ZERO));
+        assert_eq!(s.attention_depth(t0, REST), 0, "arriving is not resting");
+        // Just short of the delay, then exactly at it.
+        assert_eq!(s.attention_depth(t0 + Duration::from_millis(349), REST), 0);
+        assert_eq!(s.attention_depth(t0 + REST, REST), 1, "at the boundary it fires");
+
+        // A HELD KEY must not reset the stamp: note_selection re-stamps only when the
+        // ROW changed, so repeated frames on the same row keep accumulating rest.
+        s.note_selection(t0 + Duration::from_millis(100));
+        s.note_selection(t0 + Duration::from_millis(200));
+        assert_eq!(
+            s.attention_depth(t0 + REST, REST),
+            1,
+            "same row across frames keeps its original stamp"
+        );
+
+        // Moving the cursor re-stamps, so the clock restarts from the move.
+        s.selected = 1;
+        s.note_selection(t0 + Duration::from_millis(400));
+        assert_eq!(s.attention_depth(t0 + Duration::from_millis(400), REST), 0);
+        assert_eq!(s.attention_depth(t0 + Duration::from_millis(750), REST), 1);
+
+        // AN OPEN OVERLAY pins passive depth to 0: the eye is not on the list, so
+        // resting is not evidence of interest in a row it cannot see.
+        s.help_open = true;
+        assert_eq!(s.attention_depth(t0 + Duration::from_millis(750), REST), 0);
+        s.help_open = false;
+        assert_eq!(s.attention_depth(t0 + Duration::from_millis(750), REST), 1);
+
+        // The card is an EXPLICIT ask - depth 2 regardless of dwell.
+        s.card = Some(vec![("k".into(), "v".into())]);
+        assert_eq!(s.attention_depth(t0, REST), 2);
     }
 
     #[test]

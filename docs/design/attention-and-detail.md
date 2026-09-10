@@ -221,15 +221,23 @@ Answered by reading the code (2026-09-10):
   with an explicit `X-InfoSource: store`, and answers `X-Info: unknown` rather
   than inventing.
 
+Decided while building, defaults chosen rather than left hanging (2026-09-10):
+
+- **Rest delay: 350ms**, as one constant (`PEEK_REST` in `main.rs`) so it is tuned in
+  one place. Change the number, not the mechanism.
+- **The peek is gated to the list screens** (Queue, Find, Albums, Playlists) rather
+  than firing app-wide. The art pane is global chrome, so peeking everywhere would
+  swap its meaning on screens with no list under the cursor - including the DJ view,
+  where it sits beside a chat being typed into. The DJ screen was already excluded by
+  `cursor_target` returning `None`; that is now intentional rather than incidental.
+- **The pane title says "Preview"** while a peek is up. A pane silently showing a
+  different album than the deck is the whole risk of reusing it, and one word removes
+  it.
+
 Still Guilherme's call:
 
-- The rest delay. 350ms is a guess, and whether the peek and the `i` affordance
-  share one delay or need two. Wants trying live, not deciding on paper.
-- The DJ screen: `cursor_target` returns `None` there, so dwell, peek and card
-  would silently never fire even though the queue renders alongside the chat.
-  Plausibly right, but it should be a decision rather than an accident.
-- Peek scope: the art pane is global chrome on every screen, so the "Preview"
-  title swap happens app-wide. Accept, or gate the peek to list screens only?
+- Whether 350ms is right, and whether the peek and a future `i` affordance want
+  separate delays. One constant, easy to move.
 - `X-Offline` as a per-row pair is visible to every MPD client (ncmpcpp, mpc),
   not only the card. Fine, or should residency stay card-only?
 - Whether the notes/lyrics layer is worth building at all: `getAlbumInfo2` and
