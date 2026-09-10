@@ -127,6 +127,27 @@ fn fetch_albumart(host: &str, port: u16, uri: &str) -> Option<Vec<u8>> {
     if !read_line(&mut r).ok()?.starts_with("OK MPD") {
         return None;
     }
+    // RAISE THE CHUNK SIZE BEFORE ASKING FOR ANYTHING. The MPD default binary limit is
+    // 8 KiB, so a 2 MiB FLAC cover arrived as ~37 request/response round trips - and on
+    // this daemon each one re-resolved the cover id server-side, so it was also ~37
+    // `getSong` calls against Navidrome for a single image. One cover, one exchange.
+    //
+    // Best-effort on purpose: an older daemon that does not know `binarylimit` answers
+    // ACK, which is simply read and discarded below, and the loop then works exactly as
+    // it did before at 8 KiB. There is nothing to fall back to and nothing to detect.
+    //
+    // 1 MiB sits well under the 8 MiB sanity clamp on the read side below, so a chunk
+    // this asks for can never be one that function then refuses - and it is a request
+    // for a CEILING, not an allocation: the daemon sends what it has, so a small cover
+    // is still one small chunk.
+    w.write_all(b"binarylimit 1048576\n").ok()?;
+    w.flush().ok()?;
+    loop {
+        let line = read_line(&mut r).ok()?;
+        if line == "OK" || line.starts_with("ACK") {
+            break;
+        }
+    }
     let mut all: Vec<u8> = Vec::new();
     loop {
         w.write_all(format!("albumart {} {}\n", quote(uri), all.len()).as_bytes())

@@ -257,6 +257,20 @@ struct State {
     /// single-stream and this daemon is local single-client, so a shared value
     /// is correct; default 8192.
     binary_limit: usize,
+    /// The LAST `song id -> cover id` resolution, memoised for the chunk loop.
+    ///
+    /// A cover is served in chunks, and each chunk request re-entered `albumart` and
+    /// called `client.song()` again before reaching the already-cached bytes - so one
+    /// image cost one `getSong` PER CHUNK against Navidrome, ~37 of them at the 8 KiB
+    /// default limit. The bytes were cached from the first chunk onward; only the
+    /// resolution in front of that lookup was not.
+    ///
+    /// ONE SLOT, not a map, because that is exactly the shape of the problem: the
+    /// chunks of a single cover arrive consecutively, so a single entry collapses the
+    /// whole storm while staying bounded by construction rather than by an eviction
+    /// policy. Two clients interleaving covers simply miss and fall back to the old
+    /// behaviour, which is correct and merely not faster.
+    cover_id_memo: Option<(String, String)>,
     /// The ordering of the last `listplaylistinfo Starred` response, so a
     /// position-based `playlistdelete Starred <pos>` can map back to a song id
     /// for unstar (MPD playlist deletes are position-based, not uri-based).
@@ -1254,6 +1268,7 @@ impl Default for State {
             baseline_committed: true,
             playlist_version: 0,
             binary_limit: 8192,
+            cover_id_memo: None,
             last_starred_order: Vec::new(),
             random: false,
             repeat: false,
@@ -14035,16 +14050,47 @@ impl HypodjHandler {
             None => return self.stream_cover(uri, offset).await,
         };
         // Resolve the cover id: prefer the song's coverArt, else the song id.
-        let cover_id = match self.client.song(&song_id).await {
-            Ok(song) => song.cover_art.unwrap_or_else(|| song_id.0.clone()),
-            // If we can't resolve the song, still try the id directly.
-            Err(_) => song_id.0.clone(),
+        //
+        // MEMOISED, because this sits in FRONT of the cached bytes and so was the one
+        // part of a chunked cover fetch that still hit the network every time. One
+        // short lock to read, dropped before the await (the fade-slot discipline), one
+        // short lock to record.
+        let memo = {
+            let st = self.state.lock().unwrap();
+            st.cover_id_memo
+                .as_ref()
+                .filter(|(sid, _)| sid == &song_id.0)
+                .map(|(_, cid)| cid.clone())
         };
+        let cover_id = match memo {
+            Some(cid) => cid,
+            None => {
+                let cid = match self.client.song(&song_id).await {
+                    Ok(song) => song.cover_art.unwrap_or_else(|| song_id.0.clone()),
+                    // If we can't resolve the song, still try the id directly. NOT
+                    // memoised: a transient server failure must not pin the fallback
+                    // for every later chunk of a cover that would have resolved.
+                    Err(_) => return self.serve_cover(&song_id.0, offset).await,
+                };
+                self.state.lock().unwrap().cover_id_memo =
+                    Some((song_id.0.clone(), cid.clone()));
+                cid
+            }
+        };
+        self.serve_cover(&cover_id, offset).await
+    }
+
+    /// Fetch (or read from cache) the bytes for a resolved cover id and frame one chunk.
+    ///
+    /// Split out so the resolved path and the could-not-resolve fallback cannot drift:
+    /// both must consult the same cache under the same key and ACK identically when
+    /// there is nothing to serve.
+    async fn serve_cover(&self, cover_id: &str, offset: usize) -> MpdResponse {
         // Memory -> disk -> server, in that order (see `cover_bytes`). Empty or
         // errored: gracefully ACK no-exist (never panic).
         let key = format!("cover/{cover_id}");
         let Some(bytes) =
-            self.cover_bytes(&key, || async { self.client.cover_art(&cover_id).await.ok() }).await
+            self.cover_bytes(&key, || async { self.client.cover_art(cover_id).await.ok() }).await
         else {
             return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists");
         };
@@ -18878,6 +18924,37 @@ mod tests {
     /// The eight fields the daemon HELD IN MEMORY and never put on the wire. Every one
     /// was already kept by `map_song`, so a detail view looked like it needed a new
     /// fetch when it only needed this serializer to stop discarding the answer.
+    /// A ONE-SLOT memo's real hazard is not a miss - it is serving the WRONG cover
+    /// because the stored id was reused without checking whose it was. The lookup must
+    /// match on song id or a chunked fetch that interleaves two songs hands the second
+    /// one the first one's artwork.
+    #[tokio::test]
+    async fn the_cover_id_memo_only_answers_for_the_song_it_was_recorded_for() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        {
+            let mut st = h.state.lock().unwrap();
+            st.cover_id_memo = Some(("song-a".to_string(), "cover-a".to_string()));
+        }
+        let hit = |sid: &str| {
+            let st = h.state.lock().unwrap();
+            st.cover_id_memo
+                .as_ref()
+                .filter(|(s, _)| s == sid)
+                .map(|(_, c)| c.clone())
+        };
+        assert_eq!(hit("song-a").as_deref(), Some("cover-a"), "its own song hits");
+        assert_eq!(hit("song-b"), None, "another song MUST miss, never inherit the slot");
+
+        // Recording a second song REPLACES the slot rather than accumulating - that is
+        // what keeps it bounded without an eviction policy.
+        {
+            let mut st = h.state.lock().unwrap();
+            st.cover_id_memo = Some(("song-b".to_string(), "cover-b".to_string()));
+        }
+        assert_eq!(hit("song-b").as_deref(), Some("cover-b"));
+        assert_eq!(hit("song-a"), None, "the previous entry is gone, not shadowed");
+    }
+
     #[test]
     fn push_song_tags_emits_the_metadata_it_was_silently_dropping() {
         let mut s = playlist_test_song("s-1");
