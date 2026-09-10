@@ -14992,6 +14992,40 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
         p.push(("Time".to_string(), d.to_string()));
         p.push(("duration".to_string(), format!("{d}.000")));
     }
+    // EVERYTHING BELOW WAS ALREADY IN MEMORY AND SILENTLY DROPPED. `map_song` keeps
+    // these off the wire response and nothing ever emitted them, so a detail view
+    // looked like it needed a new fetch when it only needed this function to stop
+    // throwing the answer away. Same emit-only-when-`Some` rule as every pair above,
+    // so a strict client sees no new empty lines and "absent" stays distinguishable
+    // from "zero".
+    if let Some(r) = s.user_rating {
+        p.push(("X-Rating".to_string(), r.to_string()));
+    }
+    if let Some(c) = &s.composer {
+        p.push(("Composer".to_string(), c.clone()));
+    }
+    if let Some(pf) = &s.performer {
+        p.push(("Performer".to_string(), pf.clone()));
+    }
+    if let Some(n) = s.size {
+        p.push(("X-Size".to_string(), n.to_string()));
+    }
+    if let Some(sf) = &s.suffix {
+        p.push(("X-Suffix".to_string(), sf.clone()));
+    }
+    if let Some(ct) = &s.content_type {
+        p.push(("X-Type".to_string(), ct.clone()));
+    }
+    if let Some(c) = &s.created {
+        p.push(("X-Added".to_string(), c.clone()));
+    }
+    // THE COVER REFERENCE PER ROW, which `currentsong` alone carried before. Without
+    // it a client can only ever fetch art for what is PLAYING - so this is what later
+    // lets a rested row be peeked at all, and it costs one string on rows that have
+    // one.
+    if let Some(ca) = &s.cover_art {
+        p.push(("X-CoverArt".to_string(), ca.clone()));
+    }
 }
 
 #[cfg(test)]
@@ -18839,6 +18873,48 @@ mod tests {
         let starred: Vec<_> = pairs.iter().filter(|(k, _)| k == "X-Starred").collect();
         assert_eq!(starred.len(), 1);
         assert_eq!(starred[0].1, "1");
+    }
+
+    /// The eight fields the daemon HELD IN MEMORY and never put on the wire. Every one
+    /// was already kept by `map_song`, so a detail view looked like it needed a new
+    /// fetch when it only needed this serializer to stop discarding the answer.
+    #[test]
+    fn push_song_tags_emits_the_metadata_it_was_silently_dropping() {
+        let mut s = playlist_test_song("s-1");
+        // ABSENT stays absent: same emit-only-when-Some rule as X-Starred, so no
+        // strict client gains a single empty line and "unset" is still tellable from
+        // a real value.
+        let pairs = browse_song_pairs(&s);
+        for k in [
+            "X-Rating", "Composer", "Performer", "X-Size", "X-Suffix", "X-Type", "X-Added",
+            "X-CoverArt",
+        ] {
+            assert!(!pairs.iter().any(|(pk, _)| pk == k), "{k} must not appear when unset");
+        }
+
+        s.user_rating = Some(4);
+        s.composer = Some("Terry Riley".to_string());
+        s.performer = Some("Kronos Quartet".to_string());
+        s.size = Some(41_234_567);
+        s.suffix = Some("flac".to_string());
+        s.content_type = Some("audio/flac".to_string());
+        s.created = Some("2024-03-01T12:00:00Z".to_string());
+        s.cover_art = Some("al-77".to_string());
+        let pairs = browse_song_pairs(&s);
+        let get = |k: &str| {
+            pairs.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.clone()).unwrap_or_default()
+        };
+        assert_eq!(get("X-Rating"), "4");
+        assert_eq!(get("Composer"), "Terry Riley");
+        assert_eq!(get("Performer"), "Kronos Quartet");
+        assert_eq!(get("X-Size"), "41234567");
+        assert_eq!(get("X-Suffix"), "flac");
+        assert_eq!(get("X-Type"), "audio/flac");
+        assert_eq!(get("X-Added"), "2024-03-01T12:00:00Z");
+        // THE ONE THAT UNLOCKS THE PEEK: without a per-row cover reference a client can
+        // only ever fetch art for what is PLAYING, because X-CoverArt was currentsong's
+        // alone.
+        assert_eq!(get("X-CoverArt"), "al-77");
     }
 
     #[test]

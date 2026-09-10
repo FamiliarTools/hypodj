@@ -2983,6 +2983,28 @@ impl AudioStore {
         }
     }
 
+    /// Whether the index believes `id` is held, WITHOUT touching the filesystem.
+    ///
+    /// Deliberately weaker than [`Self::lookup`], and the difference is the whole
+    /// point. `lookup` is the play-time verdict and pays one `stat` to confirm the
+    /// bytes are really there at the recorded length - correct, and unaffordable on a
+    /// LISTING, where a 400-row response would become 400 syscalls on the socket
+    /// thread. This answers the row-level question ("does the mirror think it has
+    /// this") from the in-memory index alone.
+    ///
+    /// Suspects are excluded exactly as in `lookup`: an entry the deck has already
+    /// failed on must not be advertised as offline.
+    ///
+    /// The honest gap, stated rather than hidden: this can say yes for a file deleted
+    /// out from under the store since the last pass. That is a stale badge on a row
+    /// for at most one reconcile interval, which is the right trade against a stat
+    /// storm - and playback still resolves through `lookup`, so nothing PLAYS on this
+    /// answer.
+    pub fn resident(&self, id: &SongId) -> bool {
+        let index = self.index.lock().expect("store index lock");
+        index.get(id).is_some_and(|e| !e.suspect)
+    }
+
     /// Record that playback resolved to `id`'s local bytes. In-memory ONLY: the
     /// reconciler flushes dirty recency to sidecars on a full pass, so the
     /// one-disk-writer rule survives and a crash loses at most one interval of

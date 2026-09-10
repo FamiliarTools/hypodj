@@ -373,6 +373,18 @@ pub struct QueueItem {
     /// the daemon emits per library song, so the TUI can group the queue by album
     /// for the browse queue markers. `None` for a raw stream (no album).
     pub album_uri: Option<String>,
+    /// EVERY OTHER PAIR the daemon sent for this row, in wire order, minus the ones
+    /// already structured above.
+    ///
+    /// The daemon emits far more per song than this struct models - rating, composer,
+    /// size, format, when it was added, the cover reference - and all of it was parsed
+    /// and dropped on the floor. Keeping it lets the detail card render from what
+    /// already arrived rather than asking again, and a pair the daemon learns to send
+    /// tomorrow appears with no change on this side.
+    ///
+    /// Bounded and small: a handful of short strings per row, on a queue already
+    /// holding a title and an artist for each one.
+    pub details: Vec<(String, String)>,
 }
 
 /// Parse the flat `playlistinfo` pair list into structured queue items. Each entry
@@ -387,6 +399,18 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
             artist: find(b, "Artist").map(str::to_string),
             uri: find(b, "file").map(str::to_string),
             album_uri: find(b, "X-AlbumUri").map(str::to_string),
+            // Everything not already promoted to a field above. Filtered rather than
+            // cloned wholesale, so the card cannot show the same fact twice.
+            details: b
+                .iter()
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.as_str(),
+                        "file" | "Pos" | "Id" | "Title" | "Artist" | "X-AlbumUri"
+                    )
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         })
         .collect()
 }
@@ -743,6 +767,7 @@ mod tests {
                 artist: Some("A".into()),
                 uri: Some("song/1".into()),
                 album_uri: None,
+                details: Vec::new(),
             }
         );
         // Second block has no Artist -> None.
@@ -754,6 +779,7 @@ mod tests {
                 artist: None,
                 uri: Some("song/2".into()),
                 album_uri: None,
+                details: Vec::new(),
             }
         );
     }

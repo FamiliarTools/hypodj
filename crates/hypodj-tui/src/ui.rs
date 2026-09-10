@@ -56,6 +56,9 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     let overlay_drawn = state.menu.is_some()
         || state.help_open
         || state.heard_open
+        // The card joins this disjunction or it punches a permanent silhouette out of a
+        // sixel cover - a bug already fixed once here for the other overlays.
+        || state.card.is_some()
         || (state.mode == Mode::Confirm && state.screen != Screen::Dj);
     if overlay_drawn {
         state.sixel_covered.set(true);
@@ -121,6 +124,11 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     // region cannot hold that. Below the help overlay so `?` still wins.
     if state.heard_open {
         render_heard_overlay(f, f.area(), state);
+    }
+    // The info card, in the same band as the heard panel and for the same reason: its
+    // keys are intercepted in `key_normal` after heard's, so it must draw after it too.
+    if state.card.is_some() {
+        render_info_card(f, f.area(), state);
     }
     // The row context menu sits ABOVE the confirm popup and the heard panel - its keys
     // are intercepted FIRST in `key_normal`, so it must also be the one the eye sees
@@ -297,16 +305,79 @@ fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
         }
     }
 
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    let scroll = state.heard.measure(lines.len(), inner_h);
+    let max_scroll = state.heard.max.get();
     // Record the measured max so the scroll keys can clamp against it: without it `j`
     // past the end keeps incrementing an offset only the renderer clamps, and `k` then
     // appears stuck at the bottom while it unwinds the phantom distance.
-    state.heard_max_scroll.set(max_scroll);
-    let scroll = state.heard_scroll.min(max_scroll);
     let title = if max_scroll > 0 {
         format!("Marks ({}/{})  j/k scroll  t closes", scroll + 1, max_scroll + 1)
     } else {
         "Marks  t closes".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(base)
+        .title(Span::styled(title, head));
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(block).style(base).scroll((scroll, 0)),
+        popup,
+    );
+}
+
+/// The `i` detail card: everything the daemon already told us about one song, laid out
+/// as a label column and a value column.
+///
+/// It renders PAIRS, not a typed song, and that is the point - a field the daemon did
+/// not send is simply a row that is not here, so there is no per-field `Option` to
+/// thread and no placeholder to invent. What the card can show grows the moment the
+/// daemon emits more, with no change on this side.
+///
+/// Content-sized rather than full-frame (the help overlay's shape, not heard's): the
+/// rows are short label/value pairs, so a full-frame box would be mostly empty and
+/// would hide the queue for no gain.
+fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
+    let Some(rows) = &state.card else { return };
+    let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
+    let base = Style::default().fg(fg);
+    let head = base.add_modifier(Modifier::BOLD);
+
+    // The label column is measured from the content, so a long label never collides with
+    // its own value and a card of short labels does not carry a wide empty gutter.
+    let label_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    let widest = rows
+        .iter()
+        .map(|(k, v)| label_w.saturating_sub(k.chars().count()) + k.chars().count() + 2 + v.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let w = (widest as u16 + 4).min(region.width.saturating_sub(2)).max(20);
+    let h = (rows.len() as u16 + 2).min(region.height.saturating_sub(2)).max(3);
+    let popup = Rect {
+        x: region.x + region.width.saturating_sub(w) / 2,
+        y: region.y + region.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    let inner_h = h.saturating_sub(2);
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, v)| {
+            Line::from(vec![
+                Span::styled(format!("{k:<label_w$}  "), base.add_modifier(Modifier::DIM)),
+                Span::styled(v.clone(), base),
+            ])
+        })
+        .collect();
+
+    let scroll = state.card_scroll.measure(lines.len(), inner_h);
+    let max_scroll = state.card_scroll.max.get();
+    let title = if max_scroll > 0 {
+        format!("Info ({}/{})  j/k scroll  i closes", scroll + 1, max_scroll + 1)
+    } else {
+        "Info  i closes".to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -400,10 +471,9 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     // taller than this, the overlay SCROLLS instead of silently truncating: the offset
     // is clamped to the last full page so a short terminal can still reach every binding.
     let inner_h = popup.height.saturating_sub(2);
-    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    let scroll = state.help.measure(lines.len(), inner_h);
+    let max_scroll = state.help.max.get();
     // See `render_heard_overlay`: the keys clamp against this measured max.
-    state.help_max_scroll.set(max_scroll);
-    let scroll = state.help_scroll.min(max_scroll);
     let title = if max_scroll > 0 {
         // Every other overlay says how to leave it in its own title; the one titled
         // "Help" was the single panel that did not.
@@ -1422,6 +1492,7 @@ mod tests {
             artist: Some(artist.into()),
             uri: Some(format!("song/{pos}")),
             album_uri: None,
+            details: Vec::new(),
         };
         s.queue = vec![
             item(0, "Playing", "Various Artists"),
@@ -1506,6 +1577,50 @@ mod tests {
     /// visible: the head learning to name the in-flight count cost 17 cells, which the
     /// deferred clause's byte parenthetical paid for. Without this test the next clause
     /// to grow would silently drop both reasons on his actual screen.
+    /// The `i` card renders from pairs the daemon ALREADY sent with the listing - no
+    /// socket, no request, no latency. This is the whole reason step one was an emission
+    /// fix rather than a fetch feature.
+    #[test]
+    fn the_info_card_renders_the_metadata_the_row_already_carried() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.queue = vec![hypodj_client::model::QueueItem {
+            pos: 0,
+            title: "Ps Exclusive".into(),
+            artist: Some("Life Without Buildings".into()),
+            uri: Some("song/1".into()),
+            album_uri: None,
+            details: vec![
+                ("Album".into(), "Any Other City".into()),
+                ("X-Plays".into(), "12".into()),
+                ("X-LastPlayed".into(), "1".into()),
+                ("X-Rating".into(), "5".into()),
+                ("X-Suffix".into(), "flac".into()),
+                ("X-Size".into(), "41234567".into()),
+                ("X-Starred".into(), "1".into()),
+                // An unmapped pair: present on the wire, deliberately NOT shown, because
+                // a raw `X-Whatever` in a human card is worse than an absent row.
+                ("X-Undocumented".into(), "42".into()),
+            ],
+        }];
+        s.selected = 0;
+        s.card = Some(s.card_rows_for_selection_for_test());
+        let out = render_to_lines_sized(&s, 100, 30).join("\n");
+
+        assert!(out.contains("Info"), "the card is drawn:\n{out}");
+        assert!(out.contains("Ps Exclusive"), "{out}");
+        assert!(out.contains("Any Other City"), "{out}");
+        assert!(out.contains("12"), "the play count the daemon already sent:\n{out}");
+        // Rendered for a person: days get a unit, a rating gets its scale, bytes get
+        // a human size - none of which the wire values carry.
+        assert!(out.contains("yesterday"), "a bare '1' would read as a date:\n{out}");
+        assert!(out.contains("5/5"), "{out}");
+        assert!(out.contains("39 MiB"), "size is humanised, not raw bytes:\n{out}");
+        assert!(out.contains("yes"), "starred is a presence flag:\n{out}");
+        assert!(!out.contains("X-Undocumented"), "unmapped pairs stay hidden:\n{out}");
+        assert!(!out.contains("41234567"), "no raw byte count:\n{out}");
+    }
+
     #[test]
     fn the_real_mirror_line_still_shows_its_reasons_at_the_real_terminal_width() {
         let mut s = TuiState::new();
@@ -1643,7 +1758,7 @@ mod tests {
         // binding is reachable. The title also advertises the scroll position.
         let mut s = TuiState::new();
         s.help_open = true;
-        s.help_scroll = 0;
+        s.help.scroll = 0;
         let top = render_to_lines_sized(&s, 60, 12).join("\n");
         assert!(top.contains("Help"), "overlay titled + fits:\n{top}");
         assert!(top.contains("scroll"), "scroll affordance shown when clamped:\n{top}");
@@ -1654,7 +1769,7 @@ mod tests {
         // The range is a probe, not a bound: it must stay comfortably past the real max
         // scroll, which grows by one row every time the keymap does.
         let reachable = (0..80u16).any(|off| {
-            s.help_scroll = off;
+            s.help.scroll = off;
             render_to_lines_sized(&s, 60, 12).join("\n").contains("quit")
         });
         assert!(reachable, "every binding is reachable by scrolling on a short terminal");
@@ -1684,6 +1799,7 @@ mod tests {
                 artist: Some("C418".into()),
                 uri: Some("song/1".into()),
                 album_uri: None,
+                details: Vec::new(),
             }],
         );
         let target = Target {
@@ -2478,6 +2594,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            details: Vec::new(),
         }];
         s.now.hint = Some(AmbientHint {
             kind: HintKind::UpNext,
@@ -2503,6 +2620,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            details: Vec::new(),
         }];
         s.now.continuation = Some("NTS 1".into());
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
@@ -2527,6 +2645,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            details: Vec::new(),
         }];
         let intent = s.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert_eq!(
@@ -2556,6 +2675,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            details: Vec::new(),
         }];
         s.now.continuation = Some("more like Roygbiv".into());
         let out = render_to_lines(&s).join("\n");

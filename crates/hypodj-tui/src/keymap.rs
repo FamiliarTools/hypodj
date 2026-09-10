@@ -51,6 +51,9 @@ pub enum Act {
     FavSelected,
     FavCurrent,
     Heard,
+    /// Open the info card on the selected row. A pure CLIENT act: it renders pairs the
+    /// row already carries, so it reaches no socket and cannot fail.
+    Info,
     PlaySel,
     Enqueue,
     /// Remove the selected QUEUE row. Removing the row you are HEARING is a transport
@@ -206,6 +209,7 @@ pub const KEYMAP: &[Binding] = &[
     // outlives the one-line banner that announced it - so the gesture needs a read-back
     // that is not "go run another program". The daemon renders it; this key asks for it.
     Binding { matchers: &[Char('t')], keys: "t", group: Favorites, scope: Scope::Global, act: Heard, help: "what you marked, and the audio kept" },
+    Binding { matchers: &[Char('i')], keys: "i", group: General, scope: Scope::Global, act: Info, help: "details about the selected song" },
     // General.
     Binding { matchers: &[Char('?')], keys: "?", group: General, scope: Scope::Global, act: HelpToggle, help: "toggle this help" },
     Binding { matchers: &[Char('q')], keys: "q", group: General, scope: Scope::Global, act: Quit, help: "quit" },

@@ -456,6 +456,81 @@ fn scrub_intent(secs: i32) -> Intent {
     Intent::Command(format!("seekcur {arg}"))
 }
 
+/// A scrollable overlay's offset, plus the max the RENDERER last measured.
+///
+/// The pair has to travel together or the clamp is a lie: the key handler cannot know
+/// how tall the content is (that depends on the terminal it is about to be drawn into),
+/// so the renderer measures and the keys clamp against that measurement. Splitting them
+/// into two loose fields is what let `j` inflate an invisible offset past the end, which
+/// `k` then had to walk all the way back before the view moved at all.
+///
+/// Extracted because the help and heard overlays had this logic line-for-line twice and
+/// the info card would have made it three times.
+/// Bytes a person reads. Mirrors the daemon's own rule so a size shown here and a size
+/// shown by `dj store` cannot be spelled two ways.
+fn human_bytes(n: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if n >= 1024 * MIB {
+        let g = n as f64 / (1024.0 * MIB as f64);
+        if (g - g.round()).abs() < 0.05 {
+            format!("{} GiB", g.round() as u64)
+        } else {
+            format!("{g:.1} GiB")
+        }
+    } else if n >= MIB {
+        format!("{} MiB", n / MIB)
+    } else {
+        format!("{} KiB", n / 1024)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ScrollBox {
+    /// Current offset in rows. Only ever nonzero when the content outgrew the terminal.
+    pub scroll: u16,
+    /// Content rows minus visible inner height, written every frame the overlay draws.
+    /// A `Cell` because the renderer holds `&TuiState`, not `&mut`.
+    pub max: Cell<u16>,
+}
+
+impl ScrollBox {
+    /// Back to the top. Called on OPEN rather than on close, so a reopened overlay never
+    /// starts halfway down someone else's reading position.
+    pub fn reset(&mut self) {
+        self.scroll = 0;
+    }
+
+    /// Record the measurement and return the offset actually usable this frame.
+    /// One call site per overlay, so measuring and clamping cannot drift apart.
+    pub fn measure(&self, content_rows: usize, inner_h: u16) -> u16 {
+        let max = (content_rows as u16).saturating_sub(inner_h);
+        self.max.set(max);
+        self.scroll.min(max)
+    }
+
+    /// Apply a scroll key. Returns whether it was one - so the caller can keep owning
+    /// its own close keys, which differ per overlay (`?` vs `t`).
+    pub fn on_key(&mut self, code: KeyCode) -> bool {
+        let max = self.max.get();
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll = self.scroll.saturating_add(1).min(max);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll = self.scroll.min(max).saturating_sub(1);
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.scroll = self.scroll.saturating_add(10).min(max);
+            }
+            KeyCode::PageUp => {
+                self.scroll = self.scroll.saturating_sub(10);
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
 pub struct TuiState {
     pub now: NowPlaying,
     pub queue: Vec<QueueItem>,
@@ -558,13 +633,7 @@ pub struct TuiState {
     /// The help overlay's vertical scroll offset (rows). Nonzero only when the overlay
     /// is taller than the terminal; nav keys scroll it and the renderer clamps it to the
     /// real max so a short terminal can still reach every binding. Reset when help opens.
-    pub help_scroll: u16,
-    /// The last max scroll offset the renderer measured for the help overlay (content
-    /// rows minus the visible inner height). Written every frame the overlay is drawn and
-    /// read by the scroll keys so `j` CANNOT run past the end: without it the offset kept
-    /// incrementing invisibly and `k` had to walk all that phantom distance back before
-    /// the view moved at all.
-    pub help_max_scroll: Cell<u16>,
+    pub help: ScrollBox,
     /// The daemon's `heard` read-back, one entry per rendered line, or empty when the
     /// overlay has never been asked for. THE TAPE'S ONLY WINDOW in this process: `mark`
     /// keeps audio, and the segment outlives by weeks the one-line banner that announced
@@ -579,10 +648,19 @@ pub struct TuiState {
     pub heard_open: bool,
     /// The overlay's vertical scroll offset (rows), clamped by the renderer against the
     /// real content so a short terminal can still reach the last row. Reset on open.
-    pub heard_scroll: u16,
-    /// The heard overlay's measured max scroll, in the exact shape of
-    /// [`Self::help_max_scroll`] and for the same reason.
-    pub heard_max_scroll: Cell<u16>,
+    pub heard: ScrollBox,
+    /// The info card's rows, or `None` when it is closed. An OVERLAY FIELD and never a
+    /// fifth [`Mode`] - the same call this file already made for the context menu, and
+    /// for the same reason: mutual exclusion between overlays holds by construction
+    /// through [`Self::take_screen`], while a Mode variant would need every dispatch arm
+    /// to remember it exists.
+    ///
+    /// Pre-rendered `(label, value)` rows rather than a Song, because the card's job is
+    /// to display whatever pairs the daemon actually sent - a field the daemon does not
+    /// know is simply a row that is not there, with no `Option` to thread per field.
+    pub card: Option<Vec<(String, String)>>,
+    /// The card's scroll, in the shape help and heard now share.
+    pub card_scroll: ScrollBox,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -706,12 +784,12 @@ impl Default for TuiState {
             viz_playing: false,
             menu: None,
             help_open: false,
-            help_scroll: 0,
-            help_max_scroll: Cell::new(0),
+            help: ScrollBox::default(),
             heard_lines: Vec::new(),
             heard_open: false,
-            heard_scroll: 0,
-            heard_max_scroll: Cell::new(0),
+            heard: ScrollBox::default(),
+            card: None,
+            card_scroll: ScrollBox::default(),
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             sixel_supported: false,
@@ -837,9 +915,90 @@ impl TuiState {
     fn take_screen(&mut self) {
         self.menu = None;
         self.help_open = false;
-        self.help_scroll = 0;
+        self.help.reset();
         self.heard_open = false;
-        self.heard_scroll = 0;
+        self.heard.reset();
+        self.card = None;
+        self.card_scroll.reset();
+    }
+
+    /// Open the info card on the given rows. Empty rows are refused rather than opening
+    /// an empty box, matching `open_heard` - an overlay with nothing in it reads as a
+    /// bug, not as an answer.
+    pub fn open_card(&mut self, rows: Vec<(String, String)>) {
+        if rows.is_empty() {
+            return;
+        }
+        self.take_screen();
+        self.card = Some(rows);
+        self.card_scroll.reset();
+    }
+
+    /// The label/value rows for the info card, built from the selected queue row.
+    ///
+    /// Returns empty for anything with nothing to say (a stream, an out-of-range
+    /// selection), which `open_card` turns into "do not open" rather than an empty box.
+    ///
+    /// LABELS ARE MAPPED, values are not. The wire keys are MPD-shaped (`X-Rating`,
+    /// `X-LastPlayed`) and a card is read by a person, so the mapping happens here at
+    /// the display edge. A key with no mapping is skipped rather than shown raw: an
+    /// unmapped pair is one the daemon added and this list has not caught up with, and
+    /// showing `X-Foo` to a user is worse than showing nothing.
+    #[cfg(test)]
+    pub(crate) fn card_rows_for_selection_for_test(&self) -> Vec<(String, String)> {
+        self.card_rows_for_selection()
+    }
+
+    fn card_rows_for_selection(&self) -> Vec<(String, String)> {
+        let Some(item) = self.queue.get(self.selected) else { return Vec::new() };
+        let mut rows: Vec<(String, String)> = Vec::new();
+        rows.push(("title".to_string(), item.title.clone()));
+        if let Some(a) = &item.artist {
+            rows.push(("artist".to_string(), a.clone()));
+        }
+        // Ordered by what a person asks first, not by wire order: what it is, then what
+        // I have done with it, then what the file is.
+        const LABELS: &[(&str, &str)] = &[
+            ("Album", "album"),
+            ("Date", "year"),
+            ("Track", "track"),
+            ("Genre", "genre"),
+            ("Composer", "composer"),
+            ("Performer", "performer"),
+            ("X-Plays", "plays"),
+            ("X-LastPlayed", "last played"),
+            ("X-Rating", "rating"),
+            ("X-Suffix", "format"),
+            ("Format", "bitrate"),
+            ("X-Size", "size"),
+            ("X-Added", "added"),
+            ("Comment", "comment"),
+        ];
+        let find = |k: &str| {
+            item.details.iter().find(|(dk, _)| dk == k).map(|(_, v)| v.as_str())
+        };
+        for (key, label) in LABELS {
+            let Some(v) = find(key) else { continue };
+            let shown = match *key {
+                // Whole days, rendered by the daemon; say the unit here so a bare "54"
+                // is not read as a date.
+                "X-LastPlayed" => match v {
+                    "0" => "today".to_string(),
+                    "1" => "yesterday".to_string(),
+                    d => format!("{d} days ago"),
+                },
+                "X-Rating" => format!("{v}/5"),
+                "X-Size" => human_bytes(v.parse::<u64>().unwrap_or(0)),
+                _ => v.to_string(),
+            };
+            rows.push((label.to_string(), shown));
+        }
+        // Starred is a flag, not a value: the pair is absent when not starred, so its
+        // mere presence is the answer.
+        if find("X-Starred").is_some() {
+            rows.push(("starred".to_string(), "yes".to_string()));
+        }
+        rows
     }
 
     pub fn open_heard(&mut self, lines: Vec<String>) {
@@ -849,7 +1008,7 @@ impl TuiState {
         self.take_screen();
         self.heard_lines = lines;
         self.heard_open = true;
-        self.heard_scroll = 0;
+        self.heard.reset();
     }
 
     /// Map a key to an Intent (or pure state change). The dispatch is per-mode.
@@ -882,25 +1041,16 @@ impl TuiState {
             // binding); everything else is swallowed. The offset is clamped HERE against
             // the max the renderer last measured, so `j` at the bottom is a no-op rather
             // than silently inflating an offset `k` would then have to unwind.
-            let help_max = self.help_max_scroll.get();
             match key.code {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.help_open = false;
-                    self.help_scroll = 0;
+                    self.help.reset();
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.help_scroll = self.help_scroll.saturating_add(1).min(help_max);
+                // Every other key either scrolls or is swallowed, which is what makes
+                // this a true modal.
+                code => {
+                    self.help.on_key(code);
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.help_scroll = self.help_scroll.min(help_max).saturating_sub(1);
-                }
-                KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.help_scroll = self.help_scroll.saturating_add(10).min(help_max);
-                }
-                KeyCode::PageUp => {
-                    self.help_scroll = self.help_scroll.saturating_sub(10);
-                }
-                _ => {}
             }
             return None;
         }
@@ -910,25 +1060,30 @@ impl TuiState {
         // a one-line banner is.
         if self.heard_open {
             // Offsets clamped against the renderer's measured max, same as help.
-            let heard_max = self.heard_max_scroll.get();
             match key.code {
                 KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.heard_open = false;
-                    self.heard_scroll = 0;
+                    self.heard.reset();
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.heard_scroll = self.heard_scroll.saturating_add(1).min(heard_max);
+                code => {
+                    self.heard.on_key(code);
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.heard_scroll = self.heard_scroll.min(heard_max).saturating_sub(1);
+            }
+            return None;
+        }
+        // The info card, the third overlay in the same shape: its own letter, Esc or q
+        // close it, everything else scrolls or is swallowed. `i` is a toggle for the same
+        // reason `?` is - the key that opened it is the key a hand reaches for to be rid
+        // of it.
+        if self.card.is_some() {
+            match key.code {
+                KeyCode::Char('i') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.card = None;
+                    self.card_scroll.reset();
                 }
-                KeyCode::PageDown | KeyCode::Char(' ') => {
-                    self.heard_scroll = self.heard_scroll.saturating_add(10).min(heard_max);
+                code => {
+                    self.card_scroll.on_key(code);
                 }
-                KeyCode::PageUp => {
-                    self.heard_scroll = self.heard_scroll.saturating_sub(10);
-                }
-                _ => {}
             }
             return None;
         }
@@ -1059,6 +1214,15 @@ impl TuiState {
             // empty panel and then filled it would be claiming an answer it does not
             // have yet.
             Act::Heard => Some(Intent::Command("heard marks".into())),
+            // `i` opens the card from what the SELECTED ROW ALREADY CARRIES - no socket,
+            // no request, no latency and nothing that can fail. The daemon sent these
+            // pairs with the listing; the client was discarding them. Anything needing a
+            // fresh server read (a play count that moved since the listing) is a later
+            // layer that fills this same card in.
+            Act::Info => {
+                self.open_card(self.card_rows_for_selection());
+                None
+            }
             Act::PlaySel => self.enter_action(),
             // `d` / Delete removes the selected QUEUE row (elsewhere a deliberate no-op:
             // a browse row is not IN the queue, so there is nothing to remove). The
@@ -2374,6 +2538,7 @@ mod tests {
             artist: None,
             uri: Some(format!("song/{pos}")),
             album_uri: None,
+            details: Vec::new(),
         }
     }
 
@@ -3080,21 +3245,21 @@ mod tests {
         // unwind all that phantom distance before the overlay appeared to move at all.
         let mut s = TuiState::new();
         s.handle_key(ch('?'));
-        s.help_max_scroll.set(3);
+        s.help.max.set(3);
         for _ in 0..20 {
             s.handle_key(ch('j'));
         }
-        assert_eq!(s.help_scroll, 3, "j pins at the last page instead of running past it");
+        assert_eq!(s.help.scroll, 3, "j pins at the last page instead of running past it");
         // One `k` moves one row up - immediately.
         s.handle_key(ch('k'));
-        assert_eq!(s.help_scroll, 2);
+        assert_eq!(s.help.scroll, 2);
         // PgDn is bounded the same way, and a stale offset from a taller terminal (the
         // window was resized shorter, shrinking the max) is pulled back on the first key.
         s.handle_key(key(KeyCode::PageDown));
-        assert_eq!(s.help_scroll, 3);
-        s.help_scroll = 50;
+        assert_eq!(s.help.scroll, 3);
+        s.help.scroll = 50;
         s.handle_key(ch('k'));
-        assert_eq!(s.help_scroll, 2, "an over-large offset resolves against the real max");
+        assert_eq!(s.help.scroll, 2, "an over-large offset resolves against the real max");
     }
 
     #[test]
@@ -3102,13 +3267,13 @@ mod tests {
         // Same contract as help: the tape overlay cannot over-scroll either.
         let mut s = TuiState::new();
         s.open_heard(vec!["a".into(), "b".into(), "c".into()]);
-        s.heard_max_scroll.set(1);
+        s.heard.max.set(1);
         for _ in 0..10 {
             s.handle_key(ch('j'));
         }
-        assert_eq!(s.heard_scroll, 1);
+        assert_eq!(s.heard.scroll, 1);
         s.handle_key(ch('k'));
-        assert_eq!(s.heard_scroll, 0);
+        assert_eq!(s.heard.scroll, 0);
     }
 
     #[test]
@@ -3117,30 +3282,30 @@ mod tests {
         // `?` opens help at the top.
         assert_eq!(s.handle_key(ch('?')), None);
         assert!(s.help_open);
-        assert_eq!(s.help_scroll, 0);
+        assert_eq!(s.help.scroll, 0);
         // Stand in for a frame having been drawn: the keys clamp against the max the
         // renderer measured, and a tall-enough viewport leaves plenty of room here.
-        s.help_max_scroll.set(100);
+        s.help.max.set(100);
         // j / Down scroll down; k / Up scroll up (clamped at 0). PageDown jumps.
         s.handle_key(ch('j'));
         s.handle_key(key(KeyCode::Down));
-        assert_eq!(s.help_scroll, 2);
+        assert_eq!(s.help.scroll, 2);
         s.handle_key(ch('k'));
-        assert_eq!(s.help_scroll, 1);
+        assert_eq!(s.help.scroll, 1);
         s.handle_key(key(KeyCode::PageDown));
-        assert_eq!(s.help_scroll, 11);
+        assert_eq!(s.help.scroll, 11);
         // Up never underflows.
-        s.help_scroll = 0;
+        s.help.scroll = 0;
         s.handle_key(ch('k'));
-        assert_eq!(s.help_scroll, 0);
+        assert_eq!(s.help.scroll, 0);
         // Every other key is swallowed while the modal is open (no transport leak).
         assert_eq!(s.handle_key(ch('p')), None);
         assert!(s.help_open);
         // Closing resets the offset so the next open starts at the top.
-        s.help_scroll = 5;
+        s.help.scroll = 5;
         s.handle_key(key(KeyCode::Esc));
         assert!(!s.help_open);
-        assert_eq!(s.help_scroll, 0);
+        assert_eq!(s.help.scroll, 0);
     }
 
     #[test]
@@ -3270,6 +3435,7 @@ mod tests {
             artist: None,
             uri: Some(uri.into()),
             album_uri: Some(al.into()),
+            details: Vec::new(),
         };
         // Two distinct songs of album/1, plus a DUPLICATE of song/1 (must not
         // double-count), plus one song of album/2.
@@ -3451,16 +3617,16 @@ mod tests {
         let mut s = TuiState::new();
         s.open_heard(vec!["3 marks, oldest first".into(), "23:17  * NTS 2  [tape 2: 5m, window]".into()]);
         assert!(s.heard_open);
-        assert_eq!(s.heard_scroll, 0);
-        s.heard_max_scroll.set(100);
+        assert_eq!(s.heard.scroll, 0);
+        s.heard.max.set(100);
         // Scrolls.
         assert_eq!(s.handle_key(ch('j')), None);
-        assert_eq!(s.heard_scroll, 1);
+        assert_eq!(s.heard.scroll, 1);
         assert_eq!(s.handle_key(ch('k')), None);
-        assert_eq!(s.heard_scroll, 0);
+        assert_eq!(s.heard.scroll, 0);
         // Under-scroll saturates rather than wrapping to the last page.
         assert_eq!(s.handle_key(ch('k')), None);
-        assert_eq!(s.heard_scroll, 0);
+        assert_eq!(s.heard.scroll, 0);
         // Transport and nav keys are SWALLOWED: `p` must not pause the music under a
         // panel the human is reading, and `>` must not skip the very track being read
         // about.
@@ -3470,10 +3636,10 @@ mod tests {
         assert!(s.heard_open, "none of that closed it either");
         // Its own letter closes it, and the scroll resets so the next open starts at the
         // top rather than wherever the last read ended.
-        s.heard_scroll = 4;
+        s.heard.scroll = 4;
         assert_eq!(s.handle_key(ch('t')), None);
         assert!(!s.heard_open);
-        assert_eq!(s.heard_scroll, 0);
+        assert_eq!(s.heard.scroll, 0);
         // Esc and q close it too, exactly as they close help.
         s.open_heard(vec!["a".into(), "b".into()]);
         assert_eq!(s.handle_key(key(KeyCode::Esc)), None);
