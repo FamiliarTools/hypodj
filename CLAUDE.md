@@ -65,6 +65,14 @@ nix develop --command cargo test  -j4 --workspace
   room on the alt port. Always override audio to null in the copied config (and
   MPRIS off) so the live proof stays SILENT - your process must leave no sound in
   the human's environment. Also always tear the test daemon down afterward.
+  **The same copied config also resolves the same `store.dir`, so the probe
+  daemon's reconciler converges the REAL offline mirror** - two reconcilers on one
+  directory, and convergence deletes what it does not recognise. Override
+  `[store].enable = false` (or point `dir` at a throwaway path) in the copied
+  config. Observed 2026-09-11: a probe launched from a shell escaped this only by
+  accident, because `$STATE_DIRECTORY` is set by systemd and a shell-launched
+  process lacks it, so the store disabled itself with a warn. Do not rely on that
+  - the audio rule and this one are the same rule about the same file.
 - **Devshell `cargo test` green does NOT mean the Nix package builds.**
   `nix/package.nix` and `nix/clients.nix` run `doCheck` with `-p hypodj-core` in a
   CERTLESS, network-less sandbox where `handler_with_null_player()` returns `None`.
