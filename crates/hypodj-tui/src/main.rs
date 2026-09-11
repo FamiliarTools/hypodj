@@ -238,7 +238,14 @@ fn event_loop(
             // Convert the coalesced intents into worker Reqs; the worker runs them off
             // the render path so a Subsonic-backed browse/enqueue never blocks input
             // or draw.
-            dispatch(req_tx, &workers.cc_tx, &workers.find_tx, state, coalesce_intents(intents));
+            dispatch(
+                req_tx,
+                &workers.cc_tx,
+                &workers.find_tx,
+                &workers.info_tx,
+                state,
+                coalesce_intents(intents),
+            );
             sync_title(terminal, state, &mut last_title);
         }
 
@@ -336,6 +343,7 @@ fn dispatch(
     tx: &Sender<Req>,
     cc_tx: &Sender<Req>,
     find_tx: &Sender<Req>,
+    info_tx: &Sender<Req>,
     state: &mut TuiState,
     intents: Vec<Intent>,
 ) {
@@ -354,6 +362,12 @@ fn dispatch(
             // nothing, so the trailing batch refresh must not fire for it.
             Intent::Find(query) => {
                 let _ = find_tx.send(Req::Find(query));
+            }
+            // Its own socket, never the FIFO command socket: a detail lookup that waits
+            // on Navidrome must not head-of-line-block the refreshes that keep
+            // now-playing alive.
+            Intent::Info(uri) => {
+                let _ = info_tx.send(Req::Info(uri));
             }
             Intent::ConfirmArm => {
                 // Echo the choice INTO the DJ chat immediately so the keypress is
@@ -564,6 +578,20 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
                 // wake outright would leave the now-playing stale until the 5s safety
                 // net. Mark dirty; the in-flight Snapshot re-arms one catch-up refresh.
                 state.refresh_dirty = true;
+            }
+        }
+        Inbound::Info { uri, pairs } => {
+            // Adopt only while the card is still open ON THIS ROW. A reply for a card
+            // the user has closed, or moved off, is dropped - the `Art` gate, reused.
+            if state.card_uri.as_deref() == Some(uri.as_str()) {
+                let rows = state::card_rows_from_pairs(&pairs);
+                if rows.is_empty() {
+                    state.status_msg = Some("nothing known about that one".into());
+                    state.card = None;
+                    state.card_uri = None;
+                } else {
+                    state.card = Some(rows);
+                }
             }
         }
         Inbound::Art { key, art } => {
@@ -970,6 +998,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Req>();
         let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
         let (find_tx, _find_rx) = mpsc::channel::<Req>();
+        let (info_tx, _info_rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Dj;
         state.enter_confirm(Pending {
@@ -979,7 +1008,7 @@ mod tests {
             note: None,
             trust: None,
         });
-        dispatch(&tx, &cc_tx, &find_tx, &mut state, vec![Intent::ConfirmArm]);
+        dispatch(&tx, &cc_tx, &find_tx, &info_tx, &mut state, vec![Intent::ConfirmArm]);
         assert!(state.dj_log.iter().any(|l| l == "> y"), "choice echoed to chat");
         assert_eq!(state.mode, Mode::Normal, "confirm dismissed");
         assert!(state.pending.is_none(), "pending consumed");
@@ -1215,13 +1244,14 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Req>();
         let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
         let (find_tx, _find_rx) = mpsc::channel::<Req>();
+        let (info_tx, _info_rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Dj;
         state.enter_confirm(Pending {
             token: Some("nl-1".into()),
             ..Default::default()
         });
-        dispatch(&tx, &cc_tx, &find_tx, &mut state, vec![Intent::ConfirmCancel]);
+        dispatch(&tx, &cc_tx, &find_tx, &info_tx, &mut state, vec![Intent::ConfirmCancel]);
         assert!(state.dj_log.iter().any(|l| l == "cancelled"), "cancellation echoed");
         assert_eq!(state.mode, Mode::Normal);
         assert!(state.pending.is_none());

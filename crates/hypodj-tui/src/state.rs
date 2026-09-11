@@ -373,6 +373,10 @@ pub enum Intent {
     Enqueue { uri: String, play: bool },
     /// Load a playlist by name (`load <name>`), appending to the queue.
     LoadPlaylist(String),
+    /// Ask the daemon for one song's detail on the dedicated info socket. Like `Find`
+    /// it is NOT a mutation, so it must never set `sent_mutation` and never trail a
+    /// refresh.
+    Info(String),
     /// Run a library query on the dedicated find socket. NOT a mutation, so it must
     /// never set `sent_mutation` and never trail a `request_refresh`.
     Find(String),
@@ -521,6 +525,81 @@ impl TuiState {
 ///
 /// Extracted because the help and heard overlays had this logic line-for-line twice and
 /// the info card would have made it three times.
+/// Turn a daemon `info` pair list into card rows.
+///
+/// The SAME mapping the local path uses, so a card fetched from the daemon and a card
+/// built from a queue row cannot label or format the same fact two different ways.
+pub fn card_rows_from_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    if pairs.iter().any(|(k, v)| k == "X-Info" && v == "unknown") {
+        return Vec::new();
+    }
+    let find = |k: &str| pairs.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.as_str());
+    let mut rows = Vec::new();
+    if let Some(t) = find("Title") {
+        rows.push(("title".to_string(), t.to_string()));
+    }
+    if let Some(a) = find("Artist") {
+        rows.push(("artist".to_string(), a.to_string()));
+    }
+    rows.extend(mapped_detail_rows(pairs));
+    // Only the fetched path can answer this: residency costs a stat, which a listing
+    // cannot afford per row but a single card can.
+    match find("X-Offline") {
+        Some("1") => rows.push(("offline".to_string(), "yes".to_string())),
+        Some("0") => rows.push(("offline".to_string(), "no".to_string())),
+        _ => {}
+    }
+    // WHICH HALF IS FRESH, and only when it is not. A card sourced from the mirror
+    // shows user stats frozen at mirror time, and presenting that with the same
+    // confidence as a live answer is the lie this line prevents.
+    if find("X-InfoSource") == Some("store") {
+        rows.push(("source".to_string(), "offline copy - may be stale".to_string()));
+    }
+    rows
+}
+
+/// The label mapping shared by both card paths. A key with no mapping is SKIPPED: an
+/// unmapped pair is one the daemon added and this list has not caught up with, and a
+/// raw `X-Foo` in a human card is worse than an absent row.
+fn mapped_detail_rows(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    let find = |k: &str| pairs.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.as_str());
+    const LABELS: &[(&str, &str)] = &[
+        ("Album", "album"),
+        ("Date", "year"),
+        ("Track", "track"),
+        ("Genre", "genre"),
+        ("Composer", "composer"),
+        ("Performer", "performer"),
+        ("X-Plays", "plays"),
+        ("X-LastPlayed", "last played"),
+        ("X-Rating", "rating"),
+        ("X-Suffix", "format"),
+        ("Format", "bitrate"),
+        ("X-Size", "size"),
+        ("X-Added", "added"),
+        ("Comment", "comment"),
+    ];
+    let mut rows = Vec::new();
+    for (key, label) in LABELS {
+        let Some(v) = find(key) else { continue };
+        let shown = match *key {
+            "X-LastPlayed" => match v {
+                "0" => "today".to_string(),
+                "1" => "yesterday".to_string(),
+                d => format!("{d} days ago"),
+            },
+            "X-Rating" => format!("{v}/5"),
+            "X-Size" => human_bytes(v.parse::<u64>().unwrap_or(0)),
+            _ => v.to_string(),
+        };
+        rows.push((label.to_string(), shown));
+    }
+    if find("X-Starred").is_some() {
+        rows.push(("starred".to_string(), "yes".to_string()));
+    }
+    rows
+}
+
 /// Bytes a person reads. Mirrors the daemon's own rule so a size shown here and a size
 /// shown by `dj store` cannot be spelled two ways.
 fn human_bytes(n: u64) -> String {
@@ -746,6 +825,11 @@ pub struct TuiState {
     pub card: Option<Vec<(String, String)>>,
     /// The card's scroll, in the shape help and heard now share.
     pub card_scroll: ScrollBox,
+    /// The uri the open card is ABOUT, when it was opened on a row whose detail had to
+    /// be fetched. Load-bearing for staleness: an `info` reply is adopted only while
+    /// this still matches, so a card closed or moved off before the answer arrives
+    /// simply discards it. `None` for a card rendered entirely from local row data.
+    pub card_uri: Option<String>,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -879,6 +963,7 @@ impl Default for TuiState {
             heard: ScrollBox::default(),
             card: None,
             card_scroll: ScrollBox::default(),
+            card_uri: None,
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             sixel_supported: false,
@@ -1009,6 +1094,7 @@ impl TuiState {
         self.heard.reset();
         self.card = None;
         self.card_scroll.reset();
+        self.card_uri = None;
     }
 
     /// Open the info card on the given rows. Empty rows are refused rather than opening
@@ -1040,53 +1126,18 @@ impl TuiState {
 
     fn card_rows_for_selection(&self) -> Vec<(String, String)> {
         let Some(item) = self.queue.get(self.selected) else { return Vec::new() };
-        let mut rows: Vec<(String, String)> = Vec::new();
-        rows.push(("title".to_string(), item.title.clone()));
+        // Only the QUEUE holds per-row pairs; a browse or Find row was never sent them,
+        // so an empty answer here is the caller's signal to ask the daemon instead.
+        if self.screen != Screen::Queue {
+            return Vec::new();
+        }
+        let mut rows = vec![("title".to_string(), item.title.clone())];
         if let Some(a) = &item.artist {
             rows.push(("artist".to_string(), a.clone()));
         }
-        // Ordered by what a person asks first, not by wire order: what it is, then what
-        // I have done with it, then what the file is.
-        const LABELS: &[(&str, &str)] = &[
-            ("Album", "album"),
-            ("Date", "year"),
-            ("Track", "track"),
-            ("Genre", "genre"),
-            ("Composer", "composer"),
-            ("Performer", "performer"),
-            ("X-Plays", "plays"),
-            ("X-LastPlayed", "last played"),
-            ("X-Rating", "rating"),
-            ("X-Suffix", "format"),
-            ("Format", "bitrate"),
-            ("X-Size", "size"),
-            ("X-Added", "added"),
-            ("Comment", "comment"),
-        ];
-        let find = |k: &str| {
-            item.details.iter().find(|(dk, _)| dk == k).map(|(_, v)| v.as_str())
-        };
-        for (key, label) in LABELS {
-            let Some(v) = find(key) else { continue };
-            let shown = match *key {
-                // Whole days, rendered by the daemon; say the unit here so a bare "54"
-                // is not read as a date.
-                "X-LastPlayed" => match v {
-                    "0" => "today".to_string(),
-                    "1" => "yesterday".to_string(),
-                    d => format!("{d} days ago"),
-                },
-                "X-Rating" => format!("{v}/5"),
-                "X-Size" => human_bytes(v.parse::<u64>().unwrap_or(0)),
-                _ => v.to_string(),
-            };
-            rows.push((label.to_string(), shown));
-        }
-        // Starred is a flag, not a value: the pair is absent when not starred, so its
-        // mere presence is the answer.
-        if find("X-Starred").is_some() {
-            rows.push(("starred".to_string(), "yes".to_string()));
-        }
+        // ONE mapping for both card sources: a locally-built card and a fetched one
+        // cannot label or format the same fact differently.
+        rows.extend(mapped_detail_rows(&item.details));
         rows
     }
 
@@ -1309,8 +1360,26 @@ impl TuiState {
             // fresh server read (a play count that moved since the listing) is a later
             // layer that fills this same card in.
             Act::Info => {
-                self.open_card(self.card_rows_for_selection());
-                None
+                // LOCAL FIRST. A queue row already carries its pairs from the listing,
+                // so the card opens with no socket, no latency and nothing that can
+                // fail. Anywhere else - a browse row, a Find hit - the listing never
+                // carried that detail, so the daemon is asked. Same card either way.
+                let rows = self.card_rows_for_selection();
+                if !rows.is_empty() {
+                    self.open_card(rows);
+                    return None;
+                }
+                let uri = self.cursor_target().and_then(|t| t.uri)?;
+                if !uri.starts_with("song/") {
+                    // An album or playlist row is not a song; say so rather than
+                    // opening an empty box or silently doing nothing.
+                    self.status_msg = Some("no details for that row".into());
+                    return None;
+                }
+                self.take_screen();
+                self.card_uri = Some(uri.clone());
+                self.card = Some(vec![("".to_string(), "looking it up...".to_string())]);
+                Some(Intent::Info(uri))
             }
             Act::PlaySel => self.enter_action(),
             // `d` / Delete removes the selected QUEUE row (elsewhere a deliberate no-op:

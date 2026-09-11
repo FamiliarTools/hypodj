@@ -301,6 +301,16 @@ pub enum MpdCommand {
     /// `ADVERTISED_MPD_VERSION` untouched. See [`StoreCmd`] and
     /// [`crate::handler::HypodjHandler::handle_store`].
     Store(StoreCmd),
+    /// `info <uri>` - everything the daemon knows about ONE song, as flat pairs.
+    ///
+    /// A hypodj extension like its siblings, so it is deliberately ABSENT from the
+    /// `commands` advertisement and `ADVERTISED_MPD_VERSION` is untouched - that list
+    /// names the real MPD surface.
+    ///
+    /// Exists because a LISTING cannot carry everything: browse and Find rows are
+    /// rendered from a directory walk, so a client that wants detail for a row it is
+    /// merely looking at has nowhere to ask. One verb, one uri, one answer.
+    Info(String),
 
     /// `continuation on|off` / `continuation [status]` - the startle-safe opt-in for
     /// end-of-queue CONTINUATION radio: when the play queue drains, flow into a
@@ -1445,6 +1455,13 @@ pub fn parse(line: &str) -> MpdCommand {
         "mark" => parse_mark(&args, line),
         "heard" => parse_heard(&args, line),
         "store" => parse_store(&args, line),
+        // Exactly one argument, the uri. A bare `info` is a usage error rather than a
+        // guess at what the user meant - there is no "current" default here, because
+        // the thing being asked about is a row the cursor is on, not the deck.
+        "info" => match args.len() {
+            1 => MpdCommand::Info(args[0].clone()),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
         "continuation" => parse_continuation(&args, line),
         "radio" => parse_radio(&args, line),
         "station" => parse_station(&args, line),

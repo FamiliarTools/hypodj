@@ -81,6 +81,12 @@ pub enum Req {
     /// and stage one routes into an unbounded paging path that a broad query can
     /// keep busy. Isolated, a slow query is a slow query, not a broken player.
     Find(String),
+    /// `info <uri>` for the row the card is opening on, run on the DEDICATED info
+    /// socket for the identical reason `Find` has one: the command socket is strictly
+    /// FIFO, so a detail lookup that waits on Navidrome would head-of-line-block every
+    /// following Refresh and freeze now-playing with no UI signal, and a 5s timeout
+    /// there is read as a transport drop and prints "connection lost".
+    Info(String),
     /// Drain and stop the worker (quit teardown).
     Shutdown,
 }
@@ -91,6 +97,10 @@ pub enum Inbound {
     Resp { epoch: u64, kind: RespKind },
     /// An `idle` push: the changed subsystems (empty on a bare-OK / catch-up wake).
     Wake(Vec<String>),
+    /// The `info` answer for `uri`, carried back so the render thread can drop a reply
+    /// for a card that has since closed or moved - the `Art` staleness pattern, reused
+    /// rather than reinvented. `pairs` is empty when the daemon said it knows nothing.
+    Info { uri: String, pairs: Vec<(String, String)> },
     /// A fetched cover for the art-request `key` (`(file uri, cover url)`), carried
     /// back so the render thread can reject a late response for a since-changed key
     /// (task kmrhj8m). `art` is None on missing art / decode failure / a no-exist ACK.
@@ -144,6 +154,7 @@ pub struct Workers {
     pub art_tx: Sender<(String, Option<String>)>,
     /// The dedicated find worker's request channel (library queries).
     pub find_tx: Sender<Req>,
+    pub info_tx: Sender<Req>,
     pub stop: Arc<AtomicBool>,
     /// Cloned command-socket handle: `shutdown(Both)` unblocks a parked read at quit.
     pub cmd_shutdown: TcpStream,
@@ -207,11 +218,17 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
     // Dedicated FIND worker: opens a SHORT-LIVED socket per query, in the same shape
     // the art worker and the CC grounding socket already use. Owns no state, so a
     // timeout kills only that socket and the next query reconnects lazily.
+    let (info_tx, info_rx) = mpsc::channel::<Req>();
     let (find_tx, find_rx) = mpsc::channel::<Req>();
     {
         let in_tx = in_tx.clone();
         let host = host.to_string();
         thread::spawn(move || find_worker(find_rx, in_tx, &host, port));
+    }
+    {
+        let host = host.to_string();
+        let in_tx_info = in_tx.clone();
+        thread::spawn(move || info_worker(info_rx, in_tx_info, &host, port));
     }
 
     // Dedicated CC worker: owns NO socket (it only shells out to `claude` and posts
@@ -246,6 +263,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         inbound_rx: in_rx,
         art_tx,
         find_tx,
+        info_tx,
         stop,
         cmd_shutdown,
         idle_shutdown,
@@ -459,6 +477,10 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
     let send = |kind: RespKind| tx.send(Inbound::Resp { epoch, kind }).is_ok();
     match req {
         Req::Shutdown => false,
+        // Never reaches the command socket: the render thread routes it to info_tx,
+        // exactly as it does Find. Reaching here would mean a routing bug, and doing
+        // nothing is the safe shape of that bug - no ACK, no drop, no freeze.
+        Req::Info(_) => false,
         Req::Refresh { known_version } => match do_refresh(conn, known_version) {
             Ok(kind) => {
                 send(kind);
@@ -884,6 +906,24 @@ fn run_find(host: &str, port: u16, query: &str) -> Result<FindHits, String> {
         // A read timeout here is a SLOW QUERY, not a dropped player: say so, and say
         // what to do about it, instead of bouncing a connection the user still has.
         Err(_) => Err("search timed out - try a narrower query".to_string()),
+    }
+}
+
+/// One `info` round trip per request, on its own connection.
+///
+/// Deliberately the simplest worker in the file: no paging, no retry, no state. A
+/// failure answers with empty pairs rather than an error string, because the card's
+/// honest rendering of "nothing known" and of "could not ask" is the same - and the
+/// daemon already distinguishes them in the pairs when it can.
+fn info_worker(rx: Receiver<Req>, tx: Sender<Inbound>, host: &str, port: u16) {
+    while let Ok(req) = rx.recv() {
+        let Req::Info(uri) = req else { continue };
+        let pairs = MpdConn::connect(host, port)
+            .and_then(|mut c| c.command(&format!("info {}", quote_arg(&uri))))
+            .unwrap_or_default();
+        if tx.send(Inbound::Info { uri, pairs }).is_err() {
+            break;
+        }
     }
 }
 

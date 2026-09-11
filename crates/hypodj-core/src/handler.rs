@@ -6268,6 +6268,58 @@ impl HypodjHandler {
         s
     }
 
+    /// `info <uri>` - every fact the daemon holds about one song, as flat pairs.
+    ///
+    /// LIVE FIRST, then the mirror, then an honest refusal. `client.song()` is the only
+    /// source of a play count that has moved since the offline mirror ran - the sidecar's
+    /// embedded `Song` is written once at commit and never refreshed, so reading user
+    /// stats from it would show a number frozen months ago. When the server cannot be
+    /// reached the sidecar is still the right answer for the FILE half, so it is served
+    /// with `X-InfoSource: store` rather than withheld: offline detail beats no detail,
+    /// as long as the client can tell which it got.
+    ///
+    /// A uri that resolves to nothing answers `X-Info: unknown`. It does not invent, and
+    /// it does not ACK - "I have never heard of this" is a real answer to a real
+    /// question, and a client must be able to tell it from a transport failure.
+    ///
+    /// Reuses `push_song_tags`, so the card and every listing row describe a song with
+    /// ONE serializer and cannot disagree about the same track.
+    async fn handle_info(&self, uri: &str) -> MpdResponse {
+        let Some(id) = song_id_from_uri(uri) else {
+            // Not a library song - a stream row, an album, a playlist. Honest rather
+            // than an error: there is nothing to say, and saying so is the answer.
+            return MpdResponse::pairs().pair("X-Info", "unknown").build();
+        };
+        let (song, source) = match self.client.song(&id).await {
+            Ok(s) => (Some(s), "server"),
+            Err(_) => (
+                self.audio_store().and_then(|st| st.cached_song(&id)),
+                "store",
+            ),
+        };
+        let Some(song) = song else {
+            return MpdResponse::pairs().pair("X-Info", "unknown").build();
+        };
+        let mut p = vec![
+            ("file".to_string(), format!("song/{}", song.id.0)),
+            ("Title".to_string(), song.title.clone()),
+        ];
+        push_song_tags(&mut p, &song, crate::store::now_unix());
+        // WHICH HALF OF THE ANSWER IS FRESH. Without this a client showing "12 plays"
+        // cannot tell a current count from one frozen at mirror time, and would present
+        // both with the same confidence.
+        p.push(("X-InfoSource".to_string(), source.to_string()));
+        // The mirror's own verdict, and the ONE place it is worth paying a stat for:
+        // this is a single song the user is looking at, not a 400-row listing.
+        if let Some(store) = self.audio_store() {
+            p.push((
+                "X-Offline".to_string(),
+                if store.lookup(&id).is_some() { "1" } else { "0" }.to_string(),
+            ));
+        }
+        MpdResponse::Pairs(p)
+    }
+
     /// `store` / `store frontier` / `store pause` / `store resume` / `store now`.
     ///
     /// SYNC and cheap by contract: it answers from the status a pass already
@@ -13133,6 +13185,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Heard(q) => self.heard(q).await,
 
             MpdCommand::Store(cmd) => self.handle_store(cmd),
+            MpdCommand::Info(uri) => self.handle_info(&uri).await,
             MpdCommand::Next => {
                 // A manual `next` always advances (single governs only auto-advance);
                 // random/repeat/consume are honored via plan_next. The transition
