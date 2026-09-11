@@ -461,6 +461,13 @@ struct State {
     /// track are excluded from the next refill). EPHEMERAL: never persisted to
     /// resume.toml (same stance as `fresh_enqueue_anchor`).
     autofill_seen: VecDeque<SongId>,
+    /// The ALBUM-mode counterpart of [`State::autofill_seen`]: the album ids recent
+    /// album-shaped refills appended, FIFO-capped at [`AUTOFILL_ALBUM_SEEN_CAP`]. Album
+    /// mode deliberately keeps every track of an album (dropping "already seen" tracks
+    /// would defeat the whole point of appending a WHOLE album), so the no-immediate-
+    /// repeat invariant has to hold at album granularity instead. EPHEMERAL, like its
+    /// track-level sibling.
+    autofill_seen_albums: VecDeque<AlbumId>,
     /// The clock instant of the most recent autofill FETCH attempt (stamped BEFORE the
     /// fetch), or `None` until the first. The DEGENERATE-INPUT FUSE: a true-drain within
     /// [`AUTOFILL_MIN_INTERVAL`] of this stamp is a pathological instant-EOF spiral (a
@@ -1308,6 +1315,7 @@ impl Default for State {
             station_identity_gen: 0,
             // No autofill has run yet: an empty dedup ring and no fetch stamp.
             autofill_seen: VecDeque::new(),
+            autofill_seen_albums: VecDeque::new(),
             last_autofill_at: None,
         }
     }
@@ -1494,6 +1502,70 @@ impl State {
         while self.autofill_seen.len() > AUTOFILL_SEEN_CAP {
             self.autofill_seen.pop_front();
         }
+    }
+
+    /// Record `id` in the ALBUM-mode dedup ring ([`State::autofill_seen_albums`]),
+    /// FIFO-capped at [`AUTOFILL_ALBUM_SEEN_CAP`]. Called once per album-shaped refill,
+    /// with the album it appended, so the next one walks ONWARD instead of re-serving
+    /// the record that just played.
+    fn push_autofill_seen_album(&mut self, id: AlbumId) {
+        self.autofill_seen_albums.push_back(id);
+        while self.autofill_seen_albums.len() > AUTOFILL_ALBUM_SEEN_CAP {
+            self.autofill_seen_albums.pop_front();
+        }
+    }
+
+    /// Is the listening context ALBUM-SHAPED - is the user playing records rather than
+    /// loose tracks? Returns the album currently being listened through when so.
+    ///
+    /// The test is the queue's own shape, not a mode flag the user has to set: take the
+    /// anchor (the current track, else the last library song on the deck) and measure
+    /// the CONTIGUOUS run of its album around it. A run of at least
+    /// [`ALBUM_CONTEXT_MIN_RUN`] entries is someone playing a record; a shuffle, a
+    /// hand-picked selection, or a track-level autofill walk essentially never puts
+    /// three tracks of one album back to back. Deliberately STICKY through its own
+    /// output: once an album-shaped refill appends a whole record, that record IS a long
+    /// contiguous run, so the next drain still reads as album mode and the walk stays in
+    /// records for as long as the user lets it play.
+    ///
+    /// `None` for a stream anchor, a song with no `album_id` (a server that does not
+    /// report one cannot support album mode at all), or a run that is too short.
+    fn album_context(&self) -> Option<AlbumId> {
+        let anchor = match self.current {
+            Some(i) if i < self.queue.len() => i,
+            _ => self
+                .queue
+                .iter()
+                .rposition(|it| matches!(it.entry, QueueEntry::Song(_)))?,
+        };
+        let album = match &self.queue.get(anchor)?.entry {
+            QueueEntry::Song(s) => s.album_id.clone()?,
+            QueueEntry::Stream { .. } => return None,
+        };
+        let is_same = |it: &QueueItem| match &it.entry {
+            QueueEntry::Song(s) => s.album_id.as_ref() == Some(&album),
+            QueueEntry::Stream { .. } => false,
+        };
+        let mut run = 0usize;
+        for it in self.queue[..=anchor].iter().rev() {
+            if !is_same(it) {
+                break;
+            }
+            run += 1;
+        }
+        for it in self.queue[anchor + 1..].iter() {
+            if !is_same(it) {
+                break;
+            }
+            run += 1;
+        }
+        // The run test, OR: this IS the record the last album-shaped refill put on. That
+        // second clause is what makes the mode survive a SHORT album (an EP of two tracks
+        // is a record too, but its run can never reach the threshold) without weakening
+        // the test for music the user queued themselves - it only ever fires on an album
+        // this walk chose, and it stops firing the moment the anchor leaves that album.
+        let is_our_current_record = self.autofill_seen_albums.back() == Some(&album);
+        (run >= ALBUM_CONTEXT_MIN_RUN || is_our_current_record).then_some(album)
     }
 }
 
@@ -2968,6 +3040,22 @@ const CONTINUATION_WARM_REARM_SLACK_SECS: f64 = 2.0;
 /// not permanent exclusion). Linear `contains` is fine at this size.
 const AUTOFILL_SEEN_CAP: usize = 200;
 
+/// ALBUM-mode dedup ring capacity ([`State::autofill_seen_albums`]). Ten records is
+/// several hours of listening - long enough that an album never comes back around in one
+/// sitting, short enough that a small library still has somewhere to go.
+const AUTOFILL_ALBUM_SEEN_CAP: usize = 10;
+
+/// How many CONTIGUOUS tracks of one album on the deck read as "the user is playing this
+/// record" ([`State::album_context`]). Three is the smallest run that is not plausibly a
+/// coincidence of shuffle or of a track-level similarity walk, and it lets album mode
+/// engage a few tracks into the FIRST record rather than only after a full one.
+const ALBUM_CONTEXT_MIN_RUN: usize = 3;
+
+/// How many similar-track candidates an album-shaped refill will expand into albums
+/// before giving up and falling back to the track walk. Each attempt is one `getAlbum`,
+/// so this is the per-drain ceiling on album expansion calls.
+const AUTOFILL_ALBUM_CANDIDATES: usize = 4;
+
 /// AUTOFILL degenerate-input FUSE window ([`State::last_autofill_at`]). A true-drain
 /// that re-enters the refill within this interval of the previous fetch is a
 /// pathological instant-EOF spiral (a corrupt library where every appended song errors
@@ -3239,6 +3327,13 @@ struct AutofillTestHook {
     calls: u32,
     /// The seed id the last fetch used (proves the fresh-seed re-autofill walk).
     last_seed: Option<SongId>,
+    /// Scripted per-call album expansions, front popped by
+    /// [`HypodjHandler::autofill_album_songs`]. `Ok(vec)` models a getAlbum success
+    /// (empty = an album with no songs), `Err(())` a transport error.
+    albums: VecDeque<Result<Vec<Song>, ()>>,
+    /// Every album id an album-shaped refill asked to expand, in order (proves WHICH
+    /// album the refill chose and that the candidate ceiling holds).
+    album_calls: Vec<AlbumId>,
 }
 
 /// TEST-ONLY scripted wire hook for the `radio` seed resolve (see
@@ -9900,6 +9995,20 @@ impl HypodjHandler {
         self.autofill_test.lock().unwrap().batches.push_back(batch);
     }
 
+    /// TEST-ONLY: script the NEXT album expansion an album-shaped refill performs (FIFO).
+    /// `Ok(vec)` models a getAlbum success (empty vec = an album with no songs);
+    /// `Err(())` models a transport error.
+    #[cfg(test)]
+    pub(crate) fn push_autofill_album(&self, album: Result<Vec<Song>, ()>) {
+        self.autofill_test.lock().unwrap().albums.push_back(album);
+    }
+
+    /// TEST-ONLY: every album id an album-shaped refill asked to expand, in order.
+    #[cfg(test)]
+    pub(crate) fn autofill_album_calls(&self) -> Vec<AlbumId> {
+        self.autofill_test.lock().unwrap().album_calls.clone()
+    }
+
     /// TEST-ONLY: how many times autofill_fetch was entered (proves one-fetch-per-drain).
     #[cfg(test)]
     pub(crate) fn autofill_fetch_calls(&self) -> u32 {
@@ -10492,7 +10601,7 @@ impl HypodjHandler {
 
     async fn autofill_once(&self, seed_override: Option<SongId>, start: AutofillStart) -> usize {
         // 1. One short lock: armed? fuse? snapshot the dedup ring; stamp the fetch time.
-        let (n, seen) = {
+        let (n, seen, album_ctx, seen_albums) = {
             let mut st = self.state.lock().unwrap();
             // Armed? The runtime toggle must be ON (default OFF - never a surprise). Same
             // toggle as radio: ONE arm switch, `mode` selects the behavior.
@@ -10515,7 +10624,19 @@ impl HypodjHandler {
             st.last_autofill_at = Some(now);
             let seen: std::collections::HashSet<SongId> =
                 st.autofill_seen.iter().cloned().collect();
-            (self.autofill_count.load(Ordering::Relaxed).max(1), seen)
+            // MATCH THE SHAPE OF WHAT IS BEING PLAYED: read the album context under the
+            // SAME short lock as everything else (the queue may not be touched across the
+            // awaits below). `Some(album)` means the user is playing records, so this
+            // refill appends a record.
+            let album_ctx = st.album_context();
+            let seen_albums: std::collections::HashSet<AlbumId> =
+                st.autofill_seen_albums.iter().cloned().collect();
+            (
+                self.autofill_count.load(Ordering::Relaxed).max(1),
+                seen,
+                album_ctx,
+                seen_albums,
+            )
         };
         // The seed: the caller's EXPLICIT one (a `radio <thing>` gesture) if it supplied
         // one, else the recency seed (its own short lock inside seed_source). No seed -
@@ -10540,9 +10661,71 @@ impl HypodjHandler {
                 return 0;
             }
         };
-        // 3. Filter lock-free: drop the seed itself, drop anything in the dedup ring,
-        //    dedup within the batch, and truncate to N. All-already-seen -> honest stop.
+        // 3a. ALBUM MODE: the user is playing records, so append a RECORD - a whole
+        //     album, in disc/track order - instead of compiling a mixtape out of other
+        //     people's albums. The similar-track fetch above is reused as the SUGGESTION
+        //     layer (it already knows what sounds like the seed); each candidate's album
+        //     is the actual unit appended. Bounded at [`AUTOFILL_ALBUM_CANDIDATES`]
+        //     expansions per drain. If nothing expands (no album ids, every album already
+        //     recently served, every getAlbum failed) this falls THROUGH to the ordinary
+        //     track walk below rather than stopping: keeping the music going outranks
+        //     keeping it album-shaped.
+        let mut chosen_album: Option<AlbumId> = None;
         let mut picked: Vec<Song> = Vec::new();
+        if let Some(ref cur_album) = album_ctx {
+            let mut tried = 0usize;
+            let mut tried_albums: std::collections::HashSet<AlbumId> =
+                std::collections::HashSet::new();
+            for cand in &fetched {
+                if tried >= AUTOFILL_ALBUM_CANDIDATES {
+                    break;
+                }
+                let Some(aid) = cand.album_id.clone() else { continue };
+                // Never the record that is playing (that is a replay, not a next one),
+                // never one the last few refills already served, never the same album
+                // twice within this candidate list.
+                if aid == *cur_album || seen_albums.contains(&aid) || !tried_albums.insert(aid.clone())
+                {
+                    continue;
+                }
+                tried += 1;
+                match self.autofill_album_songs(&aid).await {
+                    Ok(songs) if !songs.is_empty() => {
+                        // Play it as a record: disc then track, with absent numbers
+                        // sorting first in the server's own order (a stable sort keeps
+                        // that order intact).
+                        let mut songs = songs;
+                        songs.sort_by_key(|s| (s.disc.unwrap_or(1), s.track.unwrap_or(0)));
+                        tracing::info!(
+                            album = %aid.0,
+                            tracks = songs.len(),
+                            "autofill: album context - appending a whole album"
+                        );
+                        picked = songs;
+                        chosen_album = Some(aid);
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::info!(album = %aid.0, error = %e, "autofill: album expand failed; trying the next candidate");
+                        continue;
+                    }
+                }
+            }
+            if picked.is_empty() {
+                tracing::info!(
+                    "autofill: album context but no fresh album resolved; falling back to the track walk"
+                );
+            }
+        }
+        // 3b. TRACK MODE (and the album fallback): filter lock-free - drop the seed
+        //    itself, drop anything in the dedup ring, dedup within the batch, and
+        //    truncate to N. All-already-seen -> honest stop. Album mode deliberately
+        //    SKIPS this: a record is appended whole, including a track the walk happens
+        //    to have played recently.
+        if !picked.is_empty() {
+            return self.autofill_append(picked, chosen_album, start).await;
+        }
         let mut batch_seen: std::collections::HashSet<SongId> = std::collections::HashSet::new();
         for song in fetched {
             if song.id == seed || seen.contains(&song.id) || !batch_seen.insert(song.id.clone()) {
@@ -10557,6 +10740,21 @@ impl HypodjHandler {
             tracing::info!(seed = %seed.0, "autofill: all similar songs already recently seen; ending stopped");
             return 0;
         }
+        self.autofill_append(picked, None, start).await
+    }
+
+    /// Append one resolved autofill batch and (unless it is a prefetch) continue onto it.
+    /// Shared verbatim by the TRACK walk and the ALBUM-shaped refill - the only thing the
+    /// two differ in is HOW `picked` was chosen, so everything after the choice (the one
+    /// short lock scope, the dedup bookkeeping, the continue, the by-id rollback on a
+    /// cold-load failure) lives here once. `album` is `Some` only for an album-shaped
+    /// batch, and records that album in the album dedup ring.
+    async fn autofill_append(
+        &self,
+        picked: Vec<Song>,
+        album: Option<AlbumId>,
+        start: AutofillStart,
+    ) -> usize {
         // 4. Append the picked Songs as ordinary library entries in ONE short lock scope
         //    (never across an await). Each id is recorded in the dedup ring so the NEXT
         //    refill excludes this batch. Capture the appended ids (for a clean by-id
@@ -10571,6 +10769,9 @@ impl HypodjHandler {
                 st.push_autofill_seen(song.id.clone());
                 st.queue.push(QueueItem::queued(id, QueueEntry::Song(song)));
                 appended_ids.push(id);
+            }
+            if let Some(aid) = album {
+                st.push_autofill_seen_album(aid);
             }
             st.playlist_version += 1;
             (first_idx, appended_ids)
@@ -10631,6 +10832,25 @@ impl HypodjHandler {
             }
         }
         self.client.similar(seed, Some(count)).await
+    }
+
+    /// Expand one album id into its tracks for an ALBUM-shaped refill. The second wire
+    /// seam of autofill, mockable for exactly the reason [`Self::autofill_fetch`] is: a
+    /// `#[cfg(test)]` build pops a scripted album from [`Self::autofill_test`] and
+    /// records the id asked for, so the shape logic around it (which album gets chosen,
+    /// the dedup, the disc/track ordering, the fallback to the track walk) is real code
+    /// under test. Called with NO std lock held.
+    async fn autofill_album_songs(&self, id: &AlbumId) -> Result<Vec<Song>, SubsonicError> {
+        #[cfg(test)]
+        {
+            let mut t = self.autofill_test.lock().unwrap();
+            t.album_calls.push(id.clone());
+            if let Some(scripted) = t.albums.pop_front() {
+                return scripted
+                    .map_err(|_| SubsonicError::Request("test autofill album error".into()));
+            }
+        }
+        self.client.album_songs(id).await
     }
 
     // ── continuation WARM: LEAD prefetch of the station (slice 2) ────────────
@@ -15865,6 +16085,179 @@ mod tests {
     fn arm_autofill(h: &HypodjHandler) {
         h.state.lock().unwrap().continuation = true;
         h.set_continuation_mode(ContinuationMode::Autofill, crate::config::DEFAULT_AUTOFILL_COUNT);
+    }
+
+    // A song that belongs to an album, at a given track number: the material album mode
+    // is detected from and built out of.
+    fn album_track(id: &str, album: &str, track: u32) -> Song {
+        Song {
+            album: Some(album.to_string()),
+            album_id: Some(AlbumId(album.to_string())),
+            track: Some(track),
+            ..playlist_test_song(id)
+        }
+    }
+
+    // Put a whole record on the deck, with `current` on its first track.
+    async fn enqueue_album(h: &HypodjHandler, album: &str, n: u32) {
+        for t in 1..=n {
+            h.enqueue_song_for_test(album_track(&format!("{album}-{t}"), album, t)).await;
+        }
+    }
+
+    // ALBUM MODE, the headline: when the deck is a RECORD (a contiguous run of one
+    // album), the refill appends a WHOLE OTHER RECORD in track order - not a mixtape
+    // compiled out of single tracks from several albums. The similar-track fetch is still
+    // the suggestion layer, but the unit appended is the album its first usable candidate
+    // belongs to.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_album_context_appends_a_whole_album() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        enqueue_album(&h, "A", 3).await;
+        h.state.lock().unwrap().current = Some(2);
+        arm_autofill(&h);
+        // The similar fetch suggests one track from album B (and one loose track with no
+        // album at all, which album mode must skip over rather than choke on).
+        h.push_autofill_batch(Ok(vec![
+            autofill_song("loose"),
+            album_track("B-2", "B", 2),
+        ]));
+        // B expands to its three tracks - deliberately scripted OUT of order, so the
+        // disc/track sort is what puts the record right.
+        h.push_autofill_album(Ok(vec![
+            album_track("B-3", "B", 3),
+            album_track("B-1", "B", 1),
+            album_track("B-2", "B", 2),
+        ]));
+
+        h.advance_on_eof(EofSignal::default()).await;
+
+        assert_eq!(
+            h.autofill_album_calls(),
+            vec![AlbumId("B".into())],
+            "the loose candidate is skipped and album B is the one expanded"
+        );
+        assert_eq!(
+            h.queue_song_ids(),
+            vec![
+                SongId("A-1".into()),
+                SongId("A-2".into()),
+                SongId("A-3".into()),
+                SongId("B-1".into()),
+                SongId("B-2".into()),
+                SongId("B-3".into()),
+            ],
+            "the WHOLE album B lands after album A, in track order"
+        );
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, Some(3), "playback continues onto the first track of the new record");
+    }
+
+    // The contrapositive, so the feature cannot be "always albums": a deck of loose
+    // tracks (no contiguous album run) still gets the ordinary TRACK walk, and never
+    // reaches for getAlbum at all.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_track_context_stays_track_shaped() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Three tracks, three DIFFERENT albums: a shuffle, not a record.
+        h.enqueue_song_for_test(album_track("x", "X", 1)).await;
+        h.enqueue_song_for_test(album_track("y", "Y", 4)).await;
+        h.enqueue_song_for_test(album_track("z", "Z", 2)).await;
+        h.state.lock().unwrap().current = Some(2);
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![album_track("q", "Q", 1), album_track("r", "R", 5)]));
+
+        h.advance_on_eof(EofSignal::default()).await;
+
+        assert!(h.autofill_album_calls().is_empty(), "no album expansion off an album-less context");
+        assert_eq!(
+            h.queue_song_ids(),
+            vec![
+                SongId("x".into()),
+                SongId("y".into()),
+                SongId("z".into()),
+                SongId("q".into()),
+                SongId("r".into()),
+            ],
+            "the similar TRACKS are appended as-is"
+        );
+    }
+
+    // STICKY across refills, and never the same record twice: the appended album is
+    // itself a contiguous run, so the NEXT drain still reads as album mode - and the
+    // album dedup ring keeps it from re-serving the record that just played, even when
+    // the similar fetch suggests a track from it.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_album_mode_walks_on_to_a_fresh_album() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        enqueue_album(&h, "A", 3).await;
+        h.state.lock().unwrap().current = Some(2);
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![album_track("B-1", "B", 1)]));
+        h.push_autofill_album(Ok(vec![album_track("B-1", "B", 1), album_track("B-2", "B", 2)]));
+        h.advance_on_eof(EofSignal::default()).await;
+
+        // Drain the appended record: B-1 -> B-2, then off the end of B-2.
+        h.state.lock().unwrap().current = Some(4);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        // Refill 2's similar fetch suggests B again (already served) and then C.
+        h.push_autofill_batch(Ok(vec![album_track("B-2", "B", 2), album_track("C-1", "C", 1)]));
+        h.push_autofill_album(Ok(vec![album_track("C-1", "C", 1), album_track("C-2", "C", 2)]));
+
+        h.advance_on_eof(EofSignal::default()).await;
+
+        assert_eq!(
+            h.autofill_album_calls(),
+            vec![AlbumId("B".into()), AlbumId("C".into())],
+            "refill 2 skips the just-served album B and expands C - B is never re-fetched"
+        );
+        assert_eq!(
+            h.queue_song_ids(),
+            vec![
+                SongId("A-1".into()),
+                SongId("A-2".into()),
+                SongId("A-3".into()),
+                SongId("B-1".into()),
+                SongId("B-2".into()),
+                SongId("C-1".into()),
+                SongId("C-2".into()),
+            ],
+            "record after record after record"
+        );
+    }
+
+    // KEEPING THE MUSIC GOING OUTRANKS KEEPING IT ALBUM-SHAPED: album context, but every
+    // expansion fails (a transport error, then an empty album). Rather than stopping, the
+    // refill falls THROUGH to the ordinary track walk with the same fetched batch.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_album_expand_failure_falls_back_to_the_track_walk() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        enqueue_album(&h, "A", 3).await;
+        h.state.lock().unwrap().current = Some(2);
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![album_track("B-1", "B", 1), album_track("C-1", "C", 1)]));
+        h.push_autofill_album(Err(())); // B: transport error
+        h.push_autofill_album(Ok(vec![])); // C: album with no songs
+
+        h.advance_on_eof(EofSignal::default()).await;
+
+        assert_eq!(
+            h.autofill_album_calls(),
+            vec![AlbumId("B".into()), AlbumId("C".into())],
+            "both candidates are tried before giving up on album shape"
+        );
+        assert_eq!(
+            h.queue_song_ids(),
+            vec![
+                SongId("A-1".into()),
+                SongId("A-2".into()),
+                SongId("A-3".into()),
+                SongId("B-1".into()),
+                SongId("C-1".into()),
+            ],
+            "the music keeps going as loose similar tracks rather than stopping"
+        );
+        assert_eq!(h.autofill_fetch_calls(), 1, "still exactly ONE similar fetch for the drain");
     }
 
     // ARMED + mode autofill: a true drain appends the similar LIBRARY songs as first-class
