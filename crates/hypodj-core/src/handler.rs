@@ -15296,11 +15296,18 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
     if let Some(g) = &s.genre {
         p.push(("Genre".to_string(), g.clone()));
     }
-    if let Some(mb) = &s.musicbrainz_id {
-        p.push(("MUSICBRAINZ_TRACKID".to_string(), mb.clone()));
+    // `Some("")` IS NOT A VALUE. The server sends empty strings for unset text fields,
+    // so `map_song` faithfully stores `Some("")` and these two pairs went out as
+    // `Comment: ` and `MUSICBRAINZ_TRACKID: ` - empty lines on every song row, which is
+    // exactly what the emit-only-when-Some rule above exists to prevent. Observed on
+    // the live daemon. Filtering here rather than in `map_song` keeps the model a
+    // faithful record of what the server said and puts the display judgement at the
+    // display edge.
+    if let Some(mb) = s.musicbrainz_id.as_deref().filter(|v| !v.trim().is_empty()) {
+        p.push(("MUSICBRAINZ_TRACKID".to_string(), mb.to_string()));
     }
-    if let Some(c) = &s.comment {
-        p.push(("Comment".to_string(), c.clone()));
+    if let Some(c) = s.comment.as_deref().filter(|v| !v.trim().is_empty()) {
+        p.push(("Comment".to_string(), c.to_string()));
     }
     if let Some(br) = s.bitrate {
         // ncmpcpp/MPD surface bitrate via the status `bitrate:` line, but a

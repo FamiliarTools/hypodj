@@ -581,7 +581,12 @@ fn mapped_detail_rows(pairs: &[(String, String)]) -> Vec<(String, String)> {
     ];
     let mut rows = Vec::new();
     for (key, label) in LABELS {
-        let Some(v) = find(key) else { continue };
+        // An EMPTY value is not a value. A daemon that sends `Comment: ` (the server
+        // does, for unset text fields) must not put a blank row in the card - belt and
+        // braces against the daemon-side filter, because the card renders whatever
+        // arrives and an older daemon on the other end of this protocol still sends
+        // them.
+        let Some(v) = find(key).filter(|v| !v.trim().is_empty()) else { continue };
         let shown = match *key {
             "X-LastPlayed" => match v {
                 "0" => "today".to_string(),
