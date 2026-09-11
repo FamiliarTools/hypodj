@@ -73,17 +73,24 @@ nix develop --command cargo test  -j4 --workspace
   and fails the build while the devshell stays green). Run `nix build .#hypodj` (or
   `nixos-rebuild build`) before calling a change deploy-ready.
 
-## Deploy (human-gated - an agent cannot finish it)
+## Deploy (an agent CAN finish it on bubble-gum)
 
 hypodj is the `hypodj` flake input (`github:FamiliarTools/hypodj`) in
-`~/os-configurations`. An agent does step 1 and the build; the **switch is the
-user's** - agents cannot `sudo` (the sandbox sets no-new-privileges).
+`~/os-configurations`. An agent can run all three steps. `sudo` is dead in an
+agent process (no-new-privileges), but the switch does not need it - see
+`hosts/bubble-gum/agent-operations.nix`.
 
 1. push `master`, then in `~/os-configurations`: `nix flake update hypodj` and
-   commit the bump scoped (`git commit -- flake.lock`), leaving unrelated lock
-   churn unstaged.
+   commit the bump scoped (`git commit -m "..." -- flake.lock`, message BEFORE
+   the `--`), leaving unrelated lock churn unstaged.
 2. `nixos-rebuild build --flake .#bubble-gum --cores 4 --max-jobs 1`
-3. **[user]** `sudo nixos-rebuild switch --flake .#bubble-gum ...`
+3. `systemctl start agent-nixos-switch.service` (it builds the toplevel itself,
+   so step 2 is only a warm-up). Watch `ActiveState`, not `is-active` - a
+   `Type=oneshot` reads inactive while still activating. Read the run from
+   `journalctl -u agent-nixos-switch`.
+
+The switch restarts `hypodj.service` and stops whatever is playing, so ask
+before running it while music is on - that gate is about timing, not authority.
 
 The live daemon binds `127.0.0.1:6600`. NOTE: the running build can lag `master`
 by several merges (the user switches manually) - match the deployed
