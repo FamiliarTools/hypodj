@@ -338,6 +338,47 @@ pub struct Station {
     pub home_page_url: Option<String>,
 }
 
+/// Written material ABOUT an album, from the server's metadata agent.
+///
+/// `notes` is PRE-SPLIT into lines here rather than kept as one blob, and that is a
+/// protocol requirement, not a formatting preference: MPD pairs are serialized as
+/// `"{key}: {value}\n"` with no escaping whatsoever, so a value carrying an embedded
+/// newline can fabricate a bare `OK` line and desync the socket for the rest of the
+/// connection. Splitting at the edge where the text is parsed means no downstream code
+/// can ever hold a multi-line value to begin with.
+///
+/// Not persisted anywhere - no `Serialize`, and never embedded in a sidecar.
+#[derive(Debug, Clone)]
+pub struct AlbumNotes {
+    pub notes: Vec<String>,
+    pub last_fm_url: Option<String>,
+    pub music_brainz_id: Option<String>,
+}
+
+/// The same, for an artist. `similar` carries NAMES rather than the wire's own artist
+/// aggregate: a wire type must not leak out of subsonic.rs, which is the repo's
+/// one-file blast radius rule.
+#[derive(Debug, Clone)]
+pub struct ArtistBio {
+    pub biography: Vec<String>,
+    pub last_fm_url: Option<String>,
+    pub music_brainz_id: Option<String>,
+    pub similar: Vec<String>,
+}
+
+/// One song's lyrics, already line-split for the same protocol reason as
+/// [`AlbumNotes::notes`].
+///
+/// `synced` records whether the server had per-line timings, even though the timings
+/// themselves are dropped for now - keeping the flag means a later karaoke view can
+/// tell "this song has no synced lyrics" from "we did not ask for them".
+#[derive(Debug, Clone)]
+pub struct SongLyrics {
+    pub lines: Vec<String>,
+    pub lang: Option<String>,
+    pub synced: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

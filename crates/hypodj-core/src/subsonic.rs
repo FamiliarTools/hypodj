@@ -37,6 +37,10 @@ use url::Url;
 /// [`SubsonicClient::similar`] falls through to `getSimilarSongs2` on any error or
 /// empty result.
 const SONIC_SIMILARITY_EXT: &str = "sonicSimilarity";
+/// The OpenSubsonic extension name for per-song lyrics. Same posture as
+/// [`SONIC_SIMILARITY_EXT`]: probed, never assumed, and a server that does not
+/// advertise it simply takes the legacy path.
+const SONG_LYRICS_EXT: &str = "songLyrics";
 
 /// Connect timeout for the METADATA HTTP client (see
 /// [`build_metadata_http_client`]). Bounds the one failure the kernel otherwise
@@ -456,6 +460,129 @@ impl SubsonicClient {
     // ── radio / similar / top (feature 4) ──────────────────────────────────
 
     /// Songs similar to a seed song/artist id.
+    /// Split server text into lines safe to put on the MPD wire.
+    ///
+    /// THIS IS A PROTOCOL REQUIREMENT, not tidiness. Pairs are serialized as
+    /// `"{key}: {value}\n"` with no escaping anywhere, so a value carrying a newline
+    /// can fabricate a bare `OK` line - ending the response frame early and desyncing
+    /// the socket for the rest of the connection. Control characters are stripped for
+    /// the same reason.
+    ///
+    /// `.lines()` handles CRLF, which matters because `.lrc` lyric files commonly use
+    /// it and the client's own line reader strips a trailing `\r` only at the frame
+    /// level, not inside a value.
+    fn clean_lines(text: &str) -> Vec<String> {
+        text.lines()
+            .map(|l| {
+                l.chars()
+                    .filter(|c| !c.is_control())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// Written notes about an album, or `None` when the server has none.
+    ///
+    /// A metadata agent that is disabled or has nothing for this album is NOT an error
+    /// condition to the caller - it is the ordinary case, and the only honest rendering
+    /// is an absent section. So every failure collapses to `None` here rather than
+    /// propagating: the alternative is an error string reaching the wire, and
+    /// `opensubsonic::Error::Parse` embeds the ENTIRE response body, which would be
+    /// both a protocol hazard and useless to a reader.
+    pub async fn album_notes(&self, id: &AlbumId) -> Option<crate::model::AlbumNotes> {
+        let info = self.inner.get_album_info2(&id.0).await.ok()?;
+        let notes = info.notes.as_deref().map(Self::clean_lines).unwrap_or_default();
+        // Nothing to say is `None`, not an empty struct: the caller renders sections by
+        // presence, so an empty one would draw a heading over nothing.
+        if notes.is_empty() && info.last_fm_url.is_none() && info.music_brainz_id.is_none() {
+            return None;
+        }
+        Some(crate::model::AlbumNotes {
+            notes,
+            last_fm_url: info.last_fm_url,
+            music_brainz_id: info.music_brainz_id,
+        })
+    }
+
+    /// An artist's biography, plus the names of similar artists. Same all-failures-are-
+    /// `None` posture as [`Self::album_notes`].
+    ///
+    /// The similar list is mapped to plain NAMES: the wire's artist aggregate must not
+    /// escape this file, which is the one-file blast radius the architecture rests on.
+    pub async fn artist_bio(&self, id: &ArtistId) -> Option<crate::model::ArtistBio> {
+        let info = self.inner.get_artist_info2(&id.0, Some(5), None).await.ok()?;
+        let biography = info.biography.as_deref().map(Self::clean_lines).unwrap_or_default();
+        let similar: Vec<String> = info.similar_artist.into_iter().map(|a| a.name).collect();
+        if biography.is_empty() && similar.is_empty() && info.last_fm_url.is_none() {
+            return None;
+        }
+        Some(crate::model::ArtistBio {
+            biography,
+            last_fm_url: info.last_fm_url,
+            music_brainz_id: info.music_brainz_id,
+            similar,
+        })
+    }
+
+    /// A song's lyrics: the OpenSubsonic extension when advertised, else legacy
+    /// `getLyrics`. Mirrors [`Self::similar`]'s probe-then-fall-through shape.
+    ///
+    /// THE INNER BUDGET IS LOAD-BEARING. The metadata client's own per-request timeout
+    /// is 15s, far longer than the caller's whole deadline, so a server that advertises
+    /// `songLyrics` and then answers slowly would consume the entire allowance and the
+    /// legacy fallback would never be tried - leaving an advertising server WORSE off
+    /// than a plain-Subsonic one. Two seconds bounds the attempt so the fallback is
+    /// still reachable.
+    ///
+    /// The extension's `StructuredLyrics` requires `lang` and `synced` on the wire, so a
+    /// server omitting either fails deserialization for the WHOLE list. That is caught
+    /// here as an ordinary miss and falls through, rather than propagating.
+    pub async fn lyrics(&self, song: &Song) -> Option<crate::model::SongLyrics> {
+        if self.supports(SONG_LYRICS_EXT) {
+            let attempt = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.inner.get_lyrics_by_song_id(&song.id.0, Some(false)),
+            )
+            .await;
+            if let Ok(Ok(list)) = attempt {
+                // Prefer the entry the server calls the main one; else the first.
+                let pick = list
+                    .structured_lyrics
+                    .into_iter()
+                    .next();
+                if let Some(sl) = pick {
+                    let lines: Vec<String> = sl
+                        .line
+                        .iter()
+                        .flat_map(|l| Self::clean_lines(&l.value))
+                        .collect();
+                    if !lines.is_empty() {
+                        return Some(crate::model::SongLyrics {
+                            lines,
+                            lang: Some(sl.lang),
+                            synced: sl.synced,
+                        });
+                    }
+                }
+            }
+        }
+        // LEGACY, by artist NAME and title - getLyrics takes no id. Reached when the
+        // extension is absent, slow, malformed, or simply empty.
+        let legacy = self
+            .inner
+            .get_lyrics(song.artist.as_deref(), Some(&song.title))
+            .await
+            .ok()?;
+        let lines = Self::clean_lines(legacy.value.as_deref()?);
+        if lines.is_empty() {
+            return None;
+        }
+        Some(crate::model::SongLyrics { lines, lang: None, synced: false })
+    }
+
     pub async fn similar_songs(
         &self,
         id: &SongId,
@@ -1631,6 +1758,35 @@ mod tests {
         assert_eq!(s.title, "Similar One");
         assert_eq!(s.genre.as_deref(), Some("Techno"));
         assert_eq!(s.year, Some(2021));
+    }
+
+    /// The one guarantee that keeps server text from corrupting the MPD frame.
+    ///
+    /// Pairs go out as `"{key}: {value}\n"` with no escaping, so a value containing a
+    /// newline can fabricate a bare `OK` and end the response early - desyncing the
+    /// socket for the rest of the connection. Nothing downstream re-checks this, so it
+    /// is checked here, at the only place multi-line server text is turned into values.
+    #[test]
+    fn clean_lines_splits_crlf_and_can_never_return_an_embeddable_newline() {
+        let out = SubsonicClient::clean_lines("line one\r\n\r\nline: two\r\n");
+        assert_eq!(out, vec!["line one".to_string(), "line: two".to_string()]);
+        // A colon inside a line is FINE and must survive: MPD splits a pair on the
+        // FIRST ": ", so a lyric like "line: two" is a well-formed value.
+        assert!(out.iter().any(|l| l.contains(": ")));
+        // The invariant, stated as the test's real subject: no element may carry a
+        // character that could terminate or forge a protocol line.
+        for l in &out {
+            assert!(!l.contains('\n'), "a newline would end the frame early: {l:?}");
+            assert!(!l.contains('\r'), "a CR would corrupt the line: {l:?}");
+            assert!(!l.chars().any(char::is_control), "no control chars: {l:?}");
+        }
+        // Text that is only whitespace and terminators yields nothing at all, so a
+        // heading is never drawn over an empty section.
+        assert!(SubsonicClient::clean_lines("\r\n   \r\n").is_empty());
+        assert!(SubsonicClient::clean_lines("").is_empty());
+        // A lone bare "OK" from a server is kept as a VALUE - it is only dangerous if
+        // it reaches the start of a line, which the "key: " prefix prevents.
+        assert_eq!(SubsonicClient::clean_lines("OK"), vec!["OK".to_string()]);
     }
 
     #[test]
