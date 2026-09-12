@@ -630,6 +630,11 @@ mod tests {
     // A Song with a fixed duration and album, enough for the enrichment join.
     fn song(id: &str, dur: Option<u32>, album: Option<&str>) -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId(id.into()),
             title: format!("t-{id}"),
             album: album.map(|a| a.to_string()),

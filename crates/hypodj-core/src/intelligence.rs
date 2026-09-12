@@ -661,6 +661,11 @@ mod tests {
 
     fn song_with(genre: Option<&str>, year: Option<u32>) -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId("s1".into()),
             title: "t".into(),
             album: None,
@@ -787,6 +792,11 @@ mod pull_tests {
 
     fn song(id: &str) -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId(id.into()),
             title: id.into(),
             album: None,

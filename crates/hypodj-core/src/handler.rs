@@ -12271,6 +12271,13 @@ fn offline_restore_song(
 /// answer. A `stream_url` needs only the id, so a placeholder stays attempt-playable.
 fn placeholder_song(id: &SongId) -> Song {
     Song {
+        // NOTHING INVENTED, per this function's own contract: the placeholder knows
+        // only an id, so every new fact is absent rather than guessed.
+        artist_id: None,
+        bpm: None,
+        sampling_rate: None,
+        bit_depth: None,
+        channel_count: None,
         id: id.clone(),
         title: id.0.clone(),
         album: None,
@@ -15352,6 +15359,27 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
     if let Some(ca) = &s.cover_art {
         p.push(("X-CoverArt".to_string(), ca.clone()));
     }
+    // THE ARTIST AS A URI, which the daemon has never emitted anywhere. Without it a
+    // client's "go to artist" can only query by NAME, and a name is not a handle.
+    if let Some(a) = &s.artist_id {
+        p.push(("X-ArtistUri".to_string(), format!("artist/{}", a.0)));
+    }
+    // The file's own audio facts. Emitted here rather than only on the `info` answer
+    // because this function IS the info answer's serializer - adding them anywhere else
+    // would mean two descriptions of one song. Same emit-only-when-Some rule, so a
+    // server that does not analyse bpm produces no line rather than a zero.
+    if let Some(n) = s.bpm {
+        p.push(("X-Bpm".to_string(), n.to_string()));
+    }
+    if let Some(n) = s.sampling_rate {
+        p.push(("X-SampleRate".to_string(), n.to_string()));
+    }
+    if let Some(n) = s.bit_depth {
+        p.push(("X-BitDepth".to_string(), n.to_string()));
+    }
+    if let Some(n) = s.channel_count {
+        p.push(("X-Channels".to_string(), n.to_string()));
+    }
 }
 
 #[cfg(test)]
@@ -15758,6 +15786,11 @@ mod tests {
     // A minimal library Song for queue/playlist wiring tests (no network).
     fn playlist_test_song(id: &str) -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId(id.to_string()),
             title: format!("Song {id}"),
             album: None,
@@ -20107,6 +20140,11 @@ mod tests {
 
     fn sample_song() -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId("so-1".into()),
             title: "Independent Us".into(),
             album: Some("Let Love Rumpel".into()),
@@ -24827,6 +24865,11 @@ mod tests {
 
     fn mk_song(id: &str) -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId(id.to_string()),
             title: format!("Song {id}"),
             album: None,

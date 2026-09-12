@@ -202,6 +202,33 @@ pub struct Song {
     /// `None` = no play record, which is NOT the same as zero-just-now.
     #[serde(default)]
     pub play_count: Option<u32>,
+    /// The artist as a BROWSE id, from the wire `artistId`.
+    ///
+    /// `artist` above is a NAME, which is a display string; this is the handle a client
+    /// can navigate with. Kept because "go to artist" has had nowhere to point: the
+    /// daemon emitted no artist uri anywhere, so the menu entry could only ever query
+    /// by name.
+    #[serde(default)]
+    pub artist_id: Option<ArtistId>,
+    /// Beats per minute, when the server has analysed it.
+    #[serde(default)]
+    pub bpm: Option<u32>,
+    /// The file's own audio facts: sample rate in Hz, bit depth, channel count.
+    ///
+    /// These complete the "what the file is" half of a detail view, which could
+    /// previously say format and bitrate but not whether a FLAC was 16/44 or 24/96 -
+    /// the distinction a person actually keeps a lossless library for.
+    ///
+    /// All four numerics arrive as `Option<i32>` on the wire and are clamped through
+    /// `.max(0) as u32` in `map_song`, the same way `size` already is: a negative
+    /// value is nonsense rather than a signal, and clamping keeps the model's type
+    /// honest about that.
+    #[serde(default)]
+    pub sampling_rate: Option<u32>,
+    #[serde(default)]
+    pub bit_depth: Option<u32>,
+    #[serde(default)]
+    pub channel_count: Option<u32>,
     /// When this user last played the track, ISO-8601 / RFC 3339 with an offset
     /// (wire `Child.played`), e.g. `2026-08-06T14:17:24+01:00`. Carried VERBATIM
     /// exactly like `created`; interpret it with [`Song::played_days_ago`], which
@@ -324,6 +351,11 @@ mod tests {
     /// A minimal song carrying only a `played` stamp, which is all these tests read.
     fn played_song(played: Option<&str>) -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId("so-1".into()),
             title: "t".into(),
             album: None,

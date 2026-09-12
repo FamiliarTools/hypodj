@@ -921,6 +921,16 @@ fn map_song(c: data::Child) -> Song {
         // `size` is `i64` on the wire; a negative value is nonsense, so clamp it
         // to 0 rather than wrapping into a huge u64 (a huge fingerprint would
         // make every commit check fail forever instead of once).
+        // THE ARTIST AS A HANDLE, not a name. `artist` is a display string; this is
+        // what a client can navigate with, and the daemon has never emitted one.
+        artist_id: c.artist_id.map(crate::model::ArtistId),
+        // Four more `.max(0)` clamps for the same reason `size` has one: these are
+        // `Option<i32>` on the wire, and a negative sample rate is nonsense rather
+        // than a signal worth preserving.
+        bpm: c.bpm.map(|v| v.max(0) as u32),
+        sampling_rate: c.sampling_rate.map(|v| v.max(0) as u32),
+        bit_depth: c.bit_depth.map(|v| v.max(0) as u32),
+        channel_count: c.channel_count.map(|v| v.max(0) as u32),
         size: c.size.map(|s| s.max(0) as u64),
         // Kept verbatim here; the store sanitizes it to `[a-z0-9]{1,8}` (else
         // `bin`) before it can ever become a path component.

@@ -515,6 +515,11 @@ mod tests {
 
     fn a_song() -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId("so-1".into()),
             title: "Independent Us".into(),
             album: Some("Let Love Rumpel".into()),

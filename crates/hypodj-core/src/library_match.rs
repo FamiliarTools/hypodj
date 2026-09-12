@@ -409,6 +409,11 @@ mod tests {
     /// A library song carrying only the fields the matcher reads.
     fn song(id: &str, title: &str, artist: Option<&str>) -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId(id.to_string()),
             title: title.to_string(),
             artist: artist.map(str::to_string),

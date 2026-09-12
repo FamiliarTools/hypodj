@@ -4712,6 +4712,11 @@ mod tests {
     /// A song carrying a full store fingerprint, as `map_song` would produce it.
     fn song(id: &str, size: u64, suffix: &str, created: Option<&str>) -> Song {
         Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: sid(id),
             title: format!("t-{id}"),
             album: Some("al".into()),
@@ -5638,6 +5643,70 @@ title = "Minimal"
             assert!(is_tmp_name(&name), "{name:?} must be sweepable");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar written BEFORE the five new `Song` fields existed must still load, with
+    /// every new field absent rather than the entry being invalidated.
+    ///
+    /// This is the decisive safety test for adding anything to `Song`, and the stakes
+    /// are the reason it is a verbatim copy of a real on-disk sidecar rather than a
+    /// hand-rolled minimal one: there are ~468 of these on this machine, and an entry
+    /// whose sidecar fails to parse is HEALED by deleting the sidecar and the audio, so
+    /// a parse regression is a 16 GB silent re-download, not a warning.
+    #[test]
+    fn a_sidecar_written_before_the_new_song_fields_still_parses() {
+        // Verbatim shape of ~/.local/state/hypodj/store/<id>.toml as written by the
+        // deployed daemon, including the empty `musicbrainz_id` the server really sends.
+        const OLD: &str = r#"
+schema_version = 1
+endpoint = "download"
+content_type = "audio/flac"
+pinned = true
+stale = false
+fetched_at_unix = 1787656224
+last_played_unix = 1787656224
+
+[fingerprint]
+size = 53355431
+suffix = "flac"
+created = "2026-07-01T20:52:30.913402897+01:00"
+
+[song]
+id = "05iQK8pfKwVhQYF0bwf7LD"
+title = "Halftime Blues"
+album = "Let Love Rumpel - Part 2"
+album_id = "4xpzUL7GfeK5aWJTHDHlh1"
+artist = "Kalabrese"
+track = 10
+duration_secs = 292
+cover_art = "mf-05iQK8pfKwVhQYF0bwf7LD_6a456ec2"
+starred = true
+musicbrainz_id = ""
+year = 2022
+bitrate = 1454
+comment = "Visit https://rumpelmusig.bandcamp.com"
+size = 53355431
+suffix = "flac"
+content_type = "audio/flac"
+"#;
+        let sc = sidecar_from_toml(OLD).expect("an old sidecar must still parse");
+        // The entry is intact: the fingerprint that gates every commit is unchanged.
+        assert_eq!(sc.fingerprint.size, 53_355_431);
+        assert_eq!(sc.fingerprint.suffix, "flac");
+        assert_eq!(sc.song.title, "Halftime Blues");
+        assert_eq!(sc.song.track, Some(10));
+        // And every field added later is simply absent. Option defaults to None on a
+        // missing key in serde, so this holds with or without #[serde(default)] - the
+        // attribute is convention here, not the mechanism.
+        assert!(sc.song.artist_id.is_none());
+        assert!(sc.song.bpm.is_none());
+        assert!(sc.song.sampling_rate.is_none());
+        assert!(sc.song.bit_depth.is_none());
+        assert!(sc.song.channel_count.is_none());
+        // THE VERSION MUST NOT MOVE. `from_toml` gates on strict equality, so bumping
+        // STORE_SCHEMA_VERSION for an additive field would orphan every sidecar on disk
+        // at the next start and heal each one by deleting its audio.
+        assert_eq!(STORE_SCHEMA_VERSION, 1, "additive fields never bump the schema");
     }
 
     #[test]
@@ -6938,6 +7007,11 @@ title = "Minimal"
             .expect("a created stamp to date the capture from");
 
         let to_song = |c: &serde_json::Value| Song {
+            artist_id: None,
+            bpm: None,
+            sampling_rate: None,
+            bit_depth: None,
+            channel_count: None,
             id: SongId(c["id"].as_str().unwrap_or_default().to_string()),
             title: c["title"].as_str().unwrap_or_default().to_string(),
             album: None,
