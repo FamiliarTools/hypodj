@@ -87,6 +87,13 @@ pub enum Req {
     /// following Refresh and freeze now-playing with no UI signal, and a 5s timeout
     /// there is read as a transport drop and prints "connection lost".
     Info(String),
+    /// `info more <uri>`, on its OWN socket and its own thread.
+    ///
+    /// Not merged into the info worker, which is strictly sequential and
+    /// connect-per-request: a 4s enrichment queued ahead of a plain `info` would
+    /// head-of-line-block the card the user is waiting to see, which is the same
+    /// mistake as putting either of them on the command socket.
+    InfoMore(String),
     /// Drain and stop the worker (quit teardown).
     Shutdown,
 }
@@ -101,6 +108,10 @@ pub enum Inbound {
     /// for a card that has since closed or moved - the `Art` staleness pattern, reused
     /// rather than reinvented. `pairs` is empty when the daemon said it knows nothing.
     Info { uri: String, pairs: Vec<(String, String)> },
+    /// The `info more` answer. Carries the uri so a reply for a card that has since
+    /// closed or moved is dropped, and is APPENDED to an open card rather than
+    /// replacing it - an empty answer must leave the base card exactly as it was.
+    InfoMore { uri: String, pairs: Vec<(String, String)> },
     /// A fetched cover for the art-request `key` (`(file uri, cover url)`), carried
     /// back so the render thread can reject a late response for a since-changed key
     /// (task kmrhj8m). `art` is None on missing art / decode failure / a no-exist ACK.
@@ -155,6 +166,7 @@ pub struct Workers {
     /// The dedicated find worker's request channel (library queries).
     pub find_tx: Sender<Req>,
     pub info_tx: Sender<Req>,
+    pub more_tx: Sender<Req>,
     pub stop: Arc<AtomicBool>,
     /// Cloned command-socket handle: `shutdown(Both)` unblocks a parked read at quit.
     pub cmd_shutdown: TcpStream,
@@ -219,6 +231,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
     // the art worker and the CC grounding socket already use. Owns no state, so a
     // timeout kills only that socket and the next query reconnects lazily.
     let (info_tx, info_rx) = mpsc::channel::<Req>();
+    let (more_tx, more_rx) = mpsc::channel::<Req>();
     let (find_tx, find_rx) = mpsc::channel::<Req>();
     {
         let in_tx = in_tx.clone();
@@ -229,6 +242,11 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         let host = host.to_string();
         let in_tx_info = in_tx.clone();
         thread::spawn(move || info_worker(info_rx, in_tx_info, &host, port));
+    }
+    {
+        let host = host.to_string();
+        let in_tx_more = in_tx.clone();
+        thread::spawn(move || more_worker(more_rx, in_tx_more, &host, port));
     }
 
     // Dedicated CC worker: owns NO socket (it only shells out to `claude` and posts
@@ -264,6 +282,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         art_tx,
         find_tx,
         info_tx,
+        more_tx,
         stop,
         cmd_shutdown,
         idle_shutdown,
@@ -481,6 +500,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
         // exactly as it does Find. Reaching here would mean a routing bug, and doing
         // nothing is the safe shape of that bug - no ACK, no drop, no freeze.
         Req::Info(_) => false,
+        Req::InfoMore(_) => false,
         Req::Refresh { known_version } => match do_refresh(conn, known_version) {
             Ok(kind) => {
                 send(kind);
@@ -922,6 +942,23 @@ fn info_worker(rx: Receiver<Req>, tx: Sender<Inbound>, host: &str, port: u16) {
             .and_then(|mut c| c.command(&format!("info {}", quote_arg(&uri))))
             .unwrap_or_default();
         if tx.send(Inbound::Info { uri, pairs }).is_err() {
+            break;
+        }
+    }
+}
+
+/// One `info more` round trip per request, on its own connection.
+///
+/// Identical in shape to `info_worker` and deliberately a separate thread rather than a
+/// shared queue: this is the slow one, and the whole reason it exists apart from the
+/// base card is that it must not delay anything.
+fn more_worker(rx: Receiver<Req>, tx: Sender<Inbound>, host: &str, port: u16) {
+    while let Ok(req) = rx.recv() {
+        let Req::InfoMore(uri) = req else { continue };
+        let pairs = MpdConn::connect(host, port)
+            .and_then(|mut c| c.command(&format!("info more {}", quote_arg(&uri))))
+            .unwrap_or_default();
+        if tx.send(Inbound::InfoMore { uri, pairs }).is_err() {
             break;
         }
     }

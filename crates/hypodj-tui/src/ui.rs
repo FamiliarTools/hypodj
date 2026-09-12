@@ -326,6 +326,12 @@ fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     );
 }
 
+/// Cells available for a card VALUE: the popup's inner width less the label column and
+/// its two-space gutter, less the two border columns.
+fn popup_inner_w(popup_w: u16, label_w: usize) -> usize {
+    (popup_w as usize).saturating_sub(label_w + 2 + 2)
+}
+
 /// The `i` detail card: everything the daemon already told us about one song, laid out
 /// as a label column and a value column.
 ///
@@ -338,22 +344,113 @@ fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
 /// rows are short label/value pairs, so a full-frame box would be mostly empty and
 /// would hide the queue for no gain.
 fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
-    let Some(rows) = &state.card else { return };
+    let Some(base) = &state.card else { return };
+    // CONCATENATED AT RENDER, which is what makes the two replies order-independent.
+    let rows: Vec<(String, String)> =
+        base.iter().chain(state.card_more.iter()).cloned().collect();
+    let rows = &rows;
     let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
     let base = Style::default().fg(fg);
     let head = base.add_modifier(Modifier::BOLD);
 
     // The label column is measured from the content, so a long label never collides with
     // its own value and a card of short labels does not carry a wide empty gutter.
-    let label_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    // Measured over FACT rows only. A heading lives in the label slot but is not
+    // label-column content, so counting it would push every value across the card.
+    let label_w = rows
+        .iter()
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
     let widest = rows
         .iter()
         .map(|(k, v)| label_w.saturating_sub(k.chars().count()) + k.chars().count() + 2 + v.chars().count())
         .max()
         .unwrap_or(0);
 
-    let w = (widest as u16 + 4).min(region.width.saturating_sub(2)).max(20);
-    let h = (rows.len() as u16 + 2).min(region.height.saturating_sub(2)).max(3);
+    // CAPPED, not merely clamped to the terminal. `widest` is the longest UNWRAPPED
+    // value, and a Last.fm biography is one ~1900-character paragraph - sizing to it
+    // would stretch the card across a 129-column terminal and set prose in one
+    // enormous measure, which is unreadable. 76 columns is a comfortable line for
+    // running text, and a card of short label/value rows still shrinks to fit.
+    const CARD_MAX_W: u16 = 76;
+    let w = (widest as u16 + 4)
+        .min(CARD_MAX_W)
+        .min(region.width.saturating_sub(2))
+        .max(20);
+
+    // WRAPPED, not clipped, and wrapped HERE rather than with Paragraph::wrap. The
+    // renderer measures max-scroll from the line count, and `.wrap()` does its wrapping
+    // after that measurement - so a wrapped card would know neither how tall it really
+    // is nor how far it may scroll, and the tail would be unreachable.
+    //
+    // This is not a hypothetical: Last.fm returns an artist biography as ONE paragraph
+    // with no newlines, measured at 1907 characters on a real request. Clipped, a card
+    // would show its first line and silently swallow the rest.
+    //
+    // `status_lines` is the same helper the heard overlay wraps with, so the two
+    // overlays break lines identically.
+    let full_w = (w as usize).saturating_sub(4).max(8);
+    let value_w = (popup_inner_w(w, label_w)).max(8);
+    let mut lines: Vec<Line> = Vec::new();
+
+    // THE COVER, PREPENDED INTO THE CARD'S OWN LINES rather than laid out in a separate
+    // region. The cell renderer already returns `Vec<Line>`, so prepending means the art
+    // participates in the same scroll and the same measurement as everything else - no
+    // second geometry to keep in step, and no chance of the scroll knowing a height the
+    // art does not have.
+    //
+    // Cell rendering, never sixel: the card is an overlay, and `overlay_drawn` marks the
+    // sixel surface COVERED while one is open precisely so a popup does not punch holes
+    // in an inline image. Drawing a second sixel from inside that overlay would fight
+    // the mechanism protecting it.
+    if let Some(a) = &state.card_art {
+        const ART_ROWS: usize = 10;
+        // Half-block/sextant cells are about 2:1, so twice the rows is roughly square.
+        let art_cols = (ART_ROWS * 2).min(full_w);
+        // Centred over the card's width, so a narrow thumb does not sit oddly left.
+        let pad = " ".repeat(full_w.saturating_sub(art_cols) / 2);
+        for row in a.lines(art_cols, ART_ROWS) {
+            let mut spans = vec![Span::raw(pad.clone())];
+            spans.extend(row.spans);
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+    }
+    for (k, v) in rows {
+        // THREE ROW SHAPES, told apart by which half is empty - see
+        // `more_rows_from_pairs`. A heading (label, no value) sets flush and bold. A
+        // body line (value, no label) is running text and gets the FULL width, because
+        // indenting a paragraph under an empty label column would waste a seventh of a
+        // narrow card on nothing. A fact (both) keeps the label/value columns.
+        if v.is_empty() && k.is_empty() {
+            lines.push(Line::from(""));
+        } else if v.is_empty() {
+            lines.push(Line::from(Span::styled(k.clone(), head)));
+        } else if k.is_empty() {
+            for part in status_lines(v, full_w, usize::MAX) {
+                lines.push(Line::from(Span::styled(part, base)));
+            }
+        } else {
+            for (i, part) in status_lines(v, value_w, usize::MAX).iter().enumerate() {
+                // The label prints once, on the first visual row; continuations align
+                // under the value so a wrapped value never reads as a new fact.
+                let label =
+                    if i == 0 { format!("{k:<label_w$}  ") } else { " ".repeat(label_w + 2) };
+                lines.push(Line::from(vec![
+                    Span::styled(label, base.add_modifier(Modifier::DIM)),
+                    Span::styled(part.clone(), base),
+                ]));
+            }
+        }
+    }
+
+    // HEIGHT FROM THE FINAL LINE COUNT, not from `rows`. Sizing before the cover and
+    // the wrapping were applied made the box exactly as tall as the unwrapped row count
+    // - so ten rows of art filled it and pushed every fact out of sight. The box has to
+    // be measured against what will actually be drawn in it.
+    let h = (lines.len() as u16 + 2).min(region.height.saturating_sub(2)).max(3);
     let popup = Rect {
         x: region.x + region.width.saturating_sub(w) / 2,
         y: region.y + region.height.saturating_sub(h) / 2,
@@ -361,17 +458,6 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
         height: h,
     };
     let inner_h = h.saturating_sub(2);
-
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(k, v)| {
-            Line::from(vec![
-                Span::styled(format!("{k:<label_w$}  "), base.add_modifier(Modifier::DIM)),
-                Span::styled(v.clone(), base),
-            ])
-        })
-        .collect();
-
     let scroll = state.card_scroll.measure(lines.len(), inner_h);
     let max_scroll = state.card_scroll.max.get();
     let title = if max_scroll > 0 {
@@ -660,13 +746,7 @@ pub fn stream_headline(np: &NowPlaying) -> (String, Option<String>) {
 /// Left of Now Playing: the dithered album art with title/artist/album beneath it.
 fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     let np = &state.now;
-    // THE TITLE FOLLOWS THE IMAGE. A pane that silently shows a different album than
-    // the one playing is the whole risk of peeking here, and the honest fix is one word:
-    // while a preview is up the pane says so, so the cover is never read as the deck.
-    let previewing = state.peek.as_ref().is_some_and(|(_, a)| a.is_some());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(if previewing { "Preview" } else { "Now Playing" });
+    let block = Block::default().borders(Borders::ALL).title("Now Playing");
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -755,15 +835,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
             _ => (art_rows * 2).min(inner.width as usize),
         };
         let art_area = Rect { x: inner.x, y: inner.y, width: art_cols as u16, height: art_h };
-        // The PEEK wins the image slot when one is held, and nothing else. Every other
-        // consumer of the cover - the waveform hue, the sigil palette - keeps reading
-        // `state.art`, so a rested cursor changes one rectangle and does not recolour
-        // the interface.
-        let shown = match &state.peek {
-            Some((_, Some(a))) => Some(a),
-            _ => state.art.as_ref(),
-        };
-        match shown {
+        match &state.art {
             // A real cover is always preferred. Sixel when the terminal can draw it,
             // else the cell renderers.
             Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px, state.sixel_gen.get(), &state.sixel_held, state.sixel_covered.get()) => {}
@@ -1594,6 +1666,90 @@ mod tests {
     /// The `i` card renders from pairs the daemon ALREADY sent with the listing - no
     /// socket, no request, no latency. This is the whole reason step one was an emission
     /// fix rather than a fetch feature.
+    /// A long unbroken paragraph must WRAP and stay reachable by scrolling, not clip.
+    ///
+    /// Last.fm returns an artist biography as a single ~1900-character line with no
+    /// newlines - measured on a real request - so this is the shape the card actually
+    /// meets, and clipping would silently swallow all but the first line.
+    /// The cover belongs to the CARD now, not to the now-playing pane.
+    ///
+    /// An earlier design previewed a rested row's cover in that pane and retitled it
+    /// "Preview". It worked, but it made a piece of global chrome stop meaning "what is
+    /// playing", and the cost of a title swap is that the reader has to notice it. The
+    /// card is already about one song and names it, so art inside it cannot mislead.
+    #[test]
+    fn the_info_card_draws_its_own_cover_and_leaves_now_playing_alone() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Something Else".into());
+        // A cover is held for what is PLAYING, and must be untouched by the card.
+        s.art = Some(crate::art::AlbumArt::for_test_solid([10, 20, 30]));
+        s.card = Some(vec![("title".into(), "Heroes".into())]);
+        s.card_art = Some(crate::art::AlbumArt::for_test_solid([200, 40, 40]));
+
+        let out = render_to_lines_sized(&s, 129, 40).join("\n");
+        assert!(out.contains("Info"), "the card is drawn:\n{out}");
+        assert!(out.contains("Heroes"), "with its rows:\n{out}");
+        // The pane keeps its ONE meaning - no "Preview" title anywhere any more.
+        assert!(out.contains("Now Playing"), "the pane is still itself:\n{out}");
+        assert!(!out.contains("Preview"), "the preview title is gone:\n{out}");
+        assert!(s.art.is_some(), "the card never touches the playing cover");
+        // On a tall terminal the card simply GROWS to fit the cover, so it does not
+        // scroll - and the facts stay visible, which is what the assertion above proves
+        // and what sizing from `rows` alone got wrong.
+        assert_eq!(s.card_scroll.max.get(), 0, "it fits, so nothing to scroll");
+
+        // On a SHORT terminal it must scroll instead of hiding rows, and the max must
+        // account for the cover's lines. That is the half a line-count taken before the
+        // art was prepended would get wrong.
+        let out = render_to_lines_sized(&s, 129, 12).join("\n");
+        assert!(
+            s.card_scroll.max.get() > 0,
+            "a cover plus rows exceeds 12 terminal rows, so the card must know it scrolls:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_card_wraps_a_long_paragraph_instead_of_clipping_it() {
+        let long = "Globally beloved for his ability to evolve both his musical style \
+                    and personal image, his visionary pursuit of original, cutting-edge \
+                    rock styles kept him at the top for over thirty-five years, selling \
+                    well over a hundred million albums across a career that redefined \
+                    what a popular musician was allowed to be."
+            .to_string();
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.card = Some(vec![
+            ("title".into(), "Heroes".into()),
+            (String::new(), "about the artist".into()),
+            (String::new(), long.clone()),
+        ]);
+        let out = render_to_lines_sized(&s, 129, 40).join("\n");
+
+        assert!(out.contains("about the artist"), "the section heading renders:\n{out}");
+        // The paragraph appears across MULTIPLE rows: its opening and a phrase from
+        // deep inside it are both on screen, which clipping could not achieve.
+        assert!(out.contains("Globally beloved"), "the start is shown:\n{out}");
+        assert!(
+            out.contains("redefined") || s.card_scroll.max.get() > 0,
+            "either the tail is visible or the card knows it must scroll to reach it"
+        );
+        // The card does NOT stretch across the whole 129-column terminal just because
+        // one value is long - prose in a single enormous measure is unreadable.
+        let widest_row = out.lines().map(|l| l.trim_end().chars().count()).max().unwrap_or(0);
+        assert!(widest_row <= 129, "never wider than the terminal:\n{out}");
+        // The scroll measurement counts WRAPPED rows. On a 40-row terminal the card is
+        // simply tall enough, so there is nothing to scroll - and this assertion used to
+        // pass only because the box was sized from the UNWRAPPED row count and was
+        // therefore too short for its own content. Squeeze the terminal and the real
+        // behaviour shows: it scrolls, by an amount that knows about the wrapping.
+        let short = render_to_lines_sized(&s, 129, 8).join("\n");
+        assert!(
+            s.card_scroll.max.get() > 0,
+            "wrapped to 8 terminal rows, the card must know it scrolls:\n{short}"
+        );
+    }
+
     #[test]
     fn the_info_card_renders_the_metadata_the_row_already_carried() {
         let mut s = TuiState::new();

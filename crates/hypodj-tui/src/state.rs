@@ -377,6 +377,8 @@ pub enum Intent {
     /// it is NOT a mutation, so it must never set `sent_mutation` and never trail a
     /// refresh.
     Info(String),
+    /// Ask for the enrichment on its own socket, after the base card is already up.
+    InfoMore(String),
     /// Run a library query on the dedicated find socket. NOT a mutation, so it must
     /// never set `sent_mutation` and never trail a `request_refresh`.
     Find(String),
@@ -466,53 +468,8 @@ fn scrub_intent(secs: i32) -> Intent {
 /// Takes `now` as an ARGUMENT rather than reading the clock, so every test of the
 /// depth ladder is exact and instant instead of sleeping.
 impl TuiState {
-    pub(crate) fn resting_for(&self, now: std::time::Instant) -> Option<std::time::Duration> {
-        let since = self.sel_since?;
-        self.sel_key.as_ref()?;
-        Some(now.saturating_duration_since(since))
-    }
 
-    /// Record where the cursor is. Re-stamps ONLY when the row actually changed, which
-    /// is what makes a held arrow key cost one comparison per frame rather than
-    /// resetting a timer per keypress.
-    ///
-    /// Called after key dispatch and after inbound responses are applied, so it sees the
-    /// settled cursor for the frame rather than an intermediate position.
-    pub(crate) fn note_selection(&mut self, now: std::time::Instant) {
-        let want = self.cursor_target();
-        if self.sel_key.as_ref().map(|t| &t.label) == want.as_ref().map(|t| &t.label)
-            && self.sel_key.as_ref().map(|t| &t.uri) == want.as_ref().map(|t| &t.uri)
-        {
-            return;
-        }
-        self.sel_key = want;
-        self.sel_since = self.sel_key.as_ref().map(|_| now);
-    }
 
-    /// The depth of attention on the current row: how much the user has shown they want.
-    ///
-    /// A PURE FUNCTION of settled state, recomputed every frame - never an event, never
-    /// a timer callback. That is what collapses scroll bursts, reconnects, cold start
-    /// and a key pressed mid-fetch into one code path: the next frame.
-    ///
-    /// 0 - the row is merely on screen. 1 - the cursor has rested, so a cover peek is
-    /// wanted. 2 - the card is open, which is an explicit ask and needs no dwell.
-    ///
-    /// An OPEN OVERLAY pins depth to 0 for anything passive: while the help, heard or
-    /// menu overlay is up, the eye is not on the list at all, so resting there is not
-    /// evidence of interest in a row it cannot see.
-    pub(crate) fn attention_depth(&self, now: std::time::Instant, rest: std::time::Duration) -> u8 {
-        if self.card.is_some() {
-            return 2;
-        }
-        if self.help_open || self.heard_open || self.menu.is_some() {
-            return 0;
-        }
-        match self.resting_for(now) {
-            Some(d) if d >= rest => 1,
-            _ => 0,
-        }
-    }
 }
 
 /// A scrollable overlay's offset, plus the max the RENDERER last measured.
@@ -525,6 +482,61 @@ impl TuiState {
 ///
 /// Extracted because the help and heard overlays had this logic line-for-line twice and
 /// the info card would have made it three times.
+/// Turn a daemon `info more` pair list into card rows.
+///
+/// ITERATES the pairs; it does not look keys up. That distinction is the whole function:
+/// `card_rows_from_pairs` finds the FIRST value for each key in a fixed whitelist, which
+/// is right for one-value-per-key facts and catastrophically wrong here - sixty repeated
+/// `X-Lyric` pairs would yield a single row, and a whitelist miss would yield none at
+/// all, which the caller would read as "nothing came back".
+///
+/// Section headings are emitted as a row with an EMPTY label, so the renderer's
+/// label/value columns lay them out as a lone line rather than a mislabelled value.
+pub fn more_rows_from_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    // A HEADING is a row with a label and NO value; a BODY line is a row with a value
+    // and no label. That distinction is what lets the renderer set headings flush and
+    // bold while running text stays a plain block - without it both arrive as
+    // indistinguishable empty-labelled rows and a heading reads as a stray value.
+    let mut section = |rows: &mut Vec<(String, String)>, title: &str| {
+        if !rows.is_empty() {
+            rows.push((String::new(), String::new()));
+        }
+        rows.push((title.to_string(), String::new()));
+    };
+    let take = |key: &str| -> Vec<&str> {
+        pairs.iter().filter(|(k, _)| k == key).map(|(_, v)| v.as_str()).collect()
+    };
+
+    let notes = take("X-AlbumNotes");
+    if !notes.is_empty() {
+        section(&mut rows, "about the album");
+        for l in notes {
+            rows.push((String::new(), l.to_string()));
+        }
+    }
+    let bio = take("X-ArtistBio");
+    if !bio.is_empty() {
+        section(&mut rows, "about the artist");
+        for l in bio {
+            rows.push((String::new(), l.to_string()));
+        }
+    }
+    let similar = take("X-SimilarArtist");
+    if !similar.is_empty() {
+        section(&mut rows, "similar artists");
+        rows.push((String::new(), similar.join(", ")));
+    }
+    let lyrics = take("X-Lyric");
+    if !lyrics.is_empty() {
+        section(&mut rows, "lyrics");
+        for l in lyrics {
+            rows.push((String::new(), l.to_string()));
+        }
+    }
+    rows
+}
+
 /// Turn a daemon `info` pair list into card rows.
 ///
 /// The SAME mapping the local path uses, so a card fetched from the daemon and a card
@@ -731,36 +743,19 @@ pub struct TuiState {
     /// swapping the cover on the same uri each fires exactly one fetch, never per
     /// frame (task kmrhj8m).
     pub art_req_key: Option<(String, Option<String>)>,
-    /// The row the cursor is on, as of the last frame, and when it arrived there.
+    /// The cover for the song the INFO CARD is showing, and the key it was asked for.
     ///
-    /// THE WHOLE DWELL MECHANISM. There is no timer, no tick and no thread: the render
-    /// loop already free-runs at 50ms or better with an unconditional redraw, so
-    /// "resting" is a comparison against a stamp, recomputed once per frame in the same
-    /// reconcile block as `request_art`. Worst-case latency is the rest delay plus one
-    /// frame.
+    /// The card owns its own art rather than borrowing the now-playing pane's. An
+    /// earlier design previewed a rested row's cover in that pane and swapped its title
+    /// to "Preview", which worked but made a piece of global chrome stop meaning "what
+    /// is playing" - the cost of a title swap is that you have to read it. Art inside
+    /// the card has no such ambiguity: the card is already about one song and says which.
     ///
-    /// Keyed on the cursor TARGET rather than the selected index, because an index is
-    /// not identity: switching screens or drilling into a Find hit changes the row under
-    /// the eye without necessarily changing the number, and both must re-stamp.
-    ///
-    /// `Instant` and not `anim_secs`: that clock freezes when playback pauses, and a
-    /// paused deck is exactly when someone browses.
-    pub sel_key: Option<Target>,
-    pub sel_since: Option<std::time::Instant>,
-    /// The cover being PEEKED at for the rested row, keyed so a late reply for a
-    /// since-moved cursor is dropped.
-    ///
-    /// A SEPARATE FIELD, never `state.art`, and that is load-bearing twice over.
-    /// `request_art` is edge-triggered on the now-playing key, so writing a peek into
-    /// `state.art` would leave now-playing showing the wrong cover until the next track
-    /// change. And the palette consumers - the bottom-bar waveform colour, the album
-    /// sigil - read their hue from `state.art`, so the whole UI would recolour every
-    /// time the cursor came to rest. Keeping the peek beside it means the pane shows a
-    /// preview while the chrome keeps meaning what is playing.
-    pub peek: Option<(String, Option<crate::art::AlbumArt>)>,
-    /// The peek key currently requested, in the shape of `art_req_key`: the
-    /// want-vs-asked diff that makes this a reconciler rather than an event handler.
-    pub peek_req_key: Option<String>,
+    /// The key is held separately so a reply for a card that has since closed, or moved
+    /// to another row, is dropped rather than drawn (the `Inbound::Art` staleness
+    /// discipline).
+    pub card_art: Option<crate::art::AlbumArt>,
+    pub card_art_key: Option<String>,
     /// The ambient-visualizer clock, in seconds. The render loop advances this by
     /// the wall-clock frame delta ONLY while playback is `play` (so it freezes when
     /// paused/stopped) and writes it here before each draw; the idle bottom-bar wave
@@ -835,6 +830,15 @@ pub struct TuiState {
     /// this still matches, so a card closed or moved off before the answer arrives
     /// simply discards it. `None` for a card rendered entirely from local row data.
     pub card_uri: Option<String>,
+    /// The enrichment rows, held SEPARATELY from `card` so the two replies can land in
+    /// either order.
+    ///
+    /// They arrive on different sockets, and the enrichment is often the FASTER of the
+    /// two - `info more` resolves a mirrored song from local disk while `info` does a
+    /// live lookup. Appending into `card` therefore lost the enrichment whenever it won
+    /// the race, because the base reply then replaced the whole vector. Keeping them
+    /// apart and concatenating at render makes order irrelevant.
+    pub card_more: Vec<(String, String)>,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -948,10 +952,8 @@ impl Default for TuiState {
             refresh_dirty: false,
             epoch: 0,
             art_req_key: None,
-            sel_key: None,
-            sel_since: None,
-            peek: None,
-            peek_req_key: None,
+            card_art: None,
+            card_art_key: None,
             anim_secs: 0.0,
             spin_secs: 0.0,
             dj_input: String::new(),
@@ -969,6 +971,7 @@ impl Default for TuiState {
             card: None,
             card_scroll: ScrollBox::default(),
             card_uri: None,
+            card_more: Vec::new(),
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             sixel_supported: false,
@@ -1100,6 +1103,9 @@ impl TuiState {
         self.card = None;
         self.card_scroll.reset();
         self.card_uri = None;
+        self.card_more.clear();
+        self.card_art = None;
+        self.card_art_key = None;
     }
 
     /// Open the info card on the given rows. Empty rows are refused rather than opening
@@ -1112,6 +1118,10 @@ impl TuiState {
         self.take_screen();
         self.card = Some(rows);
         self.card_scroll.reset();
+        // A fresh card never inherits the previous row's enrichment or cover.
+        self.card_more.clear();
+        self.card_art = None;
+        self.card_art_key = None;
     }
 
     /// The label/value rows for the info card, built from the selected queue row.
@@ -1371,7 +1381,15 @@ impl TuiState {
                 // carried that detail, so the daemon is asked. Same card either way.
                 let rows = self.card_rows_for_selection();
                 if !rows.is_empty() {
+                    let uri = self.cursor_target().and_then(|t| t.uri);
                     self.open_card(rows);
+                    // The card is up INSTANTLY from local pairs; the enrichment is asked
+                    // for separately and appends when it lands. `card_uri` is set so a
+                    // reply for a card the user has since closed is dropped.
+                    if let Some(u) = uri.filter(|u| u.starts_with("song/")) {
+                        self.card_uri = Some(u.clone());
+                        return Some(Intent::InfoMore(u));
+                    }
                     return None;
                 }
                 let uri = self.cursor_target().and_then(|t| t.uri)?;
@@ -4443,56 +4461,6 @@ mod tests {
         }
     }
 
-    /// Dwell with an INJECTED clock: no sleeps, exact boundaries. The ladder is a pure
-    /// function of settled state, so it must be testable without wall-clock at all.
-    #[test]
-    fn attention_depth_rises_only_on_rest_and_is_pinned_by_an_open_overlay() {
-        use std::time::{Duration, Instant};
-        const REST: Duration = Duration::from_millis(350);
-        let t0 = Instant::now();
-        let mut s = TuiState::new();
-        s.queue = vec![item(0), item(1)];
-        s.screen = Screen::Queue;
-        s.selected = 0;
-
-        // Nothing stamped yet -> not resting, depth 0.
-        assert_eq!(s.resting_for(t0), None);
-        assert_eq!(s.attention_depth(t0, REST), 0);
-
-        s.note_selection(t0);
-        assert_eq!(s.resting_for(t0), Some(Duration::ZERO));
-        assert_eq!(s.attention_depth(t0, REST), 0, "arriving is not resting");
-        // Just short of the delay, then exactly at it.
-        assert_eq!(s.attention_depth(t0 + Duration::from_millis(349), REST), 0);
-        assert_eq!(s.attention_depth(t0 + REST, REST), 1, "at the boundary it fires");
-
-        // A HELD KEY must not reset the stamp: note_selection re-stamps only when the
-        // ROW changed, so repeated frames on the same row keep accumulating rest.
-        s.note_selection(t0 + Duration::from_millis(100));
-        s.note_selection(t0 + Duration::from_millis(200));
-        assert_eq!(
-            s.attention_depth(t0 + REST, REST),
-            1,
-            "same row across frames keeps its original stamp"
-        );
-
-        // Moving the cursor re-stamps, so the clock restarts from the move.
-        s.selected = 1;
-        s.note_selection(t0 + Duration::from_millis(400));
-        assert_eq!(s.attention_depth(t0 + Duration::from_millis(400), REST), 0);
-        assert_eq!(s.attention_depth(t0 + Duration::from_millis(750), REST), 1);
-
-        // AN OPEN OVERLAY pins passive depth to 0: the eye is not on the list, so
-        // resting is not evidence of interest in a row it cannot see.
-        s.help_open = true;
-        assert_eq!(s.attention_depth(t0 + Duration::from_millis(750), REST), 0);
-        s.help_open = false;
-        assert_eq!(s.attention_depth(t0 + Duration::from_millis(750), REST), 1);
-
-        // The card is an EXPLICIT ask - depth 2 regardless of dwell.
-        s.card = Some(vec![("k".into(), "v".into())]);
-        assert_eq!(s.attention_depth(t0, REST), 2);
-    }
 
     #[test]
     fn cursor_target_names_the_row_the_eye_is_on_for_every_screen() {

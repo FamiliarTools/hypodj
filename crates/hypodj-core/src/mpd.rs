@@ -311,6 +311,14 @@ pub enum MpdCommand {
     /// rendered from a directory walk, so a client that wants detail for a row it is
     /// merely looking at has nowhere to ask. One verb, one uri, one answer.
     Info(String),
+    /// `info more <uri>` - the written material ABOUT a song that lives in other
+    /// services: album notes, artist biography, lyrics.
+    ///
+    /// Separate from [`MpdCommand::Info`] because it is the only part that can be SLOW.
+    /// `info` answers from what the daemon already holds; this one fans out to a
+    /// metadata agent and a lyrics source, so it gets its own deadline and its own
+    /// transport, and a client can render the fast answer first and let this fill in.
+    InfoMore(String),
 
     /// `continuation on|off` / `continuation [status]` - the startle-safe opt-in for
     /// end-of-queue CONTINUATION radio: when the play queue drains, flow into a
@@ -1460,6 +1468,11 @@ pub fn parse(line: &str) -> MpdCommand {
         // the thing being asked about is a row the cursor is on, not the deck.
         "info" => match args.len() {
             1 => MpdCommand::Info(args[0].clone()),
+            // `info more <uri>` - the SAME verb one rung deeper, not a second unrelated
+            // one. The depth ladder the card is built on becomes literal on the wire:
+            // `info` is what the daemon already holds, `info more` is what it has to go
+            // and ask other services for.
+            2 if args[0].eq_ignore_ascii_case("more") => MpdCommand::InfoMore(args[1].clone()),
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         "continuation" => parse_continuation(&args, line),

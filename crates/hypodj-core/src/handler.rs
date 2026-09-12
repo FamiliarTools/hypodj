@@ -6268,6 +6268,136 @@ impl HypodjHandler {
         s
     }
 
+    /// How long the whole `info more` answer may take, end to end.
+    ///
+    /// UNDER the clients' own 5s socket read timeout, and that margin is the entire
+    /// point. The daemon writes NOTHING until the handler returns, so a client's
+    /// per-read timeout bounds this whole function - overrun it and the client sees a
+    /// transport failure rather than a slow answer, which its worker turns into empty
+    /// pairs and the TUI renders as "nothing known". A prompt partial answer beats a
+    /// complete one nobody receives.
+    const INFO_MORE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+    /// Ceilings on what one `info more` answer may put on the wire.
+    ///
+    /// The budget bounds TIME; these bound SIZE, and nothing else on the path does. The
+    /// metadata client has timeouts but no body cap, the frame is formatted into one
+    /// buffer before a single write, and the client's per-read timeout never fires while
+    /// bytes keep arriving - so a server returning a 20 MB "biography" would be faithfully
+    /// relayed into an unbounded frame and an unbounded card.
+    ///
+    /// The per-line cap is deliberately generous rather than tidy: a real Last.fm
+    /// biography was measured at 1907 characters in ONE line, so anything near that would
+    /// truncate genuine data. 4096 leaves room and still bounds the per-frame re-wrap the
+    /// TUI does on every draw.
+    const INFO_MORE_MAX_LINE: usize = 4096;
+    const INFO_MORE_MAX_PROSE_LINES: usize = 300;
+    const INFO_MORE_MAX_LYRIC_LINES: usize = 500;
+    const INFO_MORE_MAX_SIMILAR: usize = 20;
+
+    /// Truncate one value to [`Self::INFO_MORE_MAX_LINE`] on a CHARACTER boundary.
+    ///
+    /// `char_indices` rather than byte slicing: a cut through a multi-byte character
+    /// would panic, and the text here is arbitrary server-supplied prose in any script.
+    fn clamp_line(mut v: String) -> String {
+        if v.chars().count() > Self::INFO_MORE_MAX_LINE {
+            let end = v
+                .char_indices()
+                .nth(Self::INFO_MORE_MAX_LINE)
+                .map(|(i, _)| i)
+                .unwrap_or(v.len());
+            v.truncate(end);
+        }
+        v
+    }
+
+    /// `info more <uri>` - album notes, artist biography and lyrics for one song.
+    ///
+    /// THREE CALLS, ONE WALL CLOCK, AND NO ALL-OR-NOTHING. The obvious shape -
+    /// `timeout(BUDGET, join!(a, b, c))` - is wrong: when it elapses it drops the whole
+    /// join and discards legs that had ALREADY returned, so a slow lyrics source would
+    /// throw away notes that arrived in 200ms. Instead one deadline is computed once
+    /// and each leg is bounded against that same instant, so every leg that finishes in
+    /// time is kept and only the stragglers become absent.
+    ///
+    /// The song resolution is INSIDE the budget too. It is the one part that was already
+    /// there and the easiest to forget: `client.song()` is bounded only by the metadata
+    /// client's own 15s, which alone would blow the client's 5s. The mirror is tried
+    /// first because for a starred song it is a local read and costs nothing.
+    ///
+    /// Absent is the normal answer. No metadata agent, no Last.fm entry, no lyrics: the
+    /// reply is `OK` with no pairs, never an ACK. A client must be able to tell "there
+    /// is nothing to show" from "the request failed", and the card is required to stay
+    /// open on the former.
+    async fn handle_info_more(&self, uri: &str) -> MpdResponse {
+        let Some(id) = song_id_from_uri(uri) else {
+            return MpdResponse::pairs().pair("X-Info", "unknown").build();
+        };
+        let deadline = tokio::time::Instant::now() + Self::INFO_MORE_BUDGET;
+
+        // Local first: a mirrored song needs no network to identify at all.
+        let song = match self.audio_store().and_then(|st| st.cached_song(&id)) {
+            Some(s) => Some(s),
+            None => match tokio::time::timeout_at(deadline, self.client.song(&id)).await {
+                Ok(Ok(s)) => Some(s),
+                _ => None,
+            },
+        };
+        let Some(song) = song else {
+            return MpdResponse::pairs().pair("X-Info", "unknown").build();
+        };
+
+        // CONCURRENT, each against the SAME deadline. Every wrapper already answers
+        // `None` on any failure, so a leg that times out is indistinguishable from a
+        // server that had nothing - which is correct, because to the reader they are
+        // the same fact.
+        let album = song.album_id.clone();
+        let artist = song.artist_id.clone();
+        let (notes, bio, lyrics) = tokio::join!(
+            async {
+                match &album {
+                    Some(a) => timeout_at_or_none(deadline, self.client.album_notes(a)).await,
+                    None => None,
+                }
+            },
+            async {
+                match &artist {
+                    Some(a) => timeout_at_or_none(deadline, self.client.artist_bio(a)).await,
+                    None => None,
+                }
+            },
+            async { timeout_at_or_none(deadline, self.client.lyrics(&song)).await },
+        );
+
+        let mut p: Vec<(String, String)> = Vec::new();
+        // ONE PAIR PER LINE, always. The values are already line-split by the wrappers
+        // (see `clean_lines`), so this loop cannot emit a value containing a newline -
+        // which on this line-delimited protocol would forge a frame boundary.
+        if let Some(n) = notes {
+            for line in n.notes.into_iter().take(Self::INFO_MORE_MAX_PROSE_LINES) {
+                p.push(("X-AlbumNotes".to_string(), Self::clamp_line(line)));
+            }
+        }
+        if let Some(b) = bio {
+            for line in b.biography.into_iter().take(Self::INFO_MORE_MAX_PROSE_LINES) {
+                p.push(("X-ArtistBio".to_string(), Self::clamp_line(line)));
+            }
+            for name in b.similar.into_iter().take(Self::INFO_MORE_MAX_SIMILAR) {
+                p.push(("X-SimilarArtist".to_string(), Self::clamp_line(name)));
+            }
+        }
+        if let Some(l) = lyrics {
+            // Whether they were time-synced is worth saying even though the timings are
+            // dropped: it distinguishes "this song has no synced lyrics" from "we did
+            // not ask for them".
+            p.push(("X-LyricsSynced".to_string(), if l.synced { "1" } else { "0" }.to_string()));
+            for line in l.lines.into_iter().take(Self::INFO_MORE_MAX_LYRIC_LINES) {
+                p.push(("X-Lyric".to_string(), Self::clamp_line(line)));
+            }
+        }
+        MpdResponse::Pairs(p)
+    }
+
     /// `info <uri>` - every fact the daemon holds about one song, as flat pairs.
     ///
     /// LIVE FIRST, then the mirror, then an honest refusal. `client.song()` is the only
@@ -13193,6 +13323,7 @@ impl MpdHandler for HypodjHandler {
 
             MpdCommand::Store(cmd) => self.handle_store(cmd),
             MpdCommand::Info(uri) => self.handle_info(&uri).await,
+            MpdCommand::InfoMore(uri) => self.handle_info_more(&uri).await,
             MpdCommand::Next => {
                 // A manual `next` always advances (single governs only auto-advance);
                 // random/repeat/consume are honored via plan_next. The transition
@@ -14971,6 +15102,19 @@ fn parse_artist_rows(rows: &[(String, String)]) -> Vec<(ArtistId, String)> {
 }
 
 /// Parse a `song/<id>` uri into a `SongId`.
+/// Await `fut` until `deadline`, collapsing BOTH a timeout and a `None` result to
+/// `None`.
+///
+/// The two are the same fact to a reader - "there is nothing to show here" - and
+/// keeping them distinct would only tempt a caller into reporting a timeout, which is
+/// the one thing that must never reach the wire.
+async fn timeout_at_or_none<T>(
+    deadline: tokio::time::Instant,
+    fut: impl std::future::Future<Output = Option<T>>,
+) -> Option<T> {
+    tokio::time::timeout_at(deadline, fut).await.ok().flatten()
+}
+
 fn song_id_from_uri(uri: &str) -> Option<SongId> {
     uri.strip_prefix("song/").map(|s| SongId(s.to_string()))
 }

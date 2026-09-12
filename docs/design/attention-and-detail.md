@@ -2,7 +2,7 @@
 
 Status: active
 Created: 2026-09-10
-Updated: 2026-09-10
+Updated: 2026-09-13
 
 ## Context
 
@@ -41,6 +41,33 @@ against `art_req_key`, and fires once on change. And it is the offline store's
 reconciler in miniature: a desired set, diffed against held truth, one owner,
 every edge case collapsing into "the next pass". The info system should be the
 third instance of that shape, not a fourth idea.
+
+## Reversed on 2026-09-13: no dwell, no peek
+
+Guilherme's call, and it removes a problem rather than trading one: **the passive
+dwell preview is gone, and the cover is drawn inside the `i` card instead.**
+
+The peek worked and was tested, but it borrowed the now-playing art pane - global
+chrome on every screen - and swapped its title to "Preview" to stay honest. That
+was the best available fix for a real ambiguity, and it still left a piece of the
+interface meaning two things depending on a word the reader had to notice. The
+card is already about one song and names it, so art inside it cannot mislead at
+all. The ambiguity is not managed; it is absent.
+
+What went with it: the dwell substrate (`sel_key`, `sel_since`, `note_selection`,
+`resting_for`, `attention_depth`), `request_peek`, the peek fields and their two
+tests. Nothing consumed the substrate once the peek was gone, and keeping a
+depth ladder with no reader would have been machinery pretending to be a design.
+
+What survives, and is the part worth keeping from all of it: the **want-vs-asked
+reconciler**. `request_card_art` is the same shape as `request_art` - compute
+what the state wants, compare against what was last asked for, fire only on a
+change - and the art reply is still routed by which subject still wants it. The
+idea was never the dwell; it was that these requests are derived, not evented.
+
+The sections below describe the superseded design and are kept because the
+reasoning about the art pane, the adoption gate and the palette consumers is
+still what makes the card's own art correct.
 
 ## The ladder
 

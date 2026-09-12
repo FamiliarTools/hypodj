@@ -243,6 +243,7 @@ fn event_loop(
                 &workers.cc_tx,
                 &workers.find_tx,
                 &workers.info_tx,
+                &workers.more_tx,
                 state,
                 coalesce_intents(intents),
             );
@@ -261,17 +262,15 @@ fn event_loop(
         }
         // Keep album art in step: on a track-uri change, ask the art worker (once).
         request_art(&workers.art_tx, state);
+        // And the open card's own cover, by the same want-vs-asked diff. The card is
+        // about one song and says which, so its art needs no disambiguating title the
+        // way borrowing the now-playing pane did.
+        request_card_art(&workers.art_tx, state);
         // Stamp where the cursor is, AFTER key dispatch and after inbound responses have
         // been applied, so it records the settled row for this frame rather than an
         // intermediate one. This is the whole dwell mechanism: no timer, no tick, no
         // thread - the loop already redraws unconditionally at 50ms or better, so
         // "resting" is a comparison against this stamp.
-        // ONE clock read for the frame - `frame_now`, already taken at the top. Two
-        // separate Instant::now() calls here would let the stamp and the dwell
-        // comparison disagree inside a single frame.
-        state.note_selection(frame_now);
-        // The peek: one more want-vs-held diff in the same block, for the same reason.
-        request_peek(&workers.art_tx, state, frame_now);
         // Keep the album sigil in step: rebuild only when the album identity changes
         // (static, cached - never regenerated per frame).
         update_sigil(state);
@@ -344,6 +343,7 @@ fn dispatch(
     cc_tx: &Sender<Req>,
     find_tx: &Sender<Req>,
     info_tx: &Sender<Req>,
+    more_tx: &Sender<Req>,
     state: &mut TuiState,
     intents: Vec<Intent>,
 ) {
@@ -367,7 +367,15 @@ fn dispatch(
             // on Navidrome must not head-of-line-block the refreshes that keep
             // now-playing alive.
             Intent::Info(uri) => {
-                let _ = info_tx.send(Req::Info(uri));
+                // BOTH AT ONCE, on separate sockets. They are independent - the base
+                // card renders from the fast reply and the enrichment appends to it -
+                // so sequencing them would only add the slow one's latency to the fast
+                // one's. Neither can block the other.
+                let _ = info_tx.send(Req::Info(uri.clone()));
+                let _ = more_tx.send(Req::InfoMore(uri));
+            }
+            Intent::InfoMore(uri) => {
+                let _ = more_tx.send(Req::InfoMore(uri));
             }
             Intent::ConfirmArm => {
                 // Echo the choice INTO the DJ chat immediately so the keypress is
@@ -594,16 +602,29 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
                 }
             }
         }
+        Inbound::InfoMore { uri, pairs } => {
+            // APPENDS, and on an empty answer does NOTHING. Both halves matter: notes
+            // and lyrics are usually absent, and a reply that closed the card or set a
+            // status on "nothing found" would destroy the base answer the user already
+            // has. Only the base `info` reply is allowed to conclude there is nothing.
+            if state.card_uri.as_deref() == Some(uri.as_str()) {
+                // Stored beside the card, not into it: the base reply replaces `card`
+                // wholesale, so an enrichment that won the race would otherwise be
+                // discarded. It does not require the card to exist YET, either.
+                state.card_more = state::more_rows_from_pairs(&pairs);
+            }
+        }
         Inbound::Art { key, art } => {
-            // TWO SUBJECTS share one worker, so the reply is routed by which one still
-            // wants it. The now-playing gate is unchanged; the peek gate is the same
-            // want-vs-key comparison against the rested row. A reply nobody wants any
-            // more is dropped rather than cancelled - a superseded fetch completes,
-            // costs nothing, and is discarded here.
+            // TWO SUBJECTS share one worker, so the reply is routed by whichever still
+            // wants it: the now-playing pane, or the open info card. A reply nobody
+            // wants any more is dropped rather than cancelled - a superseded fetch
+            // completes, costs nothing, and is discarded here.
             if art_want(&state.now) == Some(key.clone()) {
                 state.art = art;
-            } else if state.peek_req_key.as_ref() == Some(&key.0) {
-                state.peek = Some((key.0, art));
+            } else if state.card_art_key.as_ref() == Some(&key.0) {
+                // The card's own cover. Keyed so a reply for a card that has since
+                // closed or moved to another row is dropped rather than drawn.
+                state.card_art = art;
             }
         }
         Inbound::Connected { epoch } => {
@@ -805,56 +826,33 @@ fn request_art(art_tx: &Sender<(String, Option<String>)>, state: &mut TuiState) 
     }
 }
 
-/// How long the cursor must rest before a cover is worth fetching.
-///
-/// A guess, deliberately one constant so it can be tuned in one place. Long enough that
-/// scrolling a long list asks for nothing, short enough that a deliberate pause feels
-/// answered rather than delayed.
-const PEEK_REST: Duration = Duration::from_millis(350);
 
-/// Ask the art worker for the RESTED row's cover, at most once per row.
+
+/// Ask the art worker for the OPEN CARD's cover, at most once per card.
 ///
-/// The third instance of `request_art`'s shape: compute what the current state wants,
-/// compare against what was last asked for, fire only on a change. Everything awkward
-/// falls out of that rather than needing its own case - a held arrow key wants nothing
-/// because the row never rests, a burst of frames on one row asks once, and a reply for
-/// a row the cursor has left is dropped at the gate.
+/// The third caller of the same shape as `request_art`: compute what the current state
+/// wants, compare against what was last asked for, fire only on a change. Closing the
+/// card drops the want, so nothing is fetched for a card nobody is looking at.
 ///
-/// GATED TO THE LIST SCREENS. The art pane is global chrome, so peeking on every screen
-/// would swap its meaning app-wide - including on the DJ view, where the pane sits beside
-/// a chat the user is typing into and a preview would be pure distraction. Where there is
-/// no list under the cursor there is nothing to preview.
-///
-/// Only `song/<id>` rows can be peeked: the daemon's albumart path rejects an
-/// `album/<id>` uri, so an Albums row has no cover to ask for through this route.
-fn request_peek(art_tx: &Sender<(String, Option<String>)>, state: &mut TuiState, now: Instant) {
-    let peekable = matches!(
-        state.screen,
-        Screen::Queue | Screen::Find | Screen::Albums | Screen::Playlists
-    );
-    let want: Option<String> = if peekable && state.attention_depth(now, PEEK_REST) >= 1 {
-        state
-            .sel_key
-            .as_ref()
-            .and_then(|t| t.uri.clone())
-            .filter(|u| u.starts_with("song/"))
-    } else {
-        None
-    };
-    if state.peek_req_key == want {
+/// Only `song/<id>` can be asked for - the daemon's albumart path refuses an
+/// `album/<id>` uri - and the reply is adopted only while the key still matches, so a
+/// cover for a card the user has moved off is discarded rather than drawn.
+fn request_card_art(art_tx: &Sender<(String, Option<String>)>, state: &mut TuiState) {
+    let want = state
+        .card
+        .as_ref()
+        .and(state.card_uri.clone())
+        .filter(|u| u.starts_with("song/"));
+    if state.card_art_key == want {
         return;
     }
-    state.peek_req_key = want.clone();
+    state.card_art_key = want.clone();
     match want {
-        // The peek is CLEARED on the way out, unlike now-playing art which is held
-        // until its replacement lands. The reasons invert: holding a stale cover under
-        // a moved cursor would claim the wrong row, while a moment of no preview simply
-        // shows what is playing, which is the pane's ordinary meaning.
         Some(uri) => {
-            state.peek = None;
+            state.card_art = None;
             let _ = art_tx.send((uri, None));
         }
-        None => state.peek = None,
+        None => state.card_art = None,
     }
 }
 
@@ -999,6 +997,7 @@ mod tests {
         let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
         let (find_tx, _find_rx) = mpsc::channel::<Req>();
         let (info_tx, _info_rx) = mpsc::channel::<Req>();
+        let (more_tx, _more_rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Dj;
         state.enter_confirm(Pending {
@@ -1008,7 +1007,7 @@ mod tests {
             note: None,
             trust: None,
         });
-        dispatch(&tx, &cc_tx, &find_tx, &info_tx, &mut state, vec![Intent::ConfirmArm]);
+        dispatch(&tx, &cc_tx, &find_tx, &info_tx, &more_tx, &mut state, vec![Intent::ConfirmArm]);
         assert!(state.dj_log.iter().any(|l| l == "> y"), "choice echoed to chat");
         assert_eq!(state.mode, Mode::Normal, "confirm dismissed");
         assert!(state.pending.is_none(), "pending consumed");
@@ -1094,71 +1093,57 @@ mod tests {
         assert!(rx.try_iter().next().is_none());
     }
 
-    /// The peek is a reconciler, so the two things worth pinning are what it does NOT
-    /// do: fire during a scroll, and touch the now-playing cover.
     #[test]
-    fn the_peek_asks_once_per_rested_row_and_never_touches_now_playing_art() {
+    fn an_enrichment_that_arrives_first_is_not_lost_by_the_base_reply() {
         use std::sync::mpsc::channel;
-        let (tx, rx) = channel::<(String, Option<String>)>();
+        let (tx, _rx) = channel::<Req>();
         let mut state = TuiState::new();
-        state.screen = Screen::Queue;
-        state.queue = vec![qitem("song/1"), qitem("song/2")];
-        state.selected = 0;
-        // A cover is held for what is PLAYING. It must survive everything below.
-        state.art = Some(crate::art::AlbumArt::for_test_solid([1, 2, 3]));
+        state.card_uri = Some("song/1".to_string());
+        state.card = Some(vec![(String::new(), "looking it up...".to_string())]);
 
-        let t0 = Instant::now();
-        // SCROLLING asks for nothing: the row never rests, so there is no want at all.
-        for ms in [0u64, 40, 80, 120] {
-            state.selected = (ms / 40) as usize % 2;
-            state.note_selection(t0 + Duration::from_millis(ms));
-            request_peek(&tx, &mut state, t0 + Duration::from_millis(ms));
-        }
-        assert!(rx.try_recv().is_err(), "a moving cursor generates no fetch");
-
-        // RESTING asks exactly once, however many frames pass.
-        state.selected = 0;
-        state.note_selection(t0);
-        for ms in [350u64, 400, 500, 900] {
-            state.note_selection(t0 + Duration::from_millis(ms));
-            request_peek(&tx, &mut state, t0 + Duration::from_millis(ms));
-        }
-        assert_eq!(rx.try_recv().map(|k| k.0).ok(), Some("song/1".to_string()));
-        assert!(rx.try_recv().is_err(), "one request per rested row, not one per frame");
-
-        // The now-playing cover is UNTOUCHED, which is what keeps the waveform hue and
-        // the sigil palette from flickering every time the cursor settles.
-        assert!(state.art.is_some(), "the peek never writes state.art");
-
-        // A late reply for a row the cursor has LEFT is dropped rather than shown.
-        state.selected = 1;
-        state.note_selection(t0 + Duration::from_millis(1000));
-        request_peek(&tx, &mut state, t0 + Duration::from_millis(1400));
-        let _ = rx.try_recv();
+        // ENRICHMENT FIRST.
         apply_inbound(
-            &channel().0,
+            &tx,
             &mut state,
-            Inbound::Art {
-                key: ("song/1".to_string(), None),
-                art: Some(crate::art::AlbumArt::for_test_solid([9, 9, 9])),
+            Inbound::InfoMore {
+                uri: "song/1".to_string(),
+                pairs: vec![("X-Lyric".to_string(), "a line of it".to_string())],
+            },
+        );
+        assert!(!state.card_more.is_empty(), "held beside the card, not inside it");
+
+        // THEN the base reply, which replaces `card` wholesale.
+        apply_inbound(
+            &tx,
+            &mut state,
+            Inbound::Info {
+                uri: "song/1".to_string(),
+                pairs: vec![
+                    ("Title".to_string(), "Heroes".to_string()),
+                    ("X-Plays".to_string(), "3".to_string()),
+                ],
+            },
+        );
+        let card = state.card.as_ref().expect("the base reply opened the card");
+        assert!(card.iter().any(|(_, v)| v == "Heroes"), "base rows present");
+        assert!(
+            !state.card_more.is_empty(),
+            "and the enrichment SURVIVED the replacement - this is the whole point"
+        );
+
+        // A reply for a DIFFERENT row is dropped rather than attached to this card.
+        apply_inbound(
+            &tx,
+            &mut state,
+            Inbound::InfoMore {
+                uri: "song/999".to_string(),
+                pairs: vec![("X-Lyric".to_string(), "wrong song".to_string())],
             },
         );
         assert!(
-            state.peek.as_ref().is_none_or(|(u, _)| u != "song/1"),
-            "a reply for the abandoned row is not adopted"
+            !state.card_more.iter().any(|(_, v)| v == "wrong song"),
+            "a stale reply never lands on the open card"
         );
-        assert!(state.art.is_some(), "and it still did not clobber now-playing");
-    }
-
-    fn qitem(uri: &str) -> hypodj_client::model::QueueItem {
-        hypodj_client::model::QueueItem {
-            pos: 0,
-            title: uri.to_string(),
-            artist: None,
-            uri: Some(uri.to_string()),
-            album_uri: None,
-            details: Vec::new(),
-        }
     }
 
     #[test]
@@ -1245,13 +1230,14 @@ mod tests {
         let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
         let (find_tx, _find_rx) = mpsc::channel::<Req>();
         let (info_tx, _info_rx) = mpsc::channel::<Req>();
+        let (more_tx, _more_rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Dj;
         state.enter_confirm(Pending {
             token: Some("nl-1".into()),
             ..Default::default()
         });
-        dispatch(&tx, &cc_tx, &find_tx, &info_tx, &mut state, vec![Intent::ConfirmCancel]);
+        dispatch(&tx, &cc_tx, &find_tx, &info_tx, &more_tx, &mut state, vec![Intent::ConfirmCancel]);
         assert!(state.dj_log.iter().any(|l| l == "cancelled"), "cancellation echoed");
         assert_eq!(state.mode, Mode::Normal);
         assert!(state.pending.is_none());

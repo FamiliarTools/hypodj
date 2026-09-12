@@ -515,7 +515,16 @@ impl SubsonicClient {
     pub async fn artist_bio(&self, id: &ArtistId) -> Option<crate::model::ArtistBio> {
         let info = self.inner.get_artist_info2(&id.0, Some(5), None).await.ok()?;
         let biography = info.biography.as_deref().map(Self::clean_lines).unwrap_or_default();
-        let similar: Vec<String> = info.similar_artist.into_iter().map(|a| a.name).collect();
+        // CLEANED LIKE EVERYTHING ELSE. An artist name is server-controlled text and
+        // ends up as a pair value, so it is subject to exactly the same frame hazard as
+        // a biography - it was the one field on this path that bypassed `clean_lines`.
+        // A name is one line by nature, so anything past the first is dropped rather
+        // than emitted as a second nameless entry.
+        let similar: Vec<String> = info
+            .similar_artist
+            .into_iter()
+            .filter_map(|a| Self::clean_lines(&a.name).into_iter().next())
+            .collect();
         if biography.is_empty() && similar.is_empty() && info.last_fm_url.is_none() {
             return None;
         }
@@ -548,11 +557,20 @@ impl SubsonicClient {
             )
             .await;
             if let Ok(Ok(list)) = attempt {
-                // Prefer the entry the server calls the main one; else the first.
-                let pick = list
-                    .structured_lyrics
-                    .into_iter()
-                    .next();
+                // PREFER THE MAIN LYRICS. A server may return several entries for one
+                // song - the original plus translations - and `kind` is how it says
+                // which is which. Taking the first would show a reader a translation
+                // into a language they did not ask for, chosen by response order.
+                // An entry with no `kind` at all is treated as the main one, which is
+                // what a server that only has one set sends.
+                let mut entries = list.structured_lyrics;
+                let main = entries.iter().position(|e| {
+                    e.kind.as_deref().is_none_or(|k| k.eq_ignore_ascii_case("main"))
+                });
+                let pick = match main {
+                    Some(i) => Some(entries.swap_remove(i)),
+                    None => entries.into_iter().next(),
+                };
                 if let Some(sl) = pick {
                     let lines: Vec<String> = sl
                         .line
