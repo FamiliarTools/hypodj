@@ -60,9 +60,11 @@ OPTIONS:
   --host <h>    daemon host (default 127.0.0.1)
   --port <p>    daemon port (default 6600, matches the live deploy; a DEV daemon
                 defaults to 6601 - point at it with HYPODJ_PORT=6601)
-  --nl-translator <auto|rules|claude>
+  --nl-translator <auto|rules|daemon|claude|cc>
                 pin the NL path (default auto = Claude Code when available,
-                else daemon nl). Probes: rules. Also HYPODJ_NL_TRANSLATOR.
+                else daemon nl; rules/daemon force daemon nl, claude/cc prefer
+                Claude Code). Probes: rules. Also HYPODJ_NL_TRANSLATOR.
+                May appear before or after the phrase.
   -h, --help    this help
   -V, --version print version and exit
 
@@ -111,6 +113,22 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
     let mut words = Vec::new();
     let mut it = raw.into_iter();
     while let Some(a) = it.next() {
+        // `--flag=value` spellings, accepted anywhere like the space-separated form.
+        if let Some(v) = a.strip_prefix("--nl-translator=") {
+            nl_translator = Some(v.to_string());
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--host=") {
+            host = Some(v.to_string());
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--port=") {
+            port = Some(
+                v.parse::<u16>()
+                    .map_err(|_| format!("bad port: {v}"))?,
+            );
+            continue;
+        }
         match a.as_str() {
             "--host" => host = Some(it.next().ok_or("--host needs a value")?),
             "--port" => {
@@ -121,28 +139,24 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
                 nl_translator = Some(it.next().ok_or("--nl-translator needs a value")?);
             }
             "-h" | "--help" => help = true,
-            // Everything after the first non-flag word is part of the phrase.
-            // Flatten each argv element on whitespace so a single quoted arg
-            // ("favorite this song") and the unquoted form (favorite this song)
-            // both yield the same WORD tokens - route() needs per-word tokens to
-            // recognize a bare-favorite phrase, and the TUI already splits this
-            // way. Collapsing repeated internal whitespace is fine for the NL
-            // reconstruction (route joins the words back with single spaces).
             // `stations` is a FILESYSTEM gesture, not a phrase: its arguments are
             // PATHS, and several of the real .pls files carry spaces in their names.
             // So keep the argv boundaries the shell already established, verbatim,
             // instead of re-splitting a path into fragments that name nothing.
-            "stations" => {
+            // Claimed only as the FIRST phrase word; a later "stations" is NL text.
+            "stations" if words.is_empty() => {
                 words.push(a);
                 words.extend(it.by_ref());
                 break;
             }
             _ => {
+                // Known global flags are recognized ANYWHERE on the command line, so a
+                // trailing `dj "play something calmer" --nl-translator rules` still pins
+                // Rules instead of polluting the phrase and silently taking Auto.
+                // Unknown --words (e.g. `heard --all`) stay phrase text. Flatten each
+                // argv element on whitespace so a single quoted arg ("favorite this
+                // song") and the unquoted form both yield the same WORD tokens.
                 words.extend(a.split_whitespace().map(str::to_string));
-                for rest in it.by_ref() {
-                    words.extend(rest.split_whitespace().map(str::to_string));
-                }
-                break;
             }
         }
     }
@@ -607,6 +621,31 @@ mod tests {
         assert_eq!(p.host.as_deref(), Some("example"));
         assert_eq!(p.port, Some(6601));
         assert_eq!(p.words, v(&["next", "song"]));
+    }
+
+    #[test]
+    fn parse_args_trailing_nl_translator_after_phrase_still_pins() {
+        // The merged-review blocking bug: parse_args stopped at the first non-flag
+        // word, so `dj "play something calmer" --nl-translator rules` swallowed the
+        // flag into the phrase and silently took Auto. Trailing globals must still
+        // pin (or fail loud on a bad value), never pollute the phrase.
+        let p = parse_args(v(&["play something calmer", "--nl-translator", "rules"])).unwrap();
+        assert_eq!(p.nl_translator.as_deref(), Some("rules"));
+        assert_eq!(p.words, v(&["play", "something", "calmer"]));
+        assert_eq!(
+            nl::NlTranslatorPin::resolve(p.nl_translator.as_deref(), None).unwrap(),
+            nl::NlTranslatorPin::Rules
+        );
+        // Unquoted phrase words plus trailing pin behave the same.
+        let p = parse_args(v(&["play", "something", "calmer", "--nl-translator", "rules"])).unwrap();
+        assert_eq!(p.nl_translator.as_deref(), Some("rules"));
+        assert_eq!(p.words, v(&["play", "something", "calmer"]));
+        // `--flag=value` spelling after the phrase also pins.
+        let p = parse_args(v(&["play something calmer", "--nl-translator=rules"])).unwrap();
+        assert_eq!(p.nl_translator.as_deref(), Some("rules"));
+        assert_eq!(p.words, v(&["play", "something", "calmer"]));
+        // A trailing flag with no value fails loud, never silent Auto.
+        assert!(parse_args(v(&["play something calmer", "--nl-translator"])).is_err());
     }
 }
 
