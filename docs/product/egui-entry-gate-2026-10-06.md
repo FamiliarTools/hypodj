@@ -64,6 +64,8 @@ Observed:
 
 Artifact log: `~/tmp/hypodj-probe-dfs-2026-10-06/cli-rules-proof.log`
 
+**Re-proof (2026-10-06, post-merge pin on master `f5c3b49`):** same silent probe recipe; `target/debug/dj --port 6610 --nl-translator rules "play something calmer"` (also `HYPODJ_NL_TRANSLATOR=rules`). Echo `(via rules)` then play 5 calmer NOW; confirm armed plan 0; queue 1->6; now-playing Everest->2Arabia; toward calmer. Live 6600 untouched. Log: `~/tmp/hypodj-probe-dfs-2026-10-06/cli-rules-reproof.log`.
+
 **Pass (CLI + daemon contract):** echo fields present, confirm armed a plan id,
 queue and now-playing changed as the echoed plan promised, audio stayed null.
 
