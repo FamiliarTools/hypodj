@@ -161,7 +161,7 @@ the pretty shell picked." **This gate requires an explicit pin** via shared
 | --- | --- | --- |
 | `rules` | `HYPODJ_NL_TRANSLATOR=rules` or `dj --nl-translator rules` | Force daemon `nl` (skip client Claude Code) on CLI and TUI |
 | `claude` / `cc` | env or `--nl-translator claude` | Prefer Claude Code on both surfaces |
-| `auto` (default) | unset / blank | Today's human split: CLI tries CC then daemon; TUI colon uses daemon `nl`; DJ View uses CC |
+| `auto` (default) | unset / blank | Asymmetric by surface (this is the point of the pin): CLI tries client-side Claude Code first and silently falls through to daemon `nl` when `claude` is absent or the call fails; TUI colon always uses daemon `nl`; TUI DJ View always uses the CC door and reports a loud miss line (`Claude Code: ...`) instead of falling through to daemon `nl` |
 
 For the egui gate, pin `rules` (or pin `claude` everywhere and accept its plan),
 and compare outcomes under that pin. Do not claim parity across a rules arm on
