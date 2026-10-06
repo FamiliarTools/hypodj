@@ -35,7 +35,7 @@ use ratatui::Terminal;
 
 use hypodj_client::config::{self, Env};
 use hypodj_client::mpd::MpdError;
-use hypodj_client::nl::quote_arg;
+use hypodj_client::nl::{quote_arg, NlTranslatorPin};
 
 use state::{coalesce_intents, Intent, Mode, Screen, TuiState};
 use worker::{Inbound, Req, RespKind, Workers};
@@ -69,7 +69,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "dj-gui - hypodj interactive TUI\n\nUSAGE:\n  dj-gui            launch the jukebox TUI\n\nOPTIONS:\n  -h, --help    this help\n  -V, --version print version and exit"
+                    "dj-gui - hypodj interactive TUI\n\nUSAGE:\n  dj-gui            launch the jukebox TUI\n\nOPTIONS:\n  -h, --help    this help\n  -V, --version print version and exit\n\nENV:\n  HYPODJ_NL_TRANSLATOR  auto|rules|claude (pin NL path; probes use rules)"
                 );
                 return;
             }
@@ -89,6 +89,13 @@ fn run() -> Result<(), MpdError> {
 
     let mut terminal = setup_terminal().map_err(|e| MpdError::Io(e.to_string()))?;
     let mut state = TuiState::new();
+    // Pin the NL translator path (shared with the CLI). A bad env value fails loud
+    // before the alternate screen is useful, so a mistyped probe does not silently
+    // take Auto and break parity.
+    state.nl_translator = match NlTranslatorPin::from_process_env() {
+        Ok(p) => p,
+        Err(e) => return Err(MpdError::Io(e)),
+    };
     // Probe the visual-system primitives once at startup (raw mode is on; the OSC 11
     // read is bounded so a non-answering terminal / tmux can never hang us). Capability
     // + truecolor come from the env only (no query). See album_color for the tmux note.

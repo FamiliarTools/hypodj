@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use hypodj_client::model::{NowPlaying, QueueItem};
-use hypodj_client::nl::not_understood_hint;
+use hypodj_client::nl::{not_understood_hint, NlTranslatorPin};
 use hypodj_client::route::{route, Action};
 
 use crate::find::{Find, Focus};
@@ -768,6 +768,9 @@ pub struct TuiState {
     pub spin_secs: f64,
     /// The DJ View "ask>" input line (the NL query being typed on Screen::Dj).
     pub dj_input: String,
+    /// NL translator pin (env `HYPODJ_NL_TRANSLATOR`; default Auto). Shared with
+    /// the CLI so a probe can force rules on every surface.
+    pub nl_translator: NlTranslatorPin,
     /// The DJ View scrollback: coarse CC progress + result lines, newest at the
     /// bottom. Bounded so a long session never grows without limit.
     pub dj_log: Vec<String>,
@@ -957,6 +960,7 @@ impl Default for TuiState {
             anim_secs: 0.0,
             spin_secs: 0.0,
             dj_input: String::new(),
+            nl_translator: NlTranslatorPin::Auto,
             dj_log: Vec::new(),
             dj_phase: None,
             viz_active: false,
@@ -2405,7 +2409,30 @@ impl TuiState {
                 None
             }
             Action::FavoriteCurrent => self.favorite_current(),
-            Action::Nl(phrase) => Some(Intent::Nl(phrase)),
+            // Colon Auto stays on daemon `nl` (today's split). Pin overrides below.
+            Action::Nl(phrase) => Some(self.nl_intent_for_colon(phrase)),
+        }
+    }
+
+    /// Colon-line NL: Auto and Rules use daemon `nl`; Claude forces the CC door.
+    fn nl_intent_for_colon(&mut self, phrase: String) -> Intent {
+        match self.nl_translator {
+            NlTranslatorPin::Claude => {
+                self.dj_phase = Some("thinking...".to_string());
+                Intent::Cc(phrase)
+            }
+            NlTranslatorPin::Auto | NlTranslatorPin::Rules => Intent::Nl(phrase),
+        }
+    }
+
+    /// DJ-view NL: Auto and Claude use the CC door; Rules forces daemon `nl`.
+    fn nl_intent_for_dj(&mut self, phrase: String) -> Intent {
+        match self.nl_translator {
+            NlTranslatorPin::Rules => Intent::Nl(phrase),
+            NlTranslatorPin::Auto | NlTranslatorPin::Claude => {
+                self.dj_phase = Some("thinking...".to_string());
+                Intent::Cc(phrase)
+            }
         }
     }
 
@@ -2632,11 +2659,8 @@ impl TuiState {
                         self.push_dj_log(not_understood_hint());
                         None
                     }
-                    // A fuzzy phrase (queue-edit ask, fade, enqueue, ...) -> Claude.
-                    Action::Nl(phrase) => {
-                        self.dj_phase = Some("thinking...".to_string());
-                        Some(Intent::Cc(phrase))
-                    }
+                    // A fuzzy phrase -> CC under Auto/Claude; daemon `nl` under Rules.
+                    Action::Nl(phrase) => Some(self.nl_intent_for_dj(phrase)),
                 }
             }
             KeyCode::Char(c) => {
@@ -4370,6 +4394,32 @@ mod tests {
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
             Some(Intent::Cc("fade out slowly".into()))
+        );
+        assert_eq!(s.dj_phase.as_deref(), Some("thinking..."));
+    }
+
+    #[test]
+    fn dj_rules_pin_sends_fuzzy_phrase_to_daemon_nl() {
+        let mut s = TuiState::new();
+        s.nl_translator = NlTranslatorPin::Rules;
+        s.handle_key(key(KeyCode::F(4)));
+        s.dj_input = "play something calmer".into();
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Nl("play something calmer".into()))
+        );
+        assert_eq!(s.dj_phase, None, "rules pin must not open the CC thinking phase");
+    }
+
+    #[test]
+    fn colon_claude_pin_sends_phrase_to_cc() {
+        let mut s = TuiState::new();
+        s.nl_translator = NlTranslatorPin::Claude;
+        s.mode = Mode::Command;
+        s.input = "fade out".into();
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Cc("fade out".into()))
         );
         assert_eq!(s.dj_phase.as_deref(), Some("thinking..."));
     }

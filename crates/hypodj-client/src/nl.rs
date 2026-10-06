@@ -128,6 +128,66 @@ pub fn not_understood_hint() -> String {
     s
 }
 
+/// Which NL translator path a shell should use for echo-before-arm.
+///
+/// Shared by CLI and TUI so a probe can pin the SAME path on every surface
+/// (the egui entry-gate parity rule). Default [`NlTranslatorPin::Auto`] keeps
+/// today's human behavior: Claude Code when available, else daemon `nl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NlTranslatorPin {
+    /// Current human behavior: try client-side Claude Code when present, else
+    /// fall through to daemon `nl` (rules / hybrid on the server).
+    #[default]
+    Auto,
+    /// Force daemon `nl`. Skip the client-side Claude Code door entirely.
+    /// Probes use this so "play something calmer" cannot be rewritten by CC.
+    Rules,
+    /// Prefer client-side Claude Code. If `claude` is absent or the call fails,
+    /// fall through to daemon `nl` the same way Auto does when CC cannot run.
+    Claude,
+}
+
+impl NlTranslatorPin {
+    /// Parse a pin spelling. Accepted: `auto`, `rules` / `daemon`, `claude` / `cc`
+    /// (case-insensitive). Anything else is an error so a mistyped probe env fails
+    /// loud instead of silently taking Auto.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "rules" | "daemon" => Ok(Self::Rules),
+            "claude" | "cc" => Ok(Self::Claude),
+            other => Err(format!(
+                "unknown NL translator pin {other:?} (want auto, rules, or claude)"
+            )),
+        }
+    }
+
+    /// Resolve flag over env over Auto. A blank env value is treated as unset
+    /// (same posture as `HYPODJ_STATIONS_DIR`). Flag wins when present.
+    pub fn resolve(flag: Option<&str>, env: Option<&str>) -> Result<Self, String> {
+        if let Some(f) = flag {
+            return Self::parse(f);
+        }
+        match env.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(v) => Self::parse(v),
+            None => Ok(Self::Auto),
+        }
+    }
+
+    /// Read `HYPODJ_NL_TRANSLATOR` from the real process environment (no flag).
+    /// TUI and other shells with no argv pin use this.
+    pub fn from_process_env() -> Result<Self, String> {
+        Self::resolve(None, std::env::var("HYPODJ_NL_TRANSLATOR").ok().as_deref())
+    }
+
+    /// Should this shell attempt the client-side Claude Code door before daemon `nl`?
+    /// False only for [`NlTranslatorPin::Rules`].
+    pub fn prefer_claude(self) -> bool {
+        !matches!(self, Self::Rules)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +279,39 @@ mod tests {
             "that plan expired, run the phrase again"
         );
         assert!(map_ack_reason("plan no longer valid: queue changed").contains("queue changed"));
+    }
+
+    #[test]
+    fn translator_pin_parse_spellings() {
+        assert_eq!(NlTranslatorPin::parse("auto").unwrap(), NlTranslatorPin::Auto);
+        assert_eq!(NlTranslatorPin::parse("RULES").unwrap(), NlTranslatorPin::Rules);
+        assert_eq!(NlTranslatorPin::parse("daemon").unwrap(), NlTranslatorPin::Rules);
+        assert_eq!(NlTranslatorPin::parse("claude").unwrap(), NlTranslatorPin::Claude);
+        assert_eq!(NlTranslatorPin::parse("cc").unwrap(), NlTranslatorPin::Claude);
+        assert!(NlTranslatorPin::parse("llama").is_err());
+    }
+
+    #[test]
+    fn translator_pin_resolve_flag_beats_env_blank_is_unset() {
+        assert_eq!(
+            NlTranslatorPin::resolve(Some("rules"), Some("claude")).unwrap(),
+            NlTranslatorPin::Rules
+        );
+        assert_eq!(
+            NlTranslatorPin::resolve(None, Some("claude")).unwrap(),
+            NlTranslatorPin::Claude
+        );
+        assert_eq!(
+            NlTranslatorPin::resolve(None, Some("  ")).unwrap(),
+            NlTranslatorPin::Auto
+        );
+        assert_eq!(NlTranslatorPin::resolve(None, None).unwrap(), NlTranslatorPin::Auto);
+    }
+
+    #[test]
+    fn translator_pin_prefer_claude_only_rules_skips() {
+        assert!(NlTranslatorPin::Auto.prefer_claude());
+        assert!(NlTranslatorPin::Claude.prefer_claude());
+        assert!(!NlTranslatorPin::Rules.prefer_claude());
     }
 }
