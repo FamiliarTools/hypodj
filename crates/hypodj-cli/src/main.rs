@@ -60,6 +60,9 @@ OPTIONS:
   --host <h>    daemon host (default 127.0.0.1)
   --port <p>    daemon port (default 6600, matches the live deploy; a DEV daemon
                 defaults to 6601 - point at it with HYPODJ_PORT=6601)
+  --nl-translator <auto|rules|claude>
+                pin the NL path (default auto = Claude Code when available,
+                else daemon nl). Probes: rules. Also HYPODJ_NL_TRANSLATOR.
   -h, --help    this help
   -V, --version print version and exit
 
@@ -94,6 +97,8 @@ fn main() {
 struct Parsed {
     host: Option<String>,
     port: Option<u16>,
+    /// Optional `--nl-translator` pin (auto / rules / claude).
+    nl_translator: Option<String>,
     help: bool,
     words: Vec<String>,
 }
@@ -101,6 +106,7 @@ struct Parsed {
 fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
     let mut host = None;
     let mut port = None;
+    let mut nl_translator = None;
     let mut help = false;
     let mut words = Vec::new();
     let mut it = raw.into_iter();
@@ -110,6 +116,9 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
             "--port" => {
                 let v = it.next().ok_or("--port needs a value")?;
                 port = Some(v.parse::<u16>().map_err(|_| format!("bad port: {v}"))?);
+            }
+            "--nl-translator" => {
+                nl_translator = Some(it.next().ok_or("--nl-translator needs a value")?);
             }
             "-h" | "--help" => help = true,
             // Everything after the first non-flag word is part of the phrase.
@@ -137,7 +146,7 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
             }
         }
     }
-    Ok(Parsed { host, port, help, words })
+    Ok(Parsed { host, port, nl_translator, help, words })
 }
 
 fn run(raw: Vec<String>) -> Result<(), MpdError> {
@@ -203,6 +212,13 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
 
     let env = Env { get: &|k| std::env::var(k).ok() };
     let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+    let pin = match nl::NlTranslatorPin::resolve(
+        parsed.nl_translator.as_deref(),
+        std::env::var("HYPODJ_NL_TRANSLATOR").ok().as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return Err(MpdError::Io(e)),
+    };
     let mut conn = MpdConn::connect(&host, port)?;
 
     match action {
@@ -221,7 +237,7 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
             }
         }
         Action::FavoriteCurrent => favorite_current(&mut conn)?,
-        Action::Nl(phrase) => nl_handshake(&mut conn, &phrase)?,
+        Action::Nl(phrase) => nl_handshake(&mut conn, &phrase, pin)?,
         Action::Help => unreachable!(),
     }
     Ok(())
@@ -286,18 +302,26 @@ fn print_card(conn: &mut MpdConn) -> Result<(), MpdError> {
 }
 
 /// The full NL handshake, all on the one open socket. Under `cc` (and only when the
-/// `claude` CLI is present) the phrase is first translated CLIENT-SIDE by Claude
-/// Code into a validated Plan IR, echoed + confirmed here, and armed via a normal
-/// `plan add <dsl>` (re-clamped + dry-run validated daemon-side, the same trust
-/// boundary as `nl confirm`). When `cc` is off, `claude` is absent, or the call
-/// fails, it falls through to today's daemon `nl` path unchanged.
-fn nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<(), MpdError> {
+/// pin prefers Claude and the `claude` CLI is present) the phrase is first translated
+/// CLIENT-SIDE by Claude Code into a validated Plan IR, echoed + confirmed here, and
+/// armed via a normal `plan add <dsl>` (re-clamped + dry-run validated daemon-side,
+/// the same trust boundary as `nl confirm`). Pin `rules` (env `HYPODJ_NL_TRANSLATOR`
+/// or `--nl-translator`) skips CC so probes share one translator path. When `cc` is
+/// off, `claude` is absent, the pin is rules, or the call fails, it falls through to
+/// today's daemon `nl` path unchanged.
+fn nl_handshake(
+    conn: &mut MpdConn,
+    phrase: &str,
+    pin: nl::NlTranslatorPin,
+) -> Result<(), MpdError> {
     // NOTE: the latent-field pull is set DAEMON-SIDE at the confirmed enqueue
     // (`plan_enqueue`), never speculatively primed here before the user confirms - a
     // rejected or non-enqueue ask must never leave a lingering bias behind.
     #[cfg(feature = "cc")]
     {
-        if hypodj_nl::cc::cc_available() {
+        // Pin `rules` skips the Claude Code side door so probes share one translator
+        // path with the TUI. Auto / claude keep today's try-CC-then-daemon behavior.
+        if pin.prefer_claude() && hypodj_nl::cc::cc_available() {
             match cc_nl_handshake(conn, phrase)? {
                 true => return Ok(()),
                 // The CC call failed (spawn/parse/no-DSL); fall through to the daemon.
@@ -305,6 +329,7 @@ fn nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<(), MpdError> {
             }
         }
     }
+    let _ = pin; // used under feature = "cc"; keep signature stable without cc.
     let req = nl::nl_request(phrase);
     let pairs = match conn.command(&req) {
         Ok(p) => p,
@@ -555,6 +580,25 @@ mod tests {
         let p = parse_args(v(&["--port", "6699", "store"])).unwrap();
         assert_eq!(p.port, Some(6699));
         assert_eq!(p.words, v(&["store"]));
+    }
+
+    #[test]
+    fn parse_args_nl_translator_flag() {
+        let p = parse_args(v(&[
+            "--nl-translator",
+            "rules",
+            "--port",
+            "6610",
+            "play something calmer",
+        ]))
+        .unwrap();
+        assert_eq!(p.nl_translator.as_deref(), Some("rules"));
+        assert_eq!(p.port, Some(6610));
+        assert_eq!(p.words, v(&["play", "something", "calmer"]));
+        assert_eq!(
+            nl::NlTranslatorPin::resolve(p.nl_translator.as_deref(), Some("claude")).unwrap(),
+            nl::NlTranslatorPin::Rules
+        );
     }
 
     #[test]
