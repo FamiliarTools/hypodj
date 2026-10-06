@@ -1251,4 +1251,284 @@ mod tests {
         let reqs: Vec<Req> = rx.try_iter().collect();
         assert!(reqs.iter().any(|r| matches!(r, Req::Cancel(_))), "cancel dispatched");
     }
+
+    /// Approach A headless key pump (see docs/product/agent-driven-surface-tests):
+    /// KeyEvents into handle_key, dispatch onto the REAL worker, drain inbounds
+    /// through apply_inbound exactly like the live loop, then assert daemon truth.
+    /// Headless (TestBackend only, no DISPLAY), silent (a fake MPD deck, never the
+    /// live daemon or real audio), rules pinned via the state field (the hermetic
+    /// twin of HYPODJ_NL_TRANSLATOR=rules, which stays out of the test process env
+    /// so parallel tests cannot see it).
+    #[test]
+    fn nl_key_pump_echo_confirm_arm_moves_the_deck() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use hypodj_client::mpd::MpdConn;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        /// The fake deck: one seeded track, then the six track calmer deck after arm.
+        struct Deck {
+            armed: bool,
+        }
+
+        fn status_of(deck: &Deck) -> String {
+            let len = if deck.armed { 6 } else { 1 };
+            format!("volume: 50\nstate: play\nsong: 0\nplaylist: 3\nplaylistlength: {len}\nOK\n")
+        }
+
+        fn current_of(deck: &Deck) -> String {
+            if deck.armed {
+                "file: song/heater\nTitle: Heater\nArtist: Perila & Ulla\nAlbum: Calmer Cuts\nOK\n"
+                    .to_string()
+            } else {
+                "file: song/everest\nTitle: Everest\nArtist: Klangstof\nAlbum: Seed\nOK\n"
+                    .to_string()
+            }
+        }
+
+        fn queue_of(deck: &Deck) -> String {
+            let tracks: &[(&str, &str, &str)] = if deck.armed {
+                &[
+                    ("song/everest", "Everest", "Klangstof"),
+                    ("song/heater", "Heater", "Perila & Ulla"),
+                    ("song/desert-blue", "Desert Blue", "Calmer Cuts"),
+                    ("song/misery-goats", "Misery Goats", "Calmer Cuts"),
+                    ("song/this-is-a-low", "This Is A Low", "Calmer Cuts"),
+                    ("song/get-your-snack-on", "Get Your Snack On", "Calmer Cuts"),
+                ]
+            } else {
+                &[("song/everest", "Everest", "Klangstof")]
+            };
+            let mut out = String::new();
+            for (i, (file, title, artist)) in tracks.iter().enumerate() {
+                out.push_str(&format!(
+                    "file: {file}\nTitle: {title}\nArtist: {artist}\nPos: {i}\nId: {i}\n"
+                ));
+            }
+            out.push_str("OK\n");
+            out
+        }
+
+        fn serve_one(stream: TcpStream, deck: Arc<Mutex<Deck>>) {
+            let reader_stream = stream.try_clone().expect("clone fake conn");
+            let mut reader = BufReader::new(reader_stream);
+            let mut stream = stream;
+            stream.write_all(b"OK MPD 0.24.0\n").expect("greet");
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let cmd = line.trim_end().to_string();
+                // Hold idle briefly so the idle worker parks instead of hot looping.
+                if cmd == "idle" {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let reply = {
+                    let mut deck = deck.lock().expect("deck");
+                    if cmd.starts_with("nl confirm") {
+                        deck.armed = true;
+                        "plan_id: 3\nOK\n".to_string()
+                    } else if cmd.starts_with("nl cancel") || cmd == "noidle" {
+                        "OK\n".to_string()
+                    } else if cmd.starts_with("nl ") {
+                        "nl_echo: via rules | [1] play 5 calmer tracks NOW (enqueue + start playback) now\nnl_token: nl-test1\nOK\n".to_string()
+                    } else if cmd == "status" {
+                        status_of(&deck)
+                    } else if cmd == "currentsong" {
+                        current_of(&deck)
+                    } else if cmd == "playlistinfo" {
+                        queue_of(&deck)
+                    } else if cmd == "idle" {
+                        "changed: player\nOK\n".to_string()
+                    } else {
+                        "OK\n".to_string()
+                    }
+                };
+                if stream.write_all(reply.as_bytes()).is_err() {
+                    return;
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake bind");
+        let port = listener.local_addr().expect("fake addr").port();
+        let deck = Arc::new(Mutex::new(Deck { armed: false }));
+        let accept_deck = deck.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let deck = accept_deck.clone();
+                std::thread::spawn(move || serve_one(stream, deck));
+            }
+        });
+
+        let workers = worker::spawn("127.0.0.1", port).expect("fake daemon accepts");
+        let mut state = TuiState::new();
+        state.nl_translator = NlTranslatorPin::Rules;
+
+        // Headless renderer for the soft witness: TestBackend frames, no display.
+        let render_text = |state: &TuiState| -> String {
+            use ratatui::backend::TestBackend;
+            use ratatui::Terminal;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test backend");
+            terminal.draw(|f| ui::render(f, state)).expect("draw");
+            let buf = terminal.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Storyboard for feel discovery: one snapshot per flow stage, each headed by
+        // the interaction facts a screenshot cannot carry (mode, screen, queue shape,
+        // pending steps). Written to a temp file and printed, so a headless agent can
+        // read the chrome evolution (command line, popup wording, armed feedback) and
+        // seed follow up ideas about prompts and flow, all without a display. The
+        // verdict still comes from daemon truth below, never from these frames.
+        let mut story: Vec<(String, String)> = Vec::new();
+        let mut snap = |stage: &str, state: &TuiState| -> String {
+            let header = format!(
+                "mode={:?} screen={:?} queue={} now={:?} status={:?} pending_steps={:?}",
+                state.mode,
+                state.screen,
+                state.queue.len(),
+                state.now.title,
+                state.status_msg,
+                state.pending.as_ref().map(|p| p.steps.clone()).unwrap_or_default()
+            );
+            let frame = format!("{header}\n{}", render_text(state));
+            story.push((stage.to_string(), frame.clone()));
+            frame
+        };
+
+        // The live loop wiring, extracted inline: coalesce, dispatch, fold inbounds.
+        let pump_keys = |state: &mut TuiState, keys: Vec<KeyEvent>| -> Vec<Intent> {
+            let mut intents = Vec::new();
+            for k in keys {
+                if let Some(intent) = state.handle_key(k) {
+                    intents.push(intent);
+                }
+            }
+            intents
+        };
+        let dispatch_all = |state: &mut TuiState, intents: Vec<Intent>| {
+            dispatch(
+                &workers.req_tx,
+                &workers.cc_tx,
+                &workers.find_tx,
+                &workers.info_tx,
+                &workers.more_tx,
+                state,
+                coalesce_intents(intents),
+            );
+        };
+        let drain_once = |state: &mut TuiState| {
+            while let Ok(msg) = workers.inbound_rx.try_recv() {
+                apply_inbound(&workers.req_tx, state, msg);
+            }
+        };
+        let drain_until =
+            |state: &mut TuiState, done: &mut dyn FnMut(&TuiState) -> bool, what: &str| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !done(state) {
+                    assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                    match workers.inbound_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(msg) => apply_inbound(&workers.req_tx, state, msg),
+                        Err(_) => {}
+                    }
+                }
+                drain_once(state);
+            };
+
+        let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+        let ch = |c: char| key(KeyCode::Char(c));
+
+        // Colon, the phrase, Enter. Only the submit yields an intent, and the rules
+        // pin routes it to daemon nl (never the CC door, so no thinking phase).
+        // Snapshot the typed command line first: it is the opening chrome frame.
+        let mut keys = vec![key(KeyCode::Char(':'))];
+        keys.extend("play something calmer".chars().map(ch));
+        let typed = pump_keys(&mut state, keys);
+        assert!(typed.is_empty(), "typing the phrase yields no intent yet");
+        snap("typed", &state);
+        let intents = pump_keys(&mut state, vec![key(KeyCode::Enter)]);
+        assert_eq!(intents.len(), 1, "colon submit yields one intent");
+        assert!(
+            matches!(&intents[0], Intent::Nl(p) if p == "play something calmer"),
+            "phrase routes to NL, got {:?}", intents[0]
+        );
+        assert!(state.dj_phase.is_none(), "rules pin opens no CC thinking phase");
+        dispatch_all(&mut state, intents);
+
+        // The worker runs nl on the command socket; the Confirm folds to a popup.
+        drain_until(
+            &mut state,
+            &mut |s| s.mode == Mode::Confirm && s.pending.is_some(),
+            "the NL confirm",
+        );
+        let pending = state.pending.as_ref().expect("pending plan");
+        assert_eq!(pending.token.as_deref(), Some("nl-test1"), "owner token held");
+        assert_eq!(pending.trust.as_deref(), Some("via rules"), "rules trust shown");
+        assert!(
+            pending.steps.iter().any(|s| s.contains("calmer")),
+            "echo steps shown: {:?}", pending.steps
+        );
+        let confirm_frame = snap("confirm", &state);
+        assert!(confirm_frame.contains("confirm? [y/N]"), "popup prompts");
+        assert!(confirm_frame.contains("calmer"), "popup shows the echoed plan");
+
+        // The y press arms through the SAME Req::Arm contract the unit tests cover.
+        let intent = state.handle_key(ch('y'));
+        assert_eq!(intent, Some(Intent::ConfirmArm), "y arms");
+        dispatch_all(&mut state, vec![intent.unwrap()]);
+        assert_eq!(state.mode, Mode::Normal, "confirm dismissed");
+        assert!(state.pending.is_none(), "pending consumed");
+        drain_until(
+            &mut state,
+            &mut |s| {
+                s.status_msg.as_ref().is_some_and(|m| m.contains("armed"))
+                    && s.queue.len() == 6
+            },
+            "the armed banner and refreshed queue",
+        );
+
+        // Daemon truth on a second conn: the pass criterion. Queue grew 1 to 6,
+        // now playing moved to the armed track. The storyboard file path rides along
+        // in the failure message as the headless soft witness (chrome context for
+        // the agent, both for bugs and for feel follow ups, never the verdict).
+        assert!(deck.lock().expect("deck").armed, "fake deck armed");
+        snap("armed", &state);
+        let witness_path = std::env::temp_dir().join("hypodj-tui-keypump-story.txt");
+        let body = story
+            .iter()
+            .map(|(s, f)| format!("=== {s} ===\n{f}\n"))
+            .collect::<String>();
+        std::fs::write(&witness_path, &body).expect("storyboard write");
+        println!("keypump storyboard: {}", witness_path.display());
+        let witness = format!("storyboard: {}", witness_path.display());
+        let mut conn = MpdConn::connect("127.0.0.1", port).expect("second conn");
+        let status = conn.command("status").expect("status");
+        let len = status
+            .iter()
+            .find(|(k, _)| k == "playlistlength")
+            .and_then(|(_, v)| v.parse::<usize>().ok());
+        assert_eq!(len, Some(6), "queue length after arm\n{witness}");
+        let current = conn.command("currentsong").expect("currentsong");
+        let title = current.iter().find(|(k, _)| k == "Title").map(|(_, v)| v.clone());
+        assert_eq!(title.as_deref(), Some("Heater"), "now playing after arm\n{witness}");
+        let queue = conn.command("playlistinfo").expect("playlistinfo");
+        assert_eq!(
+            queue.iter().filter(|(k, _)| k == "file").count(),
+            6,
+            "six queue entries\n{witness}"
+        );
+
+        teardown(&workers);
+    }
 }
