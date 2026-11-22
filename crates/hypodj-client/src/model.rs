@@ -1136,6 +1136,7 @@ mod tests {
         assert_eq!(schedule_reply(&[]), None);
     }
 
+    #[test]
     fn the_journal_parses_newest_first_and_keeps_the_daemons_own_words() {
         let pairs = p(&[
             ("jid", "9"),
