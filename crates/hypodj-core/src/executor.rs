@@ -34,7 +34,7 @@ use crate::clock::Clock;
 use crate::event::{DjEvent, DjEventKind, QueueId};
 use crate::handler::{FadeIntent, FadeRequest, HypodjHandler, PlanOutcome};
 use crate::plan::{fires, Action, ArmedPlan, FadeIntentIr, Fire, PlanId, Resolved};
-use crate::player::PlayState;
+use crate::player::{mpv_volume_to_db, PlayState};
 use crate::timer::{TimerGuard, TimerHandle};
 
 /// A live-position jump larger than this (a seek, not the second-by-second
@@ -64,6 +64,16 @@ pub struct PendingPlan {
     /// position JUMPED (a seek) is detected and the timer re-armed; `None` when
     /// the plan is not a remaining-plan or is currently disarmed.
     pub remaining_deadline: Option<tokio::time::Instant>,
+    /// `true` only for a plan the DAEMON armed for one of its own reserved
+    /// convenience-feature origins (sleep / winddown / wake). Singleton identity
+    /// hangs off THIS, never off `armed.raw.origin` alone: `origin` is a free
+    /// string a client picks (`plan add ... origin sleep`), so a string-only
+    /// lookup let a client plan masquerade as the sleep timer - duplicating the
+    /// `X-hypodj-sleep-remaining` status key, surviving `sleep off` while still
+    /// counting down, and being swept away by an unrelated re-arm. Lives HERE
+    /// (registry-side) rather than in [`ArmedPlan`] so nothing serializable, and
+    /// therefore nothing a producer can author, can ever set it.
+    pub reserved: bool,
 }
 
 /// The executor task. Generic over the [`Clock`] so it runs identically under
@@ -143,14 +153,20 @@ impl<C: Clock> Executor<C> {
 
         let snap = self.handler.queue_snapshot();
         let pending = self.handler.plan_pending_handle();
-        let mut fired: Vec<(PlanId, Action)> = Vec::new();
+        // The plan's ORIGIN rides along with its action: the journal records who
+        // caused each effect, and this path fires with NO client connected.
+        let mut fired: Vec<(PlanId, Action, String)> = Vec::new();
         {
             // ONE short lock: collect fired ids + drop once/stale plans, mirroring
             // the timer live-set. No `.await` under this std Mutex.
             let mut g = pending.lock().unwrap();
             g.retain_mut(|pp| match fires(&pp.armed, ev, &snap) {
                 Fire::Yes => {
-                    fired.push((pp.armed.id, pp.armed.raw.action.clone()));
+                    fired.push((
+                        pp.armed.id,
+                        pp.armed.raw.action.clone(),
+                        pp.armed.raw.origin.clone(),
+                    ));
                     // Every armed anchor here is single-use (a concrete
                     // QueueId/AlbumId/absolute deadline fires exactly once), so a
                     // fired plan is ALWAYS removed at selection (dropping its guard),
@@ -170,7 +186,7 @@ impl<C: Clock> Executor<C> {
             });
         }
         // Stable total order: ascending PlanId, reproducible across runs.
-        fired.sort_by_key(|(id, _)| *id);
+        fired.sort_by_key(|(id, _, _)| *id);
         if !fired.is_empty() {
             self.execute_batch(fired);
         }
@@ -250,14 +266,17 @@ impl<C: Clock> Executor<C> {
     /// `once` - so a non-once Immediate plan never lingers as an un-fireable zombie.
     fn on_immediate(&self, id: PlanId) {
         let pending = self.handler.plan_pending_handle();
-        let action = {
+        let armed = {
             let mut g = pending.lock().unwrap();
-            g.iter().position(|pp| pp.armed.id == id).map(|pos| g.remove(pos).armed.raw.action)
+            g.iter().position(|pp| pp.armed.id == id).map(|pos| {
+                let raw = g.remove(pos).armed.raw;
+                (raw.action, raw.origin)
+            })
         };
         // Run OFF the select loop (an Immediate Enqueue does network calls): a slow
         // add-time action must not wedge the loop either.
-        if let Some(a) = action {
-            self.execute_batch(vec![(id, a)]);
+        if let Some((a, origin)) = armed {
+            self.execute_batch(vec![(id, a, origin)]);
         }
     }
 
@@ -301,11 +320,11 @@ impl<C: Clock> Executor<C> {
     /// are isolated (fades still serialize through the single
     /// [`HypodjHandler::start_fade_spec`] slot / one envelope), so the end state does
     /// not depend on completion order.
-    fn execute_batch(&self, fired: Vec<(PlanId, Action)>) {
-        for (id, action) in fired {
+    fn execute_batch(&self, fired: Vec<(PlanId, Action, String)>) {
+        for (id, action, origin) in fired {
             let h = self.handler.clone();
             tokio::spawn(async move {
-                let jh = tokio::spawn(run_action(h, id, action));
+                let jh = tokio::spawn(run_action(h, id, action, origin));
                 if let Err(e) = jh.await {
                     tracing::error!(plan = id.0, error = %e, "plan action task panicked");
                 }
@@ -355,8 +374,11 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
     match ir {
         FadeIntentIr::Out { secs } => FadeRequest { intent: FadeIntent::Out, dur: dur(*secs), commit_logical: None },
         FadeIntentIr::In { secs } => FadeRequest { intent: FadeIntent::In, dur: dur(*secs), commit_logical: None },
-        FadeIntentIr::To { target_db, vol, secs } => FadeRequest {
-            intent: FadeIntent::To { target_db: *target_db, vol: *vol },
+        // The dB target is DERIVED from the requested 0..=100 volume through the
+        // cubic-softvol seam - the plan IR carries no independent dB, so the level
+        // the echo shows is exactly the level the envelope drives to.
+        FadeIntentIr::To { vol, secs } => FadeRequest {
+            intent: FadeIntent::To { target_db: mpv_volume_to_db(*vol as f64), vol: *vol },
             dur: dur(*secs),
             commit_logical: None,
         },
@@ -367,8 +389,8 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
             dur: dur(*secs),
             commit_logical: None,
         },
-        FadeIntentIr::WakeTo { target_db, vol, secs } => FadeRequest {
-            intent: FadeIntent::WakeTo { target_db: *target_db, vol: *vol },
+        FadeIntentIr::WakeTo { vol, secs } => FadeRequest {
+            intent: FadeIntent::WakeTo { target_db: mpv_volume_to_db(*vol as f64), vol: *vol },
             dur: dur(*secs),
             commit_logical: None,
         },
@@ -379,8 +401,8 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
 /// ([`HypodjHandler::run_action_outcome`]). An arm-and-forget plan ignores the
 /// outcome except to log a failure (log-and-continue); the `plan add` reporting path
 /// threads the same outcome back to the client.
-async fn run_action(handler: Arc<HypodjHandler>, id: PlanId, action: Action) {
-    if let PlanOutcome::Failed(e) = handler.run_action_outcome(&action).await {
+async fn run_action(handler: Arc<HypodjHandler>, id: PlanId, action: Action, origin: String) {
+    if let PlanOutcome::Failed(e) = handler.run_action_outcome(&action, &origin).await {
         tracing::error!(plan = id.0, error = %e, "plan action failed (log-and-continue)");
     }
 }

@@ -224,6 +224,17 @@ pub enum MpdCommand {
     /// [`PlanCmd`] and [`parse_plan`].
     Plan(PlanCmd),
 
+    /// `journal` - the UNDO RING: the last 32 [`crate::plan::Action`] executions
+    /// with the daemon's own outcome text, newest first, each flagged with whether
+    /// it is undoable RIGHT NOW. NOT a standard MPD command; a hypodj extension.
+    Journal,
+    /// `undo [<jid>]` - retract the top undoable journal entry, or the named one
+    /// (which must BE the top). The argument is carried RAW rather than pre-parsed
+    /// so a non-numeric id can ACK instead of silently degrading to "the top" - the
+    /// one thing a retraction verb must never do. NOT a standard MPD command; a
+    /// hypodj extension.
+    Undo(Option<String>),
+
     /// `nl "<request>"` / `nl confirm <token>` / `nl cancel <token>` - the P3
     /// OPTIONAL natural-language surface. Translate EMITS a validated plan echoed
     /// for confirmation; confirm arms it via the P2 registry; cancel drops the
@@ -949,13 +960,10 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
             "to" => {
                 let vol = toks.get(2)?.parse::<u8>().ok()?;
                 let secs = parse_secs(toks.get(3)?)?;
-                // The target dB is derived from the requested 0..=100 volume (the
-                // same cubic-softvol seam the handler uses); validate clamps it.
-                Some(Action::Fade(FadeIntentIr::To {
-                    target_db: crate::player::mpv_volume_to_db(vol as f64),
-                    vol,
-                    secs,
-                }))
+                // Only the 0..=100 volume is carried; the target dB is derived from
+                // it (the same cubic-softvol seam the handler uses) at execute time,
+                // so the echoed level cannot diverge from the driven one.
+                Some(Action::Fade(FadeIntentIr::To { vol, secs }))
             }
             _ => None,
         },
@@ -1008,10 +1016,14 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
 }
 
 /// Parse a queue selector off the leading tokens: `current` | `pos <n>` |
-/// `last <n>` | `range <start> <end>` | `match <query>`. Positions are 1-based.
+/// `last <n>` | `range <start> <end>` | `match <query>` | `id <qid>`. Positions
+/// are 1-based; `id` is the STABLE queue id (`Id:` on the wire), which is the
+/// only form that still names the row a caller read earlier - trimming and
+/// autofill shift every position.
 fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
     match toks.first()?.to_lowercase().as_str() {
         "current" => Some(QueueSelector::Current),
+        "id" => Some(QueueSelector::Qid(toks.get(1)?.parse().ok()?)),
         "pos" => Some(QueueSelector::Position(toks.get(1)?.parse().ok()?)),
         "last" => Some(QueueSelector::Last(toks.get(1)?.parse().ok()?)),
         "range" => Some(QueueSelector::Range {
@@ -1498,6 +1510,11 @@ pub fn parse(line: &str) -> MpdCommand {
         }
         "fade" => parse_fade(&args, line),
         "plan" => parse_plan(&args, line),
+        // The retraction surface. `journal` takes no argument; `undo` takes an
+        // OPTIONAL journal id, kept as a raw token so the handler can ACK a
+        // non-numeric one (see [`MpdCommand::Undo`]).
+        "journal" => MpdCommand::Journal,
+        "undo" => MpdCommand::Undo(arg(0)),
         "nl" => parse_nl(&args, line),
         "sleep" => parse_sleep(&args, line),
         "winddown" => parse_winddown(&args, line),
@@ -2343,6 +2360,55 @@ mod parse_tests {
         // A malformed plan is a fail-loud Unsupported, never a panic.
         assert!(matches!(parse("plan add trigger track"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("plan frobnicate"), MpdCommand::Unsupported(_)));
+    }
+
+    // The retraction verbs. `undo`'s argument is carried RAW so the handler can ACK
+    // a non-numeric id: silently degrading it to "the top" would retract something
+    // the caller did not name, which is the one thing a retraction verb must never
+    // do. A quoted or spaced id is still just one token.
+    #[test]
+    fn parses_journal_and_undo() {
+        assert!(matches!(parse("journal"), MpdCommand::Journal));
+        assert!(matches!(parse("undo"), MpdCommand::Undo(None)));
+        match parse("undo 7") {
+            MpdCommand::Undo(Some(s)) => assert_eq!(s, "7"),
+            other => panic!("got {other:?}"),
+        }
+        match parse("undo not-a-number") {
+            MpdCommand::Undo(Some(s)) => assert_eq!(s, "not-a-number"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    // `id <qid>` parses to the stable-id selector: the only queue target that
+    // still names the row a caller read earlier, after a front trim shifted every
+    // position. A missing or non-numeric id is a fail-loud Unsupported.
+    #[test]
+    fn parses_qid_queue_selector() {
+        match parse("plan add trigger immediate action remove id 88") {
+            MpdCommand::Plan(PlanCmd::Add(raw)) => {
+                assert!(matches!(raw.action, Action::Remove { sel: QueueSelector::Qid(88) }));
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("plan add trigger immediate action play id 4294967296") {
+            MpdCommand::Plan(PlanCmd::Add(raw)) => {
+                assert!(matches!(raw.action, Action::Play { sel: QueueSelector::Qid(4294967296) }));
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id"),
+            MpdCommand::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id -1"),
+            MpdCommand::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id nine"),
+            MpdCommand::Unsupported(_)
+        ));
     }
 
     #[test]

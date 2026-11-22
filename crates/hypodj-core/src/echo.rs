@@ -18,37 +18,14 @@ fn secs(s: f64) -> String {
     }
 }
 
-/// Quote + escape a selector value so a multi-word value ("good vibes", "drum
-/// and bass") survives the `plan add` tokenizer as ONE token (it splits on
-/// unquoted whitespace and unescapes `\"`/`\\` inside quotes). A single bare word
-/// is emitted verbatim; anything with whitespace/quote/backslash is quoted.
+/// Quote + escape a DSL value so a multi-word value survives the `plan add`
+/// tokenizer as ONE token, refusing (`None`) anything carrying a control char.
 ///
-/// Returns `None` when the value contains a control character (newline, CR, tab,
-/// etc.). The `plan add <dsl>` line is framed on the wire by a literal `\n`, and
-/// the tokenizer's `\`-escape only unescapes the NEXT char (never re-encodes a
-/// literal newline), so a value carrying a newline would smuggle EXTRA command
-/// lines past the single-owner confirm gate. Refusing to render it makes the
-/// caller fall back to direct arming (or a loud "cannot express" miss) - a
-/// control char is nonsense in a music selector anyway.
-fn dsl_value(s: &str) -> Option<String> {
-    if s.chars().any(|c| c.is_control()) {
-        return None;
-    }
-    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
-        let mut out = String::with_capacity(s.len() + 2);
-        out.push('"');
-        for c in s.chars() {
-            if c == '"' || c == '\\' {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-        out.push('"');
-        Some(out)
-    } else {
-        Some(s.to_string())
-    }
-}
+/// RE-EXPORTED, not implemented here: the rule lives in [`hypodj_dsl`] so the
+/// daemon's echo and an out-of-process producer of a `plan add` line (which
+/// cannot link `libmpv`, so cannot depend on this crate) share one implementation
+/// and cannot drift. See that crate for the full why.
+pub use hypodj_dsl::dsl_value;
 
 /// Render the trigger portion of the `plan add` DSL.
 fn trigger_dsl(t: &RawTrigger) -> Option<String> {
@@ -78,7 +55,7 @@ fn action_dsl(a: &Action) -> Option<String> {
     Some(match a {
         Action::Fade(FadeIntentIr::Out { secs: s }) => format!("action fade out {}", secs(*s)),
         Action::Fade(FadeIntentIr::In { secs: s }) => format!("action fade in {}", secs(*s)),
-        Action::Fade(FadeIntentIr::To { vol, secs: s, .. }) => {
+        Action::Fade(FadeIntentIr::To { vol, secs: s }) => {
             format!("action fade to {} {}", vol, secs(*s))
         }
         Action::Stop => "action stop".into(),
@@ -132,6 +109,7 @@ fn qselector_dsl(sel: &QueueSelector) -> Option<String> {
         QueueSelector::Last(n) => format!("last {n}"),
         QueueSelector::Range { start, end } => format!("range {start} {end}"),
         QueueSelector::QueryMatch(q) => format!("match {}", dsl_value(q)?),
+        QueueSelector::Qid(id) => format!("id {id}"),
     })
 }
 
@@ -173,8 +151,8 @@ pub fn describe_plan(raw: &RawPlan) -> String {
     let what = match &raw.action {
         Action::Fade(FadeIntentIr::Out { secs: s }) => format!("fade OUT over {}", human_dur(*s)),
         Action::Fade(FadeIntentIr::In { secs: s }) => format!("fade IN over {}", human_dur(*s)),
-        Action::Fade(FadeIntentIr::To { vol, secs: s, .. }) => {
-            format!("fade to volume {} over {}", vol, human_dur(*s))
+        Action::Fade(FadeIntentIr::To { vol, secs: s }) => {
+            format!("fade to {} over {}", level_phrase(*vol), human_dur(*s))
         }
         Action::Stop => "stop playback".to_string(),
         Action::Pause => "pause playback".to_string(),
@@ -194,8 +172,8 @@ pub fn describe_plan(raw: &RawPlan) -> String {
         Action::Fade(FadeIntentIr::ToFloor { secs: s }) => {
             format!("wind DOWN to the quiet floor over {}", human_dur(*s))
         }
-        Action::Fade(FadeIntentIr::WakeTo { vol, secs: s, .. }) => {
-            format!("wake UP to volume {} over {}", vol, human_dur(*s))
+        Action::Fade(FadeIntentIr::WakeTo { vol, secs: s }) => {
+            format!("wake UP to {} over {}", level_phrase(*vol), human_dur(*s))
         }
         Action::Wake { selector, count } => match selector {
             Some(sel) => {
@@ -279,6 +257,18 @@ fn describe_qselector(sel: &QueueSelector) -> String {
         }
         QueueSelector::Range { start, end } => format!("tracks {start} through {end}"),
         QueueSelector::QueryMatch(q) => format!("tracks matching \"{q}\""),
+        QueueSelector::Qid(id) => format!("the track with id {id}"),
+    }
+}
+
+/// The human phrase for a fade's target level. Volume 0 IS the cubic-softvol
+/// floor (true silence), and "fade to volume 0" does not read as "this goes
+/// quiet" - name it, so an owner can tell a cue apart from a fade-out.
+fn level_phrase(vol: u8) -> String {
+    if vol == 0 {
+        "SILENCE (volume 0)".to_string()
+    } else {
+        format!("volume {vol}")
     }
 }
 
@@ -371,6 +361,27 @@ mod tests {
         });
     }
 
+    // The Qid selector renders as `id <n>` in the DSL and names the id in the
+    // human sentence - the agent-facing target the human reads back.
+    #[test]
+    fn qid_selector_renders_dsl_and_human_text() {
+        use crate::plan::QueueSelector;
+        assert_eq!(qselector_dsl(&QueueSelector::Qid(88)).as_deref(), Some("id 88"));
+        assert_eq!(describe_qselector(&QueueSelector::Qid(88)), "the track with id 88");
+        let raw = RawPlan {
+            version: 1,
+            trigger: RawTrigger::Immediate,
+            action: Action::Remove { sel: QueueSelector::Qid(88) },
+            once: false,
+            origin: String::new(),
+        };
+        assert_eq!(
+            render_dsl(&raw).as_deref(),
+            Some("trigger immediate action remove id 88")
+        );
+        assert!(describe_plan(&raw).contains("the track with id 88"), "{}", describe_plan(&raw));
+    }
+
     #[test]
     fn render_dsl_round_trips_queue_edit_actions() {
         use crate::plan::{ClearScope, MoveDest, QueueSelector};
@@ -388,6 +399,7 @@ mod tests {
             QueueSelector::Last(2),
             QueueSelector::Range { start: 2, end: 5 },
             QueueSelector::QueryMatch("blue in green".into()),
+            QueueSelector::Qid(88),
         ] {
             assert_round_trip(&imm(Action::Remove { sel }));
         }
@@ -447,6 +459,74 @@ mod tests {
         });
         assert!(d.contains("start playback"), "not honest about starting: {d}");
         assert!(d.contains("at the door"));
+    }
+
+    /// The dB target a plan fade ACTUALLY drives toward, read off the same
+    /// [`crate::executor::map_fade`] seam the executor uses. `None` for a fade
+    /// whose target is not an explicit dB (Out/In/ToFloor).
+    fn real_fade_target_db(raw: &RawPlan) -> Option<f64> {
+        let ir = match &raw.action {
+            Action::Fade(ir) => ir,
+            other => panic!("not a fade: {other:?}"),
+        };
+        match crate::executor::map_fade(ir).intent {
+            crate::handler::FadeIntent::To { target_db, .. }
+            | crate::handler::FadeIntent::WakeTo { target_db, .. } => Some(target_db),
+            _ => None,
+        }
+    }
+
+    /// SAFETY (the echo cannot lie about loudness): two plans that render to the
+    /// SAME DSL / human sentence must drive the SAME fade. `FadeIntentIr::To`
+    /// carried a `target_db` INDEPENDENT of `vol` while only `vol` reached the
+    /// echo, so `fade to volume 40` and a fade to silence were indistinguishable
+    /// in the string a human approves - and `target_db` is what actually drives
+    /// the envelope. The JSON here is the real ingress (a serde-deserialized raw
+    /// plan), so a stale/hostile `target_db` key stays exercised after the field
+    /// is gone from the IR.
+    #[test]
+    fn fade_to_echo_cannot_hide_the_real_target() {
+        let plan = |target_db: &str| -> RawPlan {
+            let json = format!(
+                r#"{{"trigger":{{"kind":"immediate"}},"action":{{"act":"fade","dir":"to","target_db":{target_db},"vol":40,"secs":10.0}}}}"#
+            );
+            serde_json::from_str(&json).expect("raw plan JSON")
+        };
+        let loud = plan("-8.0");
+        let silent = plan("-120.0");
+        // Both echo identically today (only `vol` is rendered) ...
+        assert_eq!(render_dsl(&loud), render_dsl(&silent));
+        assert_eq!(describe_plan(&loud), describe_plan(&silent));
+        // ... so they MUST also fade identically, or the echo is a lie.
+        assert_eq!(
+            real_fade_target_db(&loud),
+            real_fade_target_db(&silent),
+            "same echo, different real fade target: the approved string is a lie",
+        );
+        // And the rendered volume is the one actually driven (the cubic softvol
+        // seam), not an unrelated dB smuggled alongside it.
+        assert_eq!(
+            real_fade_target_db(&loud),
+            Some(crate::player::mpv_volume_to_db(40.0)),
+        );
+    }
+
+    /// A human must be able to tell "fade to volume 40" from "fade to silence":
+    /// vol 0 IS silence (the cubic softvol floor), so the sentence says so.
+    #[test]
+    fn describe_fade_to_zero_says_silence() {
+        let imm = |action| RawPlan {
+            version: 1,
+            trigger: RawTrigger::Immediate,
+            action,
+            once: false,
+            origin: String::new(),
+        };
+        let d = describe_plan(&imm(Action::Fade(FadeIntentIr::To { vol: 0, secs: 10.0 })));
+        assert!(d.to_lowercase().contains("silence"), "vol 0 must read as silence: {d}");
+        let d40 = describe_plan(&imm(Action::Fade(FadeIntentIr::To { vol: 40, secs: 10.0 })));
+        assert!(d40.contains("volume 40"), "{d40}");
+        assert!(!d40.to_lowercase().contains("silence"), "vol 40 is not silence: {d40}");
     }
 
     #[test]

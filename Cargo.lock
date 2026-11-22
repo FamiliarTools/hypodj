@@ -978,6 +978,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hypodj-dsl",
  "libc",
  "libmpv2",
  "mpris-server",
@@ -1006,6 +1007,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hypodj-dsl"
+version = "0.2.0"
+
+[[package]]
+name = "hypodj-mcp"
+version = "0.2.0"
+dependencies = [
+ "hypodj-client",
+ "hypodj-dsl",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

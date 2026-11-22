@@ -41,6 +41,10 @@ use crate::fade::{
     FadeProgress, FadeSpec, FadeTarget, StartleBounds,
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot, TimerId};
+use crate::journal::{
+    action_shape, action_verb, changed_anything, queue_effect_holds, restores_volume, Journal,
+    Snapshot, UndoRefusal, WorldKey,
+};
 use crate::intelligence::{
     lexicon_pull, pull_reweight, FeatureStore, MetadataStore, Pull, PullField, TrackFeatures,
     LEXICON_PULL_STRENGTH,
@@ -81,8 +85,10 @@ use crate::timer::{TimerGuard, TimerHandle};
 /// its MPD song id (a monotonically increasing integer, MPD's stable per-song
 /// handle, distinct from queue pos).
 #[derive(Clone)]
-struct QueueItem {
-    id: u64,
+pub(crate) struct QueueItem {
+    /// The MPD song id. `pub(crate)` because [`crate::journal`] reads it to key a
+    /// snapshot's current row against the live world (a qid, never a position).
+    pub(crate) id: u64,
     entry: QueueEntry,
     /// Wall-clock epoch seconds of the FIRST live position sample this entry ever
     /// produced, or `None` while it has produced none. It is the only field that makes
@@ -127,7 +133,7 @@ struct QueueItem {
 
 impl QueueItem {
     /// A freshly QUEUED row: nothing has played it yet.
-    fn queued(id: u64, entry: QueueEntry) -> Self {
+    pub(crate) fn queued(id: u64, entry: QueueEntry) -> Self {
         Self { id, entry, played_at: None, carried: false }
     }
 
@@ -2125,6 +2131,24 @@ impl PlanOutcome {
     }
 }
 
+/// The baseline volume a fade [`Action`] will COMMIT when its envelope lands, or
+/// `None` when the action does not drive to a knowable level.
+///
+/// A plan fade is non-committing: `Terminal::SetBaseline(vol)` assigns
+/// `target_volume` only at the end of the ramp, so the journal records this as the
+/// post-key volume (see [`HypodjHandler::journal_record`]). `Out` (fade to silence
+/// and stop) and `In` / `ToFloor` (whose landing level is resolved from the LIVE
+/// config inside `start_fade_spec`, not from the IR) are deliberately absent: they
+/// keep the plain post-key reading and go stale when their own envelope lands,
+/// which refuses rather than clobbers.
+fn fade_lands_at(action: &Action) -> Option<u8> {
+    match action {
+        Action::Fade(FadeIntentIr::To { vol, .. })
+        | Action::Fade(FadeIntentIr::WakeTo { vol, .. }) => Some(*vol),
+        _ => None,
+    }
+}
+
 /// "track" vs "tracks" for a count.
 fn tracks_word(n: usize) -> &'static str {
     if n == 1 {
@@ -2782,6 +2806,13 @@ pub struct HypodjHandler {
     /// its [`PendingPlan`], so `plan_cancel`/`plan_replace` disarm the timer by
     /// dropping the entry (RAII), never a phantom `WallClock` fire.
     plan_pending: Arc<Mutex<Vec<PendingPlan>>>,
+    /// The UNDO JOURNAL: the last 32 [`Action`] executions with the world each one
+    /// replaced. Written UNCONDITIONALLY at the single [`Self::run_action_outcome`]
+    /// dispatch (origin is recorded, never tested), so the agent's only write
+    /// channel is retractable by construction. Memory-only and dies with the daemon
+    /// - deliberate: `resume.toml` already persists queue state and a second on-disk
+    /// shadow would diverge from it.
+    journal: Journal,
     /// Monotonic, NEVER-reused plan id source (mirrors the timer `next_id` idiom),
     /// so a stale cancel/replace can never hit a recycled plan.
     next_plan_id: AtomicU64,
@@ -3460,6 +3491,7 @@ impl HypodjHandler {
             nts_catalogue_cache: TtlLru::new(4, Duration::from_secs(3600)),
             library_match_cache: TtlLru::new(64, Duration::from_secs(3600)),
             plan_pending: Arc::new(Mutex::new(Vec::new())),
+            journal: Journal::new(),
             next_plan_id: AtomicU64::new(0),
             plan_timers: OnceLock::new(),
             plan_immediate: OnceLock::new(),
@@ -3595,8 +3627,8 @@ impl HypodjHandler {
         if immediates.contains(&id) {
             // Immediate: run inline for the true outcome. An Immediate plan holds no
             // timer guard, so dropping the (un-enrolled) pending disarms nothing.
-            let action = pendings.remove(0).armed.raw.action;
-            let outcome = self.run_action_outcome(&action).await;
+            let raw = pendings.remove(0).armed.raw;
+            let outcome = self.run_action_outcome(&raw.action, &raw.origin).await;
             Ok((id, Some(outcome)))
         } else {
             self.plan_pending.lock().unwrap().extend(pendings);
@@ -3621,9 +3653,16 @@ impl HypodjHandler {
     pub fn run_action_outcome<'a>(
         &'a self,
         action: &'a Action,
+        origin: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PlanOutcome> + Send + 'a>> {
         Box::pin(async move {
-        match action {
+        // THE GATE (see [`crate::journal`]). Capture the world BEFORE, record the
+        // REAL outcome AFTER. UNCONDITIONAL on `origin` - the origin is written into
+        // the entry and never tested here, so a spoofed or missing one can never
+        // switch journaling off. A `Noop` cannot change anything, so it neither
+        // clones the queue nor takes a ring slot.
+        let pre = if matches!(action, Action::Noop) { None } else { Some(self.capture_world()) };
+        let outcome = match action {
             // Fade precedence: start_fade_spec IS the single FadeSlot (validates
             // before aborting; logs an autonomous takeover).
             Action::Fade(ir) => match self.start_fade_spec(crate::executor::map_fade(ir)).await {
@@ -3703,8 +3742,151 @@ impl HypodjHandler {
                 Err(e) => PlanOutcome::Failed(e),
             },
             Action::Noop => PlanOutcome::Effect("nothing to do".into()),
+        };
+        if let Some((snap, pre_key)) = pre {
+            self.journal_record(action, origin, snap, pre_key, &outcome);
         }
+        outcome
         })
+    }
+
+    /// Capture the world an [`Action`] is about to replace: the whole queue (rows
+    /// with their stable qids), the playhead, the transport and the baseline
+    /// volume, plus the [`WorldKey`] as it stood BEFORE.
+    ///
+    /// The queue clone and the key are read under ONE `State` lock, so the key can
+    /// never describe a different sample than the snapshot beside it. The elapsed
+    /// atomic and the reported play state are read first (both take their own
+    /// locks), which is why they are read OUTSIDE - never nest.
+    fn capture_world(&self) -> (Snapshot, WorldKey) {
+        let elapsed_ms = self.last_elapsed_ms.load(Ordering::Relaxed);
+        let state = self.reported_play_state();
+        let st = self.state.lock().unwrap();
+        let current = st.current;
+        let current_qid = current.and_then(|i| st.queue.get(i)).map(|it| it.id);
+        let target_volume = st.target_volume;
+        let snap = Snapshot {
+            queue: st.queue.clone(),
+            next_qid: st.next_id,
+            current,
+            elapsed_ms,
+            state,
+            target_volume,
+            // Assigned by `journal_record`, which is the one that knows the action.
+            restores_volume: false,
+        };
+        let key = WorldKey {
+            playlist_version: st.playlist_version,
+            current_qid,
+            state,
+            target_volume,
+        };
+        (snap, key)
+    }
+
+    /// The queue's qid vector beside the live [`WorldKey`], read under ONE lock so
+    /// the two can never describe different samples. The vector is what the WINDOW
+    /// check (see [`crate::journal::QueueEffect`]) compares against the pre-world:
+    /// `playlist_version` counts that something changed, only the ids say WHAT.
+    fn world_rows(&self) -> (Vec<u64>, WorldKey) {
+        let state = self.reported_play_state();
+        let st = self.state.lock().unwrap();
+        let ids: Vec<u64> = st.queue.iter().map(|it| it.id).collect();
+        let key = WorldKey {
+            playlist_version: st.playlist_version,
+            current_qid: st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
+            state,
+            target_volume: st.target_volume,
+        };
+        (ids, key)
+    }
+
+    /// The live [`WorldKey`]: the drift detector `undo` compares against. Same read
+    /// discipline as [`Self::capture_world`].
+    pub(crate) fn world_key(&self) -> WorldKey {
+        let state = self.reported_play_state();
+        let st = self.state.lock().unwrap();
+        WorldKey {
+            playlist_version: st.playlist_version,
+            current_qid: st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
+            state,
+            target_volume: st.target_volume,
+        }
+    }
+
+    /// Push one [`crate::journal::JournalEntry`] for an action that actually did
+    /// something, with the daemon's OWN outcome text - and decide whether that entry
+    /// may carry a snapshot at all.
+    ///
+    /// Two questions, in order.
+    ///
+    /// **Did anything happen?** The world moved (its rows or its key), OR the action
+    /// runs an ENVELOPE whose effect the key cannot see yet (a plan fade commits its
+    /// baseline only at its terminal). Neither alone is sufficient, and the pair is
+    /// what keeps a nothing-action out of the ring: an entry that restores nothing
+    /// must never sit on top offering "u to undo", because a human who presses it and
+    /// sees nothing happen presses it again.
+    ///
+    /// **Was it OURS?** See [`crate::journal::QueueEffect`]. The action ran with the
+    /// daemon still serving every other connection, so the world after it contains
+    /// whatever the human did DURING it. Only a post-world that this action ALONE
+    /// explains may be retracted; anything else is recorded (attributable, in the
+    /// daemon's own words) with NO snapshot, so `undo` never offers to put back a
+    /// world that was not only ours. A partly-applied FAILURE lands here by design:
+    /// after an error nothing can say which of the new rows were the daemon's.
+    fn journal_record(
+        &self,
+        action: &Action,
+        origin: &str,
+        mut snap: Snapshot,
+        pre_key: WorldKey,
+        outcome: &PlanOutcome,
+    ) {
+        let pre_ids: Vec<u64> = snap.queue.iter().map(|it| it.id).collect();
+        let (post_ids, raw_post_key) = self.world_rows();
+        let moved = post_ids != pre_ids || raw_post_key != pre_key;
+        // The only effect a world key cannot see: an envelope in flight.
+        let in_flight = matches!(action, Action::Fade(_) | Action::Wake { .. })
+            && changed_anything(outcome);
+        if !moved && !in_flight {
+            return;
+        }
+        let shape = action_shape(action, outcome);
+        let ours = queue_effect_holds(&shape, &pre_ids, &post_ids)
+            // A level the action does not drive must be exactly where it was found.
+            // The `setvol` glide commits at INSTALL and the sub-JND dither lands it
+            // within one of the ask, so that one is the width of the window.
+            && match shape.commits_volume {
+                None => raw_post_key.target_volume == pre_key.target_volume,
+                Some(v) => {
+                    raw_post_key.target_volume == pre_key.target_volume
+                        || raw_post_key.target_volume.abs_diff(v) <= 1
+                }
+            }
+            // An action that does not move the deck itself must find it where it
+            // left it - this is what catches an EOF advance or a human pause landing
+            // inside the long network window of an append.
+            && (shape.moves_deck
+                || (raw_post_key.current_qid == pre_key.current_qid
+                    && raw_post_key.state == pre_key.state));
+        snap.restores_volume = restores_volume(action);
+        let mut post_key = raw_post_key;
+        // A plan fade is NON-committing: `target_volume` stays at the pre level for
+        // the whole ramp and is committed only by `Terminal::SetBaseline`. Record the
+        // level the envelope is DRIVING to, so the entry does not go stale the
+        // instant its own fade lands (`is_live` accepts the pre level too, which
+        // covers the ramp itself).
+        if let Some(v) = fade_lands_at(action) {
+            post_key.target_volume = v;
+        }
+        self.journal.push(
+            Instant::now(),
+            origin,
+            action_verb(action),
+            outcome.render(),
+            ours.then_some(snap),
+            post_key,
+        );
     }
 
     /// Validate + arm (mint ids, arm deadline timers) a batch of raw plans WITHOUT
@@ -3761,7 +3943,9 @@ impl HypodjHandler {
                 armed_at: now,
                 timer_id,
             };
-            pendings.push(PendingPlan { armed, guard, remaining_deadline: None });
+            // Never reserved: this is the path EVERY producer-supplied plan takes
+            // (`plan add`, `nl confirm`, a batch). Only `set_singleton` promotes.
+            pendings.push(PendingPlan { armed, guard, remaining_deadline: None, reserved: false });
             ids.push(id);
         }
         Ok((pendings, ids, immediates))
@@ -3810,10 +3994,14 @@ impl HypodjHandler {
 
     // ── convenience features: sleep / winddown / wake ────────────────────────
 
-    /// A read-only view of every armed plan's `(id, origin, deadline)`. The
+    /// A read-only view of EVERY armed plan's `(id, origin, deadline)`. The
     /// deadline is the absolute [`Instant`] for a [`Resolved::OnDeadline`] plan and
     /// `None` otherwise. Pure registry read (a short lock, no `.await`), so a
     /// remaining-time computation is fake-clock assertable.
+    ///
+    /// `origin` here is a producer-chosen string, NOT a capability: a client can
+    /// send `plan add ... origin sleep`. The convenience features read
+    /// [`Self::feature_deadlines`] instead.
     pub fn plan_deadlines(&self) -> Vec<(PlanId, String, Option<Instant>)> {
         self.plan_pending
             .lock()
@@ -3829,14 +4017,36 @@ impl HypodjHandler {
             .collect()
     }
 
-    /// The id of the SINGLE armed plan with this reserved origin, if any. Backs
-    /// single-instance control (replace/cancel) for the convenience features.
-    fn find_by_origin(&self, origin: &str) -> Option<PlanId> {
+    /// `(id, origin, deadline)` for the DAEMON-armed convenience-feature plans
+    /// only ([`PendingPlan::reserved`]). The feature surfaces (status pairs,
+    /// remaining, cancel) read THIS rather than [`Self::plan_deadlines`], so a
+    /// client plan that names a reserved origin is just a normal plan.
+    fn feature_deadlines(&self) -> Vec<(PlanId, String, Option<Instant>)> {
         self.plan_pending
             .lock()
             .unwrap()
             .iter()
-            .find(|pp| pp.armed.raw.origin == origin)
+            .filter(|pp| pp.reserved)
+            .map(|pp| {
+                let deadline = match pp.armed.resolved {
+                    Resolved::OnDeadline(inst) => Some(inst),
+                    _ => None,
+                };
+                (pp.armed.id, pp.armed.raw.origin.clone(), deadline)
+            })
+            .collect()
+    }
+
+    /// The id of the SINGLE armed FEATURE plan with this reserved origin, if any.
+    /// Backs single-instance control (replace/cancel) for the convenience
+    /// features. Matches on the reserved flag AND the origin, so a client plan
+    /// carrying the same origin string is never the one cancelled.
+    fn find_feature(&self, origin: &str) -> Option<PlanId> {
+        self.plan_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pp| pp.reserved && pp.armed.raw.origin == origin)
             .map(|pp| pp.armed.id)
     }
 
@@ -3851,10 +4061,17 @@ impl HypodjHandler {
     /// second instance. A failed validate leaves the old plan untouched (arm runs
     /// before the lock).
     fn set_singleton(&self, origin: &str, raw: RawPlan) -> Result<PlanId, PlanError> {
-        let (pendings, mut ids, immediates) = self.prepare_batch(vec![raw])?;
+        let (mut pendings, mut ids, immediates) = self.prepare_batch(vec![raw])?;
+        // The ONLY promotion to a reserved feature plan: armed here, by the daemon
+        // itself, for one of its own origins.
+        for pp in &mut pendings {
+            pp.reserved = true;
+        }
         {
             let mut g = self.plan_pending.lock().unwrap();
-            g.retain(|pp| pp.armed.raw.origin != origin);
+            // Drop only the prior FEATURE plan of this origin: a client plan that
+            // happens to carry the same origin string is not ours to delete.
+            g.retain(|pp| !(pp.reserved && pp.armed.raw.origin == origin));
             g.extend(pendings);
         }
         self.nudge_immediates(immediates);
@@ -3894,7 +4111,7 @@ impl HypodjHandler {
     /// deterministic under the fake clock).
     pub fn sleep_remaining(&self) -> Option<Duration> {
         let now = Instant::now();
-        self.plan_deadlines()
+        self.feature_deadlines()
             .into_iter()
             .find(|(_, origin, _)| origin == ORIGIN_SLEEP)
             .and_then(|(_, _, deadline)| deadline)
@@ -3903,7 +4120,7 @@ impl HypodjHandler {
 
     /// Cancel the armed sleep plan (RAII disarm). `true` if one was cancelled.
     pub fn sleep_cancel(&self) -> bool {
-        match self.find_by_origin(ORIGIN_SLEEP) {
+        match self.find_feature(ORIGIN_SLEEP) {
             Some(id) => self.plan_cancel(id),
             None => false,
         }
@@ -3935,7 +4152,7 @@ impl HypodjHandler {
 
     /// Cancel the armed winddown plan (RAII disarm). `true` if one was cancelled.
     pub fn winddown_cancel(&self) -> bool {
-        match self.find_by_origin(ORIGIN_WINDDOWN) {
+        match self.find_feature(ORIGIN_WINDDOWN) {
             Some(id) => self.plan_cancel(id),
             None => false,
         }
@@ -3963,7 +4180,7 @@ impl HypodjHandler {
     /// The remaining time on the armed wake plan, or `None` if none is armed.
     pub fn wake_remaining(&self) -> Option<Duration> {
         let now = Instant::now();
-        self.plan_deadlines()
+        self.feature_deadlines()
             .into_iter()
             .find(|(_, origin, _)| origin == ORIGIN_WAKE)
             .and_then(|(_, _, deadline)| deadline)
@@ -3972,7 +4189,7 @@ impl HypodjHandler {
 
     /// Cancel the armed wake plan (RAII disarm). `true` if one was cancelled.
     pub fn wake_cancel(&self) -> bool {
-        match self.find_by_origin(ORIGIN_WAKE) {
+        match self.find_feature(ORIGIN_WAKE) {
             Some(id) => self.plan_cancel(id),
             None => false,
         }
@@ -3981,8 +4198,10 @@ impl HypodjHandler {
     /// The armed human-features (sleep / wind-down / wake) as X- prefixed MPD
     /// status pairs, computed from a SINGLE plan-registry snapshot so the three
     /// features never desync among themselves. Empty when nothing is armed, so the
-    /// Status response stays lean. This is a pure SURFACING of the existing armed
-    /// plan deadlines (see [`Self::plan_deadlines`]) - it recomputes nothing.
+    /// Status response stays lean. This is a pure SURFACING of the DAEMON-armed
+    /// feature deadlines (see [`Self::feature_deadlines`]) - it recomputes
+    /// nothing, and a client plan carrying a reserved `origin` is not one of them
+    /// (it could otherwise emit a duplicate key: malformed MPD status).
     ///
     /// - `X-hypodj-sleep-remaining`   secs until the sleep fade-to-stop fires
     /// - `X-hypodj-winddown-active`   `1` while a wind-down plan is armed
@@ -3996,7 +4215,7 @@ impl HypodjHandler {
     /// status line stays well-formed.
     pub fn armed_feature_pairs(&self) -> Vec<(&'static str, String)> {
         let now = Instant::now();
-        let deadlines = self.plan_deadlines();
+        let deadlines = self.feature_deadlines();
         let mut out = Vec::new();
         for (_, origin, deadline) in &deadlines {
             let remaining = deadline.map(|inst| inst.saturating_duration_since(now));
@@ -4672,13 +4891,17 @@ impl HypodjHandler {
         }
     }
 
-    /// Snapshot the per-entry search text + current index under the lock, so the
-    /// pure [`crate::plan::resolve_selector`] can resolve a selector without holding
-    /// the lock across the match.
-    fn queue_texts(&self) -> (Vec<String>, Option<usize>) {
+    /// Snapshot the per-entry search text + stable queue id + current index under
+    /// ONE lock, so the pure [`crate::plan::resolve_selector`] can resolve a
+    /// selector without holding the lock across the match. The two vecs are
+    /// parallel by construction, from the same instant of the same queue - a
+    /// [`crate::plan::QueueSelector::Qid`] resolved against a text vec from a
+    /// different sample would name the wrong row.
+    fn queue_texts(&self) -> (Vec<String>, Vec<u64>, Option<usize>) {
         let st = self.state.lock().unwrap();
         let texts = st.queue.iter().map(|it| Self::item_search_text(&it.entry)).collect();
-        (texts, st.current)
+        let qids = st.queue.iter().map(|it| it.id).collect();
+        (texts, qids, st.current)
     }
 
     /// DETERMINISTIC queue-edit executor for the confirmed [`Action::Remove`] /
@@ -4690,8 +4913,8 @@ impl HypodjHandler {
     pub async fn plan_queue_edit(&self, action: &Action) -> Result<usize, String> {
         match action {
             Action::Remove { sel } => {
-                let (texts, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                let (texts, qids, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
                 Ok(self.remove_indices(&idxs).await)
             }
             Action::Clear { scope } => match scope {
@@ -4713,24 +4936,39 @@ impl HypodjHandler {
                     Ok(self.remove_indices(&idxs).await)
                 }
                 crate::plan::ClearScope::Range { start, end } => {
-                    let (texts, current) = self.queue_texts();
+                    let (texts, qids, current) = self.queue_texts();
                     let idxs = crate::plan::resolve_selector(
                         &crate::plan::QueueSelector::Range { start: *start, end: *end },
                         &texts,
+                        &qids,
                         current,
                     );
                     Ok(self.remove_indices(&idxs).await)
                 }
             },
             Action::Move { sel, dest } => {
-                let (texts, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                let (texts, qids, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
                 Ok(self.move_indices(&idxs, *dest).await)
             }
             Action::Play { sel } => {
-                let (texts, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                let (texts, qids, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
                 match idxs.first() {
+                    // ALREADY ON IT. "play the track that matches X" names the track
+                    // he wants under the needle, and it already is - so loading it
+                    // would restart from zero the music he is in the middle of, which
+                    // is the one thing a jump onto the current row must never do.
+                    // `play_index` has no already-current guard on purpose (a wire
+                    // `play <pos>` deliberately restarts), so the guard sits here, on
+                    // the plan arm. Nothing changes, so nothing is journaled and no
+                    // banner offers to undo a jump that never happened.
+                    Some(&idx)
+                        if current == Some(idx)
+                            && self.reported_play_state() == PlayState::Playing =>
+                    {
+                        Ok(1)
+                    }
                     Some(&idx) => {
                         self.play_index(idx).await?;
                         Ok(1)
@@ -4890,6 +5128,72 @@ impl HypodjHandler {
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "plan", &e.to_string()),
             },
         }
+    }
+
+    /// `journal` -> the undo ring, NEWEST FIRST, as MPD pairs (`jid` / `jage` /
+    /// `jorigin` / `jact` / `jdid` / `jundoable`). `jundoable` is computed against
+    /// the LIVE world key at read time, so a client badge offering "u to undo" is
+    /// only ever offering an undo that would actually be accepted.
+    fn journal_pairs(&self) -> MpdResponse {
+        let live = self.world_key();
+        let mut b = MpdResponse::pairs();
+        for v in self.journal.views(Instant::now(), &live) {
+            b = b
+                .pair("jid", v.id.to_string())
+                .pair("jage", v.age_secs.to_string())
+                .pair("jorigin", v.origin)
+                .pair("jact", v.act.to_string())
+                .pair("jdid", v.did)
+                .pair("jundoable", if v.undoable { "1" } else { "0" }.to_string());
+        }
+        b.build()
+    }
+
+    /// `undo [<jid>]` - retract the top undoable journal entry (or the named one,
+    /// which must BE the top), answering with the `jid` + `jdid` of what was undone.
+    ///
+    /// Every refusal is LOUD (an ACK), never a silent no-op: a human who pressed
+    /// undo and saw nothing happen would press it again.
+    async fn undo(&self, arg: Option<String>) -> MpdResponse {
+        let want = match arg.as_deref() {
+            None => None,
+            Some(s) => match s.parse::<u64>() {
+                Ok(n) => Some(n),
+                // Fail LOUD rather than falling back to "the top": `undo 3x` must
+                // never retract something the caller did not name.
+                Err(_) => return ack(ACK_ERROR_ARG, "undo", "journal id must be a number"),
+            },
+        };
+        let live = self.world_key();
+        let taken = match self.journal.take_undoable(want, &live) {
+            Ok(t) => t,
+            Err(UndoRefusal::Nothing) => return ack(ACK_ERROR_NO_EXIST, "undo", "nothing to undo"),
+            Err(UndoRefusal::NotTop) => {
+                return ack(ACK_ERROR_ARG, "undo", "not the newest undoable entry")
+            }
+            Err(UndoRefusal::Stale) => {
+                return ack(ACK_ERROR_UNKNOWN, "undo", "the world moved since then; not undoing")
+            }
+        };
+        if let Err(e) = self.install_snapshot(&taken.snap).await {
+            return ack(ACK_ERROR_UNKNOWN, "undo", &e);
+        }
+        // Record the retraction itself: NOT undoable (an undo of an undo is a redo,
+        // which this ring does not promise), but visible so the human can see it
+        // happened and what it put back.
+        let post = self.world_key();
+        self.journal.push(
+            Instant::now(),
+            "undo",
+            "undo",
+            format!("undone: {}", taken.did),
+            None,
+            post,
+        );
+        MpdResponse::pairs()
+            .pair("jid", taken.id.to_string())
+            .pair("jdid", taken.did)
+            .build()
     }
 
     /// Dispatch a parsed `sleep` command: (re)arm / report / cancel the single
@@ -10147,6 +10451,232 @@ impl HypodjHandler {
         Ok(())
     }
 
+    /// THE RETRACTION PRIMITIVE: put a [`Snapshot`] back - the rows, and only as much
+    /// of the deck and the level as the action being retracted actually disturbed.
+    ///
+    /// Deliberately NOT a reuse of [`Self::restore`], which is wrong for undo in
+    /// three ways: it re-resolves song ids over the network (an undo must work with
+    /// the server away, and must not stall on it), it RENUMBERS every qid (breaking
+    /// the identity the journal promises and every qid a client is holding), and it
+    /// rolls `playlist_version` BACKWARDS, which makes `status`'s `playlist:` field
+    /// decrease so ncmpcpp and dj-gui skip the re-read and keep showing the wiped
+    /// queue.
+    ///
+    /// An undo lands on a world the human is living in, so it touches as LITTLE as it
+    /// can, in three widening steps:
+    ///
+    /// 1. the ROWS, always - that is what an undo is;
+    /// 2. the DECK only when the current row (by qid) or the transport no longer
+    ///    matches the snapshot. Undoing the removal of a row that is not playing must
+    ///    not reload the track being listened to. When it does have to move, the load
+    ///    runs from SILENCE and ramps back up, exactly like the smooth-restart path -
+    ///    never a hard cut;
+    /// 3. the LEVEL only when the action moved the level itself
+    ///    ([`Snapshot::restores_volume`]). A queue edit's retraction never reaches for
+    ///    the knob and never cancels the envelope holding it, so a sleep fade running
+    ///    underneath an agent's `dj_remove` still reaches its own terminal - which is
+    ///    the thing that stops the music.
+    ///
+    /// And when the level does come back, it comes back as a RAMP through the single
+    /// fade slot, never a step: mid-wind-down the live gain sits tens of dB under the
+    /// baseline, and a step there is exactly the startle the fade machinery exists to
+    /// prevent.
+    pub(crate) async fn install_snapshot(&self, snap: &Snapshot) -> Result<(), String> {
+        // Read what the deck holds NOW, before anything is mutated.
+        let (live_qid, dipping, live_vol) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
+                st.pending_skip.is_some(),
+                st.target_volume,
+            )
+        };
+        let live_state = self.reported_play_state();
+        let snap_qid = snap.current.and_then(|i| snap.queue.get(i)).map(|it| it.id);
+        let deck_ok = live_qid == snap_qid && live_state == snap.state;
+
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        // The level to land on: the snapshot's only when this action owned the knob,
+        // otherwise the LIVE one - a reload still has to ramp back up to something.
+        let vol = if snap.restores_volume { snap.target_volume } else { live_vol };
+        let queue = snap.queue.clone();
+        let next_qid = snap.next_qid;
+        let current = snap.current;
+
+        if deck_ok && !dipping {
+            // THE QUIET PATH, and the common one: the rows go back and nothing else
+            // is disturbed. No fade-slot lock, because nothing here is a manual volume
+            // change - whatever envelope is in flight belongs to whoever started it and
+            // keeps running.
+            {
+                let mut st = self.state.lock().unwrap();
+                st.queue = queue;
+                // FORWARD only: an id minted after the snapshot must never be
+                // re-issued to a different song.
+                st.next_id = next_qid.max(st.next_id);
+                st.current = current;
+                // FORWARD only, never back to the snapshot's own version: a client
+                // re-reads the queue when `playlist:` GROWS, so rolling it back would
+                // leave every client showing the world this call just replaced.
+                st.playlist_version = st.playlist_version.wrapping_add(1);
+            }
+            self.notify_change();
+            if snap.restores_volume {
+                self.restore_baseline_volume(vol).await;
+            }
+            // What drains next just changed, so any warm parked behind the current
+            // track was derived from the world this call replaced. The shared funnel
+            // disarms it and re-arms only if the RESTORED queue really drains into one.
+            self.reschedule_continuation_warm().await;
+            return Ok(());
+        }
+
+        // ONE fade-slot lock: CANCEL the in-flight fade and apply the whole state
+        // mutation indivisibly (the manual-volume invariant - releasing between the
+        // cancel and the mutation lets a concurrent fade from another connection slip
+        // in). The abort+join also kills a pending `Terminal::SkipLoad` /
+        // `Terminal::Pause`, which would otherwise land on the RESTORED queue and
+        // load a row nobody asked for. The cost is named rather than hidden: an
+        // UNRELATED envelope dies here too, and with it any terminal it was carrying.
+        // It is unavoidable once the deck itself has to be taken over, and the quiet
+        // path above is what keeps it off the common case.
+        self.fade
+            .cancel_with(|| {
+                let mut st = self.state.lock().unwrap();
+                st.queue = queue;
+                st.next_id = next_qid.max(st.next_id);
+                st.current = current;
+                st.playlist_version = st.playlist_version.wrapping_add(1);
+                // Any in-flight skip target belongs to the world being replaced.
+                st.pending_skip = None;
+                st.target_volume = vol;
+                st.logical_gain_db = mpv_volume_to_db(vol as f64);
+                st.baseline_committed = true;
+                st.fading = false;
+                if !deck_ok {
+                    // A load follows: start SILENT so the first buffer is inaudible and
+                    // the ramp below owns the rise.
+                    st.live_gain_db = synth_floor;
+                    st.pending_pause = false;
+                }
+                // deck_ok here means only the dip died; the live gain stays where the
+                // dip left it and the ramp below carries it back to the baseline.
+            })
+            .await;
+        self.notify_change();
+
+        if deck_ok {
+            // The superseded dip's `Terminal::SkipLoad` will never run, so its
+            // prefetched warm is stale - drop it, else the still-playing current
+            // track's natural EOF auto-advances into it.
+            let _ = self.player.drop_warm().await;
+            self.restore_baseline_volume(vol).await;
+            self.reschedule_continuation_warm().await;
+            return Ok(());
+        }
+
+        match (snap.state, snap.current) {
+            (PlayState::Playing, Some(idx)) => {
+                let elapsed = snap.elapsed_ms as f64 / 1000.0;
+                let target_db = mpv_volume_to_db(vol as f64);
+                let dur = self.clamp_fade_dur(Duration::from_secs(self.fade_cfg.restart_fade_secs));
+                // The ramp starts sub-audible, so seek back by the LEAD - the wall time
+                // that ramp first crosses audibility - and the playhead lands at the
+                // snapshot position at the first AUDIBLE instant: no audible content
+                // skipped or replayed under the inaudible head. Read off the SAME spec
+                // the fade below runs (`live_gain_db == synth_floor` here), so the two
+                // cannot drift.
+                let lead = self
+                    .wake_ramp_spec(synth_floor, target_db, dur)
+                    .ok()
+                    .and_then(|spec| spec.time_to_reach_db(AUDIBILITY_DB))
+                    .unwrap_or(Duration::ZERO);
+                let _ = self.player.set_volume(0).await;
+                self.play_index_from_silence(idx).await?;
+                let seek_to = (elapsed - lead.as_secs_f64()).max(0.0);
+                if seek_to > 0.0 {
+                    let _ = self.player.seek(seek_to).await;
+                }
+                self.note_elapsed_ms((seek_to * 1000.0) as u64);
+                let intent = FadeIntent::WakeTo { target_db, vol };
+                let _ = self
+                    .start_fade_spec(FadeRequest { intent, dur, commit_logical: None })
+                    .await;
+            }
+            (PlayState::Paused, Some(idx)) => {
+                // Load the row silently, put the playhead back, and freeze it: a
+                // genuinely paused deck at the saved position rather than a stopped one
+                // pretending to be one. Nothing audible escapes - the load runs at mpv
+                // volume 0 and the pause lands before any ramp is installed.
+                let _ = self.player.set_volume(0).await;
+                self.play_index_from_silence(idx).await?;
+                let seek_to = snap.elapsed_ms as f64 / 1000.0;
+                if seek_to > 0.0 {
+                    let _ = self.player.seek(seek_to).await;
+                }
+                if let Err(e) = self.player.pause().await {
+                    return Err(e.to_string());
+                }
+                // Paused is silent, so restoring mpv's real gain here is inaudible and
+                // guarantees a later resume starts at the right level (mirrors
+                // `Terminal::Pause`).
+                let _ = self.player.set_volume(vol).await;
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.live_gain_db = mpv_volume_to_db(vol as f64);
+                    st.fading = false;
+                    // `play_index_from_silence` retires the intent on its way in; the
+                    // snapshot says Paused, so re-assert it now that the freeze landed.
+                    st.pending_pause = true;
+                }
+                self.note_elapsed_ms(snap.elapsed_ms);
+            }
+            _ => {
+                // Stopped, or a snapshot with no current row. The shared stop primitive
+                // does the housekeeping too (baseline re-asserted, continuation warm
+                // disarmed, store told the deck carries nothing).
+                self.stop_playback().await;
+            }
+        }
+        self.notify_change();
+        // The restored world has to derive its OWN warm: the one parked behind the
+        // deck was computed against the queue this call just replaced.
+        self.reschedule_continuation_warm().await;
+        Ok(())
+    }
+
+    /// Put a baseline volume back the way every other level change in this daemon
+    /// moves: as a RAMP through the single fade slot. An undo can land on a deck
+    /// whose live gain is tens of dB under the baseline (mid wind-down, mid sleep
+    /// fade), and a bare `set_volume` there is a step of exactly the size the fade
+    /// machinery exists to prevent.
+    ///
+    /// No dither, unlike [`Self::glide_to_volume`]: the knob's sub-JND jitter is
+    /// there to humanize a deliberate drag, while a retraction must land on the
+    /// level that was RECORDED, not within one of it.
+    async fn restore_baseline_volume(&self, vol: u8) {
+        let target_db = mpv_volume_to_db(vol as f64);
+        let req = FadeRequest {
+            intent: FadeIntent::Glide { target_db, vol },
+            dur: self.glide_fade_dur(),
+            commit_logical: Some((target_db, vol)),
+        };
+        if self.start_fade_spec(req).await.is_err() {
+            // Defensive, mirroring `glide_to_volume`: a rejected spec must never turn
+            // the retraction into a silent no-op. Cancel-then-mutate atomically under
+            // one slot lock (the manual-volume invariant), and drop the warm target a
+            // superseded skip dip left parked.
+            self.fade
+                .cancel_with(|| {
+                    self.state.lock().unwrap().set_manual_volume(vol, self.deck_loaded())
+                })
+                .await;
+            let _ = self.player.drop_warm().await;
+            let _ = self.player.set_volume(vol).await;
+        }
+        self.notify_change();
+    }
+
     /// Build the exact wake ramp-in [`FadeSpec`] the restore path spawns via
     /// `start_fade_spec` for a [`FadeIntent::WakeTo`]: sub-JND (extends to honor the
     /// per-step cap), `DbLinear`, from `from_db` up to `target_db`, at the configured
@@ -13362,6 +13892,8 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::Plan(cmd) => self.handle_plan(cmd).await,
+            MpdCommand::Journal => self.journal_pairs(),
+            MpdCommand::Undo(jid) => self.undo(jid).await,
             MpdCommand::Nl(cmd) => self.handle_nl(cmd).await,
             MpdCommand::Sleep(cmd) => self.handle_sleep(cmd),
             MpdCommand::Winddown(cmd) => self.handle_winddown(cmd),
@@ -19659,7 +20191,9 @@ mod tests {
         // The DJ NL surface: an append-only Enqueue lands N>0 real tracks WITHOUT
         // autoplaying (current stays None). The fresh gesture outranks the lingering A.
         let before = h.state.lock().unwrap().queue.len();
-        let out = h.run_action_outcome(&Action::Enqueue { selector: Selector::Radio, count: 3 }).await;
+        let out = h
+            .run_action_outcome(&Action::Enqueue { selector: Selector::Radio, count: 3 }, "test")
+            .await;
         let n = match out {
             PlanOutcome::Added { n, .. } => n,
             other => panic!("expected Added, got {other:?}"),
@@ -19686,7 +20220,9 @@ mod tests {
         let (player2, _events2) = NullPlayer::spawn();
         let h2 = HypodjHandler::new(Arc::clone(&client), player2);
         h2.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
-        let out2 = h2.run_action_outcome(&Action::PlayNow { selector: Selector::Radio, count: 1 }).await;
+        let out2 = h2
+            .run_action_outcome(&Action::PlayNow { selector: Selector::Radio, count: 1 }, "test")
+            .await;
         assert!(matches!(out2, PlanOutcome::Played { .. }), "PlayNow reports Played");
         assert!(h2.state.lock().unwrap().current.is_some(), "PlayNow starts playback");
         assert!(
@@ -25757,6 +26293,60 @@ mod tests {
         assert!(remaining > 890 && remaining <= 900, "reflects last re-arm: {remaining}");
     }
 
+    // SAFETY (reserved-origin masquerade): `plan add ... origin sleep` lets a
+    // CLIENT name a reserved singleton origin. Singleton identity must therefore
+    // rest on who ARMED the plan (the daemon's own convenience command), never on
+    // the untrusted string: an impostor must not duplicate the status key, must
+    // not be cancelled by `sleep off`, must not survive as the "armed sleep" after
+    // the genuine one is cancelled, and must not be swept away by a re-arm either.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_plan_cannot_masquerade_as_a_reserved_singleton() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        fn count(resp: &MpdResponse, key: &str) -> usize {
+            match resp {
+                MpdResponse::Pairs(p) => p.iter().filter(|(k, _)| k == key).count(),
+                _ => 0,
+            }
+        }
+        // The genuine feature plans.
+        h.sleep_set(Duration::from_secs(600)).expect("arm sleep");
+        h.winddown_set(Some(Duration::from_secs(600))).expect("arm winddown");
+
+        // The impostors, arriving exactly as a client sends them (the wire parse).
+        let at = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        for origin in [ORIGIN_SLEEP, ORIGIN_WINDDOWN] {
+            let cmd = crate::mpd::parse(&format!(
+                "plan add trigger at {at} action noop origin {origin}"
+            ));
+            assert!(
+                matches!(h.handle(cmd).await, MpdResponse::Pairs(_)),
+                "the plan still arms - it is a normal plan, just not a feature one",
+            );
+        }
+
+        // Status stays well-formed and reports the GENUINE deadlines only.
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(count(&resp, "X-hypodj-sleep-remaining"), 1, "impostor duplicated the key");
+        assert_eq!(count(&resp, "X-hypodj-winddown-active"), 1, "impostor duplicated the key");
+        let remaining: u64 =
+            pair(&resp, "X-hypodj-sleep-remaining").expect("present").parse().expect("digits");
+        assert!(remaining > 590 && remaining <= 600, "impostor's 2h leaked in: {remaining}");
+
+        // A re-arm replaces the genuine plan and leaves the client's plan alone.
+        h.sleep_set(Duration::from_secs(900)).expect("re-arm sleep");
+        assert_eq!(h.plan_list().len(), 4, "a re-arm must not delete a client plan");
+
+        // `sleep off` cancels the genuine plan, and NOTHING keeps counting down
+        // behind it (the impostor stays armed but was never the sleep timer).
+        assert!(h.sleep_cancel(), "cancels the genuine sleep");
+        assert!(h.winddown_cancel(), "cancels the genuine winddown");
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(count(&resp, "X-hypodj-sleep-remaining"), 0, "impostor kept counting down");
+        assert_eq!(count(&resp, "X-hypodj-winddown-active"), 0, "impostor kept the flag lit");
+        assert_eq!(h.sleep_remaining(), None, "no armed sleep remains");
+        assert_eq!(h.plan_list().len(), 2, "the client plans are untouched");
+    }
+
     // Wind-down and wake each surface their own X- pairs when armed: an immediate
     // wind-down reports active-with-no-remaining; a scheduled wake reports both a
     // remaining and an absolute wake-at epoch.
@@ -26547,31 +27137,33 @@ mod tests {
 
         // A Play matching "Song s-2" jumps to it.
         let out = h
-            .run_action_outcome(&Action::Play {
-                sel: crate::plan::QueueSelector::QueryMatch("s-2".into()),
-            })
+            .run_action_outcome(
+                &Action::Play { sel: crate::plan::QueueSelector::QueryMatch("s-2".into()) },
+                "test",
+            )
             .await;
         assert_eq!(out, PlanOutcome::Jumped(1));
         assert_eq!(out.render(), "jumped to the matching track");
 
         // A Play matching nothing is a clean no-op - never a wrong-target jump.
         let out = h
-            .run_action_outcome(&Action::Play {
-                sel: crate::plan::QueueSelector::QueryMatch("no-such-track".into()),
-            })
+            .run_action_outcome(
+                &Action::Play { sel: crate::plan::QueueSelector::QueryMatch("no-such-track".into()) },
+                "test",
+            )
             .await;
         assert_eq!(out, PlanOutcome::Jumped(0));
         assert_eq!(out.render(), "no matching track to play");
 
         // A Remove of the last entry reports the real removed count.
         let out = h
-            .run_action_outcome(&Action::Remove { sel: crate::plan::QueueSelector::Last(1) })
+            .run_action_outcome(&Action::Remove { sel: crate::plan::QueueSelector::Last(1) }, "test")
             .await;
         assert_eq!(out, PlanOutcome::Removed(1));
 
         // Noop is inert.
         assert_eq!(
-            h.run_action_outcome(&Action::Noop).await,
+            h.run_action_outcome(&Action::Noop, "test").await,
             PlanOutcome::Effect("nothing to do".into())
         );
     }
@@ -29056,4 +29648,785 @@ mod tests {
         assert!(!store.take_full_request_for_test(), "a window change kicks LIGHT");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── the UNDO JOURNAL: the agent gate is retractability, not permission ─────
+    //
+    // Every test here drives the REAL `run_action_outcome` dispatch, because that
+    // is the single interception point the whole design rests on: an `Action` that
+    // could reach the queue without passing through it would make the journal a
+    // decoration. The one exception is named where it appears.
+
+    /// The queue as `(qid, id)` rows - the IDENTITY an undo must put back, not just
+    /// the order. A restore that renumbered the qids would break every client
+    /// holding one, and every agent target read a minute earlier.
+    fn rows(h: &HypodjHandler) -> Vec<(u64, String)> {
+        let st = h.state.lock().unwrap();
+        st.queue
+            .iter()
+            .map(|it| {
+                let name = match &it.entry {
+                    QueueEntry::Song(s) => s.id.0.clone(),
+                    QueueEntry::Stream { url, .. } => url.clone(),
+                };
+                (it.id, name)
+            })
+            .collect()
+    }
+
+    /// The first value for `key` - the NEWEST journal entry, since `journal`
+    /// renders newest first.
+    fn newest(pairs: &[(String, String)], key: &str) -> Option<String> {
+        pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    fn qid_at(h: &HypodjHandler, idx: usize) -> u64 {
+        h.state.lock().unwrap().queue[idx].id
+    }
+
+    fn version(h: &HypodjHandler) -> u64 {
+        h.state.lock().unwrap().playlist_version
+    }
+
+    /// Every player event the actor has emitted so far, drained AFTER a round trip
+    /// through it: the actor sends an event before it takes the next command, so a
+    /// reply to a later command proves the earlier events are already queued. That
+    /// makes "the deck was NOT touched" an observation rather than a race.
+    async fn drain_events(
+        h: &HypodjHandler,
+        events: &mut tokio::sync::mpsc::Receiver<PlayerEvent>,
+    ) -> Vec<PlayerEvent> {
+        let v = h.state.lock().unwrap().target_volume;
+        let _ = h.player.set_volume(v).await;
+        let mut out = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// The wall time the smooth-restart ramp spends BELOW audibility, off the same
+    /// spec `install_snapshot` reads. The undo seeks back by exactly this, so the
+    /// saved position is where the music becomes audible again rather than where
+    /// the inaudible head starts.
+    fn ramp_lead_secs(h: &HypodjHandler) -> f64 {
+        let dur = h.clamp_fade_dur(Duration::from_secs(h.fade_cfg.restart_fade_secs));
+        let target_db = mpv_volume_to_db(h.state.lock().unwrap().target_volume as f64);
+        h.wake_ramp_spec(h.fade_cfg.synth_floor_db, target_db, dur)
+            .expect("the restore ramp spec")
+            .time_to_reach_db(AUDIBILITY_DB)
+            .expect("the ramp crosses audibility")
+            .as_secs_f64()
+    }
+
+    /// The seek position the actor last saw, if any.
+    fn last_seek(evs: &[PlayerEvent]) -> Option<f64> {
+        evs.iter().rev().find_map(|e| match e {
+            PlayerEvent::TimePos { pos, .. } => Some(*pos),
+            _ => None,
+        })
+    }
+
+    // A clear is the worst case and the shape the agent's `dj_clear` takes: the
+    // whole queue back, WITH its ids and order, and the playlist version moved
+    // FORWARD so every client re-reads (rolling it back is what left ncmpcpp
+    // showing the wiped queue).
+    #[tokio::test(start_paused = true)]
+    async fn undo_puts_back_the_whole_queue_a_clear_wiped() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 5).await;
+        let before = rows(&h);
+
+        let out = h
+            .run_action_outcome(&Action::Clear { scope: crate::plan::ClearScope::All }, "mcp:sess-1")
+            .await;
+        assert_eq!(out, PlanOutcome::Cleared(5));
+        assert!(rows(&h).is_empty(), "the clear really happened");
+
+        // The journal says WHO, WHAT, and the daemon's OWN words for what it did.
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j, "jorigin").as_deref(), Some("mcp:sess-1"));
+        assert_eq!(newest(&j, "jact").as_deref(), Some("clear"));
+        assert_eq!(newest(&j, "jdid").as_deref(), Some("cleared 5 tracks"));
+        assert_eq!(newest(&j, "jundoable").as_deref(), Some("1"));
+        assert_eq!(newest(&j, "jage").as_deref(), Some("0"));
+
+        let v_before = version(&h);
+        let r = pairs_of(h.handle(MpdCommand::Undo(None)).await);
+        assert_eq!(newest(&r, "jdid").as_deref(), Some("cleared 5 tracks"));
+        assert_eq!(rows(&h), before, "the queue is back, ids and order intact");
+        assert!(version(&h) > v_before, "playlist_version moved FORWARD, so clients re-read");
+
+        // Claimed: a second undo has nothing to retract and says so LOUDLY.
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        // The retraction is itself visible in the journal, and is not undoable.
+        let j2 = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j2, "jact").as_deref(), Some("undo"));
+        assert_eq!(newest(&j2, "jdid").as_deref(), Some("undone: cleared 5 tracks"));
+        assert_eq!(newest(&j2, "jundoable").as_deref(), Some("0"));
+    }
+
+    // The same clear, but with music playing: the deck has to come back too - the
+    // right row, from silence, with the playhead where it was.
+    #[tokio::test(start_paused = true)]
+    async fn undo_of_a_clear_brings_the_deck_back_from_silence() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+        h.play_for_test(0).await;
+        h.note_elapsed_ms(30_000);
+        let before = rows(&h);
+        let playing_qid = qid_at(&h, 0);
+
+        let out = h
+            .run_action_outcome(&Action::Clear { scope: crate::plan::ClearScope::All }, "mcp:s")
+            .await;
+        assert_eq!(out, PlanOutcome::Cleared(3));
+        assert_eq!(h.reported_play_state(), PlayState::Stopped, "the clear stopped the deck");
+        drain_events(&h, &mut events).await;
+
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(rows(&h), before);
+        assert_eq!(h.state.lock().unwrap().current, Some(0));
+        assert_eq!(qid_at(&h, 0), playing_qid, "the same row is current, by id");
+        assert_eq!(h.reported_play_state(), PlayState::Playing);
+        // The playhead really went back: the actor saw a seek into the saved
+        // position's window - biased back by at most the ramp's inaudible LEAD (so
+        // no audible content is skipped), never past it and never to 0.
+        let evs = drain_events(&h, &mut events).await;
+        let pos = last_seek(&evs).expect("the undo seeked the playhead back");
+        let lead = ramp_lead_secs(&h);
+        assert!(pos > 0.0 && pos < 30.0, "seek landed at {pos}s, not back inside the track");
+        assert!(
+            (pos - (30.0 - lead)).abs() < 0.01,
+            "seek landed at {pos}s; the saved 30s minus the ramp's inaudible {lead}s head is what
+             puts the AUDIBLE resume exactly where he left off"
+        );
+    }
+
+    // The other half of the same rule: undoing the removal of a row that is NOT
+    // playing must not reload the track he is listening to. "Not touched" is
+    // observed at the player actor, not inferred.
+    #[tokio::test(start_paused = true)]
+    async fn undo_of_a_remove_never_touches_the_deck() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        seed_queue(&h, 5).await;
+        h.play_for_test(0).await;
+        h.note_elapsed_ms(30_000);
+        let before = rows(&h);
+        let victim = qid_at(&h, 3);
+
+        let out = h
+            .run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim) },
+                "mcp:s",
+            )
+            .await;
+        assert_eq!(out, PlanOutcome::Removed(1));
+        assert_eq!(rows(&h).len(), 4);
+        drain_events(&h, &mut events).await;
+
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(rows(&h), before, "the removed row is back, in place, with its id");
+        let evs = drain_events(&h, &mut events).await;
+        assert!(evs.is_empty(), "the undo reloaded the deck: {evs:?}");
+        assert_eq!(h.last_elapsed_ms.load(Ordering::Relaxed), 30_000, "the playhead never moved");
+    }
+
+    // A jump moved the playhead to another row; the undo has to bring it back to
+    // the track it left, at the position it left it.
+    #[tokio::test(start_paused = true)]
+    async fn undo_of_a_jump_returns_the_playhead_to_the_track_it_left() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        seed_queue(&h, 4).await;
+        h.play_for_test(0).await;
+        h.note_elapsed_ms(45_000);
+        let home = qid_at(&h, 0);
+        let target = qid_at(&h, 2);
+        drain_events(&h, &mut events).await;
+
+        let out = h
+            .run_action_outcome(
+                &Action::Play { sel: crate::plan::QueueSelector::Qid(target) },
+                "mcp:s",
+            )
+            .await;
+        assert_eq!(out, PlanOutcome::Jumped(1));
+        assert_eq!(h.state.lock().unwrap().current, Some(2));
+        drain_events(&h, &mut events).await;
+
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h.state.lock().unwrap().current, Some(0));
+        assert_eq!(qid_at(&h, 0), home);
+        assert_eq!(h.reported_play_state(), PlayState::Playing);
+        let evs = drain_events(&h, &mut events).await;
+        let pos = last_seek(&evs).expect("the undo seeked back into the track it left");
+        let lead = ramp_lead_secs(&h);
+        assert!(pos > 0.0 && pos < 45.0, "seek landed at {pos}s, not back inside the track");
+        assert!((pos - (45.0 - lead)).abs() < 0.01, "seek landed at {pos}s, not 45s minus the {lead}s ramp head");
+    }
+
+    // Transport: a pause is retracted by resuming, a stop by starting again where
+    // it stopped. Both go through the same silence-then-ramp load, never a hard cut.
+    #[tokio::test(start_paused = true)]
+    async fn undo_of_a_pause_resumes_and_undo_of_a_stop_restarts() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 2).await;
+        h.play_for_test(0).await;
+        h.note_elapsed_ms(20_000);
+        assert_eq!(
+            h.run_action_outcome(&Action::Pause, "mcp:s").await,
+            PlanOutcome::Effect("paused".into())
+        );
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "the pause was retracted");
+
+        let Some((h2, _e2)) = handler_with_null_player() else { return };
+        seed_queue(&h2, 2).await;
+        h2.play_for_test(0).await;
+        h2.note_elapsed_ms(20_000);
+        assert_eq!(
+            h2.run_action_outcome(&Action::Stop, "mcp:s").await,
+            PlanOutcome::Effect("stopped".into())
+        );
+        assert_eq!(h2.reported_play_state(), PlayState::Stopped);
+        assert!(matches!(h2.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h2.reported_play_state(), PlayState::Playing, "the stop was retracted");
+        assert_eq!(h2.state.lock().unwrap().current, Some(0));
+    }
+
+
+    // THE WINDOW, on the rows. `plan_enqueue` awaits a network fetch and the daemon
+    // keeps serving ncmpcpp meanwhile, so the world AFTER the action holds his row
+    // too. Reading the key there and calling it ours is what made an undo restore the
+    // pre-action queue OVER the row he had just added - undo doing the one thing it
+    // exists to prevent.
+    #[tokio::test(start_paused = true)]
+    async fn a_row_he_added_while_the_action_ran_is_not_ours_to_retract() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 2).await;
+        let (snap, key) = h.capture_world();
+        // The action's own three appends ...
+        seed_queue(&h, 3).await;
+        // ... and HIS, from another connection, inside the same window.
+        h.enqueue_song_for_test(playlist_test_song("his-own")).await;
+        h.journal_record(
+            &Action::Enqueue { selector: Selector::Radio, count: 3 },
+            "mcp:sess-1",
+            snap,
+            key,
+            &PlanOutcome::Added { n: 3, selector: "\"calm\"".into() },
+        );
+
+        // Recorded - it happened, it is attributable, and it says so in the daemon's
+        // own words ...
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j, "jorigin").as_deref(), Some("mcp:sess-1"));
+        assert_eq!(newest(&j, "jdid").as_deref(), Some("added 3 tracks"));
+        // ... and NOT undoable, because four rows appeared where three were ours.
+        assert_eq!(newest(&j, "jundoable").as_deref(), Some("0"));
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert_eq!(rows(&h).len(), 6, "his row stands");
+    }
+
+    // The same window, on the KNOB. A queue edit does not move the level, so a level
+    // that moved while it ran moved under somebody else's hand.
+    #[tokio::test(start_paused = true)]
+    async fn a_knob_he_turned_while_the_action_ran_is_not_ours_to_retract() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().set_manual_volume(70, true);
+        let (snap, key) = h.capture_world();
+        let victim = qid_at(&h, 2);
+        let sel = crate::plan::QueueSelector::Qid(victim);
+        let n = h
+            .plan_queue_edit(&Action::Remove { sel: sel.clone() })
+            .await
+            .expect("the remove itself ran");
+        assert_eq!(n, 1);
+        // His hand on the knob, inside the same window.
+        h.state.lock().unwrap().set_manual_volume(25, true);
+        h.journal_record(&Action::Remove { sel }, "mcp:s", snap, key, &PlanOutcome::Removed(1));
+
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j, "jdid").as_deref(), Some("removed 1 track"));
+        assert_eq!(newest(&j, "jundoable").as_deref(), Some("0"));
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert_eq!(h.state.lock().unwrap().target_volume, 25, "his level stands");
+    }
+
+    // His sleep is fading the room out. An agent removes a row he is not listening to
+    // and he retracts it - and the fade has to still be running afterwards, because
+    // its terminal is the thing that stops the music. A queue edit's retraction never
+    // touches the fade slot and never reaches for the knob.
+    #[tokio::test(start_paused = true)]
+    async fn undoing_a_queue_edit_leaves_his_fade_running_and_his_level_alone() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 4).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().set_manual_volume(70, true);
+        h.start_fade(fade_args(FadeKind::Out, 600)).await.expect("his wind-down");
+        assert!(h.fade_active_for_test().await, "his envelope is running");
+
+        let victim = qid_at(&h, 3);
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Removed(1)
+        );
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(rows(&h).len(), 4, "the row is back");
+        assert!(h.fade_active_for_test().await, "the undo killed his sleep fade");
+        assert_eq!(h.state.lock().unwrap().target_volume, 70, "and it left his level alone");
+    }
+
+    // When the level IS the action's to put back, it comes back as a ramp. The
+    // retraction used to assert the baseline straight onto the sink from wherever the
+    // envelope had got to - measured at 24 dB in one sample, with music playing.
+    #[tokio::test(start_paused = true)]
+    async fn undoing_a_level_action_ramps_back_and_never_steps() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 2).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().set_manual_volume(60, true);
+        assert_eq!(
+            h.run_action_outcome(&Action::Fade(FadeIntentIr::To { vol: 9, secs: 60.0 }), "mcp:s")
+                .await,
+            PlanOutcome::Effect("fading".into())
+        );
+        // The envelope has carried the live gain most of the way down.
+        h.state.lock().unwrap().live_gain_db = mpv_volume_to_db(9.0);
+
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h.state.lock().unwrap().target_volume, 60, "the baseline is back at once");
+        let live = h.state.lock().unwrap().live_gain_db;
+        assert!(
+            live < mpv_volume_to_db(20.0),
+            "the retraction stepped the audible level to the baseline in one sample ({live} dB)"
+        );
+        // And the ramp it started really lands there.
+        h.wait_for_fade().await;
+        let landed = h.state.lock().unwrap().live_gain_db;
+        assert!(
+            (landed - mpv_volume_to_db(60.0)).abs() < 0.5,
+            "the restore ramp settled at {landed} dB, not the restored baseline"
+        );
+    }
+
+    // The retraction used to return early on an untouched deck without re-deriving the
+    // WARM - the target parked behind the current track, computed against the queue the
+    // undo just replaced. mpv auto-advances into that target at the natural EOF, so a
+    // stale one is an advance into a row that no longer drains next.
+    #[tokio::test(start_paused = true)]
+    async fn undoing_a_remove_re_derives_the_warm_it_left_parked() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("a")).await;
+        h.enqueue_song_for_test(playlist_test_song("b")).await;
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.play_for_test(0).await;
+        let target = |h: &HypodjHandler| {
+            h.state.lock().unwrap().pending_continuation_warm.as_ref().map(|w| w.target.clone())
+        };
+        h.reschedule_continuation_warm().await;
+        assert_eq!(
+            target(&h),
+            Some(WarmTarget::QueueNext { idx: 1 }),
+            "row b drains next, so the one warm slot parks row b, not the station"
+        );
+
+        let victim = h.state.lock().unwrap().queue[1].id;
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Removed(1)
+        );
+        assert_eq!(
+            target(&h),
+            Some(WarmTarget::Station),
+            "the current row is the last one now: a station warm arms behind it"
+        );
+
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "row b is back");
+        assert_eq!(
+            target(&h),
+            Some(WarmTarget::QueueNext { idx: 1 }),
+            "the restored queue drains into row b, so the station warm had to go with it"
+        );
+    }
+
+    // "Play the track that matches X" when X is the track under the needle: it is
+    // already playing, so there is nothing to jump to. Loading it would restart from
+    // zero the music he is in the middle of, and the entry it left behind offered to
+    // retract a jump that never happened.
+    #[tokio::test(start_paused = true)]
+    async fn a_jump_onto_the_track_already_playing_never_reloads_it() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+        h.play_for_test(1).await;
+        h.note_elapsed_ms(30_000);
+        let here = qid_at(&h, 1);
+        drain_events(&h, &mut events).await;
+
+        assert_eq!(
+            h.run_action_outcome(&Action::Play { sel: crate::plan::QueueSelector::Qid(here) }, "mcp:s")
+                .await,
+            PlanOutcome::Jumped(1)
+        );
+        let evs = drain_events(&h, &mut events).await;
+        assert!(evs.is_empty(), "it reloaded the track he was listening to: {evs:?}");
+        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.last_elapsed_ms.load(Ordering::Relaxed), 30_000, "the playhead never moved");
+        // Nothing moved, so nothing sits on the ring offering to put back a world he
+        // never left.
+        assert!(pairs_of(h.handle(MpdCommand::Journal).await).is_empty());
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+    }
+
+    // A plan fade is NON-committing: `target_volume` stays at the pre level for the
+    // whole ramp and lands only at the terminal. Both halves of that lifetime must
+    // be undoable, and the undo must kill the envelope rather than race it.
+    #[tokio::test(start_paused = true)]
+    async fn undo_of_a_fade_puts_the_baseline_back_in_flight_and_after_it_lands() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 2).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().set_manual_volume(55, true);
+
+        // IN FLIGHT: the baseline has not moved yet.
+        assert_eq!(
+            h.run_action_outcome(&Action::Fade(FadeIntentIr::To { vol: 20, secs: 6.0 }), "mcp:s")
+                .await,
+            PlanOutcome::Effect("fading".into())
+        );
+        assert!(h.fade_active_for_test().await, "the envelope is running");
+        assert_eq!(h.state.lock().unwrap().target_volume, 55, "not committed until the terminal");
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h.state.lock().unwrap().target_volume, 55);
+        // The retraction SUPERSEDED the fade to 20 and put the baseline back as a
+        // ramp of its own, so an envelope is still running - the restore glide. What
+        // proves the old one is dead is where the level RESTS: had it survived, its
+        // terminal would commit 20.
+        assert!(h.fade_active_for_test().await, "the retraction ramps back, never steps");
+        h.wait_for_fade().await;
+        assert_eq!(
+            h.state.lock().unwrap().target_volume,
+            55,
+            "the superseded fade to 20 never landed"
+        );
+
+        // LANDED: the same retraction still works once the terminal committed 20 -
+        // the entry recorded the level its own fade was driving to, so the fade
+        // landing is not read as somebody else's drift.
+        let Some((h2, _e2)) = handler_with_null_player() else { return };
+        seed_queue(&h2, 2).await;
+        h2.play_for_test(0).await;
+        h2.state.lock().unwrap().set_manual_volume(55, true);
+        assert_eq!(
+            h2.run_action_outcome(&Action::Fade(FadeIntentIr::To { vol: 20, secs: 6.0 }), "mcp:s")
+                .await,
+            PlanOutcome::Effect("fading".into())
+        );
+        h2.wait_for_fade().await;
+        assert_eq!(h2.state.lock().unwrap().target_volume, 20, "the envelope landed");
+        assert!(matches!(h2.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h2.state.lock().unwrap().target_volume, 55, "the baseline is back");
+    }
+
+    // The two remaining deterministic variants: a reorder and an absolute setvol.
+    // A `Move` is the case a diff-based journal would get wrong in silence (the
+    // inverse of a move is another move, and an off-by-one lands rows in the wrong
+    // order); the whole-queue snapshot cannot be wrong. A `SetVolume` glide, unlike
+    // a plan fade, COMMITS its baseline at install - and the dither means the level
+    // it commits is within one of what was asked, which is exactly why the entry
+    // records the live post-level rather than the requested one.
+    #[tokio::test(start_paused = true)]
+    async fn undo_of_a_move_and_of_a_setvol_put_the_order_and_the_level_back() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 4).await;
+        let before = rows(&h);
+        let mover = qid_at(&h, 3);
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Move {
+                    sel: crate::plan::QueueSelector::Qid(mover),
+                    dest: crate::plan::MoveDest::Position(1),
+                },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Moved(1)
+        );
+        assert_eq!(rows(&h)[0].0, mover, "the row really moved to the front");
+        assert_ne!(rows(&h), before);
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(rows(&h), before, "the order is back, row for row, id for id");
+
+        let Some((h2, _e2)) = handler_with_null_player() else { return };
+        seed_queue(&h2, 2).await;
+        h2.play_for_test(0).await;
+        h2.state.lock().unwrap().set_manual_volume(55, true);
+        assert_eq!(
+            h2.run_action_outcome(&Action::SetVolume(20), "mcp:s").await,
+            PlanOutcome::Effect("set volume to 20".into())
+        );
+        h2.wait_for_fade().await;
+        let landed = h2.state.lock().unwrap().target_volume;
+        assert!((19..=21).contains(&landed), "the glide committed {landed}, not ~20");
+        assert!(matches!(h2.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h2.state.lock().unwrap().target_volume, 55, "his level is back");
+    }
+
+    // The APPEND leg (what `dj_enqueue` / `dj_play_now` cause). Its dispatch cannot
+    // run here - every library selector resolves over the network and the test
+    // client has no server - so the two halves are proven separately: the RESTORE
+    // primitive against a real append here, and the RECORDING rule against a real
+    // `Added` outcome in the no-op test below.
+    #[tokio::test(start_paused = true)]
+    async fn install_snapshot_drops_appended_rows_without_rolling_ids_back() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        seed_queue(&h, 2).await;
+        h.play_for_test(0).await;
+        let before = rows(&h);
+        let (snap, _key) = h.capture_world();
+
+        seed_queue(&h, 3).await; // the agent's three tracks land at the end
+        assert_eq!(rows(&h).len(), 5);
+        let grown_next = h.state.lock().unwrap().next_id;
+        drain_events(&h, &mut events).await;
+
+        h.install_snapshot(&snap).await.expect("restore");
+        assert_eq!(rows(&h), before, "the appended rows are gone, the rest untouched");
+        assert_eq!(
+            h.state.lock().unwrap().next_id,
+            grown_next,
+            "ids only ever move FORWARD, so a later append can never re-issue a qid"
+        );
+        let evs = drain_events(&h, &mut events).await;
+        assert!(evs.is_empty(), "an append/undo pair never reloads the current track: {evs:?}");
+    }
+
+    // A no-op must not consume a ring slot, and above all must not become the top
+    // undoable entry - `undo` would then answer "nothing happened" to a human
+    // asking for his queue back.
+    #[tokio::test(start_paused = true)]
+    async fn a_no_op_action_consumes_no_ring_slot() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+
+        assert_eq!(
+            h.run_action_outcome(&Action::Noop, "mcp:s").await,
+            PlanOutcome::Effect("nothing to do".into())
+        );
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::QueryMatch("nonesuch".into()) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Removed(0)
+        );
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Play { sel: crate::plan::QueueSelector::Qid(9999) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Jumped(0)
+        );
+        assert!(
+            pairs_of(h.handle(MpdCommand::Journal).await).is_empty(),
+            "three no-ops, zero ring slots"
+        );
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+
+        // The RECORDING rule for the append leg, on the real outcome type: a
+        // resolved-to-nothing enqueue is a no-op, one that really appended is not.
+        let (snap, key) = h.capture_world();
+        let act = Action::Enqueue { selector: Selector::Radio, count: 3 };
+        h.journal_record(
+            &act,
+            "mcp:s",
+            snap.clone(),
+            key,
+            &PlanOutcome::Added { n: 0, selector: "\"calm\"".into() },
+        );
+        assert!(pairs_of(h.handle(MpdCommand::Journal).await).is_empty(), "added 0 takes no slot");
+        // The three rows the enqueue really appended. They have to BE there: an
+        // `Added { n: 3 }` over an untouched queue is not a world this action
+        // produced, and the window check refuses to call it ours.
+        seed_queue(&h, 3).await;
+        h.journal_record(
+            &act,
+            "mcp:s",
+            snap,
+            key,
+            &PlanOutcome::Added { n: 3, selector: "\"calm\"".into() },
+        );
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j, "jact").as_deref(), Some("enqueue"));
+        assert_eq!(newest(&j, "jdid").as_deref(), Some("added 3 tracks"));
+        assert_eq!(newest(&j, "jundoable").as_deref(), Some("1"));
+    }
+
+    // The ring is 32 deep. The oldest entry falls off, and naming it ACKs rather
+    // than quietly retracting whatever IS on top.
+    #[tokio::test(start_paused = true)]
+    async fn the_ring_holds_thirty_two_and_an_evicted_entry_cannot_be_undone() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, crate::journal::RING_CAP + 1).await;
+        for _ in 0..(crate::journal::RING_CAP + 1) {
+            let victim = qid_at(&h, 0);
+            assert_eq!(
+                h.run_action_outcome(
+                    &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim) },
+                    "mcp:s"
+                )
+                .await,
+                PlanOutcome::Removed(1)
+            );
+        }
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(
+            j.iter().filter(|(k, _)| k == "jid").count(),
+            crate::journal::RING_CAP,
+            "the ring never grows past its cap"
+        );
+        assert!(!j.iter().any(|(k, v)| k == "jid" && v == "1"), "the oldest entry was evicted");
+        assert!(
+            matches!(h.handle(MpdCommand::Undo(Some("1".into()))).await, MpdResponse::Ack { .. }),
+            "an evicted id ACKs; it never degrades to the top"
+        );
+        // The top itself is still retractable.
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+    }
+
+    // Drift, class by class. Each one is somebody else's effect landing between the
+    // act and the retraction, and undo must REFUSE rather than clobber it.
+    #[tokio::test(start_paused = true)]
+    async fn undo_refuses_after_a_human_add_or_a_volume_change() {
+        // (a) a human `add` (the same edge an autofill top-up rides): the queue
+        // version moved, so the snapshot no longer describes this world.
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+        assert_eq!(
+            h.run_action_outcome(&Action::Clear { scope: crate::plan::ClearScope::All }, "mcp:s")
+                .await,
+            PlanOutcome::Cleared(3)
+        );
+        h.enqueue_song_for_test(playlist_test_song("his-own")).await;
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert_eq!(
+            rows(&h).len(),
+            1,
+            "his one added row stands; the undo did not bulldoze it with the old queue"
+        );
+        // And the journal now advertises the entry as NOT undoable, so no client
+        // badge offers a retraction that would be refused.
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j, "jundoable").as_deref(), Some("0"));
+
+        // (b) a volume change (a knob, an MPRIS drag, a setvol) - invisible to the
+        // playlist version, which is exactly why the key carries the volume.
+        let Some((h2, _e2)) = handler_with_null_player() else { return };
+        seed_queue(&h2, 3).await;
+        h2.play_for_test(0).await;
+        let victim = qid_at(&h2, 2);
+        assert_eq!(
+            h2.run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Removed(1)
+        );
+        h2.handle(MpdCommand::SetVol(30)).await;
+        h2.wait_for_fade().await;
+        assert!(matches!(h2.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert_eq!(rows(&h2).len(), 2, "the queue is left exactly as it stood");
+        let vol = h2.state.lock().unwrap().target_volume;
+        assert!((29..=31).contains(&vol), "his volume ({vol}) was reverted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn undo_refuses_after_the_playhead_or_the_transport_moved() {
+        // (c) the current row moved (an EOF advance, a skip, a human `play`): the
+        // queue is untouched, so only the current-qid slot of the key can see it.
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 4).await;
+        h.play_for_test(0).await;
+        let victim = qid_at(&h, 3);
+        assert_eq!(
+            h.run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Removed(1)
+        );
+        h.play_for_test(1).await;
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "playback stayed where he put it");
+        assert_eq!(rows(&h).len(), 3);
+
+        // (d) the transport moved: he paused between the act and the retraction.
+        let Some((h2, _e2)) = handler_with_null_player() else { return };
+        seed_queue(&h2, 4).await;
+        h2.play_for_test(0).await;
+        let victim2 = qid_at(&h2, 3);
+        assert_eq!(
+            h2.run_action_outcome(
+                &Action::Remove { sel: crate::plan::QueueSelector::Qid(victim2) },
+                "mcp:s"
+            )
+            .await,
+            PlanOutcome::Removed(1)
+        );
+        h2.handle(MpdCommand::Pause(Some(true))).await;
+        assert_eq!(h2.reported_play_state(), PlayState::Paused);
+        assert!(matches!(h2.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert_eq!(h2.reported_play_state(), PlayState::Paused, "his pause stands");
+        assert_eq!(rows(&h2).len(), 3);
+    }
+
+    // The wire's fail-loud edges: a non-numeric id must never degrade to the top,
+    // an id that is not the top must not silently discard what is stacked on it,
+    // and an empty ring answers a well-formed OK rather than an ACK.
+    #[tokio::test(start_paused = true)]
+    async fn the_undo_wire_fails_loud_on_every_edge() {
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        assert!(pairs_of(h.handle(MpdCommand::Journal).await).is_empty(), "an empty ring is OK");
+        assert!(matches!(
+            h.handle(MpdCommand::Undo(Some("not-a-number".into()))).await,
+            MpdResponse::Ack { .. }
+        ));
+
+        seed_queue(&h, 4).await;
+        let first_victim = qid_at(&h, 3);
+        h.run_action_outcome(
+            &Action::Remove { sel: crate::plan::QueueSelector::Qid(first_victim) },
+            "mcp:s",
+        )
+        .await;
+        let older = newest(&pairs_of(h.handle(MpdCommand::Journal).await), "jid").unwrap();
+        let second_victim = qid_at(&h, 2);
+        h.run_action_outcome(
+            &Action::Remove { sel: crate::plan::QueueSelector::Qid(second_victim) },
+            "mcp:s",
+        )
+        .await;
+        assert!(
+            matches!(h.handle(MpdCommand::Undo(Some(older))).await, MpdResponse::Ack { .. }),
+            "undo is a stack: an older entry cannot be pulled out from under a newer one"
+        );
+        assert_eq!(rows(&h).len(), 2, "the refusal changed nothing");
+    }
+
 }

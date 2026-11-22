@@ -1,0 +1,21 @@
+[package]
+name = "hypodj-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dj-mcp"
+path = "src/main.rs"
+
+# The AGENT surface: a stdio MCP server that speaks the MPD protocol to hypodj and
+# nothing else. Deliberately NOT a dependent of hypodj-core - that crate hard-links
+# libmpv2 (`Cargo.toml:36`, not optional), and an MCP child spawned by harn must not
+# carry an audio runtime it never uses. Everything it needs is here: the shared
+# blocking client (MpdConn), the one DSL quoting rule, and JSON.
+[dependencies]
+hypodj-client = { path = "../hypodj-client" }
+hypodj-dsl = { path = "../hypodj-dsl" }
+serde.workspace = true
+serde_json = "1"

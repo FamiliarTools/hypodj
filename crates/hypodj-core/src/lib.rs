@@ -23,6 +23,8 @@ pub mod fade;
 pub mod handler;
 pub mod heard;
 pub mod intelligence;
+/// The UNDO JOURNAL behind `journal` / `undo` (internal: the wire is the surface).
+pub(crate) mod journal;
 pub mod library_match;
 pub mod model;
 pub mod mpd;

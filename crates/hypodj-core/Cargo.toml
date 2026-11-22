@@ -15,6 +15,9 @@ schema = ["dep:schemars"]
 
 [dependencies]
 schemars = { version = "0.8", optional = true }
+# The ONE implementation of `plan add` DSL value quoting. Zero deps, no libmpv, so
+# an out-of-process producer of a `plan add` line quotes identically to the echo.
+hypodj-dsl = { path = "../hypodj-dsl" }
 tokio.workspace = true
 serde.workspace = true
 toml.workspace = true

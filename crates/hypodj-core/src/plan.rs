@@ -35,9 +35,15 @@ use crate::model::{AlbumId, SongId};
 /// acceptable bounded hole in an otherwise fully-bounded IR.
 pub const MAX_ENQUEUE: u32 = 100;
 
-/// Reserved plan origins for the convenience sleep/winddown/wake features. Each
-/// names the SINGLE active instance of its feature in the registry, so a
-/// `find_by_origin` lookup can replace/cancel it (single-instance control).
+/// The origins the DAEMON stamps on the plans it arms for the convenience
+/// sleep/winddown/wake features, so its own single active instance of a feature
+/// is identifiable in the registry (replace/cancel/status).
+///
+/// `RawPlan::origin` is a free, producer-chosen string - a client can send
+/// `plan add ... origin sleep` - so these names are NOT a capability and the
+/// registry never treats the string alone as one. The single-instance lookups
+/// match a registry-side flag (`PendingPlan::reserved`, set only where the
+/// daemon itself arms the plan) AND the origin.
 pub const ORIGIN_SLEEP: &str = "sleep";
 pub const ORIGIN_WINDDOWN: &str = "winddown";
 pub const ORIGIN_WAKE: &str = "wake";
@@ -117,6 +123,23 @@ pub enum TrackSel {
 /// A bounded plan action. Mirrors the [`crate::handler::FadeIntent`] seam EXACTLY
 /// for fades (no arbitrary curve, no Ramp), so nothing here can express an op the
 /// startle-safe primitive would refuse.
+///
+/// ## What "bounded" does and does NOT mean (read before trusting a comment here)
+///
+/// Bounded means EXPRESSIVE bounds: a producer can only name ops in this enum,
+/// numerics are clamped ([`clamp_action`]), and the queue-edit selectors resolve
+/// against the live queue at execute time (a no-match is a clean no-op, never a
+/// wrong-target edit). That is the guarantee this module actually enforces.
+///
+/// It is NOT an authorization boundary, and no variant here is gated by the
+/// daemon. The `nl` route does echo a translated plan and wait for an owner's
+/// y/N before arming, but that is ONE route: `plan add trigger immediate action
+/// clear all` arms and runs the same action with no echo and no confirm, the MPD
+/// socket has NO authentication of any kind, and the executor re-enters these
+/// actions internally on a timer with no client connected. So any process that
+/// can open the port can run the destructive ones. Treat the echo
+/// ([`crate::echo`]) as a FIDELITY mechanism - "what is armed is what was shown"
+/// - not as a permission check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "act", rename_all = "snake_case")]
@@ -137,14 +160,17 @@ pub enum Action {
     /// Remove the entries a [`QueueSelector`] resolves against the LIVE queue. The
     /// selector resolves at EXECUTE time (like [`Action::Enqueue`]'s content
     /// selector), never pre-baked to indices, so a NO-MATCH is a clean no-op -
-    /// never a wrong-target delete. Destructive: only reachable through the
-    /// echo-before-arm + owner y/N gate.
+    /// never a wrong-target delete.
+    ///
+    /// DESTRUCTIVE, and NOT gated by the daemon (see the [`Action`] note): what
+    /// the selector buys is AIM, not authority.
     Remove { sel: QueueSelector },
     /// Move the selected entries to a destination position (order preserved). A
     /// no-match is a clean no-op. The currently-playing entry is tracked by stable
     /// id across the rebuild, so playback never jumps to a neighbour.
     Move { sel: QueueSelector, dest: MoveDest },
-    /// Clear part or all of the queue. Destructive: only through the confirm gate.
+    /// Clear part or all of the queue. DESTRUCTIVE, and NOT gated by the daemon
+    /// (see the [`Action`] note).
     Clear { scope: ClearScope },
     /// Jump playback to the FIRST entry the selector resolves. A no-match is a
     /// clean no-op (playback is left exactly where it was).
@@ -182,6 +208,13 @@ pub enum QueueSelector {
     Current,
     /// The last `n` entries in the queue.
     Last(usize),
+    /// The one entry carrying this STABLE queue id, whatever position it now sits
+    /// at. The only selector safe to aim from a reading taken earlier: every
+    /// position-based variant is invalidated by `State::trim_spent` draining spent
+    /// rows off the FRONT of the queue (and by autofill appending), which shifts
+    /// every index while the ids stay put. A gone id resolves to the empty set -
+    /// a clean no-op, never the row that inherited the position.
+    Qid(u64),
 }
 
 /// Where an [`Action::Move`] places the selected entries.
@@ -211,10 +244,18 @@ pub enum ClearScope {
 }
 
 /// PURE. Resolve a [`QueueSelector`] to a sorted set of 0-based queue indices
-/// against a queue described by its per-entry searchable text and current index.
-/// A no-match returns an EMPTY vec (the caller treats that as a clean no-op).
-/// Unit-testable with fabricated text - no queue, no player.
-pub fn resolve_selector(sel: &QueueSelector, texts: &[String], current: Option<usize>) -> Vec<usize> {
+/// against a queue described by its per-entry searchable text, per-entry stable
+/// queue id, and current index. `texts` and `qids` are parallel, taken from the
+/// SAME snapshot of the queue; a shorter `qids` simply makes those rows
+/// unaddressable by id (never mis-addressable). A no-match returns an EMPTY vec
+/// (the caller treats that as a clean no-op). Unit-testable with fabricated text -
+/// no queue, no player.
+pub fn resolve_selector(
+    sel: &QueueSelector,
+    texts: &[String],
+    qids: &[u64],
+    current: Option<usize>,
+) -> Vec<usize> {
     let n = texts.len();
     let idx1 = |p: usize| -> Option<usize> {
         if p >= 1 && p <= n { Some(p - 1) } else { None }
@@ -245,11 +286,27 @@ pub fn resolve_selector(sel: &QueueSelector, texts: &[String], current: Option<u
             let k = (*k).min(n);
             (n - k..n).collect()
         }
+        QueueSelector::Qid(id) => qids
+            .iter()
+            .enumerate()
+            .filter(|(i, q)| *i < n && **q == *id)
+            .map(|(i, _)| i)
+            .collect(),
     }
 }
 
 /// A local serde mirror of [`crate::handler::FadeIntent`], plus the duration the
 /// bare handler intent leaves implicit. `secs` is CLAMPED to `[min_dur, max_dur]`.
+///
+/// INVARIANT (the echo cannot lie about loudness): a level-targeting variant
+/// carries ONLY `vol` (0..=100). The perceptual dB the envelope actually drives
+/// toward is DERIVED from it through the cubic-softvol seam
+/// ([`crate::player::mpv_volume_to_db`]) at execute time
+/// ([`crate::executor::map_fade`]) - it is never a second, independent field.
+/// It used to be one, and because only `vol` reached the echo, a plan a human
+/// read as "fade to volume 40" could carry `target_db: -120` and actually fade to
+/// silence. Deriving makes that divergence UNREPRESENTABLE rather than merely
+/// unlikely: the rendered number IS the driven level.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "dir", rename_all = "snake_case")]
@@ -259,7 +316,7 @@ pub enum FadeIntentIr {
     /// Wake ramp up to the comfort ceiling.
     In { secs: f64 },
     /// Deliberate cue to an explicit level, committing `vol` on completion.
-    To { target_db: f64, vol: u8, secs: f64 },
+    To { vol: u8, secs: f64 },
     /// Sub-JND wind-down to the configured non-silence floor (`floor_level_db`),
     /// leaving playback running. The floor is read from the LIVE config at spawn
     /// (never baked into the raw plan), so `secs` is the only knob carried here.
@@ -267,7 +324,7 @@ pub enum FadeIntentIr {
     /// Sub-JND wake ramp UP from silence to the SAVED comfort level, committing
     /// `vol` as the restored baseline. Distinct from `In` (which targets the
     /// comfort ceiling / vol 100): a wake restores the exact saved comfort volume.
-    WakeTo { target_db: f64, vol: u8, secs: f64 },
+    WakeTo { vol: u8, secs: f64 },
 }
 
 /// A bounded content selector for [`Action::Enqueue`]. Unimplemented variants
@@ -404,33 +461,17 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
         Action::Fade(FadeIntentIr::In { secs }) => {
             Action::Fade(FadeIntentIr::In { secs: clamp_secs(*secs) })
         }
-        Action::Fade(FadeIntentIr::To { target_db, vol, secs }) => {
-            let td = if target_db.is_finite() {
-                target_db.clamp(bounds.synth_floor_db, bounds.wake_ceiling_db)
-            } else {
-                bounds.wake_ceiling_db
-            };
-            Action::Fade(FadeIntentIr::To {
-                target_db: td,
-                vol: (*vol).min(100),
-                secs: clamp_secs(*secs),
-            })
-        }
+        Action::Fade(FadeIntentIr::To { vol, secs }) => Action::Fade(FadeIntentIr::To {
+            vol: clamp_vol(*vol, bounds),
+            secs: clamp_secs(*secs),
+        }),
         Action::Fade(FadeIntentIr::ToFloor { secs }) => {
             Action::Fade(FadeIntentIr::ToFloor { secs: clamp_secs(*secs) })
         }
-        Action::Fade(FadeIntentIr::WakeTo { target_db, vol, secs }) => {
-            let td = if target_db.is_finite() {
-                target_db.clamp(bounds.synth_floor_db, bounds.wake_ceiling_db)
-            } else {
-                bounds.wake_ceiling_db
-            };
-            Action::Fade(FadeIntentIr::WakeTo {
-                target_db: td,
-                vol: (*vol).min(100),
-                secs: clamp_secs(*secs),
-            })
-        }
+        Action::Fade(FadeIntentIr::WakeTo { vol, secs }) => Action::Fade(FadeIntentIr::WakeTo {
+            vol: clamp_vol(*vol, bounds),
+            secs: clamp_secs(*secs),
+        }),
         Action::SetVolume(v) => Action::SetVolume((*v).min(100)),
         Action::Enqueue { selector, count } => Action::Enqueue {
             selector: selector.clone(),
@@ -470,6 +511,23 @@ pub fn clamp_raw(raw: &RawPlan, bounds: &PlanBounds) -> RawPlan {
         _ => {}
     }
     out
+}
+
+/// Clamp a fade target volume into `0..=ceiling`, where the ceiling is the mpv
+/// volume equivalent of the configured `wake_ceiling_db` (the SAME comfort
+/// ceiling the old `target_db` clamp used, expressed in the one field that now
+/// carries the level). Clamping the VOLUME rather than a separate dB keeps the
+/// echoed number and the driven level in lockstep - clamping the dB alone used
+/// to leave `vol` reporting a level the envelope never reached. TOTAL: a
+/// non-finite configured ceiling falls back to the full 0..=100 range rather
+/// than feeding NaN into a comparison.
+fn clamp_vol(vol: u8, bounds: &PlanBounds) -> u8 {
+    let ceiling = if bounds.wake_ceiling_db.is_finite() {
+        crate::player::db_to_mpv_volume(bounds.wake_ceiling_db).round().clamp(0.0, 100.0) as u8
+    } else {
+        100
+    };
+    vol.min(100).min(ceiling)
 }
 
 fn clamp_secs_field(s: f64, bounds: &PlanBounds) -> f64 {
@@ -861,19 +919,15 @@ mod tests {
         }
     }
 
-    // clamps: target_db to [synth_floor, wake_ceiling], vol/SetVolume to 100,
+    // clamps: fade vol into 0..=the ceiling volume, SetVolume to 100,
     // secs/span/count clamped (clamped, never rejected).
     #[test]
     fn clamps_every_numeric() {
         let b = bounds();
-        // target_db above the ceiling clamps down; vol clamps to 100.
-        let a = clamp_action(
-            &Action::Fade(FadeIntentIr::To { target_db: 999.0, vol: 250, secs: 1e9 }),
-            &b,
-        );
+        // vol clamps to the ceiling volume (100 at the default 0 dB ceiling).
+        let a = clamp_action(&Action::Fade(FadeIntentIr::To { vol: 250, secs: 1e9 }), &b);
         match a {
-            Action::Fade(FadeIntentIr::To { target_db, vol, secs }) => {
-                assert!(target_db <= b.wake_ceiling_db && target_db >= b.synth_floor_db);
+            Action::Fade(FadeIntentIr::To { vol, secs }) => {
                 assert_eq!(vol, 100);
                 assert!(secs <= b.max_dur.as_secs_f64());
             }
@@ -908,9 +962,37 @@ mod tests {
         }
     }
 
+    // The comfort ceiling now bounds the fade target VOLUME (the single field that
+    // carries the level), so a ceiling below 0 dB is not a dead knob and the
+    // clamped number is still exactly what the envelope drives to. TOTAL: a
+    // non-finite ceiling degrades to the full 0..=100 range, never a NaN compare.
+    #[test]
+    fn fade_vol_clamped_by_the_comfort_ceiling() {
+        let mut b = bounds();
+        b.wake_ceiling_db = crate::player::mpv_volume_to_db(50.0);
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 100, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 50),
+            other => panic!("got {other:?}"),
+        }
+        match clamp_action(&Action::Fade(FadeIntentIr::WakeTo { vol: 90, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::WakeTo { vol, .. }) => assert_eq!(vol, 50),
+            other => panic!("got {other:?}"),
+        }
+        // Below the ceiling is untouched.
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 20, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 20),
+            other => panic!("got {other:?}"),
+        }
+        b.wake_ceiling_db = f64::NAN;
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 200, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 100),
+            other => panic!("got {other:?}"),
+        }
+    }
+
     // The NEW convenience-feature IR variants clamp exactly like their siblings:
-    // ToFloor secs into [min,max]; WakeTo target_db into [synth_floor, ceiling],
-    // vol -> 100, secs clamped; Action::Wake count -> MAX_ENQUEUE.
+    // ToFloor secs into [min,max]; WakeTo vol into 0..=the ceiling volume,
+    // secs clamped; Action::Wake count -> MAX_ENQUEUE.
     #[test]
     fn clamp_convenience_fade_and_wake_variants() {
         let b = bounds();
@@ -920,12 +1002,8 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
-        match clamp_action(
-            &Action::Fade(FadeIntentIr::WakeTo { target_db: 999.0, vol: 250, secs: 1e9 }),
-            &b,
-        ) {
-            Action::Fade(FadeIntentIr::WakeTo { target_db, vol, secs }) => {
-                assert!(target_db >= b.synth_floor_db && target_db <= b.wake_ceiling_db);
+        match clamp_action(&Action::Fade(FadeIntentIr::WakeTo { vol: 250, secs: 1e9 }), &b) {
+            Action::Fade(FadeIntentIr::WakeTo { vol, secs }) => {
                 assert_eq!(vol, 100);
                 assert!(secs <= b.max_dur.as_secs_f64());
             }
@@ -1126,50 +1204,101 @@ mod tests {
             "Miles Davis - Blue in Green".into(),
             "Aphex Twin - Rhubarb".into(),
         ];
+        // Stable queue ids, parallel to `texts`, deliberately NOT 1..=4 and not in
+        // position order - a Qid must resolve by identity, never by arithmetic.
+        let qids: Vec<u64> = vec![41, 7, 900, 42];
         let cur = Some(1usize);
 
         // Position (1-based) -> single index; out-of-range -> empty.
-        assert_eq!(resolve_selector(&QueueSelector::Position(1), &texts, cur), vec![0]);
-        assert_eq!(resolve_selector(&QueueSelector::Position(4), &texts, cur), vec![3]);
-        assert!(resolve_selector(&QueueSelector::Position(9), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::Position(0), &texts, cur).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Position(1), &texts, &qids, cur), vec![0]);
+        assert_eq!(resolve_selector(&QueueSelector::Position(4), &texts, &qids, cur), vec![3]);
+        assert!(resolve_selector(&QueueSelector::Position(9), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Position(0), &texts, &qids, cur).is_empty());
 
         // Range inclusive, order-normalized, clamped to the queue.
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 2, end: 3 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 2, end: 3 }, &texts, &qids, cur),
             vec![1, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 3, end: 2 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 3, end: 2 }, &texts, &qids, cur),
             vec![1, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 3, end: 99 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 3, end: 99 }, &texts, &qids, cur),
             vec![2, 3]
         );
 
         // QueryMatch: case-insensitive substring across all matching entries.
         assert_eq!(
-            resolve_selector(&QueueSelector::QueryMatch("miles".into()), &texts, cur),
+            resolve_selector(&QueueSelector::QueryMatch("miles".into()), &texts, &qids, cur),
             vec![0, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::QueryMatch("rhubarb".into()), &texts, cur),
+            resolve_selector(&QueueSelector::QueryMatch("rhubarb".into()), &texts, &qids, cur),
             vec![3]
         );
         // No match / blank query -> clean empty set (the no-op).
-        assert!(resolve_selector(&QueueSelector::QueryMatch("nonesuch".into()), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::QueryMatch("   ".into()), &texts, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::QueryMatch("nonesuch".into()), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::QueryMatch("   ".into()), &texts, &qids, cur).is_empty());
 
         // Current -> the cursor index; guarded against a stale out-of-range cursor.
-        assert_eq!(resolve_selector(&QueueSelector::Current, &texts, cur), vec![1]);
-        assert!(resolve_selector(&QueueSelector::Current, &texts, None).is_empty());
-        assert!(resolve_selector(&QueueSelector::Current, &texts, Some(99)).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Current, &texts, &qids, cur), vec![1]);
+        assert!(resolve_selector(&QueueSelector::Current, &texts, &qids, None).is_empty());
+        assert!(resolve_selector(&QueueSelector::Current, &texts, &qids, Some(99)).is_empty());
 
         // Last(n) -> the tail; clamped to the queue length; 0 / empty -> empty.
-        assert_eq!(resolve_selector(&QueueSelector::Last(2), &texts, cur), vec![2, 3]);
-        assert_eq!(resolve_selector(&QueueSelector::Last(99), &texts, cur), vec![0, 1, 2, 3]);
-        assert!(resolve_selector(&QueueSelector::Last(0), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::Position(1), &[], None).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Last(2), &texts, &qids, cur), vec![2, 3]);
+        assert_eq!(resolve_selector(&QueueSelector::Last(99), &texts, &qids, cur), vec![0, 1, 2, 3]);
+        assert!(resolve_selector(&QueueSelector::Last(0), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Position(1), &[], &[], None).is_empty());
+
+        // Qid -> the row carrying that id, wherever it sits; an id that is gone is
+        // the clean EMPTY set, never the row that inherited its position.
+        assert_eq!(resolve_selector(&QueueSelector::Qid(41), &texts, &qids, cur), vec![0]);
+        assert_eq!(resolve_selector(&QueueSelector::Qid(900), &texts, &qids, cur), vec![2]);
+        assert_eq!(resolve_selector(&QueueSelector::Qid(42), &texts, &qids, cur), vec![3]);
+        assert!(resolve_selector(&QueueSelector::Qid(1), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Qid(0), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Qid(41), &[], &[], None).is_empty());
+        // A short qids slice makes those rows unaddressable, never mis-addressable.
+        assert!(resolve_selector(&QueueSelector::Qid(900), &texts, &qids[..2], cur).is_empty());
+    }
+
+    // THE point of Qid: a position read earlier names a DIFFERENT row after
+    // `trim_spent` drains spent rows off the FRONT, while the id still names the
+    // row that was read. This is the whole reason an agent-facing target is an id.
+    #[test]
+    fn qid_survives_a_front_trim_that_invalidates_positions() {
+        let before_texts: Vec<String> = vec![
+            "spent one".into(),
+            "spent two".into(),
+            "Miles Davis - So What".into(),
+            "Aphex Twin - Rhubarb".into(),
+        ];
+        let before_qids: Vec<u64> = vec![10, 11, 12, 13];
+        // The caller reads "So What": position 3 (1-based), id 12.
+        assert_eq!(
+            resolve_selector(&QueueSelector::Position(3), &before_texts, &before_qids, Some(2)),
+            vec![2]
+        );
+        assert_eq!(
+            resolve_selector(&QueueSelector::Qid(12), &before_texts, &before_qids, Some(2)),
+            vec![2]
+        );
+
+        // The two spent rows are trimmed off the front; ids do not renumber.
+        let after_texts: Vec<String> = before_texts[2..].to_vec();
+        let after_qids: Vec<u64> = before_qids[2..].to_vec();
+
+        // Position 3 is now out of the queue entirely (and position 1 is a
+        // different row than it named before) - the id still lands on "So What".
+        assert!(
+            resolve_selector(&QueueSelector::Position(3), &after_texts, &after_qids, Some(0))
+                .is_empty()
+        );
+        let by_id = resolve_selector(&QueueSelector::Qid(12), &after_texts, &after_qids, Some(0));
+        assert_eq!(by_id, vec![0]);
+        assert_eq!(after_texts[by_id[0]], "Miles Davis - So What");
     }
 }
