@@ -8,8 +8,11 @@
 
 use chrono::{TimeZone, Utc};
 
-use hypodj_core::nl::{NlContext, NlError, NlHit, NlSource, Translator};
-use hypodj_core::plan::{Action, FadeIntentIr, PosBase, RawPlan, RawTrigger, Selector, TrackSel};
+use hypodj_core::config::{DEFAULT_SLEEP_FADE_SECS, DEFAULT_WINDDOWN_FADE_SECS};
+use hypodj_core::nl::{NlContext, NlError, NlHit, NlQuery, NlSource, Translator};
+use hypodj_core::plan::{
+    Action, FadeIntentIr, PlayMode, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
+};
 
 /// The default fade duration a bare "fade out"/"fade in" emits. 30s matches the
 /// P2 executor fixture (`fixture_track3_fade_out_on_track_start`), so the worked
@@ -18,6 +21,9 @@ pub const DEFAULT_FADE_SECS: f64 = 30.0;
 /// The default track count a bare Enqueue selector ("something calmer", "wake me
 /// with jazz") emits. Append-only + count-clamped keeps this a bounded hole.
 pub const DEFAULT_ENQUEUE_COUNT: u32 = 5;
+/// The default track count for a bare "play my favorites". Larger than a mood
+/// enqueue (favorites are a session, not a nudge); still clamped by `max_enqueue`.
+pub const DEFAULT_FAVORITES_COUNT: u32 = 20;
 
 /// The closed genre lexicon: "with <X>" maps to [`Selector::Genre`] only when X is
 /// one of these; anything else is the safe free-text [`Selector::Query`].
@@ -35,6 +41,57 @@ impl Translator for RulesTranslator {
         let plans = translate_rules(utterance, ctx)?;
         Ok(NlHit { plans, source: NlSource::Rules })
     }
+
+    fn query(&self, utterance: &str) -> Option<NlQuery> {
+        query_rules(utterance)
+    }
+}
+
+/// Lowercased words with surrounding punctuation stripped ("favorited?" ->
+/// "favorited"), so questions and trailing punctuation match the lexicon.
+fn words(utterance: &str) -> Vec<String> {
+    utterance
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-').to_string())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// A favorites word: favorite(s)/favourite(s), favorited/favourited, starred, faves.
+fn is_fav_word(w: &str) -> bool {
+    matches!(
+        w,
+        "favorite" | "favorites" | "favourite" | "favourites" | "favorited" | "favourited"
+            | "starred" | "faves" | "fave"
+    )
+}
+
+/// The READ-side grammar: a QUESTION about favorites returns an [`NlQuery`] (an
+/// immediate answer, no plan). Only clearly interrogative shapes match, so an
+/// imperative ("play my favorites") stays on the action path.
+pub fn query_rules(utterance: &str) -> Option<NlQuery> {
+    let w = words(utterance);
+    let wv: Vec<&str> = w.iter().map(String::as_str).collect();
+    if !wv.iter().any(|t| is_fav_word(t)) {
+        return None;
+    }
+    let first = *wv.first()?;
+    let about_current = wv
+        .iter()
+        .any(|t| matches!(*t, "this" | "current" | "it" | "playing" | "song" | "track"));
+    // "is this favorited?", "is the current song starred?", "did i favorite this?"
+    if matches!(first, "is" | "isn't" | "did" | "have" | "was") && about_current {
+        return Some(NlQuery::IsCurrentFavorited);
+    }
+    // "what is favorited?", "list my favorites", "show favorites", "my favorites?",
+    // a bare "favorites".
+    let listing = matches!(first, "what" | "what's" | "whats" | "which" | "list" | "show")
+        || (wv.len() <= 2 && (first == "my" || is_fav_word(first)));
+    if listing && !about_current {
+        return Some(NlQuery::Favorites);
+    }
+    None
 }
 
 /// Emit a raw plan with `origin` left empty (the adapter stamps it) and `once`.
@@ -56,6 +113,32 @@ pub fn translate_rules(utterance: &str, ctx: &NlContext) -> Result<Vec<RawPlan>,
     // 1. wake ("wake me at 7 with jazz") - an ordered same-instant batch.
     if tv.contains(&"wake") && tv.contains(&"at") {
         return wake(&tv, &low, text, ctx);
+    }
+
+    // 1b. favorites actions ("play my favorites", "queue my favorites", "shuffle
+    // my favorites"). Questions about favorites never reach here (query path).
+    let wd = words(text);
+    let wdv: Vec<&str> = wd.iter().map(String::as_str).collect();
+    if wdv.iter().any(|t| is_fav_word(t)) {
+        return favorites(&wdv);
+    }
+
+    // 1c. playback modes ("shuffle on", "turn off random", "repeat this").
+    // Before stop/pause so "stop shuffling" is a mode change, not a stop.
+    if let Some(plans) = modes(&wdv)? {
+        return Ok(plans);
+    }
+
+    // 1d. sessions: wind-down ("start a wind-down", "wind down in 10 minutes") and
+    // the sleep timer ("sleep in 30 minutes").
+    if low.contains("wind down") || low.contains("wind-down") || low.contains("winddown") {
+        let trigger = boundary_or_time(&tv, &low, text, ctx)?;
+        let secs = DEFAULT_WINDDOWN_FADE_SECS as f64;
+        return one(plan(trigger, Action::Fade(FadeIntentIr::ToFloor { secs }), true));
+    }
+    if tv.first() == Some(&"sleep") || low.contains("sleep timer") || low.contains("go to sleep")
+    {
+        return one(sleep(&tv)?);
     }
 
     // 2. calmer / similar ("something calmer", "more like this").
@@ -88,6 +171,94 @@ pub fn translate_rules(utterance: &str, ctx: &NlContext) -> Result<Vec<RawPlan>,
 
 fn one(p: RawPlan) -> Result<Vec<RawPlan>, NlError> {
     Ok(vec![p])
+}
+
+// ── favorites / modes / sleep ────────────────────────────────────────────────
+
+/// "play my favorites" -> PlayNow{Starred}; "queue|add my favorites" ->
+/// Enqueue{Starred} (append-only); "shuffle my favorites" -> random ON, then
+/// PlayNow{Starred}. Anything else naming favorites is not understood here (a
+/// "star this" write has no Action yet - punt rather than guess).
+fn favorites(wv: &[&str]) -> Result<Vec<RawPlan>, NlError> {
+    let count = leading_count(wv).unwrap_or(DEFAULT_FAVORITES_COUNT);
+    let first = wv.first().copied().unwrap_or("");
+    let play_now = || plan(RawTrigger::Immediate, Action::PlayNow { selector: Selector::Starred, count }, true);
+    match first {
+        "play" | "put" | "throw" | "start" => Ok(vec![play_now()]),
+        "shuffle" => Ok(vec![
+            plan(RawTrigger::Immediate, Action::SetMode { mode: PlayMode::Random, on: true }, true),
+            play_now(),
+        ]),
+        "queue" | "add" | "enqueue" | "append" => Ok(vec![plan(
+            RawTrigger::Immediate,
+            Action::Enqueue { selector: Selector::Starred, count },
+            true,
+        )]),
+        _ => Err(NlError::NotUnderstood),
+    }
+}
+
+/// Map a word to the playback mode it names, if any.
+fn mode_word(w: &str) -> Option<PlayMode> {
+    Some(match w {
+        "shuffle" | "shuffling" | "shuffled" | "random" | "randomize" | "unshuffle" => {
+            PlayMode::Random
+        }
+        "repeat" | "repeating" | "loop" | "looping" => PlayMode::Repeat,
+        "single" => PlayMode::Single,
+        "consume" | "consuming" => PlayMode::Consume,
+        _ => return None,
+    })
+}
+
+/// Playback modes. Exactly one mode word must appear (two is ambiguous, e.g.
+/// "repeat and shuffle"); the default direction is ON, flipped by an off-word.
+/// "repeat this [song|track]" means repeat-ONE: repeat ON + single ON (the MPD
+/// spelling of looping the current track). `Ok(None)` means no mode word.
+fn modes(wv: &[&str]) -> Result<Option<Vec<RawPlan>>, NlError> {
+    let mut found: Vec<PlayMode> = wv.iter().filter_map(|w| mode_word(w)).collect();
+    found.dedup();
+    let mode = match found.as_slice() {
+        [] => return Ok(None),
+        [m] => *m,
+        _ => return Err(NlError::Ambiguous("more than one playback mode named".into())),
+    };
+    // Utterances that only MENTION a mode word inside a longer content request
+    // ("play some random jazz") are not mode toggles: keep this to short commands
+    // whose other words are all from the closed mode-phrase vocabulary.
+    const FILLER: &[&str] = &[
+        "turn", "set", "switch", "put", "enable", "disable", "on", "off", "mode", "the",
+        "please", "playback", "this", "song", "track", "current", "one", "no", "stop",
+        "don't", "dont", "it", "now", "again", "queue", "and", "to",
+    ];
+    if wv.iter().any(|w| mode_word(w).is_none() && !FILLER.contains(w)) {
+        return Ok(None);
+    }
+    let off = wv
+        .iter()
+        .any(|w| matches!(*w, "off" | "disable" | "no" | "stop" | "don't" | "dont" | "unshuffle"));
+    let set = |mode| plan(RawTrigger::Immediate, Action::SetMode { mode, on: !off }, true);
+    let this = wv.iter().any(|w| matches!(*w, "this" | "song" | "track" | "current" | "one"));
+    if mode == PlayMode::Repeat && this && !off {
+        return Ok(Some(vec![set(PlayMode::Repeat), set(PlayMode::Single)]));
+    }
+    Ok(Some(vec![set(mode)]))
+}
+
+/// "sleep in 30 minutes" / "sleep timer 45 minutes" / "go to sleep in an hour"
+/// -> after the span, fade OUT over the default sleep fade (the `sleep` command's
+/// shape). A sleep with no readable duration is Ambiguous: guessing a span would
+/// arm a timer the user never set.
+fn sleep(tv: &[&str]) -> Result<RawPlan, NlError> {
+    let secs = (0..tv.len())
+        .find_map(|i| parse_dur(tv, i).filter(|_| tv[i].starts_with(|c: char| c.is_ascii_digit())))
+        .map(|(s, _)| s)
+        .ok_or_else(|| NlError::Ambiguous("sleep for how long?".into()))?;
+    Ok(plan(
+        RawTrigger::SpanElapsed { secs },
+        Action::Fade(FadeIntentIr::Out { secs: DEFAULT_SLEEP_FADE_SECS as f64 }),
+        true,
+    ))
 }
 
 // ── ordinals ────────────────────────────────────────────────────────────────

@@ -973,6 +973,7 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "query" => (Selector::Query(toks.get(2)?.clone()), 3),
                 "genre" => (Selector::Genre(toks.get(2)?.clone()), 3),
                 "similar_current" => (Selector::SimilarToCurrent, 2),
+                "starred" => (Selector::Starred, 2),
                 _ => return None,
             };
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
@@ -985,6 +986,7 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "query" => (Selector::Query(toks.get(2)?.clone()), 3),
                 "genre" => (Selector::Genre(toks.get(2)?.clone()), 3),
                 "similar_current" => (Selector::SimilarToCurrent, 2),
+                "starred" => (Selector::Starred, 2),
                 _ => return None,
             };
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
@@ -994,6 +996,15 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
         "remove" => Some(Action::Remove { sel: parse_qselector(&toks[1..])? }),
         "play" => Some(Action::Play { sel: parse_qselector(&toks[1..])? }),
         "noop" => Some(Action::Noop),
+        "mode" => {
+            let mode = crate::plan::PlayMode::from_word(&toks.get(1)?.to_lowercase())?;
+            let on = match toks.get(2)?.to_lowercase().as_str() {
+                "on" | "1" => true,
+                "off" | "0" => false,
+                _ => return None,
+            };
+            Some(Action::SetMode { mode, on })
+        }
         "clear" => match toks.get(1)?.to_lowercase().as_str() {
             "all" => Some(Action::Clear { scope: ClearScope::All }),
             "after" => Some(Action::Clear { scope: ClearScope::AfterCurrent }),

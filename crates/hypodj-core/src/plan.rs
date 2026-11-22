@@ -187,6 +187,46 @@ pub enum Action {
     /// that maps to NO valid action. Emitting this (honest "no action") is how the
     /// model avoids fabricating a wrong enqueue for a request it cannot express.
     Noop,
+    /// Set a playback mode (random/repeat/single/consume) on or off. Executes
+    /// through the SAME handler path as the MPD `random`/`repeat`/`single`/
+    /// `consume` commands, so NL and the direct verbs cannot diverge. Idempotent,
+    /// bounded (a bool), non-destructive.
+    SetMode { mode: PlayMode, on: bool },
+}
+
+/// A playback mode an [`Action::SetMode`] toggles. Mirrors the four MPD mode
+/// commands one-to-one.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PlayMode {
+    Random,
+    Repeat,
+    Single,
+    Consume,
+}
+
+impl PlayMode {
+    /// The MPD command word for this mode (also its `plan add` DSL spelling).
+    pub fn word(self) -> &'static str {
+        match self {
+            PlayMode::Random => "random",
+            PlayMode::Repeat => "repeat",
+            PlayMode::Single => "single",
+            PlayMode::Consume => "consume",
+        }
+    }
+
+    /// Parse the MPD command word back to a mode.
+    pub fn from_word(w: &str) -> Option<Self> {
+        match w {
+            "random" => Some(PlayMode::Random),
+            "repeat" => Some(PlayMode::Repeat),
+            "single" => Some(PlayMode::Single),
+            "consume" => Some(PlayMode::Consume),
+            _ => None,
+        }
+    }
 }
 
 /// Which queue entries a queue-edit action targets. Resolved DETERMINISTICALLY
@@ -346,6 +386,9 @@ pub enum Selector {
     Calmer(SongId),
     Genre(String),
     Radio,
+    /// The user's starred (favorited) songs, resolved server-side at EXECUTE time
+    /// from the live star set. Carries no id, so it is model-safe.
+    Starred,
 }
 
 /// The numeric clamps, sourced from the SAME [`FadeConfig`] knobs the fade
@@ -496,7 +539,8 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
         | Action::Move { .. }
         | Action::Clear { .. }
         | Action::Play { .. }
-        | Action::Noop => action.clone(),
+        | Action::Noop
+        | Action::SetMode { .. } => action.clone(),
     }
 }
 

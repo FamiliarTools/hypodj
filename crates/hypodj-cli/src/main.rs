@@ -399,6 +399,11 @@ fn nl_handshake(
         Err(e) => return Err(e),
     };
 
+    // A READ-side question is answered immediately (no plan, nothing to confirm).
+    if let Some(answer) = nl::answer_from_pairs(&pairs) {
+        println!("{answer}");
+        return Ok(());
+    }
     let token = match nl::token_from_pairs(&pairs) {
         Some(t) => t,
         None => {

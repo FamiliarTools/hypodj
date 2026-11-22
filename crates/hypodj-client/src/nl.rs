@@ -35,6 +35,12 @@ pub fn token_from_pairs(pairs: &[(String, String)]) -> Option<String> {
     pairs.iter().find(|(k, _)| k == "nl_token").map(|(_, v)| v.clone())
 }
 
+/// Extract the immediate answer to a READ-side question (the daemon's
+/// `nl_answer` pair). A query has nothing to confirm, so it carries no token.
+pub fn answer_from_pairs(pairs: &[(String, String)]) -> Option<String> {
+    pairs.iter().find(|(k, _)| k == "nl_answer").map(|(_, v)| v.clone())
+}
+
 pub fn echo_from_pairs(pairs: &[(String, String)]) -> Option<String> {
     pairs.iter().find(|(k, _)| k == "nl_echo").map(|(_, v)| v.clone())
 }

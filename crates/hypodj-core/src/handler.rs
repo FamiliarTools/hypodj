@@ -42,7 +42,7 @@ use crate::fade::{
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot, TimerId};
 use crate::journal::{
-    action_shape, action_verb, changed_anything, queue_effect_holds, restores_volume, Journal,
+    action_shape, action_verb, changed_anything, queue_effect_holds, restores_volume, Journal, Modes,
     Snapshot, UndoRefusal, WorldKey,
 };
 use crate::intelligence::{
@@ -1158,6 +1158,19 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 impl State {
+    /// The four mode flags as one value (the journal's snapshot and drift key).
+    pub(crate) fn modes(&self) -> Modes {
+        Modes { random: self.random, repeat: self.repeat, single: self.single, consume: self.consume }
+    }
+
+    /// Put the four mode flags back (an undo).
+    pub(crate) fn set_modes(&mut self, m: Modes) {
+        self.random = m.random;
+        self.repeat = m.repeat;
+        self.single = m.single;
+        self.consume = m.consume;
+    }
+
     /// One splitmix64 step over `rng_state`, the deterministic source for
     /// `random` next-track selection; seedable in tests.
     fn next_rand(&mut self) -> u64 {
@@ -2169,6 +2182,7 @@ fn selector_phrase(sel: &Selector) -> String {
         Selector::SimilarToCurrent => "the current track".to_string(),
         Selector::Calmer(_) => "calmer tracks".to_string(),
         Selector::Exact(_) => "those tracks".to_string(),
+        Selector::Starred => "your favorites".to_string(),
     }
 }
 
@@ -3742,6 +3756,17 @@ impl HypodjHandler {
                 Err(e) => PlanOutcome::Failed(e),
             },
             Action::Noop => PlanOutcome::Effect("nothing to do".into()),
+            // Same handler path as the direct MPD mode verbs (one implementation).
+            Action::SetMode { mode, on } => {
+                let cmd = match mode {
+                    crate::plan::PlayMode::Random => MpdCommand::Random(*on),
+                    crate::plan::PlayMode::Repeat => MpdCommand::Repeat(*on),
+                    crate::plan::PlayMode::Single => MpdCommand::Single(*on),
+                    crate::plan::PlayMode::Consume => MpdCommand::Consume(*on),
+                };
+                self.handle(cmd).await;
+                PlanOutcome::Effect(format!("{} {}", mode.word(), if *on { "on" } else { "off" }))
+            }
         };
         if let Some((snap, pre_key)) = pre {
             self.journal_record(action, origin, snap, pre_key, &outcome);
@@ -3774,12 +3799,14 @@ impl HypodjHandler {
             target_volume,
             // Assigned by `journal_record`, which is the one that knows the action.
             restores_volume: false,
+            modes: st.modes(),
         };
         let key = WorldKey {
             playlist_version: st.playlist_version,
             current_qid,
             state,
             target_volume,
+            modes: st.modes(),
         };
         (snap, key)
     }
@@ -3797,6 +3824,7 @@ impl HypodjHandler {
             current_qid: st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
             state,
             target_volume: st.target_volume,
+            modes: st.modes(),
         };
         (ids, key)
     }
@@ -3811,6 +3839,7 @@ impl HypodjHandler {
             current_qid: st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
             state,
             target_volume: st.target_volume,
+            modes: st.modes(),
         }
     }
 
@@ -3868,7 +3897,10 @@ impl HypodjHandler {
             // inside the long network window of an append.
             && (shape.moves_deck
                 || (raw_post_key.current_qid == pre_key.current_qid
-                    && raw_post_key.state == pre_key.state));
+                    && raw_post_key.state == pre_key.state))
+            // The flags must be exactly what this action alone writes: a human
+            // `random` landing inside the window is not ours to put back.
+            && raw_post_key.modes == pre_key.modes.after(action);
         snap.restores_volume = restores_volume(action);
         let mut post_key = raw_post_key;
         // A plan fade is NON-committing: `target_volume` stays at the pre level for
@@ -4491,6 +4523,14 @@ impl HypodjHandler {
                 .random_songs(Some(want as i32))
                 .await
                 .map_err(|e| e.to_string())?,
+            Selector::Starred => self
+                .client
+                .starred_songs()
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .take(want)
+                .collect(),
             Selector::Exact(ids) => {
                 let mut out = Vec::new();
                 for id in ids.iter().take(want) {
@@ -4620,7 +4660,7 @@ impl HypodjHandler {
             Selector::Similar(_) | Selector::SimilarToCurrent | Selector::Radio => {
                 self.pull_rerank(songs)
             }
-            Selector::Exact(_) | Selector::Genre(_) => songs,
+            Selector::Exact(_) | Selector::Genre(_) | Selector::Starred => songs,
         };
         let n = songs.len();
         for s in songs {
@@ -5328,6 +5368,10 @@ impl HypodjHandler {
             Some(t) => t.clone(),
             None => return ack(ACK_ERROR_UNKNOWN, "nl", &NlError::NotAvailable.to_string()),
         };
+        // READ-side questions answer immediately: no plan, no token, no arm.
+        if let Some(q) = translator.query(&req) {
+            return self.nl_answer(q).await;
+        }
         let ctx = self.nl_context();
         // Run the (possibly model-backed) translate OFF the reactor: Rules is
         // instant; a local model can take hundreds of ms. hypodj-nl needs no tokio.
@@ -5379,6 +5423,42 @@ impl HypodjHandler {
             .pair("nl_echo", echo)
             .pair("nl_token", token)
             .build()
+    }
+
+    /// Answer a READ-side [`crate::nl::NlQuery`] from live server state. Starred is
+    /// fetched fresh (never cached), like `listplaylistinfo Starred`.
+    async fn nl_answer(&self, q: crate::nl::NlQuery) -> MpdResponse {
+        use crate::nl::NlQuery;
+        /// Cap the listed favorites so one answer line stays readable.
+        const MAX_LISTED: usize = 20;
+        let starred = match self.client.starred_songs().await {
+            Ok(s) => s,
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, "nl", &format!("could not read favorites: {e}")),
+        };
+        let answer = match q {
+            NlQuery::Favorites if starred.is_empty() => "no favorites yet".to_string(),
+            NlQuery::Favorites => {
+                let shown: Vec<String> = starred
+                    .iter()
+                    .take(MAX_LISTED)
+                    .map(|s| match &s.artist {
+                        Some(a) => format!("{a} - {}", s.title),
+                        None => s.title.clone(),
+                    })
+                    .collect();
+                let more = starred.len().saturating_sub(MAX_LISTED);
+                let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
+                format!("{} favorites: {}{tail}", starred.len(), shown.join("; "))
+            }
+            NlQuery::IsCurrentFavorited => match self.current_song() {
+                None => "nothing (library) is playing".to_string(),
+                Some(cur) if starred.iter().any(|s| s.id == cur.id) => {
+                    format!("yes, \"{}\" is a favorite", cur.title)
+                }
+                Some(cur) => format!("no, \"{}\" is not a favorite", cur.title),
+            },
+        };
+        MpdResponse::pairs().pair("nl_answer", answer).build()
     }
 
     /// Confirm: pop the (single-use) token and RE-VALIDATE + arm each plan against
@@ -10502,6 +10582,7 @@ impl HypodjHandler {
         let queue = snap.queue.clone();
         let next_qid = snap.next_qid;
         let current = snap.current;
+        let modes = snap.modes;
 
         if deck_ok && !dipping {
             // THE QUIET PATH, and the common one: the rows go back and nothing else
@@ -10515,6 +10596,7 @@ impl HypodjHandler {
                 // re-issued to a different song.
                 st.next_id = next_qid.max(st.next_id);
                 st.current = current;
+                st.set_modes(modes);
                 // FORWARD only, never back to the snapshot's own version: a client
                 // re-reads the queue when `playlist:` GROWS, so rolling it back would
                 // leave every client showing the world this call just replaced.
@@ -10546,6 +10628,7 @@ impl HypodjHandler {
                 st.queue = queue;
                 st.next_id = next_qid.max(st.next_id);
                 st.current = current;
+                st.set_modes(modes);
                 st.playlist_version = st.playlist_version.wrapping_add(1);
                 // Any in-flight skip target belongs to the world being replaced.
                 st.pending_skip = None;
@@ -27127,6 +27210,30 @@ mod tests {
     // run_action_outcome for the DETERMINISTIC queue-edit actions (no network): a
     // matching Play jumps (Jumped(1)); a no-match Play is a clean no-op (Jumped(0),
     // "no matching track"); a Remove reports the real removed count; Noop is inert.
+    // Action::SetMode runs through the SAME path as the MPD mode verbs: each mode
+    // flips the shared state flag on and back off, and reports what it did.
+    #[tokio::test]
+    async fn run_action_outcome_set_mode_toggles_state() {
+        use crate::plan::PlayMode;
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let flag = |m: PlayMode| {
+            let st = h.state.lock().unwrap();
+            match m {
+                PlayMode::Random => st.random,
+                PlayMode::Repeat => st.repeat,
+                PlayMode::Single => st.single,
+                PlayMode::Consume => st.consume,
+            }
+        };
+        for mode in [PlayMode::Random, PlayMode::Repeat, PlayMode::Single, PlayMode::Consume] {
+            let out = h.run_action_outcome(&Action::SetMode { mode, on: true }, "test").await;
+            assert_eq!(out, PlanOutcome::Effect(format!("{} on", mode.word())));
+            assert!(flag(mode), "{mode:?} on");
+            h.run_action_outcome(&Action::SetMode { mode, on: false }, "test").await;
+            assert!(!flag(mode), "{mode:?} off");
+        }
+    }
+
     #[tokio::test]
     async fn run_action_outcome_queue_edits_report_real_counts() {
         let Some((h, _events)) = handler_with_null_player() else { return };
@@ -29763,6 +29870,36 @@ mod tests {
         assert_eq!(newest(&j2, "jact").as_deref(), Some("undo"));
         assert_eq!(newest(&j2, "jdid").as_deref(), Some("undone: cleared 5 tracks"));
         assert_eq!(newest(&j2, "jundoable").as_deref(), Some("0"));
+    }
+
+    // A mode flip is journaled and retractable like any edit: undo puts the flag
+    // back. A human toggle of ANY flag afterwards is drift the version cannot see,
+    // so the entry goes stale and undo refuses instead of reverting his toggle.
+    #[tokio::test(start_paused = true)]
+    async fn undo_of_a_set_mode_puts_the_flag_back_and_refuses_after_his_toggle() {
+        use crate::plan::PlayMode;
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 2).await;
+        let set = Action::SetMode { mode: PlayMode::Random, on: true };
+        h.run_action_outcome(&set, "mcp:s").await;
+        assert!(h.state.lock().unwrap().random);
+        let j = pairs_of(h.handle(MpdCommand::Journal).await);
+        assert_eq!(newest(&j, "jact").as_deref(), Some("setmode"));
+        assert_eq!(newest(&j, "jundoable").as_deref(), Some("1"));
+        assert!(!matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert!(!h.state.lock().unwrap().random, "undo put random back off");
+
+        // A no-op flip (already in that state) changes nothing and is not journaled.
+        let before = pairs_of(h.handle(MpdCommand::Journal).await).len();
+        h.run_action_outcome(&Action::SetMode { mode: PlayMode::Random, on: false }, "mcp:s")
+            .await;
+        assert_eq!(pairs_of(h.handle(MpdCommand::Journal).await).len(), before);
+
+        h.run_action_outcome(&set, "mcp:s").await;
+        h.handle(MpdCommand::Repeat(true)).await;
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        let st = h.state.lock().unwrap();
+        assert!(st.random && st.repeat, "his repeat and the agent's random both stand");
     }
 
     // The same clear, but with music playing: the deck has to come back too - the

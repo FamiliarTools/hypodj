@@ -41,6 +41,36 @@ use crate::player::PlayState;
 /// whole queue.
 pub(crate) const RING_CAP: usize = 32;
 
+/// The four MPD playback mode flags, as one comparable value. Captured in the
+/// [`Snapshot`] so an [`Action::SetMode`] is retractable like any other edit, and
+/// carried in the [`WorldKey`] so a human mode toggle between act and undo is
+/// drift (it bumps no version, so nothing else would see it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Modes {
+    pub(crate) random: bool,
+    pub(crate) repeat: bool,
+    pub(crate) single: bool,
+    pub(crate) consume: bool,
+}
+
+impl Modes {
+    /// These flags with `action`'s own mode write applied - what the action ALONE
+    /// leaves behind. Every other action leaves the flags exactly as found.
+    pub(crate) fn after(self, action: &Action) -> Self {
+        use crate::plan::PlayMode;
+        let mut m = self;
+        if let Action::SetMode { mode, on } = action {
+            match mode {
+                PlayMode::Random => m.random = *on,
+                PlayMode::Repeat => m.repeat = *on,
+                PlayMode::Single => m.single = *on,
+                PlayMode::Consume => m.consume = *on,
+            }
+        }
+        m
+    }
+}
+
 /// The world an [`Action`] replaced: enough to put it back row for row.
 ///
 /// The queue is cloned WHOLE (rows carry their stable qids, so a restore is
@@ -72,6 +102,10 @@ pub(crate) struct Snapshot {
     /// driving it, killing (say) a sleep fade whose terminal is the thing that
     /// stops the music.
     pub(crate) restores_volume: bool,
+    /// The mode flags. Always put back: the [`WorldKey`] carries them, so on any
+    /// live undo they equal the post-action flags, and only a `SetMode` makes the
+    /// two differ.
+    pub(crate) modes: Modes,
 }
 
 /// The DRIFT DETECTOR: the coarse shape of the world, compared before an undo is
@@ -94,6 +128,9 @@ pub(crate) struct Snapshot {
 /// - `target_volume` - assigned by `setvol`, the knob, MPRIS and every fade
 ///   terminal with NO version bump, so a version-only key would let an undo
 ///   silently revert the human's own volume drag.
+/// - `modes` - the random/repeat/single/consume flags, flipped by the MPD mode
+///   verbs with NO version bump; without them an undo would silently revert a
+///   human's `random` toggle.
 ///
 /// Deliberately NOT in the key: the ELAPSED position. It drifts every tick while
 /// music plays, so including it would expire every undo within milliseconds. The
@@ -105,6 +142,7 @@ pub(crate) struct WorldKey {
     pub(crate) current_qid: Option<u64>,
     pub(crate) state: PlayState,
     pub(crate) target_volume: u8,
+    pub(crate) modes: Modes,
 }
 
 /// What the action ITSELF is allowed to have done, so that a CONCURRENT writer's
@@ -229,6 +267,10 @@ pub(crate) fn action_shape(action: &Action, outcome: &PlanOutcome) -> ActionShap
             _ => ActionShape::deck(Opaque),
         },
         Action::Noop => ActionShape::queue_only(Untouched),
+        // A flag, never the rows, the deck or the level. Trivially retractable: the
+        // snapshot carries the flags and the window check holds the post flags to
+        // exactly this one write (see `Modes::after`).
+        Action::SetMode { .. } => ActionShape::queue_only(Untouched),
         // EXHAUSTIVE on purpose, like `action_verb`: a new variant must fail to
         // compile HERE rather than default to a shape that lets an undo clobber.
     }
@@ -324,6 +366,7 @@ impl JournalEntry {
         live.playlist_version == self.post_key.playlist_version
             && live.current_qid == self.post_key.current_qid
             && live.state == self.post_key.state
+            && live.modes == self.post_key.modes
             && (live.target_volume == self.post_key.target_volume
                 || live.target_volume == snap.target_volume)
     }
@@ -494,6 +537,7 @@ pub(crate) fn action_verb(action: &Action) -> &'static str {
         Action::Play { .. } => "play",
         Action::PlayNow { .. } => "playnow",
         Action::Noop => "noop",
+        Action::SetMode { .. } => "setmode",
         // EXHAUSTIVE on purpose (`Action` is #[non_exhaustive] only outside this
         // crate): a new variant must fail to compile HERE, so nobody adds an action
         // the journal cannot name.
@@ -532,7 +576,13 @@ mod tests {
     use crate::plan::{ClearScope, QueueSelector, Selector};
 
     fn key(version: u64, qid: Option<u64>, state: PlayState, vol: u8) -> WorldKey {
-        WorldKey { playlist_version: version, current_qid: qid, state, target_volume: vol }
+        WorldKey {
+            playlist_version: version,
+            current_qid: qid,
+            state,
+            target_volume: vol,
+            modes: Modes::default(),
+        }
     }
 
     fn snap(vol: u8) -> Snapshot {
@@ -547,6 +597,7 @@ mod tests {
             state: PlayState::Playing,
             target_volume: vol,
             restores_volume: true,
+            modes: Modes::default(),
         }
     }
 
