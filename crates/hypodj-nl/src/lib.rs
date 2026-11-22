@@ -593,6 +593,22 @@ mod tests {
         );
     }
 
+    // Sleep and wind-down name the daemon's single-instance FEATURES, so the hit
+    // says so (the handler then arms them through its own singleton path). Nothing
+    // else does - not even a fade that happens to share the sleep shape.
+    #[test]
+    fn sleep_and_winddown_are_marked_as_sessions() {
+        use hypodj_core::nl::NlSession;
+        let c = ctx(Some("s1"), 5);
+        let s = |u: &str| RulesTranslator.translate(u, &c).unwrap().session;
+        assert_eq!(s("sleep in 30 minutes"), Some(NlSession::Sleep));
+        assert_eq!(s("sleep timer 45 minutes"), Some(NlSession::Sleep));
+        assert_eq!(s("wind down in 10 minutes"), Some(NlSession::WindDown));
+        assert_eq!(s("start a wind-down"), Some(NlSession::WindDown));
+        assert_eq!(s("stop"), None);
+        assert_eq!(s("shuffle on"), None);
+    }
+
     // ── HYBRID orchestration ──────────────────────────────────────────────────
 
     struct StubLlm;
@@ -601,6 +617,7 @@ mod tests {
             Ok(NlHit {
                 plans: vec![raw(RawTrigger::Immediate, Action::Stop)],
                 source: NlSource::Llm,
+                session: None,
             })
         }
     }

@@ -9,7 +9,7 @@
 use chrono::{TimeZone, Utc};
 
 use hypodj_core::config::{DEFAULT_SLEEP_FADE_SECS, DEFAULT_WINDDOWN_FADE_SECS};
-use hypodj_core::nl::{NlContext, NlError, NlHit, NlQuery, NlSource, Translator};
+use hypodj_core::nl::{NlContext, NlError, NlHit, NlQuery, NlSession, NlSource, Translator};
 use hypodj_core::plan::{
     Action, FadeIntentIr, PlayMode, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
 };
@@ -38,8 +38,9 @@ pub struct RulesTranslator;
 
 impl Translator for RulesTranslator {
     fn translate(&self, utterance: &str, ctx: &NlContext) -> Result<NlHit, NlError> {
-        let plans = translate_rules(utterance, ctx)?;
-        Ok(NlHit { plans, source: NlSource::Rules })
+        let mut session = None;
+        let plans = rules_body(utterance, ctx, &mut session)?;
+        Ok(NlHit { plans, source: NlSource::Rules, session })
     }
 
     fn query(&self, utterance: &str) -> Option<NlQuery> {
@@ -102,6 +103,16 @@ fn plan(trigger: RawTrigger, action: Action, once: bool) -> RawPlan {
 /// The single entry point: match the utterance to one of the closed corpus
 /// patterns, or fail with a SPECIFIC [`NlError`] (NotUnderstood falls through).
 pub fn translate_rules(utterance: &str, ctx: &NlContext) -> Result<Vec<RawPlan>, NlError> {
+    rules_body(utterance, ctx, &mut None)
+}
+
+/// [`translate_rules`], also reporting through `session` when the match was one of
+/// the daemon's single-instance features (see [`NlHit::session`]).
+fn rules_body(
+    utterance: &str,
+    ctx: &NlContext,
+    session: &mut Option<NlSession>,
+) -> Result<Vec<RawPlan>, NlError> {
     let text = utterance.trim();
     if text.is_empty() {
         return Err(NlError::NotUnderstood);
@@ -134,11 +145,14 @@ pub fn translate_rules(utterance: &str, ctx: &NlContext) -> Result<Vec<RawPlan>,
     if low.contains("wind down") || low.contains("wind-down") || low.contains("winddown") {
         let trigger = boundary_or_time(&tv, &low, text, ctx)?;
         let secs = DEFAULT_WINDDOWN_FADE_SECS as f64;
+        *session = Some(NlSession::WindDown);
         return one(plan(trigger, Action::Fade(FadeIntentIr::ToFloor { secs }), true));
     }
     if tv.first() == Some(&"sleep") || low.contains("sleep timer") || low.contains("go to sleep")
     {
-        return one(sleep(&tv)?);
+        let p = sleep(&tv)?;
+        *session = Some(NlSession::Sleep);
+        return one(p);
     }
 
     // 2. calmer / similar ("something calmer", "more like this").

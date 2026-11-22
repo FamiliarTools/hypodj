@@ -3083,6 +3083,10 @@ pub struct HypodjHandler {
 /// to the connection that created it (no cross-connection arming).
 struct PendingNl {
     plans: Vec<RawPlan>,
+    /// The single-instance feature this utterance named, if any. Confirm then arms
+    /// `plans[0]`'s trigger through [`HypodjHandler::nl_arm_feature`] (the server's
+    /// own singleton path) instead of as a client plan.
+    session: Option<crate::nl::NlSession>,
     created: Instant,
     source: NlSource,
     owner: u64,
@@ -4128,14 +4132,57 @@ impl HypodjHandler {
     /// SLEEP: schedule a graceful fade-to-silence-then-stop at now+`dur`. ONE plan
     /// (Fade(Out) already StopRestores - no sibling Stop). Single-instance.
     pub fn sleep_set(&self, dur: Duration) -> Result<PlanId, PlanError> {
-        let raw = RawPlan {
-            version: 1,
-            trigger: Self::wallclock_in(dur)?,
-            action: Action::Fade(FadeIntentIr::Out { secs: self.fade_cfg.sleep_fade_secs as f64 }),
-            once: true,
-            origin: ORIGIN_SLEEP.into(),
-        };
+        let raw = self.feature_plan(crate::nl::NlSession::Sleep, Self::wallclock_in(dur)?);
         self.set_singleton(ORIGIN_SLEEP, raw)
+    }
+
+    /// The plan a FEATURE arms at `trigger`: its reserved origin and its configured
+    /// fade. One builder, so the direct commands and an NL utterance naming the same
+    /// feature can never arm different shapes.
+    fn feature_plan(&self, session: crate::nl::NlSession, trigger: RawTrigger) -> RawPlan {
+        use crate::nl::NlSession;
+        let (origin, action) = match session {
+            NlSession::Sleep => (
+                ORIGIN_SLEEP,
+                Action::Fade(FadeIntentIr::Out { secs: self.fade_cfg.sleep_fade_secs as f64 }),
+            ),
+            NlSession::WindDown => (
+                ORIGIN_WINDDOWN,
+                Action::Fade(FadeIntentIr::ToFloor {
+                    secs: self.fade_cfg.winddown_fade_secs as f64,
+                }),
+            ),
+        };
+        RawPlan { version: 1, trigger, action, once: true, origin: origin.into() }
+    }
+
+    /// A feature's trigger as the singleton arms it: a relative span becomes a
+    /// wall-clock deadline measured from NOW (as `sleep 1h` is), which also keeps it
+    /// clear of the client-plan `max_dur` span clamp. Every other trigger (a track
+    /// or album boundary, an absolute time, immediate) passes through.
+    fn feature_trigger(trigger: RawTrigger) -> Result<RawTrigger, PlanError> {
+        match trigger {
+            RawTrigger::SpanElapsed { secs } => Self::wallclock_in(
+                Duration::try_from_secs_f64(secs).map_err(|_| PlanError::OutOfBounds { field: "dur" })?,
+            ),
+            t => Ok(t),
+        }
+    }
+
+    /// Arm an NL-named feature through the SAME server-side singleton path as the
+    /// direct command: it supersedes the armed instance and its status surface sees
+    /// it. The client never names the reserved origin - the daemon does, here.
+    fn nl_arm_feature(
+        &self,
+        session: crate::nl::NlSession,
+        trigger: RawTrigger,
+    ) -> Result<PlanId, PlanError> {
+        let raw = self.feature_plan(session, Self::feature_trigger(trigger)?);
+        let origin = match session {
+            crate::nl::NlSession::Sleep => ORIGIN_SLEEP,
+            crate::nl::NlSession::WindDown => ORIGIN_WINDDOWN,
+        };
+        self.set_singleton(origin, raw)
     }
 
     /// The remaining time on the armed sleep plan, or `None` if none is armed.
@@ -4170,15 +4217,7 @@ impl HypodjHandler {
             None => RawTrigger::Immediate,
             Some(d) => Self::wallclock_in(d)?,
         };
-        let raw = RawPlan {
-            version: 1,
-            trigger,
-            action: Action::Fade(FadeIntentIr::ToFloor {
-                secs: self.fade_cfg.winddown_fade_secs as f64,
-            }),
-            once: true,
-            origin: ORIGIN_WINDDOWN.into(),
-        };
+        let raw = self.feature_plan(crate::nl::NlSession::WindDown, trigger);
         self.set_singleton(ORIGIN_WINDDOWN, raw)
     }
 
@@ -5400,6 +5439,32 @@ impl HypodjHandler {
         // numeric (duration/vol/position bounds) and snapshot-independent, so the
         // re-clamp inside `plan_add` at confirm time is idempotent. A dry-run
         // validate against the current snapshot fails loud early.
+        // A named FEATURE (sleep / wind-down): echo the plan the daemon itself will
+        // arm - its configured fade, the utterance's UNCLAMPED trigger (a client
+        // plan's span is capped at max_dur, but `sleep 1h` is a real sleep) - and
+        // arm it at confirm through the singleton path, never as a client plan.
+        if let (Some(session), [raw]) = (hit.session, hit.plans.as_slice()) {
+            let plan = self.feature_plan(session, raw.trigger.clone());
+            if let Err(e) = Self::feature_trigger(plan.trigger.clone()) {
+                return ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan invalid: {e}"));
+            }
+            let echo = describe_batch(std::slice::from_ref(&plan), hit.source);
+            let token = self.mint_nl_token();
+            let mut g = self.nl_pending.lock().unwrap();
+            prune_expired_nl(&mut g);
+            g.insert(
+                token.clone(),
+                PendingNl {
+                    plans: vec![plan],
+                    session: Some(session),
+                    created: Instant::now(),
+                    source: hit.source,
+                    owner,
+                },
+            );
+            drop(g);
+            return MpdResponse::pairs().pair("nl_echo", echo).pair("nl_token", token).build();
+        }
         let mut plans = Vec::with_capacity(hit.plans.len());
         for raw in hit.plans {
             let mut clamped = clamp_raw(&raw, &bounds);
@@ -5416,7 +5481,7 @@ impl HypodjHandler {
             prune_expired_nl(&mut g);
             g.insert(
                 token.clone(),
-                PendingNl { plans, created: Instant::now(), source: hit.source, owner },
+                PendingNl { plans, session: None, created: Instant::now(), source: hit.source, owner },
             );
         }
         MpdResponse::pairs()
@@ -5481,6 +5546,12 @@ impl HypodjHandler {
             None => return ack(ACK_ERROR_NO_EXIST, "nl", "no such nl token"),
         };
         let _ = pending.source;
+        if let (Some(session), Some(plan)) = (pending.session, pending.plans.first()) {
+            return match self.nl_arm_feature(session, plan.trigger.clone()) {
+                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan no longer valid: {e}")),
+            };
+        }
         // SAFETY (atomic batch): arm ALL plans or NONE. `plan_add_batch`
         // pre-validates every plan against ONE current snapshot and only then arms
         // them; a single invalid plan arms nothing (no partial, inconsistent arm).
@@ -20920,7 +20991,11 @@ mod tests {
             _u: &str,
             _c: &crate::nl::NlContext,
         ) -> Result<crate::nl::NlHit, crate::nl::NlError> {
-            Ok(crate::nl::NlHit { plans: vec![self.0.clone()], source: crate::nl::NlSource::Rules })
+            Ok(crate::nl::NlHit {
+                plans: vec![self.0.clone()],
+                source: crate::nl::NlSource::Rules,
+                session: None,
+            })
         }
     }
 
@@ -20953,8 +21028,70 @@ mod tests {
             Ok(crate::nl::NlHit {
                 plans: self.0.clone(),
                 source: crate::nl::NlSource::Rules,
+                session: None,
             })
         }
+    }
+
+    /// A translator that names a FEATURE (as the rules do for "sleep in an hour"):
+    /// a client-shaped plan whose action the handler must ignore, plus the session.
+    struct SessionTranslator(crate::nl::NlSession, f64);
+    impl crate::nl::Translator for SessionTranslator {
+        fn translate(
+            &self,
+            _u: &str,
+            _c: &crate::nl::NlContext,
+        ) -> Result<crate::nl::NlHit, crate::nl::NlError> {
+            Ok(crate::nl::NlHit {
+                plans: vec![RawPlan {
+                    version: 1,
+                    trigger: RawTrigger::SpanElapsed { secs: self.1 },
+                    action: Action::Fade(FadeIntentIr::Out { secs: 1.0 }),
+                    once: true,
+                    origin: String::new(),
+                }],
+                source: crate::nl::NlSource::Rules,
+                session: Some(self.0),
+            })
+        }
+    }
+
+    // An NL sleep / wind-down arms the daemon's OWN singleton, exactly like the
+    // direct command: it supersedes the armed timer (never a second one), the
+    // `sleep` status surface sees it, and a span past the client-plan max_dur clamp
+    // (30 min) is honoured in full.
+    #[tokio::test]
+    async fn nl_sleep_and_winddown_arm_the_reserved_singleton() {
+        use crate::nl::NlSession;
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.sleep_set(Duration::from_secs(600)).unwrap();
+        let old = h.find_feature(ORIGIN_SLEEP).unwrap();
+
+        h.set_translator(Arc::new(SessionTranslator(NlSession::Sleep, 3600.0)));
+        let resp = h.handle(nl_translate("sleep in an hour", 7)).await;
+        let echo = pair(&resp, "nl_echo").unwrap().to_string();
+        assert!(echo.contains("in 60 min"), "echo shows the unclamped span: {echo}");
+        let token = pair(&resp, "nl_token").unwrap().to_string();
+        let resp = h.handle(nl_confirm(&token, 7)).await;
+        assert!(pair(&resp, "plan_id").is_some(), "armed: {resp:?}");
+
+        let new = h.find_feature(ORIGIN_SLEEP).expect("the NL sleep is THE sleep feature");
+        assert_ne!(new, old, "the NL sleep superseded the direct one");
+        let n = h.feature_deadlines().iter().filter(|(_, o, _)| o == ORIGIN_SLEEP).count();
+        assert_eq!(n, 1, "exactly one sleep timer");
+        let left = h.sleep_remaining().expect("sleep status sees it").as_secs();
+        assert!((3500..=3600).contains(&left), "a full hour, not clamped: {left}s");
+
+        // The translator is injected once per handler, so a fresh one for the wind-down.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.sleep_set(Duration::from_secs(600)).unwrap();
+        h.set_translator(Arc::new(SessionTranslator(NlSession::WindDown, 600.0)));
+        let resp = h.handle(nl_translate("wind down in 10 minutes", 7)).await;
+        let token = pair(&resp, "nl_token").unwrap().to_string();
+        let resp = h.handle(nl_confirm(&token, 7)).await;
+        assert!(pair(&resp, "plan_id").is_some(), "armed: {resp:?}");
+        assert!(h.find_feature(ORIGIN_WINDDOWN).is_some(), "wind-down is the feature plan");
+        assert!(h.find_feature(ORIGIN_SLEEP).is_some(), "and leaves the sleep timer alone");
     }
 
     #[tokio::test]

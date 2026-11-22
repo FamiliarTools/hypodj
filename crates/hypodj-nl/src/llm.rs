@@ -369,7 +369,7 @@ mod backend {
                 .generate(&prompt, self.gbnf)
                 .map_err(|_| NlError::NotUnderstood)?;
             let raw = super::parse_llm_output(&out).map_err(|_| NlError::NotUnderstood)?;
-            Ok(NlHit { plans: vec![raw], source: NlSource::Llm })
+            Ok(NlHit { plans: vec![raw], source: NlSource::Llm, session: None })
         }
     }
 }

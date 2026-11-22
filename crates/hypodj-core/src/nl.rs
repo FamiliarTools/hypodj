@@ -52,6 +52,21 @@ pub enum NlSource {
 pub struct NlHit {
     pub plans: Vec<RawPlan>,
     pub source: NlSource,
+    /// Set when the utterance names one of the daemon's single-instance FEATURES
+    /// rather than a one-off plan. The handler then ignores the plan's action and
+    /// arms the feature itself through its own singleton path (the one the direct
+    /// `sleep` / `winddown` commands use), keeping only the plan's trigger - so an
+    /// NL sleep supersedes the armed one and `sleep` status sees it.
+    pub session: Option<NlSession>,
+}
+
+/// A single-instance daemon feature an utterance can name (see [`NlHit::session`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NlSession {
+    /// The sleep timer: fade out and stop.
+    Sleep,
+    /// The wind-down: a long fade to the non-silence floor.
+    WindDown,
 }
 
 /// Why a translation failed. Distinguishes a fall-through miss from a real,
