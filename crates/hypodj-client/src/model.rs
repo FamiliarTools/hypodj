@@ -100,6 +100,105 @@ pub struct NowPlaying {
     /// as a stamp, so one formatter serves every client and the date arithmetic has one
     /// implementation. `None` when there is no play record.
     pub last_played_days: Option<u32>,
+    /// The four MPD playback-mode flags from `status` (`random`/`repeat`/`single`/
+    /// `consume`). The daemon has always emitted them; a client that never read them
+    /// could neither show nor sensibly toggle them.
+    pub modes: PlaybackModes,
+}
+
+/// One MPD playback mode. The verb is the MPD command that sets it (`random 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Random,
+    Repeat,
+    Single,
+    Consume,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 4] = [Mode::Random, Mode::Repeat, Mode::Single, Mode::Consume];
+
+    /// The MPD verb, which is also the status key and the human word.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Mode::Random => "random",
+            Mode::Repeat => "repeat",
+            Mode::Single => "single",
+            Mode::Consume => "consume",
+        }
+    }
+
+    pub fn from_word(w: &str) -> Option<Mode> {
+        Mode::ALL.into_iter().find(|m| m.verb() == w)
+    }
+}
+
+/// The playback-mode flags parsed from `status`. Absent or unparseable reads as off,
+/// which is what MPD means by a missing flag.
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
+pub struct PlaybackModes {
+    pub random: bool,
+    pub repeat: bool,
+    pub single: bool,
+    pub consume: bool,
+}
+
+impl PlaybackModes {
+    fn parse(status: &[(String, String)]) -> Self {
+        let on = |k: &str| find(status, k) == Some("1");
+        PlaybackModes {
+            random: on("random"),
+            repeat: on("repeat"),
+            single: on("single"),
+            consume: on("consume"),
+        }
+    }
+
+    pub fn get(&self, m: Mode) -> bool {
+        match m {
+            Mode::Random => self.random,
+            Mode::Repeat => self.repeat,
+            Mode::Single => self.single,
+            Mode::Consume => self.consume,
+        }
+    }
+
+    /// The command line that FLIPS `m` from what this snapshot says, e.g. `random 1`.
+    pub fn toggle_command(&self, m: Mode) -> String {
+        format!("{} {}", m.verb(), if self.get(m) { 0 } else { 1 })
+    }
+
+    /// The modes that are ON as words, e.g. `random repeat`. `None` when all are off,
+    /// so the default deck renders nothing.
+    pub fn label(&self) -> Option<String> {
+        let on: Vec<&str> = Mode::ALL
+            .into_iter()
+            .filter(|m| self.get(*m))
+            .map(Mode::verb)
+            .collect();
+        (!on.is_empty()).then(|| on.join(" "))
+    }
+}
+
+/// The sentence a `sleep` / `wake` STATUS reply deserves. The daemon answers
+/// `sleep_remaining: <secs>` or `sleep: none` (likewise `wake`); both clients print
+/// it through here so the words cannot drift. `None` for any other reply (a set
+/// answers `plan_id`, a cancel a bare OK - the card is the feedback there).
+pub fn schedule_reply(pairs: &[(String, String)]) -> Option<String> {
+    let num = |k: &str| find(pairs, k).and_then(|v| v.parse::<u64>().ok());
+    if let Some(s) = num("sleep_remaining") {
+        return Some(format!("sleep in {}", fmt_remaining(s)));
+    }
+    if find(pairs, "sleep") == Some("none") {
+        return Some("no sleep timer armed".into());
+    }
+    if let Some(s) = num("wake_remaining") {
+        return Some(format!("wake in {}", fmt_remaining(s)));
+    }
+    if find(pairs, "wake") == Some("none") {
+        return Some("no wake alarm armed".into());
+    }
+    None
 }
 
 /// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
@@ -282,6 +381,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         // when the server actually has a record.
         plays: find(current, "X-Plays").and_then(|v| v.parse().ok()),
         last_played_days: find(current, "X-LastPlayed").and_then(|v| v.parse().ok()),
+        modes: PlaybackModes::parse(status),
     }
 }
 
@@ -907,4 +1007,29 @@ mod tests {
         assert_eq!(store_badge(""), None);
         assert_eq!(store_badge("starting").as_deref(), Some("starting"));
     }
+
+    #[test]
+    fn playback_modes_parse_toggle_and_label() {
+        let np = now_playing(&p(&[("state", "play"), ("random", "1"), ("repeat", "0"), ("consume", "1")]), &[]);
+        assert!(np.modes.random && np.modes.consume);
+        assert!(!np.modes.repeat && !np.modes.single);
+        assert_eq!(np.modes.label().as_deref(), Some("random consume"));
+        assert_eq!(np.modes.toggle_command(Mode::Random), "random 0");
+        assert_eq!(np.modes.toggle_command(Mode::Single), "single 1");
+        // A lean status (no flags) is all off and renders nothing.
+        assert_eq!(now_playing(&p(&[("state", "stop")]), &[]).modes.label(), None);
+        assert_eq!(Mode::from_word("repeat"), Some(Mode::Repeat));
+        assert_eq!(Mode::from_word("shuffle"), None);
+    }
+
+    #[test]
+    fn schedule_reply_words_both_answers_and_ignores_others() {
+        assert_eq!(schedule_reply(&p(&[("sleep_remaining", "720")])).as_deref(), Some("sleep in 12m"));
+        assert_eq!(schedule_reply(&p(&[("sleep", "none")])).as_deref(), Some("no sleep timer armed"));
+        assert_eq!(schedule_reply(&p(&[("wake_remaining", "25200")])).as_deref(), Some("wake in 7h 00m"));
+        assert_eq!(schedule_reply(&p(&[("wake", "none")])).as_deref(), Some("no wake alarm armed"));
+        assert_eq!(schedule_reply(&p(&[("plan_id", "3")])), None);
+        assert_eq!(schedule_reply(&[]), None);
+    }
+
 }

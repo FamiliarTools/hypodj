@@ -474,6 +474,10 @@ pub fn command_reply(line: &str, pairs: &[(String, String)]) -> Option<Reply> {
     if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "mark_result") {
         return Some(Reply::Banner(v.clone()));
     }
+    // `sleep` / `wake` status: the armed timer, worded once in the client lib.
+    if let Some(sentence) = hypodj_client::model::schedule_reply(pairs) {
+        return Some(Reply::Banner(sentence));
+    }
     let heard: Vec<String> = pairs
         .iter()
         .filter(|(k, _)| k == "heard")
@@ -1118,5 +1122,20 @@ mod tests {
         assert_eq!(command_reply("setvol 42", &pairs(&[("volume", "42"), ("state", "play")])), None);
         // And a verb whose NAME merely starts with the same letters is not `heard`.
         assert_eq!(command_reply("heardsomething", &[]), None);
+    }
+
+    #[test]
+    fn sleep_and_wake_status_answer_on_the_banner() {
+        use super::{command_reply, Reply};
+        assert_eq!(
+            command_reply("sleep", &pairs(&[("sleep_remaining", "720")])),
+            Some(Reply::Banner("sleep in 12m".into()))
+        );
+        assert_eq!(
+            command_reply("wake", &pairs(&[("wake", "none")])),
+            Some(Reply::Banner("no wake alarm armed".into()))
+        );
+        // A mode flip answers a bare OK and stays silent.
+        assert_eq!(command_reply("random 1", &[]), None);
     }
 }

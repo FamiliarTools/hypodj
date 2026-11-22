@@ -5,6 +5,8 @@
 //! This is the silent-wrong-action trap: bare `play <n>` would start the queue
 //! and drop intent, so "play something calmer" MUST route to NL.
 
+use crate::model::Mode;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Render the now-playing card (status + currentsong). Also the no-args case.
@@ -21,6 +23,10 @@ pub enum Action {
     /// the CLI must resolve the current song's uri at runtime and issue
     /// `playlistadd Starred <uri>`, so it carries no argument here.
     FavoriteCurrent,
+    /// Flip one playback mode. A bare `random` carries no target value, so the client
+    /// resolves it against the mode's CURRENT state (`PlaybackModes::toggle_command`).
+    /// `random on|off` is explicit and routes straight to a `Command` instead.
+    ToggleMode(Mode),
     /// Send the whole phrase to the NL handshake.
     Nl(String),
 }
@@ -185,8 +191,17 @@ fn route_one(verb: &str, args: &[String]) -> Action {
         "heard" => Action::Command("heard".into()),
         "clear" => Action::ClearConfirm,
         "help" => Action::Help,
-        // vol/volume alone (no scalar) is under-specified -> NL.
-        _ => Action::Nl(args.join(" ")),
+        // The bare scheduling verbs REPORT: the daemon answers `sleep`/`wake` with
+        // what is armed. Arming stays NL ("sleep in 30 minutes", "wake me at 7").
+        "sleep" => Action::Command("sleep".into()),
+        "wake" | "alarm" => Action::Command("wake".into()),
+        // vol/volume alone (no scalar) is under-specified -> NL. A bare playback-mode
+        // word toggles it. `shuffle` is deliberately NOT a mode: in MPD it reorders
+        // the queue once, a different act from the `random` play order.
+        w => match Mode::from_word(w) {
+            Some(m) => Action::ToggleMode(m),
+            None => Action::Nl(args.join(" ")),
+        },
     }
 }
 
@@ -238,6 +253,20 @@ fn route_two(verb: &str, arg: &str, args: &[String]) -> Action {
         "mark" if is_filler_noun(arg) => Action::Command("mark this".into()),
         // The heard views the daemon's parser accepts, passed through verbatim.
         "heard" if matches!(arg, "all" | "marks") => Action::Command(format!("heard {arg}")),
+        // Explicit mode values: `random on`, `repeat off`, `single 1`.
+        m if Mode::from_word(m).is_some() => match arg {
+            "on" | "1" => Action::Command(format!("{m} 1")),
+            "off" | "0" => Action::Command(format!("{m} 0")),
+            _ => Action::Nl(args.join(" ")),
+        },
+        "sleep" | "wake" | "alarm" => {
+            let verb = if verb == "sleep" { "sleep" } else { "wake" };
+            match arg {
+                "off" | "cancel" => Action::Command(format!("{verb} off")),
+                "status" | "list" => Action::Command(verb.into()),
+                _ => Action::Nl(args.join(" ")),
+            }
+        }
         // Any other two-token phrase (including "play something") is NL.
         _ => Action::Nl(args.join(" ")),
     }
@@ -585,4 +614,37 @@ mod tests {
         // Unknown lone first word.
         assert_eq!(r("shuffle"), Action::Nl("shuffle".into()));
     }
+
+    #[test]
+    fn route_playback_modes() {
+        assert_eq!(r("random"), Action::ToggleMode(Mode::Random));
+        assert_eq!(r("repeat"), Action::ToggleMode(Mode::Repeat));
+        assert_eq!(r("single"), Action::ToggleMode(Mode::Single));
+        assert_eq!(r("consume"), Action::ToggleMode(Mode::Consume));
+        assert_eq!(r("random on"), Action::Command("random 1".into()));
+        assert_eq!(r("repeat off"), Action::Command("repeat 0".into()));
+        assert_eq!(r("single 1"), Action::Command("single 1".into()));
+        assert_eq!(r("consume 0"), Action::Command("consume 0".into()));
+        // Anything else after a mode word is a phrase, not a value.
+        assert_eq!(r("repeat this album"), Action::Nl("repeat this album".into()));
+        assert_eq!(r("random jazz"), Action::Nl("random jazz".into()));
+        // `shuffle` is a queue reorder, not the random mode.
+        assert_eq!(r("shuffle"), Action::Nl("shuffle".into()));
+    }
+
+    #[test]
+    fn route_sleep_and_wake_report_and_cancel() {
+        assert_eq!(r("sleep"), Action::Command("sleep".into()));
+        assert_eq!(r("wake"), Action::Command("wake".into()));
+        assert_eq!(r("alarm"), Action::Command("wake".into()));
+        assert_eq!(r("sleep status"), Action::Command("sleep".into()));
+        assert_eq!(r("wake list"), Action::Command("wake".into()));
+        assert_eq!(r("sleep off"), Action::Command("sleep off".into()));
+        assert_eq!(r("wake cancel"), Action::Command("wake off".into()));
+        assert_eq!(r("alarm off"), Action::Command("wake off".into()));
+        // Arming is a phrase and stays NL.
+        assert_eq!(r("sleep 30m"), Action::Nl("sleep 30m".into()));
+        assert_eq!(r("wake me at 7"), Action::Nl("wake me at 7".into()));
+    }
+
 }
