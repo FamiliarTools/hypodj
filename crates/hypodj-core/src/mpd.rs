@@ -2698,6 +2698,11 @@ where
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
 
+        // MPD `close`: end the connection without a response.
+        if trimmed.trim() == "close" {
+            break;
+        }
+
         // ── command list batching ─────────────────────────────────────────
         if trimmed == "command_list_begin" || trimmed == "command_list_ok_begin" {
             let list_ok = trimmed == "command_list_ok_begin";
