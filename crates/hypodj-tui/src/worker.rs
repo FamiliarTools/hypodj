@@ -30,7 +30,7 @@ use hypodj_client::mpd::{MpdConn, MpdError};
 use hypodj_client::viz::{VizConn, VizSample};
 use hypodj_client::model::{now_playing, parse_queue, NowPlaying, QueueItem};
 use hypodj_client::nl::{
-    armed_line, echo_from_pairs, map_ack_reason, nl_request, quote_arg, result_line_from_pairs,
+    answer_from_pairs, armed_line, echo_from_pairs, map_ack_reason, nl_request, quote_arg, result_line_from_pairs,
     split_echo, token_from_pairs,
 };
 
@@ -552,6 +552,11 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             // or non-enqueue ask must never leave a lingering bias behind.
             match conn.command(&nl_request(&phrase)) {
             Ok(pairs) => {
+                // A READ-side question: show the answer, nothing to confirm.
+                if let Some(answer) = answer_from_pairs(&pairs) {
+                    send(RespKind::Banner(answer));
+                    return false;
+                }
                 match token_from_pairs(&pairs) {
                     Some(token) => {
                         let (trust, steps, note) = match echo_from_pairs(&pairs) {

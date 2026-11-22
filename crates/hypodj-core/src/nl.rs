@@ -72,9 +72,28 @@ pub enum NlError {
     NotAvailable,
 }
 
+/// A READ-side request: a question that returns information NOW instead of a
+/// plan to arm. A query has no side effect, so it skips echo-before-arm entirely
+/// (there is nothing to confirm); the handler answers it immediately with an
+/// `nl_answer` pair and NO `nl_token`. Anything that mutates stays a [`RawPlan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NlQuery {
+    /// "what is favorited?" / "list my favorites": the starred songs.
+    Favorites,
+    /// "is this favorited?" / "is the current song starred?": yes/no for current.
+    IsCurrentFavorited,
+}
+
 /// The injected NL seam. SYNC + `Send + Sync` so the daemon can run it under
 /// `spawn_blocking` (a local model can take hundreds of ms): hypodj-core needs no
 /// model dep and no `std` Mutex is ever held across an await.
 pub trait Translator: Send + Sync {
     fn translate(&self, utterance: &str, ctx: &NlContext) -> Result<NlHit, NlError>;
+
+    /// Recognize a READ-side question (see [`NlQuery`]). Checked BEFORE
+    /// [`Translator::translate`]; `None` (the default) means "not a question I
+    /// know", and the utterance proceeds to the action path.
+    fn query(&self, _utterance: &str) -> Option<NlQuery> {
+        None
+    }
 }

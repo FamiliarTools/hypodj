@@ -89,6 +89,7 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::Query(q) => format!("action enqueue query {} {count}", dsl_value(q)?),
             Selector::Genre(g) => format!("action enqueue genre {} {count}", dsl_value(g)?),
             Selector::SimilarToCurrent => format!("action enqueue similar_current {count}"),
+            Selector::Starred => format!("action enqueue starred {count}"),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -99,10 +100,14 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::Query(q) => format!("action playnow query {} {count}", dsl_value(q)?),
             Selector::Genre(g) => format!("action playnow genre {} {count}", dsl_value(g)?),
             Selector::SimilarToCurrent => format!("action playnow similar_current {count}"),
+            Selector::Starred => format!("action playnow starred {count}"),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
         Action::Noop => "action noop".into(),
+        Action::SetMode { mode, on } => {
+            format!("action mode {} {}", mode.word(), if *on { "on" } else { "off" })
+        }
         Action::Clear { scope } => match scope {
             ClearScope::All => "action clear all".into(),
             ClearScope::AfterCurrent => "action clear after".into(),
@@ -188,6 +193,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                 Selector::SimilarToCurrent => "tracks like the current one".to_string(),
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
+                Selector::Starred => "favorite (starred) tracks".to_string(),
             };
             format!("add {count} {sel} to the END of the queue (append-only)")
         }
@@ -203,6 +209,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                     Selector::Genre(g) => format!("{g} tracks"),
                     Selector::Query(q) => format!("tracks matching \"{q}\""),
                     Selector::Radio => "random tracks".to_string(),
+                    Selector::Starred => "favorite (starred) tracks".to_string(),
                     _ => "tracks".to_string(),
                 };
                 format!("wake: enqueue {count} {what}, then ramp up from silence")
@@ -220,6 +227,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                 Selector::SimilarToCurrent => "tracks like the current one".to_string(),
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
+                Selector::Starred => "favorite (starred) tracks".to_string(),
             };
             format!("play {count} {sel} NOW (enqueue + start playback)")
         }
@@ -238,6 +246,9 @@ pub fn describe_plan(raw: &RawPlan) -> String {
             }
         },
         Action::Noop => "do nothing (no valid action for this request)".to_string(),
+        Action::SetMode { mode, on } => {
+            format!("turn {} mode {}", mode.word(), if *on { "ON" } else { "OFF" })
+        }
     };
     format!("{what} {when}")
 }
@@ -408,6 +419,19 @@ mod tests {
         }));
         // Noop round-trips too.
         assert_round_trip(&imm(Action::Noop));
+        // Playback modes round-trip in both directions.
+        for mode in [
+            crate::plan::PlayMode::Random,
+            crate::plan::PlayMode::Repeat,
+            crate::plan::PlayMode::Single,
+            crate::plan::PlayMode::Consume,
+        ] {
+            assert_round_trip(&imm(Action::SetMode { mode, on: true }));
+            assert_round_trip(&imm(Action::SetMode { mode, on: false }));
+        }
+        // The starred (favorites) selector round-trips for enqueue and playnow.
+        assert_round_trip(&imm(Action::Enqueue { selector: Selector::Starred, count: 20 }));
+        assert_round_trip(&imm(Action::PlayNow { selector: Selector::Starred, count: 20 }));
         // PlayNow (library enqueue-then-start) round-trips its query/genre/radio DSL.
         assert_round_trip(&imm(Action::PlayNow {
             selector: Selector::Query("at the door".into()),

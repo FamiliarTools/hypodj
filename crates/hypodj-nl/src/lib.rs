@@ -70,6 +70,11 @@ impl Translator for HybridTranslator {
             other => other,
         }
     }
+
+    /// Questions are rules-only: the read grammar is closed and deterministic.
+    fn query(&self, utterance: &str) -> Option<hypodj_core::nl::NlQuery> {
+        self.rules.query(utterance)
+    }
 }
 
 #[cfg(test)]
@@ -79,7 +84,7 @@ mod tests {
     use hypodj_core::model::SongId;
     use hypodj_core::nl::{NlSource, Translator};
     use hypodj_core::plan::{
-        Action, FadeIntentIr, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
+        Action, FadeIntentIr, PlayMode, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
     };
 
     /// A fixed civil clock (2026-07-15 05:30 UTC) + a UTC-relative +01:00 zone, so
@@ -423,6 +428,171 @@ mod tests {
         assert_eq!(tr("do a barrel roll", &c).unwrap_err(), NlError::NotUnderstood);
     }
 
+    fn mode(mode: PlayMode, on: bool) -> RawPlan {
+        raw(RawTrigger::Immediate, Action::SetMode { mode, on })
+    }
+
+    #[test]
+    fn corpus_playback_modes() {
+        let c = ctx(Some("s1"), 5);
+        let one = |u: &str| tr(u, &c).unwrap().iter().map(j).collect::<Vec<_>>();
+        for (u, m, on) in [
+            ("shuffle on", PlayMode::Random, true),
+            ("shuffle", PlayMode::Random, true),
+            ("turn off random", PlayMode::Random, false),
+            ("stop shuffling", PlayMode::Random, false),
+            ("random off", PlayMode::Random, false),
+            ("repeat on", PlayMode::Repeat, true),
+            ("turn off repeat", PlayMode::Repeat, false),
+            ("loop the queue", PlayMode::Repeat, true),
+            ("single mode", PlayMode::Single, true),
+            ("single off", PlayMode::Single, false),
+            ("consume", PlayMode::Consume, true),
+            ("turn consume mode off", PlayMode::Consume, false),
+        ] {
+            assert_eq!(one(u), vec![j(&mode(m, on))], "{u}");
+        }
+        // "repeat this" is repeat-ONE: repeat ON + single ON, in that order.
+        assert_eq!(
+            one("repeat this song"),
+            vec![j(&mode(PlayMode::Repeat, true)), j(&mode(PlayMode::Single, true))]
+        );
+        // Two modes in one breath is ambiguous, never a guess.
+        assert!(matches!(tr("repeat and shuffle", &c), Err(NlError::Ambiguous(_))));
+        // A mode word inside a content request is NOT a mode toggle.
+        assert_eq!(tr("play some random jazz", &c).unwrap_err(), NlError::NotUnderstood);
+    }
+
+    #[test]
+    fn corpus_favorites_actions() {
+        let c = ctx(Some("s1"), 5);
+        let starred_now = raw(
+            RawTrigger::Immediate,
+            Action::PlayNow { selector: Selector::Starred, count: rules::DEFAULT_FAVORITES_COUNT },
+        );
+        assert_eq!(j(&tr("play my favorites", &c).unwrap()[0]), j(&starred_now));
+        assert_eq!(j(&tr("play my favourites please", &c).unwrap()[0]), j(&starred_now));
+        assert_eq!(
+            j(&tr("queue my favorites", &c).unwrap()[0]),
+            j(&raw(
+                RawTrigger::Immediate,
+                Action::Enqueue { selector: Selector::Starred, count: rules::DEFAULT_FAVORITES_COUNT }
+            ))
+        );
+        assert_eq!(
+            j(&tr("play 5 favorites", &c).unwrap()[0]),
+            j(&raw(RawTrigger::Immediate, Action::PlayNow { selector: Selector::Starred, count: 5 }))
+        );
+        // Shuffle my favorites: random ON, then start them.
+        let plans: Vec<_> = tr("shuffle my favorites", &c).unwrap().iter().map(j).collect();
+        assert_eq!(plans, vec![j(&mode(PlayMode::Random, true)), j(&starred_now)]);
+        // A favorites WRITE ("star this") has no Action yet: punt, never guess.
+        assert_eq!(tr("favorite this", &c).unwrap_err(), NlError::NotUnderstood);
+    }
+
+    #[test]
+    fn corpus_sessions_winddown_and_sleep() {
+        let c = ctx(Some("s1"), 5);
+        let floor = Action::Fade(FadeIntentIr::ToFloor {
+            secs: hypodj_core::config::DEFAULT_WINDDOWN_FADE_SECS as f64,
+        });
+        assert_eq!(j(&tr("wind down", &c).unwrap()[0]), j(&raw(RawTrigger::Immediate, floor.clone())));
+        assert_eq!(
+            j(&tr("start a wind-down session", &c).unwrap()[0]),
+            j(&raw(RawTrigger::Immediate, floor.clone()))
+        );
+        assert_eq!(
+            j(&tr("wind down in 10 minutes", &c).unwrap()[0]),
+            j(&raw(RawTrigger::SpanElapsed { secs: 600.0 }, floor))
+        );
+        let out = Action::Fade(FadeIntentIr::Out {
+            secs: hypodj_core::config::DEFAULT_SLEEP_FADE_SECS as f64,
+        });
+        for u in ["sleep in 30 minutes", "sleep timer 30 minutes", "go to sleep in 30 minutes"] {
+            assert_eq!(
+                j(&tr(u, &c).unwrap()[0]),
+                j(&raw(RawTrigger::SpanElapsed { secs: 1800.0 }, out.clone())),
+                "{u}"
+            );
+        }
+        // No duration: ambiguous, never an invented timer.
+        assert!(matches!(tr("sleep timer", &c), Err(NlError::Ambiguous(_))));
+    }
+
+    #[test]
+    fn query_class_favorites_questions() {
+        use hypodj_core::nl::NlQuery;
+        let t = HybridTranslator::rules_only();
+        for u in ["what is favorited?", "what's favorited", "list my favorites", "show favorites", "favorites", "my favorites?"] {
+            assert_eq!(t.query(u), Some(NlQuery::Favorites), "{u}");
+        }
+        for u in ["is this favorited?", "is the current song starred", "did i favorite this?", "is current favorited?"] {
+            assert_eq!(t.query(u), Some(NlQuery::IsCurrentFavorited), "{u}");
+        }
+        // Imperatives and unrelated asks are NOT questions (they stay on the action path).
+        for u in ["play my favorites", "shuffle my favorites", "stop", "what is this"] {
+            assert_eq!(t.query(u), None, "{u}");
+        }
+    }
+
+    /// GOLDEN corpus (5znoe5i): one table of utterance -> exact plan batch (or the
+    /// exact error), spanning every rules intent. A grammar change that shifts any
+    /// row is a visible diff here.
+    #[test]
+    fn golden_corpus() {
+        let c = ctx(Some("song-42"), 5);
+        let fade_out = |s: f64| Action::Fade(FadeIntentIr::Out { secs: s });
+        // Debug form, not JSON: the Calmer/Similar id selectors are not
+        // internally-tag serializable, and Debug covers every field.
+        let d = |p: &RawPlan| format!("{p:?}");
+        let ok = |ps: Vec<RawPlan>| -> Result<Vec<String>, NlError> { Ok(ps.iter().map(d).collect()) };
+        let imm = |a: Action| raw(RawTrigger::Immediate, a);
+        let rows: Vec<(&str, Result<Vec<String>, NlError>)> = vec![
+            ("fade out", ok(vec![imm(fade_out(30.0))])),
+            ("fade in", ok(vec![imm(Action::Fade(FadeIntentIr::In { secs: 30.0 }))])),
+            ("fade out over 20 minutes", ok(vec![imm(fade_out(1200.0))])),
+            ("fade out in 20 minutes", ok(vec![raw(RawTrigger::SpanElapsed { secs: 1200.0 }, fade_out(30.0))])),
+            ("fade the 3rd track", ok(vec![raw(RawTrigger::QueuePosition { n: 3, base: PosBase::Absolute }, fade_out(30.0))])),
+            ("stop", ok(vec![imm(Action::Stop)])),
+            ("pause", ok(vec![imm(Action::Pause)])),
+            ("stop after this album", ok(vec![raw(RawTrigger::AlbumBoundary { track: TrackSel::Current }, Action::Stop)])),
+            ("stop after this track", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Stop)])),
+            ("pause in 10 minutes", ok(vec![raw(RawTrigger::SpanElapsed { secs: 600.0 }, Action::Pause)])),
+            ("something calmer", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Enqueue { selector: Selector::Calmer(SongId("song-42".into())), count: 5 })])),
+            ("more like this", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Enqueue { selector: Selector::Similar(SongId("song-42".into())), count: 5 })])),
+            ("play something calmer", ok(vec![imm(Action::PlayNow { selector: Selector::Calmer(SongId("song-42".into())), count: 5 })])),
+            ("shuffle on", ok(vec![mode(PlayMode::Random, true)])),
+            ("turn off random", ok(vec![mode(PlayMode::Random, false)])),
+            ("repeat this", ok(vec![mode(PlayMode::Repeat, true), mode(PlayMode::Single, true)])),
+            ("single mode", ok(vec![mode(PlayMode::Single, true)])),
+            ("consume", ok(vec![mode(PlayMode::Consume, true)])),
+            ("play my favorites", ok(vec![imm(Action::PlayNow { selector: Selector::Starred, count: 20 })])),
+            ("queue my favorites", ok(vec![imm(Action::Enqueue { selector: Selector::Starred, count: 20 })])),
+            ("wind down", ok(vec![imm(Action::Fade(FadeIntentIr::ToFloor { secs: 300.0 }))])),
+            ("sleep in 30 minutes", ok(vec![raw(RawTrigger::SpanElapsed { secs: 1800.0 }, fade_out(480.0))])),
+            ("", Err(NlError::NotUnderstood)),
+            ("do a barrel roll", Err(NlError::NotUnderstood)),
+            ("fade the last track", Err(NlError::NotUnderstood)),
+            ("stop in a bit", Err(NlError::NotUnderstood)),
+            ("pause in 2 days", Err(NlError::NotUnderstood)),
+            ("sleep timer", Err(NlError::Ambiguous("sleep for how long?".into()))),
+            ("repeat and shuffle", Err(NlError::Ambiguous("more than one playback mode named".into()))),
+        ];
+        for (u, want) in rows {
+            let got = tr(u, &c).map(|ps| ps.iter().map(d).collect::<Vec<_>>());
+            assert_eq!(got, want, "golden row {u:?}");
+        }
+        // The wake row carries a clock-resolved instant; pinned under the fixed ctx.
+        let w = tr("wake me at 7 with jazz", &c).unwrap();
+        assert_eq!(
+            d(&w[0]),
+            d(&raw(
+                RawTrigger::WallClock { at: Utc.with_ymd_and_hms(2026, 7, 15, 7, 0, 0).unwrap() },
+                Action::Wake { selector: Some(Selector::Genre("jazz".into())), count: 5 }
+            ))
+        );
+    }
+
     // ── HYBRID orchestration ──────────────────────────────────────────────────
 
     struct StubLlm;
@@ -471,6 +641,11 @@ mod tests {
             "fade out in 20 minutes",
             "stop after this album",
             "stop after this track",
+            "shuffle on",
+            "turn off repeat",
+            "repeat this",
+            "play my favorites",
+            "queue my favorites",
         ] {
             let plans = tr(utterance, &c).unwrap();
             for p in &plans {

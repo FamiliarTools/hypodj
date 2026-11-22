@@ -2145,6 +2145,7 @@ fn selector_phrase(sel: &Selector) -> String {
         Selector::SimilarToCurrent => "the current track".to_string(),
         Selector::Calmer(_) => "calmer tracks".to_string(),
         Selector::Exact(_) => "those tracks".to_string(),
+        Selector::Starred => "your favorites".to_string(),
     }
 }
 
@@ -3703,6 +3704,17 @@ impl HypodjHandler {
                 Err(e) => PlanOutcome::Failed(e),
             },
             Action::Noop => PlanOutcome::Effect("nothing to do".into()),
+            // Same handler path as the direct MPD mode verbs (one implementation).
+            Action::SetMode { mode, on } => {
+                let cmd = match mode {
+                    crate::plan::PlayMode::Random => MpdCommand::Random(*on),
+                    crate::plan::PlayMode::Repeat => MpdCommand::Repeat(*on),
+                    crate::plan::PlayMode::Single => MpdCommand::Single(*on),
+                    crate::plan::PlayMode::Consume => MpdCommand::Consume(*on),
+                };
+                self.handle(cmd).await;
+                PlanOutcome::Effect(format!("{} {}", mode.word(), if *on { "on" } else { "off" }))
+            }
         }
         })
     }
@@ -4272,6 +4284,14 @@ impl HypodjHandler {
                 .random_songs(Some(want as i32))
                 .await
                 .map_err(|e| e.to_string())?,
+            Selector::Starred => self
+                .client
+                .starred_songs()
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .take(want)
+                .collect(),
             Selector::Exact(ids) => {
                 let mut out = Vec::new();
                 for id in ids.iter().take(want) {
@@ -4401,7 +4421,7 @@ impl HypodjHandler {
             Selector::Similar(_) | Selector::SimilarToCurrent | Selector::Radio => {
                 self.pull_rerank(songs)
             }
-            Selector::Exact(_) | Selector::Genre(_) => songs,
+            Selector::Exact(_) | Selector::Genre(_) | Selector::Starred => songs,
         };
         let n = songs.len();
         for s in songs {
@@ -5024,6 +5044,10 @@ impl HypodjHandler {
             Some(t) => t.clone(),
             None => return ack(ACK_ERROR_UNKNOWN, "nl", &NlError::NotAvailable.to_string()),
         };
+        // READ-side questions answer immediately: no plan, no token, no arm.
+        if let Some(q) = translator.query(&req) {
+            return self.nl_answer(q).await;
+        }
         let ctx = self.nl_context();
         // Run the (possibly model-backed) translate OFF the reactor: Rules is
         // instant; a local model can take hundreds of ms. hypodj-nl needs no tokio.
@@ -5075,6 +5099,42 @@ impl HypodjHandler {
             .pair("nl_echo", echo)
             .pair("nl_token", token)
             .build()
+    }
+
+    /// Answer a READ-side [`crate::nl::NlQuery`] from live server state. Starred is
+    /// fetched fresh (never cached), like `listplaylistinfo Starred`.
+    async fn nl_answer(&self, q: crate::nl::NlQuery) -> MpdResponse {
+        use crate::nl::NlQuery;
+        /// Cap the listed favorites so one answer line stays readable.
+        const MAX_LISTED: usize = 20;
+        let starred = match self.client.starred_songs().await {
+            Ok(s) => s,
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, "nl", &format!("could not read favorites: {e}")),
+        };
+        let answer = match q {
+            NlQuery::Favorites if starred.is_empty() => "no favorites yet".to_string(),
+            NlQuery::Favorites => {
+                let shown: Vec<String> = starred
+                    .iter()
+                    .take(MAX_LISTED)
+                    .map(|s| match &s.artist {
+                        Some(a) => format!("{a} - {}", s.title),
+                        None => s.title.clone(),
+                    })
+                    .collect();
+                let more = starred.len().saturating_sub(MAX_LISTED);
+                let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
+                format!("{} favorites: {}{tail}", starred.len(), shown.join("; "))
+            }
+            NlQuery::IsCurrentFavorited => match self.current_song() {
+                None => "nothing (library) is playing".to_string(),
+                Some(cur) if starred.iter().any(|s| s.id == cur.id) => {
+                    format!("yes, \"{}\" is a favorite", cur.title)
+                }
+                Some(cur) => format!("no, \"{}\" is not a favorite", cur.title),
+            },
+        };
+        MpdResponse::pairs().pair("nl_answer", answer).build()
     }
 
     /// Confirm: pop the (single-use) token and RE-VALIDATE + arm each plan against
@@ -26537,6 +26597,30 @@ mod tests {
     // run_action_outcome for the DETERMINISTIC queue-edit actions (no network): a
     // matching Play jumps (Jumped(1)); a no-match Play is a clean no-op (Jumped(0),
     // "no matching track"); a Remove reports the real removed count; Noop is inert.
+    // Action::SetMode runs through the SAME path as the MPD mode verbs: each mode
+    // flips the shared state flag on and back off, and reports what it did.
+    #[tokio::test]
+    async fn run_action_outcome_set_mode_toggles_state() {
+        use crate::plan::PlayMode;
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let flag = |m: PlayMode| {
+            let st = h.state.lock().unwrap();
+            match m {
+                PlayMode::Random => st.random,
+                PlayMode::Repeat => st.repeat,
+                PlayMode::Single => st.single,
+                PlayMode::Consume => st.consume,
+            }
+        };
+        for mode in [PlayMode::Random, PlayMode::Repeat, PlayMode::Single, PlayMode::Consume] {
+            let out = h.run_action_outcome(&Action::SetMode { mode, on: true }).await;
+            assert_eq!(out, PlanOutcome::Effect(format!("{} on", mode.word())));
+            assert!(flag(mode), "{mode:?} on");
+            h.run_action_outcome(&Action::SetMode { mode, on: false }).await;
+            assert!(!flag(mode), "{mode:?} off");
+        }
+    }
+
     #[tokio::test]
     async fn run_action_outcome_queue_edits_report_real_counts() {
         let Some((h, _events)) = handler_with_null_player() else { return };
