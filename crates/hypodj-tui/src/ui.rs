@@ -773,6 +773,13 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
             "F5 to search, F4 to ask the DJ",
             Style::default().add_modifier(Modifier::DIM),
         )));
+        // The modes still decide what the next play does, so a stopped deck says them.
+        if let Some(m) = np.modes.label() {
+            lines.push(Line::from(Span::styled(
+                format!("modes: {m}"),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
         if let Some(a) = &armed_line {
             lines.push(Line::from(Span::styled(
                 a.clone(),
@@ -1102,6 +1109,7 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
 /// half-labelled line is worse than a shorter one.
 fn status_line(np: &NowPlaying, width: usize) -> String {
     let volume = np.volume.filter(|v| *v >= 0).map(|v| v.min(100) as u8);
+    let modes = np.modes.label();
     let compose = |fader: bool, show_volume: bool, show_position: bool| {
         let mut bits = Vec::new();
         match np.state.as_deref() {
@@ -1124,6 +1132,12 @@ fn status_line(np: &NowPlaying, width: usize) -> String {
         if let Some(d) = np.duration {
             let total = d as u64;
             bits.push(format!("{}:{:02} total", total / 60, total % 60));
+        }
+        // The ON playback modes. Never shed (they decide what happens when this track
+        // ends), but LAST, so a pane too narrow for anything clips them before it
+        // clips the labelled duration.
+        if let Some(m) = &modes {
+            bits.push(m.clone());
         }
         bits.join(" \u{00b7} ")
     };
@@ -1529,6 +1543,21 @@ mod tests {
         // Below even that there is nothing left to drop, so the shortest honest line is
         // handed over and the terminal clips it - never a longer one.
         assert_eq!(status_line(&np, 4), "playing \u{b7} 7:14 total");
+    }
+
+    #[test]
+    fn transport_line_names_the_modes_that_are_on() {
+        use hypodj_client::model::PlaybackModes;
+        let np = NowPlaying {
+            state: Some("play".into()),
+            duration: Some(434.0),
+            modes: PlaybackModes { random: true, consume: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(status_line(&np, 80), "playing \u{b7} 7:14 total \u{b7} random consume");
+        // All off adds nothing, so the default deck reads exactly as before.
+        let plain = NowPlaying { modes: PlaybackModes::default(), ..np };
+        assert_eq!(status_line(&plain, 80), "playing \u{b7} 7:14 total");
     }
 
     #[test]

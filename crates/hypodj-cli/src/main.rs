@@ -39,6 +39,12 @@ USAGE:
   dj radio                endless radio from what is playing; it keeps going
                            (\"radio random\" to start cold, \"radio off\" to stop)
   dj vol <0-100>          set volume
+  dj random | repeat | single | consume [on|off]
+                          flip a playback mode (or set it); the card shows
+                           which are on
+  dj sleep | wake         what is armed: the sleep timer / the wake alarm
+                           (\"sleep off\", \"wake off\" cancel; arm one in words,
+                           e.g. \"sleep in 30 minutes\", \"wake me at 7\")
   dj clear                clear the queue (asks first)
   dj stations import [PATH ...] [--dry-run]
                           save every .pls under PATH as an internet radio
@@ -251,6 +257,12 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
             }
         }
         Action::FavoriteCurrent => favorite_current(&mut conn)?,
+        Action::ToggleMode(m) => {
+            // Resolve the flip against the daemon's CURRENT flag on this same socket.
+            let status = conn.command("status")?;
+            let line = model::now_playing(&status, &[]).modes.toggle_command(m);
+            run_verb(&mut conn, &line)?
+        }
         Action::Nl(phrase) => nl_handshake(&mut conn, &phrase, pin)?,
         Action::Help => unreachable!(),
     }
@@ -301,6 +313,9 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
 fn run_verb(conn: &mut MpdConn, line: &str) -> Result<(), MpdError> {
     let pairs = conn.command(line)?;
     if let Some((_, sentence)) = pairs.iter().find(|(k, _)| k == "mark_result") {
+        println!("{sentence}");
+    }
+    if let Some(sentence) = model::schedule_reply(&pairs) {
         println!("{sentence}");
     }
     print_card(conn)

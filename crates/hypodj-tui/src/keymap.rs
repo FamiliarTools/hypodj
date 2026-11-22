@@ -48,6 +48,11 @@ pub enum Act {
     ScrubFwd,
     ScrubBack,
     Radio,
+    /// Flip one playback mode, resolved against the last snapshot's flag.
+    ToggleRandom,
+    ToggleRepeat,
+    ToggleSingle,
+    ToggleConsume,
     FavSelected,
     FavCurrent,
     Heard,
@@ -185,6 +190,12 @@ pub const KEYMAP: &[Binding] = &[
     Binding { matchers: &[Ctrl('f')], keys: "C-f", group: Playback, scope: Scope::Global, act: ScrubFwd, help: "scrub forward 5s" },
     Binding { matchers: &[Ctrl('b')], keys: "C-b", group: Playback, scope: Scope::Global, act: ScrubBack, help: "scrub back 5s" },
     Binding { matchers: &[Char('r')], keys: "r", group: Playback, scope: Scope::Global, act: Radio, help: "endless radio from this row" },
+    // Modes. ncmpcpp's letters where they are free (z, y, R); `r` is radio here, so
+    // repeat takes `e`.
+    Binding { matchers: &[Char('z')], keys: "z", group: Playback, scope: Scope::Global, act: ToggleRandom, help: "toggle random order" },
+    Binding { matchers: &[Char('e')], keys: "e", group: Playback, scope: Scope::Global, act: ToggleRepeat, help: "toggle repeat (the queue)" },
+    Binding { matchers: &[Char('y')], keys: "y", group: Playback, scope: Scope::Global, act: ToggleSingle, help: "toggle single (stop after this track)" },
+    Binding { matchers: &[Char('R')], keys: "R", group: Playback, scope: Scope::Global, act: ToggleConsume, help: "toggle consume (drop played tracks)" },
     // Volume.
     Binding { matchers: &[Char('0'), Char('+'), Char('=')], keys: "0 / + / =", group: Volume, scope: Scope::Global, act: VolumeUp, help: "turn the knob up" },
     Binding { matchers: &[Char('9'), Char('-'), Char('_')], keys: "9 / - / _", group: Volume, scope: Scope::Global, act: VolumeDown, help: "turn the knob down" },
@@ -326,7 +337,7 @@ mod tests {
     #[test]
     fn documented_bindings_all_present() {
         // The set the task calls out must each have a row.
-        let want_chars = ['j', 'k', 'g', 'G', 'P', '/', 'n', 'N', ':', 'p', '<', '>', 'r', 's', 'o', 'O', 'l', 'h', 'q', '?', '0', '9', ' '];
+        let want_chars = ['j', 'k', 'g', 'G', 'P', '/', 'n', 'N', ':', 'p', '<', '>', 'r', 's', 'o', 'O', 'l', 'h', 'q', '?', '0', '9', ' ', 'z', 'e', 'y', 'R'];
         for c in want_chars {
             assert!(
                 KEYMAP.iter().any(|b| b.matchers.iter().any(|m| matches!(m, KeyMatch::Char(k) if *k == c))),

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use hypodj_client::model::{NowPlaying, QueueItem};
+use hypodj_client::model::{Mode as PlayMode, NowPlaying, QueueItem};
 use hypodj_client::nl::{not_understood_hint, NlTranslatorPin};
 use hypodj_client::route::{route, Action};
 
@@ -1354,6 +1354,10 @@ impl TuiState {
             Act::VolumeUp => Some(Intent::Command("knob up".into())),
             Act::VolumeDown => Some(Intent::Command("knob down".into())),
             Act::Pause => Some(Intent::Command("pause".into())),
+            Act::ToggleRandom => self.toggle_mode(PlayMode::Random),
+            Act::ToggleRepeat => self.toggle_mode(PlayMode::Repeat),
+            Act::ToggleSingle => self.toggle_mode(PlayMode::Single),
+            Act::ToggleConsume => self.toggle_mode(PlayMode::Consume),
             Act::Next => Some(Intent::Command("next".into())),
             Act::Prev => Some(Intent::Command("previous".into())),
             // Scrub the current track (relative seekcur).
@@ -2384,6 +2388,16 @@ impl TuiState {
         }
     }
 
+    /// Flip a playback mode against the last snapshot. A stale snapshot can only make
+    /// the flip a repeat of the current value (the next idle refresh corrects the
+    /// indicator), never set a mode he did not ask about.
+    fn toggle_mode(&mut self, m: PlayMode) -> Option<Intent> {
+        let line = self.now.modes.toggle_command(m);
+        let on = !self.now.modes.get(m);
+        self.status_msg = Some(format!("{} {}", m.verb(), if on { "on" } else { "off" }));
+        Some(Intent::Command(line))
+    }
+
     /// Route the typed line through the SAME client route() the CLI uses, so a bare
     /// verb goes to Command and a phrase goes to NL - one routing source.
     fn submit(&mut self) -> Option<Intent> {
@@ -2409,6 +2423,7 @@ impl TuiState {
                 None
             }
             Action::FavoriteCurrent => self.favorite_current(),
+            Action::ToggleMode(m) => self.toggle_mode(m),
             // Colon Auto stays on daemon `nl` (today's split). Pin overrides below.
             Action::Nl(phrase) => Some(self.nl_intent_for_colon(phrase)),
         }
@@ -2640,6 +2655,7 @@ impl TuiState {
                 // express favorite/clear and would degrade them to a no-op enqueue).
                 match route(&words) {
                     Action::FavoriteCurrent => self.favorite_current(),
+                    Action::ToggleMode(m) => self.toggle_mode(m),
                     Action::Command(line) => {
                         self.push_dj_log(format!("ok: {line}"));
                         Some(Intent::Command(line))
