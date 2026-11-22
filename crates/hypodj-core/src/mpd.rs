@@ -116,6 +116,13 @@ pub enum MpdCommand {
     Clear,
     /// `delete <pos|range>` - remove a queue entry.
     Delete(Option<String>),
+    /// `move FROM[:TO] TO` - move the half-open position range `start..end` so its
+    /// first entry lands at `to`. `end` is `None` for an open `START:` range.
+    Move { start: usize, end: Option<usize>, to: usize },
+    /// `moveid ID TO` - move the entry with MPD id `ID` to position `TO`.
+    MoveId(u64, usize),
+    /// `shuffle [START:END]` - shuffle the queue (or a half-open range of it) in place.
+    Shuffle(Option<(usize, Option<usize>)>),
     /// `playlistinfo [pos|range]` - the current queue.
     PlaylistInfo(Option<String>),
     /// `playlistid [id]` - the current queue, optionally one entry by id.
@@ -1018,6 +1025,23 @@ fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
 
 /// Parse a move destination: `pos <n>` (1-based absolute) | `rel <d>` (signed,
 /// relative to the current track).
+/// Parse an MPD position or half-open range: `N` is `(N, Some(N + 1))`, `N:M` is
+/// `(N, Some(M))`, and an open `N:` is `(N, None)` (to the end of the queue). A
+/// malformed spec or an inverted range (`M < N`) is `None` so the caller ACKs.
+pub fn parse_pos_range(spec: &str) -> Option<(usize, Option<usize>)> {
+    match spec.split_once(':') {
+        None => {
+            let n: usize = spec.parse().ok()?;
+            Some((n, Some(n.checked_add(1)?)))
+        }
+        Some((a, "")) => Some((a.parse().ok()?, None)),
+        Some((a, b)) => {
+            let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+            (b >= a).then_some((a, Some(b)))
+        }
+    }
+}
+
 fn parse_movedest(toks: &[String]) -> Option<MoveDest> {
     match toks.first()?.to_lowercase().as_str() {
         "pos" => Some(MoveDest::Position(toks.get(1)?.parse().ok()?)),
@@ -1405,9 +1429,29 @@ pub fn parse(line: &str) -> MpdCommand {
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         "add" => MpdCommand::Add(arg(0).unwrap_or_default()),
-        "addid" => MpdCommand::AddId(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok())),
+        "addid" => match arg(1).map(|s| s.parse::<usize>()) {
+            None => MpdCommand::AddId(arg(0).unwrap_or_default(), None),
+            Some(Ok(pos)) => MpdCommand::AddId(arg(0).unwrap_or_default(), Some(pos)),
+            // A bad position is a loud ACK, never a silent append.
+            Some(Err(_)) => MpdCommand::Unsupported(line.to_string()),
+        },
         "clear" => MpdCommand::Clear,
         "delete" => MpdCommand::Delete(arg(0)),
+        "move" => match (arg(0).as_deref().and_then(parse_pos_range), arg(1).and_then(|s| s.parse().ok())) {
+            (Some((start, end)), Some(to)) => MpdCommand::Move { start, end, to },
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "moveid" => match (arg(0).and_then(|s| s.parse().ok()), arg(1).and_then(|s| s.parse().ok())) {
+            (Some(id), Some(to)) => MpdCommand::MoveId(id, to),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "shuffle" => match arg(0) {
+            None => MpdCommand::Shuffle(None),
+            Some(r) => match parse_pos_range(&r) {
+                Some(range) => MpdCommand::Shuffle(Some(range)),
+                None => MpdCommand::Unsupported(line.to_string()),
+            },
+        },
         "playlistinfo" => MpdCommand::PlaylistInfo(arg(0)),
         "playlistid" => MpdCommand::PlaylistId(arg(0).and_then(|s| s.parse().ok())),
         "plchanges" => MpdCommand::PlChanges(arg(0).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -1495,6 +1539,25 @@ pub fn parse(line: &str) -> MpdCommand {
 #[cfg(test)]
 mod parse_tests {
     use super::*;
+
+    #[test]
+    fn queue_edit_commands_parse_positions_and_ranges() {
+        assert_eq!(parse_pos_range("3"), Some((3, Some(4))));
+        assert_eq!(parse_pos_range("2:5"), Some((2, Some(5))));
+        assert_eq!(parse_pos_range("2:"), Some((2, None)));
+        assert_eq!(parse_pos_range("5:2"), None);
+        assert_eq!(parse_pos_range("x"), None);
+        assert!(matches!(parse("move 1 3"), MpdCommand::Move { start: 1, end: Some(2), to: 3 }));
+        assert!(matches!(parse("move 1:4 0"), MpdCommand::Move { start: 1, end: Some(4), to: 0 }));
+        assert!(matches!(parse("move 1"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("move a 1"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("moveid 7 2"), MpdCommand::MoveId(7, 2)));
+        assert!(matches!(parse("moveid 7"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("shuffle"), MpdCommand::Shuffle(None)));
+        assert!(matches!(parse("shuffle 1:3"), MpdCommand::Shuffle(Some((1, Some(3))))));
+        assert!(matches!(parse("shuffle 3:1"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("addid song/1 2"), MpdCommand::AddId(_, Some(2))));
+    }
 
     #[test]
     fn searchall_takes_exactly_one_quoted_query() {

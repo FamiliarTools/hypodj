@@ -1441,6 +1441,56 @@ impl State {
         Some(pos)
     }
 
+    /// Reorder the queue with `f` while keeping `current` and `pending_skip` on the
+    /// SAME entries: both are indices, so they are pinned by qid before the reorder and
+    /// re-found after it. Nothing is removed, so both always re-resolve. Bumps
+    /// `playlist_version` once.
+    fn reorder_queue(&mut self, f: impl FnOnce(&mut Self)) {
+        let qid_at = |st: &Self, i: Option<usize>| i.and_then(|i| st.queue.get(i)).map(|it| it.id);
+        let cur = qid_at(self, self.current);
+        let skip = qid_at(self, self.pending_skip);
+        f(self);
+        let find = |st: &Self, q: Option<u64>| q.and_then(|q| st.queue.iter().position(|it| it.id == q));
+        if cur.is_some() {
+            self.current = find(self, cur);
+        }
+        if skip.is_some() {
+            self.pending_skip = find(self, skip);
+        }
+        self.playlist_version += 1;
+    }
+
+    /// MPD `move START:END TO`: lift the half-open range out and reinsert it so its
+    /// first entry lands at `to`. Returns false (nothing touched) when the range or
+    /// destination is out of bounds, which MPD answers with a bad-index ACK.
+    fn move_range(&mut self, start: usize, end: usize, to: usize) -> bool {
+        let len = self.queue.len();
+        if start >= end || end > len || to > len - (end - start) {
+            return false;
+        }
+        self.reorder_queue(|st| {
+            let moved: Vec<QueueItem> = st.queue.drain(start..end).collect();
+            st.queue.splice(to..to, moved);
+        });
+        true
+    }
+
+    /// MPD `shuffle [START:END]`: Fisher-Yates over the half-open range with the
+    /// state's deterministic rng. The playing entry is tracked by qid, so it keeps
+    /// playing wherever it lands. Returns false when the range is out of bounds.
+    fn shuffle_range(&mut self, start: usize, end: usize) -> bool {
+        if start > end || end > self.queue.len() {
+            return false;
+        }
+        self.reorder_queue(|st| {
+            for i in (start + 1..end).rev() {
+                let j = start + (st.next_rand() % (i - start + 1) as u64) as usize;
+                st.queue.swap(i, j);
+            }
+        });
+        true
+    }
+
     /// Point `current` back at the queue entry carrying MPD id `qid`, if it is still
     /// there. Returns whether it was found. The id (not an index) is what the failed-load
     /// walk remembers, so a delete/move that reindexed the queue in between still lands
@@ -13451,13 +13501,39 @@ impl MpdHandler for HypodjHandler {
                 }
                 Err(e) => ack(ACK_ERROR_NO_EXIST, "add", &e),
             },
-            MpdCommand::AddId(uri, _pos) => match self.enqueue_uri(&uri).await {
+            MpdCommand::AddId(uri, pos) => {
+                // MPD rejects a position past the end BEFORE adding anything.
+                if let Some(p) = pos {
+                    if p > self.state.lock().unwrap().queue.len() {
+                        return ack(ACK_ERROR_ARG, "addid", "Bad song index");
+                    }
+                }
+                match self.enqueue_uri(&uri).await {
                 Ok(id) => {
+                    if let Some(p) = pos {
+                        // enqueue_uri appended (an album appends a consecutive id run):
+                        // move that block to `p`. Clamped, since a concurrent delete
+                        // may have shrunk the queue while the add awaited.
+                        let mut st = self.state.lock().unwrap();
+                        if let Some(first) = st.queue.iter().position(|it| it.id == id) {
+                            let mut end = first + 1;
+                            while end < st.queue.len() && st.queue[end].id == st.queue[end - 1].id + 1 {
+                                end += 1;
+                            }
+                            let to = p.min(st.queue.len() - (end - first));
+                            if to != first {
+                                st.move_range(first, end, to);
+                            }
+                        }
+                        drop(st);
+                        self.notify_change();
+                    }
                     self.reschedule_continuation_warm().await;
                     MpdResponse::pairs().pair("Id", id.to_string()).build()
                 }
                 Err(e) => ack(ACK_ERROR_NO_EXIST, "addid", &e),
-            },
+                }
+            }
             MpdCommand::Clear => {
                 // Manual wins ATOMICALLY: cancel any fade AND clear the queue +
                 // reset the volume to the baseline under the SAME slot lock (see
@@ -13492,14 +13568,73 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::Delete(spec) => {
-                let pos = spec
-                    .and_then(|s| s.split(':').next().and_then(|p| p.parse::<usize>().ok()));
-                if let Some(pos) = pos {
-                    self.delete_at(pos).await;
+                match spec.as_deref().map(|s| (s.contains(':'), crate::mpd::parse_pos_range(s))) {
+                    // A single position keeps the lenient out-of-range OK.
+                    Some((false, Some((pos, _)))) => self.delete_at(pos).await,
+                    Some((true, Some((start, end)))) => {
+                        let len = self.state.lock().unwrap().queue.len();
+                        let end = end.unwrap_or(len);
+                        if start > len || end > len {
+                            return ack(ACK_ERROR_ARG, "delete", "Bad song index");
+                        }
+                        // Highest first, so each lower index is still the row the
+                        // client named; each delete_at keeps current/skip consistent.
+                        for pos in (start..end).rev() {
+                            self.delete_at(pos).await;
+                        }
+                    }
+                    Some((_, None)) => return ack(ACK_ERROR_ARG, "delete", "Bad song index"),
+                    None => {}
                 }
                 self.notify_change();
                 // A delete changes drain_is_next (deleting the tail can make the current
                 // the last entry, or deleting the current stops it): re-evaluate the warm.
+                self.reschedule_continuation_warm().await;
+                MpdResponse::ok()
+            }
+            MpdCommand::Move { start, end, to } => {
+                let ok = {
+                    let mut st = self.state.lock().unwrap();
+                    let end = end.unwrap_or(st.queue.len());
+                    st.move_range(start, end, to)
+                };
+                if !ok {
+                    return ack(ACK_ERROR_ARG, "move", "Bad song index");
+                }
+                self.notify_change();
+                // A reorder can change what follows the current entry.
+                self.reschedule_continuation_warm().await;
+                MpdResponse::ok()
+            }
+            MpdCommand::MoveId(id, to) => {
+                let res = {
+                    let mut st = self.state.lock().unwrap();
+                    match st.queue.iter().position(|it| it.id == id) {
+                        None => Err(ack(ACK_ERROR_NO_EXIST, "moveid", "No such song")),
+                        Some(from) if st.move_range(from, from + 1, to) => Ok(()),
+                        Some(_) => Err(ack(ACK_ERROR_ARG, "moveid", "Bad song index")),
+                    }
+                };
+                if let Err(e) = res {
+                    return e;
+                }
+                self.notify_change();
+                self.reschedule_continuation_warm().await;
+                MpdResponse::ok()
+            }
+            MpdCommand::Shuffle(range) => {
+                let ok = {
+                    let mut st = self.state.lock().unwrap();
+                    let (start, end) = match range {
+                        Some((s, e)) => (s, e.unwrap_or(st.queue.len())),
+                        None => (0, st.queue.len()),
+                    };
+                    st.shuffle_range(start, end)
+                };
+                if !ok {
+                    return ack(ACK_ERROR_ARG, "shuffle", "Bad song index");
+                }
+                self.notify_change();
                 self.reschedule_continuation_warm().await;
                 MpdResponse::ok()
             }
@@ -15605,6 +15740,98 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    /// Queue ids in position order, for the queue-edit parity tests.
+    fn qids(h: &HypodjHandler) -> Vec<u64> {
+        h.state.lock().unwrap().queue.iter().map(|it| it.id).collect()
+    }
+
+    async fn queue_of(h: &HypodjHandler, n: usize) {
+        for _ in 0..n {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn move_range_reorders_and_keeps_current_on_the_same_entry() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 5).await;
+        h.state.lock().unwrap().current = Some(1);
+        let v0 = h.state.lock().unwrap().playlist_version;
+        let r = h.handle(MpdCommand::Move { start: 0, end: Some(2), to: 3 }).await;
+        assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
+        assert_eq!(qids(&h), vec![2, 3, 4, 0, 1]);
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, Some(4), "the playing entry (id 1) followed the move");
+        assert!(st.playlist_version > v0);
+        drop(st);
+        let r = h.handle(MpdCommand::Move { start: 3, end: Some(5), to: 4 }).await;
+        assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }), "dest past end");
+        assert_eq!(qids(&h), vec![2, 3, 4, 0, 1], "a rejected move touches nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn moveid_moves_one_entry_and_acks_unknown_ids() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 3).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.handle(MpdCommand::MoveId(0, 2)).await;
+        assert_eq!(qids(&h), vec![1, 2, 0]);
+        assert_eq!(h.state.lock().unwrap().current, Some(2));
+        let r = h.handle(MpdCommand::MoveId(99, 0)).await;
+        assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_NO_EXIST, .. }));
+        let r = h.handle(MpdCommand::MoveId(1, 3)).await;
+        assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shuffle_permutes_only_the_range_and_tracks_current() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 8).await;
+        h.state.lock().unwrap().current = Some(3);
+        h.handle(MpdCommand::Shuffle(Some((2, Some(6))))).await;
+        let q = qids(&h);
+        assert_eq!(&q[..2], &[0, 1]);
+        assert_eq!(&q[6..], &[6, 7]);
+        let mut mid = q[2..6].to_vec();
+        mid.sort();
+        assert_eq!(mid, vec![2, 3, 4, 5], "a permutation of the range");
+        let cur = h.state.lock().unwrap().current.unwrap();
+        assert_eq!(q[cur], 3, "current still names the entry that was playing");
+        h.handle(MpdCommand::Shuffle(None)).await;
+        let mut all = qids(&h);
+        all.sort();
+        assert_eq!(all, (0..8).collect::<Vec<_>>());
+        let r = h.handle(MpdCommand::Shuffle(Some((2, Some(9))))).await;
+        assert!(matches!(r, MpdResponse::Ack { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_range_removes_the_half_open_span() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 6).await;
+        h.handle(MpdCommand::Delete(Some("1:4".into()))).await;
+        assert_eq!(qids(&h), vec![0, 4, 5]);
+        h.handle(MpdCommand::Delete(Some("1:".into()))).await;
+        assert_eq!(qids(&h), vec![0]);
+        let r = h.handle(MpdCommand::Delete(Some("0:5".into()))).await;
+        assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }));
+        assert_eq!(qids(&h), vec![0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn addid_inserts_at_the_requested_position() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 3).await;
+        h.state.lock().unwrap().current = Some(1);
+        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(0))).await;
+        assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
+        assert_eq!(qids(&h), vec![3, 0, 1, 2]);
+        assert_eq!(h.state.lock().unwrap().current, Some(2), "current shifted with its entry");
+        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(9))).await;
+        assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }));
+        assert_eq!(qids(&h).len(), 4, "a bad position adds nothing");
     }
 
     /// A handler over a TWO-DECK headless player, so the crossfade path is drivable
