@@ -1220,14 +1220,17 @@ mod tests {
         use crate::spoken::{armed_hold, command_spoken, State};
         let sleep = p(&[("sleep_remaining", "720")]);
         let spoken = command_spoken("sleep", &sleep).unwrap();
-        let hold = armed_hold(&ArmedFeatures { sleep_remaining: Some(720), ..ArmedFeatures::default() }).unwrap();
+        let hold = armed_hold(&ArmedFeatures {
+            sleep_remaining: Some(720),
+            ..ArmedFeatures::default()
+        });
         assert_eq!(spoken.state, State::Armed);
-        assert_eq!(hold.state, spoken.state);
+        assert_eq!(hold[0].state, spoken.state);
         assert_eq!(spoken.text(), "sleep in 12m");
-        assert!(hold.text().contains("sleep in 12m"));
+        assert!(hold[0].text().contains("sleep in 12m"));
         let none = command_spoken("wake", &p(&[("wake", "none")])).unwrap();
         assert_eq!(none.state, State::Note);
-        assert!(armed_hold(&ArmedFeatures::default()).is_none());
+        assert!(armed_hold(&ArmedFeatures::default()).is_empty());
     }
 
     #[test]

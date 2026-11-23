@@ -1050,6 +1050,7 @@ dependencies = [
 name = "hypodj-client"
 version = "0.2.0"
 dependencies = [
+ "hypodj-dsl",
  "hypodj-style",
  "thiserror",
 ]

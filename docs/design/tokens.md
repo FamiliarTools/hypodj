@@ -52,9 +52,11 @@ role through its own adapter (ratatui, egui, ANSI or plain text).
 |---|---|
 | `ember` | Proposed: warm amber, `oklch(0.74 0.15 60)`, fitted to at least 3:1 against `room.bg` by the same policy as `music.info`. |
 
-Ember appears only for: an **armed** plan, what is **on air** when marked, and a
-**kept** or favourited item (it replaces today's red heart). If something is ember,
-HypoDJ is holding it for you.
+Ember appears only for something set to fire later (an armed plan, a sleep or
+wake timer that is counting down), what is **on air** when marked, and a
+**kept** or favourited item (it replaces today's red heart). A wind-down that
+has already started is live, not ember. If something is ember, HypoDJ is
+holding it for you.
 
 ### 4. State: the echo-before-arm grammar
 
@@ -62,7 +64,8 @@ HypoDJ is holding it for you.
 |---|---|---|
 | `echo` (proposed, not armed) | `ink.quiet`, underlined or dotted outline | "Will do: ..." plus how to confirm |
 | `armed` (set to fire in the future) | `ember` | a plan awaiting its time, or a sleep or wake timer that is counting down and can still be disarmed |
-| `live` (happening now) | `ink.primary`, bold | what is happening |
+| `live` (happening now) | `ink.primary`, bold | what is happening, including a wind-down that has already started |
+| `note` | `ink.quiet`, no underline | a caveat, or a timer that is not set |
 | `refused` / `failed` | `ink.primary`, no colour, no alarm | one sentence: what did not happen and why |
 
 There is no red and no error colour. A refusal is calm and says why.

@@ -1,4 +1,5 @@
-//! The `plan add` DSL value grammar - quoting and its inverse, and nothing else.
+//! The `plan add` DSL value grammar, plus the fixed result sentences the daemon
+//! and the client must share. Zero dependencies, so neither side links libmpv.
 //!
 //! This crate exists so there is EXACTLY ONE implementation of the quoting rule.
 //! The daemon's echo ([`hypodj_core::echo`]) renders a plan back to the DSL; an
@@ -93,6 +94,15 @@ pub fn tokenize(line: &str) -> Vec<String> {
     }
     toks
 }
+
+/// A play that found nothing. The client refuses this sentence by the constant.
+pub const RESULT_NO_JUMP: &str = "no matching track to play";
+
+/// Stem of a failed action. The reason follows.
+pub const RESULT_FAILED: &str = "could not do that: ";
+
+/// Stem of an enqueue that resolved to nothing. The selector follows.
+pub const RESULT_ADDED_NONE: &str = "added 0 - no matches for ";
 
 #[cfg(test)]
 mod tests {

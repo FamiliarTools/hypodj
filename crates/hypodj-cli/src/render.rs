@@ -47,7 +47,10 @@ pub fn render_refusal(msg: &str, ansi: Ansi) -> String {
 pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
-    let armed = hypodj_client::spoken::armed_hold(&np.armed).map(|s| ansi.render(&s));
+    let armed: Vec<String> = hypodj_client::spoken::armed_hold(&np.armed)
+        .iter()
+        .map(|s| ansi.render(s))
+        .collect();
     let field = render_field(&np.field);
     if stopped || empty {
         // A stopped deck can still hold an armed wake alarm or a held pull - surface
@@ -56,7 +59,7 @@ pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
         let mut lines = vec!["nothing playing".to_string()];
         // The modes still decide what the next `play` does, so a stopped deck says them.
         lines.extend(np.modes.label().map(|m| format!("modes: {m}")));
-        lines.extend(armed);
+        lines.extend(armed.clone());
         lines.extend(field);
         if let Some(hint) = &np.hint {
             lines.push(hint.phrase());
@@ -127,9 +130,7 @@ pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     if let Some(l) = render_history(np.plays, np.last_played_days) {
         lines.push(l);
     }
-    if let Some(a) = armed {
-        lines.push(a);
-    }
+    lines.extend(armed);
     // The field is the last, faintest line of the card - the quietest voice.
     if let Some(fl) = field {
         lines.push(fl);
@@ -390,10 +391,9 @@ mod tests {
         let hold = hypodj_client::spoken::armed_hold(&hypodj_client::model::ArmedFeatures {
             sleep_remaining: Some(720),
             ..hypodj_client::model::ArmedFeatures::default()
-        })
-        .unwrap();
+        });
         assert_eq!(sleep_spoken.state, hypodj_style::State::Armed);
-        assert_eq!(hold.state, sleep_spoken.state);
+        assert_eq!(hold[0].state, sleep_spoken.state);
         let sleep_on = render_command("sleep", &sleep, Ansi::on_truecolor()).unwrap();
         assert!(sleep_on.contains("38;2;"), "a countdown is ember");
         assert_eq!(hypodj_style::ansi::strip(&sleep_on), sleep_spoken.text());

@@ -2172,11 +2172,7 @@ pub const PAIR_NEXT_FIRE: &str = "next_fire";
 pub const PAIR_NL_ANSWER: &str = "nl_answer";
 pub const PAIR_JDID: &str = "jdid";
 
-/// Fixed result sentences. The client refuses these by the constant, not by
-/// guessing at prose. `added 0` is structural and is not one of these.
-pub const RESULT_NO_JUMP: &str = "no matching track to play";
-pub const RESULT_FAILED: &str = "could not do that: ";
-pub const RESULT_ADDED_NONE: &str = "added 0 - no matches for ";
+pub use hypodj_dsl::{RESULT_ADDED_NONE, RESULT_FAILED, RESULT_NO_JUMP};
 
 impl PlanOutcome {
     /// The single human line the client shows after `y`/confirm. Speaks the REAL

@@ -175,19 +175,12 @@ pub fn from_reply(pairs: &[(String, String)], act: Option<Act>) -> Spoken {
     }
 }
 
-/// The handler's fixed failure sentences. `reply_shapes` locks these to the
-/// same constants in hypodj-core. A wording change there fails that test.
-const RESULT_NO_JUMP: &str = "no matching track to play";
-const RESULT_FAILED: &str = "could not do that: ";
-
-/// A result that did not happen.
-///
-/// `added 0` is the count the daemon reports, not a sentence we match.
-/// The other two are the handler's own constants, compared whole.
+/// A result that did not happen. The sentences are the daemon's constants.
 fn state_of_result(line: &str) -> State {
-    let mut words = line.split_whitespace();
-    let added_none = words.next() == Some("added") && words.next() == Some("0");
-    if added_none || line == RESULT_NO_JUMP || line.starts_with(RESULT_FAILED) {
+    if line.starts_with(hypodj_dsl::RESULT_ADDED_NONE)
+        || line == hypodj_dsl::RESULT_NO_JUMP
+        || line.starts_with(hypodj_dsl::RESULT_FAILED)
+    {
         State::Refused
     } else {
         State::Live
@@ -290,25 +283,28 @@ pub fn confirm_question(question: &str) -> Spoken {
     Spoken::new(State::Echo, vec![format!("{question} [y/N]")])
 }
 
-/// Sleep, wind-down, and wake, as one armed line. None when nothing is armed.
-pub fn armed_hold(a: &ArmedFeatures) -> Option<Spoken> {
-    if !a.any() {
-        return None;
-    }
-    let mut bits = Vec::new();
+/// Sleep, a future wind-down, and wake are armed: set to fire later.
+/// A wind-down that has already started is live, in the present tense.
+/// Empty when nothing is set and nothing is winding down.
+pub fn armed_hold(a: &ArmedFeatures) -> Vec<Spoken> {
+    let mut out = Vec::new();
+    let mut later = Vec::new();
     if let Some(s) = a.sleep_remaining {
-        bits.push(format!("sleep in {}", fmt_remaining(s)));
+        later.push(format!("sleep in {}", fmt_remaining(s)));
     }
-    if a.winddown_active {
-        match a.winddown_remaining {
-            Some(s) => bits.push(format!("wind-down in {}", fmt_remaining(s))),
-            None => bits.push("winding down".to_string()),
-        }
+    if let Some(s) = a.winddown_remaining {
+        later.push(format!("wind-down in {}", fmt_remaining(s)));
     }
     if let Some(s) = a.wake_remaining {
-        bits.push(format!("wake in {}", fmt_remaining(s)));
+        later.push(format!("wake in {}", fmt_remaining(s)));
     }
-    Some(Spoken::new(State::Armed, vec![bits.join(" \u{00b7} ")]))
+    if !later.is_empty() {
+        out.push(Spoken::new(State::Armed, vec![later.join(" \u{00b7} ")]));
+    }
+    if a.winddown_active && a.winddown_remaining.is_none() {
+        out.push(Spoken::new(State::Live, vec!["winding down".into()]));
+    }
+    out
 }
 
 /// One reply shape the handler can emit, and the state and words it must
