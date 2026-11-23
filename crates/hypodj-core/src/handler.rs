@@ -2933,6 +2933,13 @@ pub struct HypodjHandler {
     /// never held across an `.await`. Set once by the daemon via
     /// [`Self::set_state_path`].
     state_path: Mutex<Option<PathBuf>>,
+    /// Where the restart-surviving plans are persisted (`.../plans.json`), or
+    /// `None` when there is no state dir. See [`crate::plan_store`].
+    plans_path: Mutex<Option<PathBuf>>,
+    /// Serializes snapshot+write of the plans file, so two concurrent persists
+    /// can never land an OLDER snapshot after a newer one. Lock order: this,
+    /// then `plan_pending` - nothing takes this while holding `plan_pending`.
+    plans_save: Mutex<()>,
     /// The live media position, in MILLIS, captured LOCKLESSLY from the P1
     /// `Tick.time_pos` and reset on a new-Playing / Stop edge. The shutdown
     /// snapshot and the periodic checkpoint read it with a single atomic load, so
@@ -3587,6 +3594,8 @@ impl HypodjHandler {
             next_nl_token: AtomicU64::new(0),
             nl_token_hasher: RandomState::new(),
             state_path: Mutex::new(None),
+            plans_path: Mutex::new(None),
+            plans_save: Mutex::new(()),
             last_elapsed_ms: Arc::new(AtomicU64::new(0)),
             store: Arc::new(MetadataStore),
             pulls: Mutex::new(PullField::new()),
@@ -3691,6 +3700,7 @@ impl HypodjHandler {
     pub fn plan_add_batch(&self, raws: Vec<RawPlan>) -> Result<Vec<PlanId>, PlanError> {
         let (pendings, ids, immediates) = self.prepare_batch(raws)?;
         self.plan_pending.lock().unwrap().extend(pendings);
+        self.persist_plans();
         self.nudge_immediates(immediates);
         Ok(ids)
     }
@@ -3733,6 +3743,7 @@ impl HypodjHandler {
             }
         }
         self.plan_pending.lock().unwrap().extend(deferred);
+        self.persist_plans();
         let mut outcomes = std::collections::HashMap::new();
         for (id, raw) in immediates.iter().zip(run) {
             outcomes.insert(*id, self.run_action_outcome(&raw.action, &raw.origin).await);
@@ -4138,10 +4149,85 @@ impl HypodjHandler {
     /// [`crate::timer::TimerGuard`] (RAII disarm), so no phantom `WallClock` fires.
     /// Returns `true` if a plan was removed.
     pub fn plan_cancel(&self, id: PlanId) -> bool {
-        let mut g = self.plan_pending.lock().unwrap();
-        let before = g.len();
-        g.retain(|pp| pp.armed.id != id);
-        g.len() != before
+        let removed = {
+            let mut g = self.plan_pending.lock().unwrap();
+            let before = g.len();
+            g.retain(|pp| pp.armed.id != id);
+            g.len() != before
+        };
+        if removed {
+            self.persist_plans();
+        }
+        removed
+    }
+
+    /// Set where restart-surviving plans persist. Called once by the daemon AFTER
+    /// [`Self::restore_plans`], so the restore's own arms do not rewrite a
+    /// half-restored file.
+    pub fn set_plans_path(&self, p: PathBuf) {
+        *self.plans_path.lock().unwrap() = Some(p);
+    }
+
+    /// Write the persistable subset of the registry ([`crate::plan_store`]) to the
+    /// plans file. A no-op without a path; a write error is a warn, never fatal.
+    /// Sync file I/O under std mutexes only (no `.await`); the file is tiny.
+    pub fn persist_plans(&self) {
+        let Some(path) = self.plans_path.lock().unwrap().clone() else {
+            return;
+        };
+        let _serial = self.plans_save.lock().unwrap();
+        let plans = self
+            .plan_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|pp| crate::plan_store::is_persistable(&pp.armed.raw.trigger))
+            .map(|pp| crate::plan_store::PersistedPlan {
+                reserved: pp.reserved,
+                raw: pp.armed.raw.clone(),
+            })
+            .collect();
+        let f = crate::plan_store::PlansFile {
+            schema_version: crate::plan_store::PLANS_SCHEMA_VERSION,
+            plans,
+        };
+        if let Err(e) = crate::plan_store::store_atomic(&path, &f) {
+            tracing::warn!(path = %path.display(), error = %e, "could not persist plans");
+        }
+    }
+
+    /// Re-arm the plans persisted by a previous run (see [`crate::plan_store`] for
+    /// what survives and the fire-late policy). A reserved feature plan comes back
+    /// through [`Self::set_singleton`], so it is still the daemon's single
+    /// sleep/winddown/wake instance. Each plan stands alone: one that no longer
+    /// validates is logged and skipped. Returns how many were re-armed. Requires
+    /// the plan timers ([`Self::set_plan_timers`]) to be registered first.
+    pub fn restore_plans(&self, file: crate::plan_store::PlansFile) -> usize {
+        let now_civil = crate::clock::civil_now();
+        let mut armed = 0;
+        for p in file.plans {
+            let Some(trigger) = crate::plan_store::restore_trigger(&p.raw.trigger, now_civil) else {
+                tracing::warn!(origin = %p.raw.origin, "persisted plan missed while down; dropped");
+                continue;
+            };
+            let raw = RawPlan { trigger, ..p.raw };
+            let origin = raw.origin.clone();
+            let reserved_origin =
+                [ORIGIN_SLEEP, ORIGIN_WINDDOWN, ORIGIN_WAKE].contains(&origin.as_str());
+            let res = if p.reserved && reserved_origin {
+                self.set_singleton(&origin, raw)
+            } else {
+                self.plan_add(raw)
+            };
+            match res {
+                Ok(id) => {
+                    armed += 1;
+                    tracing::info!(plan = id.0, origin = %origin, "persisted plan re-armed");
+                }
+                Err(e) => tracing::warn!(origin = %origin, error = %e, "persisted plan did not re-arm"),
+            }
+        }
+        armed
     }
 
     /// Replace a plan: cancel `id` (RAII-disarming its timer) then arm `raw` as a
@@ -4237,6 +4323,7 @@ impl HypodjHandler {
             g.retain(|pp| !(pp.reserved && pp.armed.raw.origin == origin));
             g.extend(pendings);
         }
+        self.persist_plans();
         self.nudge_immediates(immediates);
         // Exactly one id for a single-plan batch.
         Ok(ids.remove(0))
@@ -4250,7 +4337,7 @@ impl HypodjHandler {
             chrono::Duration::from_std(dur).map_err(|_| PlanError::OutOfBounds { field: "dur" })?;
         // checked_add_signed so a pathological duration returns OutOfBounds rather
         // than panicking the DateTime addition.
-        let at = chrono::Utc::now()
+        let at = crate::clock::civil_now()
             .checked_add_signed(delta)
             .ok_or(PlanError::OutOfBounds { field: "dur" })?;
         Ok(RawTrigger::WallClock { at })
@@ -4537,7 +4624,7 @@ impl HypodjHandler {
         // An alarm is a LOCAL-time promise: `wake at 7` means 07:00 in the system
         // zone, DST-aware, not 07:00 UTC. Use chrono::Local (reads the system TZ)
         // and pick the next FUTURE occurrence, then reduce to UTC for the trigger.
-        let now = chrono::Local::now();
+        let now = crate::clock::civil_now().with_timezone(&chrono::Local);
         let today = now.date_naive();
         let naive_today = today.and_hms_opt(h, m, 0)?;
         let dt = match chrono::Local.from_local_datetime(&naive_today).single() {
@@ -5330,10 +5417,7 @@ impl HypodjHandler {
             PlanCmd::List => {
                 let mut b = MpdResponse::pairs();
                 let now = Instant::now();
-                let epoch_now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let civil = crate::clock::civil_now();
                 for (id, raw, deadline) in self.plan_list_with_deadlines() {
                     b = b
                         .pair("plan_id", id.0.to_string())
@@ -5343,7 +5427,11 @@ impl HypodjHandler {
                     // only): what a recurring plan will fire at NEXT, so its
                     // re-arm and restore are observable from the wire.
                     if let Some(d) = deadline {
-                        let next = epoch_now + d.saturating_duration_since(now).as_secs();
+                        // Rounded to the nearest second: the deadline is a whole
+                        // civil minute, and truncating twice reads one second early.
+                        let rem = chrono::Duration::from_std(d.saturating_duration_since(now))
+                            .unwrap_or_default();
+                        let next = ((civil + rem).timestamp_millis() + 500).div_euclid(1000);
                         b = b.pair("next_fire", next.to_string());
                     }
                 }
@@ -5477,7 +5565,7 @@ impl HypodjHandler {
             WakeCmd::Set { when, selector, count } => {
                 let at = match when {
                     WakeWhen::In(d) => match chrono::Duration::from_std(d) {
-                        Ok(delta) => chrono::Utc::now() + delta,
+                        Ok(delta) => crate::clock::civil_now() + delta,
                         Err(_) => return ack(ACK_ERROR_UNKNOWN, "wake", "duration out of range"),
                     },
                     WakeWhen::At { h, m } => match self.resolve_next_civil(h, m) {
@@ -5537,7 +5625,7 @@ impl HypodjHandler {
         NlContext {
             current,
             now: Instant::now(),
-            now_civil: chrono::Utc::now(),
+            now_civil: crate::clock::civil_now(),
             // An alarm is a LOCAL-time promise: `nl "wake me at 7"` means 07:00 in
             // the SYSTEM zone, same as the direct `wake at 7` command (which uses
             // chrono::Local in resolve_next_civil). Use the current local UTC offset
@@ -5595,7 +5683,7 @@ impl HypodjHandler {
         let bounds = self.plan_bounds();
         let snap = self.queue_snapshot();
         let now = Instant::now();
-        let now_civil = chrono::Utc::now();
+        let now_civil = crate::clock::civil_now();
         // SAFETY (echo == arm): CLAMP each plan now and store + echo the CLAMPED
         // plan, so the human confirms EXACTLY the values that will arm. Clamping is
         // numeric (duration/vol/position bounds) and snapshot-independent, so the
@@ -26875,6 +26963,63 @@ mod tests {
             pair(&resp, "X-hypodj-sleep-remaining").expect("present").parse().expect("digits");
         // Reflects the LAST re-arm (900s), not a stale earlier one.
         assert!(remaining > 890 && remaining <= 900, "reflects last re-arm: {remaining}");
+    }
+
+    // PERSISTENCE round trip (task 9omxa9z): the restart-surviving subset of the
+    // registry is written on every change, and a FRESH handler restored from that
+    // file re-arms it - the recurring wake still the reserved singleton (status
+    // and `wake cancel` see it), a client wall-clock plan as a plain plan - while
+    // a short relative plan is gone. A cancel rewrites the file without it.
+    #[tokio::test(start_paused = true)]
+    async fn persisted_plans_survive_a_restart() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let dir = std::env::temp_dir().join(format!("hypodj-persist-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plans.json");
+        h.set_plans_path(path.clone());
+
+        let daily = RawTrigger::Daily { hour: 7, minute: 0, days: crate::plan::DaySet::WEEKDAYS };
+        h.wake_set_trigger(daily, Some(Selector::Query("bon iver".into())), 20).expect("wake");
+        let at = crate::clock::civil_now() + chrono::Duration::hours(3);
+        let client = h
+            .plan_add(RawPlan {
+                version: 1,
+                trigger: RawTrigger::WallClock { at },
+                action: Action::Pause,
+                once: true,
+                origin: "mpd".into(),
+            })
+            .expect("wallclock plan");
+        h.plan_add(RawPlan {
+            version: 1,
+            trigger: RawTrigger::SpanElapsed { secs: 60.0 },
+            action: Action::Stop,
+            once: true,
+            origin: "mpd".into(),
+        })
+        .expect("span plan");
+        assert_eq!(h.plan_list().len(), 3);
+        let file = crate::plan_store::load(&path).expect("written");
+        assert_eq!(file.plans.len(), 2, "the relative span plan is not persisted");
+
+        // "Restart": a fresh handler, restored from the file.
+        let Some((h2, _ev2)) = handler_with_null_player() else { return };
+        assert_eq!(h2.restore_plans(file), 2);
+        let list = h2.plan_list_with_deadlines();
+        assert_eq!(list.len(), 2);
+        let wake = list.iter().find(|(_, r, _)| r.origin == ORIGIN_WAKE).expect("wake back");
+        assert!(matches!(wake.1.trigger, RawTrigger::Daily { hour: 7, minute: 0, .. }));
+        assert!(matches!(&wake.1.action, Action::Wake { selector: Some(Selector::Query(q)), count: 20 } if q == "bon iver"));
+        assert!(h2.wake_remaining().is_some(), "restored as the reserved wake singleton");
+        let pause = list.iter().find(|(_, r, _)| r.origin == "mpd").expect("client plan back");
+        assert!(matches!(pause.1.trigger, RawTrigger::WallClock { at: a } if a == at));
+
+        // On the original: cancelling rewrites the file without the plan.
+        assert!(h.plan_cancel(client));
+        assert_eq!(crate::plan_store::load(&path).unwrap().plans.len(), 1);
+        assert!(h.wake_cancel());
+        assert!(crate::plan_store::load(&path).unwrap().plans.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // SAFETY (reserved-origin masquerade): `plan add ... origin sleep` lets a

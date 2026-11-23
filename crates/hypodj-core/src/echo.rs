@@ -562,7 +562,7 @@ mod tests {
     fn fade_to_echo_cannot_hide_the_real_target() {
         let plan = |target_db: &str| -> RawPlan {
             let json = format!(
-                r#"{{"trigger":{{"kind":"immediate"}},"action":{{"act":"fade","dir":"to","target_db":{target_db},"vol":40,"secs":10.0}}}}"#
+                r#"{{"trigger":{{"kind":"immediate"}},"action":{{"act":"fade","v":{{"dir":"to","target_db":{target_db},"vol":40,"secs":10.0}}}}}}"#
             );
             serde_json::from_str(&json).expect("raw plan JSON")
         };

@@ -275,7 +275,7 @@ pub enum PosBase {
 /// avoid colliding with [`crate::event::TrackRef`].
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "sel", rename_all = "snake_case")]
+#[serde(tag = "sel", content = "v", rename_all = "snake_case")]
 pub enum TrackSel {
     /// The current track.
     Current,
@@ -307,7 +307,11 @@ pub enum TrackSel {
 /// - not as a permission check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "act", rename_all = "snake_case")]
+// ADJACENTLY tagged (`content = "v"`), like the other enums here with newtype
+// variants over a primitive (`SetVolume(u8)`, `Query(String)`): serde cannot
+// serialize an INTERNALLY tagged newtype of a non-map, so the persisted plans
+// file (`crate::plan_store`) could not write those plans at all.
+#[serde(tag = "act", content = "v", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Action {
     Fade(FadeIntentIr),
@@ -400,7 +404,7 @@ impl PlayMode {
 /// set - the caller treats that as a clean no-op, never a wrong-target edit.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "qsel", rename_all = "snake_case")]
+#[serde(tag = "qsel", content = "v", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum QueueSelector {
     /// The 1-based queue position `n`.
@@ -425,7 +429,7 @@ pub enum QueueSelector {
 /// Where an [`Action::Move`] places the selected entries.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "movedest", rename_all = "snake_case")]
+#[serde(tag = "movedest", content = "v", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MoveDest {
     /// To the 1-based absolute position among the remaining entries.
@@ -533,7 +537,7 @@ pub enum FadeIntentIr {
 /// behavior behind the same enum.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "select", rename_all = "snake_case")]
+#[serde(tag = "select", content = "v", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Selector {
     Query(String),

@@ -156,6 +156,7 @@ impl<C: Clock> Executor<C> {
         // The plan's ORIGIN rides along with its action: the journal records who
         // caused each effect, and this path fires with NO client connected.
         let mut fired: Vec<(PlanId, Action, String)> = Vec::new();
+        let mut dropped = false;
         {
             // ONE short lock: collect fired ids + drop once/stale plans, mirroring
             // the timer live-set. No `.await` under this std Mutex.
@@ -174,17 +175,15 @@ impl<C: Clock> Executor<C> {
                     // un-fireable zombie lingers. A RECURRING trigger keeps its
                     // registry slot and id: it is re-armed in place to its next
                     // occurrence (and dropped, loudly, if none resolves).
-                    if pp.armed.raw.trigger.is_recurring() {
-                        let kept = handler.rearm_recurring(pp);
-                        if !kept {
-                            tracing::warn!(plan = pp.armed.id.0, "recurring plan could not re-arm; dropped");
-                        }
-                        kept
-                    } else {
-                        false
+                    let kept = pp.armed.raw.trigger.is_recurring() && handler.rearm_recurring(pp);
+                    if !kept && pp.armed.raw.trigger.is_recurring() {
+                        tracing::warn!(plan = pp.armed.id.0, "recurring plan could not re-arm; dropped");
                     }
+                    dropped |= !kept;
+                    kept
                 }
                 Fire::Stale => {
+                    dropped = true;
                     tracing::warn!(
                         plan = pp.armed.id.0,
                         "plan expired: target queue id gone or already passed"
@@ -193,6 +192,11 @@ impl<C: Clock> Executor<C> {
                 }
                 Fire::No => true,
             });
+        }
+        // A plan left the registry: the persisted copy must not outlive it (a
+        // fired one-shot wake restored after a restart would ring twice).
+        if dropped {
+            self.handler.persist_plans();
         }
         // Stable total order: ascending PlanId, reproducible across runs.
         fired.sort_by_key(|(id, _, _)| *id);

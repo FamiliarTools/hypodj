@@ -31,6 +31,7 @@ pub mod mpd;
 pub mod mpris;
 pub mod nl;
 pub mod plan;
+pub mod plan_store;
 pub mod player;
 pub mod recognize;
 pub mod resume;

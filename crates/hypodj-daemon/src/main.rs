@@ -403,6 +403,21 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("tape disabled by config");
     }
 
+    // PENDING PLANS. Wall-clock and recurring plans (a `wake daily 7:00`, a
+    // `sleep 1h`) survive a restart; queue-anchored and short relative plans do
+    // not (see hypodj_core::plan_store). Re-armed BEFORE the path is set so the
+    // restore's own arms do not rewrite a half-restored file, then written once
+    // to drop anything that did not come back.
+    if let Some(dir) = &state_dir {
+        let path = dir.join("plans.json");
+        if let Some(file) = hypodj_core::plan_store::load(&path) {
+            let n = handler.restore_plans(file);
+            tracing::info!(restored = n, "pending plans restored");
+        }
+        handler.set_plans_path(path);
+        handler.persist_plans();
+    }
+
     if let Some(dir) = &state_dir {
         let path = dir.join("resume.toml");
         handler.set_state_path(path.clone());
