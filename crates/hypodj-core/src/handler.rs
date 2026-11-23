@@ -2073,6 +2073,14 @@ pub const ACK_NL_INVALID: &str = "plan invalid";
 pub const ACK_TRANSLATOR_TASK: &str = "translator task failed";
 pub const ACK_NO_PLAN: &str = "no such plan";
 
+/// Pair keys these commands put on the wire. The reply catalog locks to them.
+pub const PAIR_PLAN_ID: &str = "plan_id";
+pub const PAIR_RESULT: &str = "result";
+pub const PAIR_SLEEP_REMAINING: &str = "sleep_remaining";
+pub const PAIR_SLEEP: &str = "sleep";
+pub const PAIR_WAKE_REMAINING: &str = "wake_remaining";
+pub const PAIR_WAKE: &str = "wake";
+
 impl PlanOutcome {
     /// The single human line the client shows after `y`/confirm. Speaks the REAL
     /// count/effect (0 when the selector resolved to nothing), NEVER the asked count.
@@ -4834,9 +4842,9 @@ impl HypodjHandler {
             // X" otherwise). A deferred (armed) plan carries no outcome yet.
             PlanCmd::Add(raw) => match self.plan_add_reporting(raw).await {
                 Ok((id, outcome)) => {
-                    let mut b = MpdResponse::pairs().pair("plan_id", id.0.to_string());
+                    let mut b = MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string());
                     if let Some(o) = outcome {
-                        b = b.pair("result", o.render());
+                        b = b.pair(PAIR_RESULT, o.render());
                     }
                     b.build()
                 }
@@ -4846,7 +4854,7 @@ impl HypodjHandler {
                 let mut b = MpdResponse::pairs();
                 for (id, raw) in self.plan_list() {
                     b = b
-                        .pair("plan_id", id.0.to_string())
+                        .pair(PAIR_PLAN_ID, id.0.to_string())
                         .pair("origin", raw.origin.clone());
                 }
                 b.build()
@@ -4859,7 +4867,7 @@ impl HypodjHandler {
                 }
             }
             PlanCmd::Replace(id, raw) => match self.plan_replace(id, raw) {
-                Ok(new_id) => MpdResponse::pairs().pair("plan_id", new_id.0.to_string()).build(),
+                Ok(new_id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, new_id.0.to_string()).build(),
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "plan", &e.to_string()),
             },
         }
@@ -4870,14 +4878,14 @@ impl HypodjHandler {
     fn handle_sleep(&self, cmd: SleepCmd) -> MpdResponse {
         match cmd {
             SleepCmd::Set(dur) => match self.sleep_set(dur) {
-                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                Ok(id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string()).build(),
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "sleep", &e.to_string()),
             },
             SleepCmd::Status => match self.sleep_remaining() {
                 Some(d) => MpdResponse::pairs()
-                    .pair("sleep_remaining", d.as_secs().to_string())
+                    .pair(PAIR_SLEEP_REMAINING, d.as_secs().to_string())
                     .build(),
-                None => MpdResponse::pairs().pair("sleep", "none").build(),
+                None => MpdResponse::pairs().pair(PAIR_SLEEP, "none").build(),
             },
             SleepCmd::Cancel => {
                 self.sleep_cancel();
@@ -4890,7 +4898,7 @@ impl HypodjHandler {
     fn handle_winddown(&self, cmd: WinddownCmd) -> MpdResponse {
         match cmd {
             WinddownCmd::Set(dur) => match self.winddown_set(dur) {
-                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                Ok(id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string()).build(),
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "winddown", &e.to_string()),
             },
             WinddownCmd::Cancel => {
@@ -4916,15 +4924,15 @@ impl HypodjHandler {
                 };
                 let sel = selector.map(Selector::Query);
                 match self.wake_set(at, sel, count) {
-                    Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                    Ok(id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string()).build(),
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "wake", &e.to_string()),
                 }
             }
             WakeCmd::Status => match self.wake_remaining() {
                 Some(d) => MpdResponse::pairs()
-                    .pair("wake_remaining", d.as_secs().to_string())
+                    .pair(PAIR_WAKE_REMAINING, d.as_secs().to_string())
                     .build(),
-                None => MpdResponse::pairs().pair("wake", "none").build(),
+                None => MpdResponse::pairs().pair(PAIR_WAKE, "none").build(),
             },
             WakeCmd::Cancel => {
                 self.wake_cancel();
@@ -5077,7 +5085,7 @@ impl HypodjHandler {
             Ok(ids) => {
                 let mut b = MpdResponse::pairs();
                 for id in ids {
-                    b = b.pair("plan_id", id.0.to_string());
+                    b = b.pair(PAIR_PLAN_ID, id.0.to_string());
                 }
                 b.build()
             }

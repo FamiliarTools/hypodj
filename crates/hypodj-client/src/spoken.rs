@@ -8,7 +8,8 @@
 //! A bare OK takes its past tense from the action kind the client sent, never
 //! from words found in a step.
 
-use hypodj_style::{Spoken, State};
+use hypodj_style::Spoken;
+pub use hypodj_style::State;
 
 use crate::model::{fmt_remaining, ArmedFeatures};
 use crate::nl::{self, EchoParts};
@@ -100,7 +101,9 @@ pub fn from_reply(pairs: &[(String, String)], act: Option<Act>) -> Spoken {
     }
     match act {
         Some(act) => Spoken::new(State::Live, vec![act.past().to_string()]),
-        None => Spoken::new(State::Live, Vec::new()),
+        // A bare OK still happened. One short line, not silence and not a guess
+        // borrowed from the step text.
+        None => Spoken::new(State::Live, vec!["OK.".to_string()]),
     }
 }
 
@@ -330,9 +333,16 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         State::Live,
         &["Cancelled the wake."],
     ));
-    // A bare OK with no kind says nothing. It must not become "armed" or
-    // borrow a sentence from a step that happens to contain "clear".
-    out.push(shape("bare ok", Vec::new(), None, None, State::Live, &[]));
+    // A bare OK with no kind is still live. The line is minimal, and it must
+    // not become "armed" or borrow a sentence from a step.
+    out.push(shape(
+        "bare ok",
+        Vec::new(),
+        None,
+        None,
+        State::Live,
+        &["OK."],
+    ));
     // Refusals. The ack body is what `ack_message` returns.
     let acks: &[(&str, &str, &str)] = &[
         (
@@ -443,10 +453,8 @@ mod tests {
         assert_eq!(act_from_command("wake off"), Some(Act::WakeCancel));
         assert_eq!(act_from_command("plan add fade"), None);
         let spoken = from_reply(&[], None);
-        assert!(
-            spoken.lines.is_empty(),
-            "a bare OK with no kind invents nothing"
-        );
+        assert_eq!(spoken.state, State::Live);
+        assert_eq!(spoken.lines, vec!["OK.".to_string()]);
         assert!(!spoken.text().contains("clear"));
         assert!(!spoken.text().contains("armed"));
         let hint = reply_shapes()

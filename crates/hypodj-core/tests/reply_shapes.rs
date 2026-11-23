@@ -9,7 +9,8 @@ use hypodj_client::spoken::{reply_shapes, Act, State};
 use hypodj_core::handler::{
     effect_set_volume, PlanOutcome, ACK_NL_INVALID, ACK_NL_NO_TOKEN, ACK_NL_STALE, ACK_NO_PLAN,
     ACK_TRANSLATOR_TASK, ACK_WAKE_DURATION, ACK_WAKE_TIME, EFFECT_FADING, EFFECT_NOTHING,
-    EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING,
+    EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_PLAN_ID, PAIR_RESULT, PAIR_SLEEP,
+    PAIR_SLEEP_REMAINING, PAIR_WAKE, PAIR_WAKE_REMAINING,
 };
 use hypodj_core::nl::NlError;
 use hypodj_core::plan::PlanError;
@@ -110,26 +111,48 @@ fn the_catalog_speaks_the_handlers_sentences() {
         );
     }
 
+    let keys = [
+        PAIR_PLAN_ID,
+        PAIR_RESULT,
+        PAIR_SLEEP_REMAINING,
+        PAIR_SLEEP,
+        PAIR_WAKE_REMAINING,
+        PAIR_WAKE,
+    ];
+    for shape in &shapes {
+        for (k, _) in &shape.pairs {
+            assert!(
+                keys.contains(&k.as_str()),
+                "{} uses a pair key the handler does not send: {k}",
+                shape.name
+            );
+        }
+    }
     assert!(shapes.iter().any(|s| {
         s.state == State::Armed
-            && s.pairs == [("plan_id".into(), "4".into())]
+            && s.pairs == [(PAIR_PLAN_ID.into(), "4".into())]
             && s.lines == ["armed (plan 4)".to_string()]
     }));
     assert!(shapes
         .iter()
-        .any(|s| s.pairs.iter().filter(|(k, _)| k == "plan_id").count() == 2));
+        .any(|s| { s.pairs.iter().filter(|(k, _)| k == PAIR_PLAN_ID).count() == 2 }));
+    assert!(shapes.iter().any(|s| {
+        s.pairs
+            .iter()
+            .any(|(k, v)| k == PAIR_RESULT && v == "added 5 tracks")
+    }));
     assert!(shapes
         .iter()
-        .any(|s| s.pairs.iter().any(|(k, _)| k == "sleep_remaining")));
+        .any(|s| s.pairs.iter().any(|(k, _)| k == PAIR_SLEEP_REMAINING)));
     assert!(shapes
         .iter()
-        .any(|s| s.pairs.iter().any(|(k, v)| k == "sleep" && v == "none")));
+        .any(|s| s.pairs.iter().any(|(k, v)| k == PAIR_SLEEP && v == "none")));
     assert!(shapes
         .iter()
-        .any(|s| s.pairs.iter().any(|(k, _)| k == "wake_remaining")));
+        .any(|s| s.pairs.iter().any(|(k, _)| k == PAIR_WAKE_REMAINING)));
     assert!(shapes
         .iter()
-        .any(|s| s.pairs.iter().any(|(k, v)| k == "wake" && v == "none")));
+        .any(|s| s.pairs.iter().any(|(k, v)| k == PAIR_WAKE && v == "none")));
     assert!(shapes
         .iter()
         .any(|s| s.act == Some(Act::Clear) && s.state == State::Live));
