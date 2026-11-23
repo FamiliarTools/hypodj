@@ -681,6 +681,8 @@ pub enum WakeWhen {
     At { h: u32, m: u32 },
     /// `wake in <dur>` - a monotonic span from now.
     In(Duration),
+    /// `wake daily <time> [on <days>]` - a RECURRING local `h:m` on `days`.
+    Daily { h: u32, m: u32, days: crate::plan::DaySet },
 }
 
 /// A parsed `wake` subcommand (the convenience wake ramp-in surface).
@@ -907,6 +909,20 @@ fn parse_trigger(toks: &[String]) -> Option<RawTrigger> {
         "in" => Some(RawTrigger::SpanElapsed {
             secs: parse_secs(toks.get(1)?)?,
         }),
+        // `daily <time> [on daily|weekdays|weekends|mon,wed,...]` - the RECURRING
+        // local time-of-day trigger (re-armed after every fire).
+        "daily" => {
+            let (hour, minute) = parse_civil_time(toks.get(1)?)?;
+            let days = match toks.get(2).map(|t| t.to_lowercase()).as_deref() {
+                None => crate::plan::DaySet::EVERY,
+                Some("on") => crate::plan::DaySet::parse(toks.get(3)?)?,
+                Some(_) => return None,
+            };
+            if toks.len() > 4 {
+                return None;
+            }
+            Some(RawTrigger::Daily { hour: hour as u8, minute: minute as u8, days })
+        }
         "at" => {
             let raw = toks.get(1)?;
             let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
@@ -1302,6 +1318,23 @@ fn parse_wake(args: &[String], line: &str) -> MpdCommand {
             MpdCommand::Wake(WakeCmd::Set {
                 when: WakeWhen::At { h, m },
                 selector: parse_wake_selector(&args[2.min(args.len())..]),
+                count: DEFAULT_WAKE_ENQUEUE,
+            })
+        }
+        Some("daily") => {
+            let Some((h, m)) = args.get(1).and_then(|t| parse_civil_time(t)) else {
+                return unsupported();
+            };
+            let (days, rest) = match args.get(2).map(|t| t.to_lowercase()).as_deref() {
+                Some("on") => match args.get(3).and_then(|t| crate::plan::DaySet::parse(t)) {
+                    Some(d) => (d, 4),
+                    None => return unsupported(),
+                },
+                _ => (crate::plan::DaySet::EVERY, 2),
+            };
+            MpdCommand::Wake(WakeCmd::Set {
+                when: WakeWhen::Daily { h, m, days },
+                selector: parse_wake_selector(&args[rest.min(args.len())..]),
                 count: DEFAULT_WAKE_ENQUEUE,
             })
         }
@@ -2348,6 +2381,21 @@ mod parse_tests {
             }
             other => panic!("got {other:?}"),
         }
+        match parse("wake daily 7:15 on weekdays with jazz") {
+            MpdCommand::Wake(WakeCmd::Set { when, selector, .. }) => {
+                assert_eq!(when, WakeWhen::Daily { h: 7, m: 15, days: crate::plan::DaySet::WEEKDAYS });
+                assert_eq!(selector.as_deref(), Some("jazz"));
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("wake daily 7am") {
+            MpdCommand::Wake(WakeCmd::Set { when, selector, .. }) => {
+                assert_eq!(when, WakeWhen::Daily { h: 7, m: 0, days: crate::plan::DaySet::EVERY });
+                assert!(selector.is_none());
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(matches!(parse("wake daily 7 on funday"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("wake at bogus"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("wake in nope"), MpdCommand::Unsupported(_)));
     }

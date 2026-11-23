@@ -4024,7 +4024,7 @@ impl HypodjHandler {
         let bounds = self.plan_bounds();
         let snap = self.queue_snapshot();
         let now = Instant::now();
-        let now_civil = chrono::Utc::now();
+        let now_civil = crate::clock::civil_now();
 
         // Phase 1: clamp + validate ALL against one snapshot. NO mutation, NO timer
         // armed yet - a failure here aborts with nothing armed.
@@ -4091,6 +4091,47 @@ impl HypodjHandler {
             .iter()
             .map(|pp| (pp.armed.id, pp.armed.raw.clone()))
             .collect()
+    }
+
+    /// [`Self::plan_list`] plus each plan's armed absolute deadline (`None` for an
+    /// edge-anchored plan), read under the same single lock.
+    pub fn plan_list_with_deadlines(&self) -> Vec<(PlanId, RawPlan, Option<Instant>)> {
+        self.plan_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pp| {
+                let deadline = match pp.armed.resolved {
+                    Resolved::OnDeadline(inst) => Some(inst),
+                    _ => None,
+                };
+                (pp.armed.id, pp.armed.raw.clone(), deadline)
+            })
+            .collect()
+    }
+
+    /// Re-arm a RECURRING plan that just fired, in place: its next occurrence
+    /// replaces the resolved anchor, a fresh timer replaces the spent one (the
+    /// old guard drops - RAII disarm). Returns `false` for a single-use plan (the
+    /// caller drops it) or when no next occurrence resolves. Sync and called under
+    /// the executor's registry lock, so it never touches `plan_pending` itself.
+    pub(crate) fn rearm_recurring(&self, pp: &mut PendingPlan) -> bool {
+        let Some(resolved) =
+            crate::plan::rearm(&pp.armed.raw.trigger, Instant::now(), crate::clock::civil_now())
+        else {
+            return false;
+        };
+        let Resolved::OnDeadline(deadline) = resolved else {
+            return false;
+        };
+        let Some(timers) = self.plan_timers.get() else {
+            return false;
+        };
+        let (tid, guard) = timers.arm(deadline);
+        pp.armed.resolved = resolved;
+        pp.armed.timer_id = Some(tid);
+        pp.guard = Some(guard);
+        true
     }
 
     /// Cancel one plan by id. Dropping its [`PendingPlan`] drops any held
@@ -4324,9 +4365,23 @@ impl HypodjHandler {
         selector: Option<Selector>,
         count: u32,
     ) -> Result<PlanId, PlanError> {
+        self.wake_set_trigger(RawTrigger::WallClock { at }, selector, count)
+    }
+
+    /// WAKE on any deadline trigger: a one-shot [`RawTrigger::WallClock`] or a
+    /// RECURRING [`RawTrigger::Daily`] (`wake daily 7:00 on weekdays`), which the
+    /// executor re-arms after each fire so the singleton stays armed for the next
+    /// morning. Same single-instance slot either way: a recurring wake replaces a
+    /// one-shot and vice versa.
+    pub fn wake_set_trigger(
+        &self,
+        trigger: RawTrigger,
+        selector: Option<Selector>,
+        count: u32,
+    ) -> Result<PlanId, PlanError> {
         let raw = RawPlan {
             version: 1,
-            trigger: RawTrigger::WallClock { at },
+            trigger,
             action: Action::Wake { selector, count },
             once: true,
             origin: ORIGIN_WAKE.into(),
@@ -5274,10 +5329,23 @@ impl HypodjHandler {
             },
             PlanCmd::List => {
                 let mut b = MpdResponse::pairs();
-                for (id, raw) in self.plan_list() {
+                let now = Instant::now();
+                let epoch_now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                for (id, raw, deadline) in self.plan_list_with_deadlines() {
                     b = b
                         .pair("plan_id", id.0.to_string())
-                        .pair("origin", raw.origin.clone());
+                        .pair("origin", raw.origin.clone())
+                        .pair("when", crate::echo::describe_when(&raw.trigger));
+                    // The armed deadline as a unix epoch second (deadline plans
+                    // only): what a recurring plan will fire at NEXT, so its
+                    // re-arm and restore are observable from the wire.
+                    if let Some(d) = deadline {
+                        let next = epoch_now + d.saturating_duration_since(now).as_secs();
+                        b = b.pair("next_fire", next.to_string());
+                    }
                 }
                 b.build()
             }
@@ -5399,6 +5467,13 @@ impl HypodjHandler {
     /// Dispatch a parsed `wake` command: (re)arm / report / cancel the single wake.
     fn handle_wake(&self, cmd: WakeCmd) -> MpdResponse {
         match cmd {
+            WakeCmd::Set { when: WakeWhen::Daily { h, m, days }, selector, count } => {
+                let trigger = RawTrigger::Daily { hour: h as u8, minute: m as u8, days };
+                match self.wake_set_trigger(trigger, selector.map(Selector::Query), count) {
+                    Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "wake", &e.to_string()),
+                }
+            }
             WakeCmd::Set { when, selector, count } => {
                 let at = match when {
                     WakeWhen::In(d) => match chrono::Duration::from_std(d) {
@@ -5409,6 +5484,7 @@ impl HypodjHandler {
                         Some(at) => at,
                         None => return ack(ACK_ERROR_UNKNOWN, "wake", "bad time"),
                     },
+                    WakeWhen::Daily { .. } => unreachable!("matched above"),
                 };
                 let sel = selector.map(Selector::Query);
                 match self.wake_set(at, sel, count) {

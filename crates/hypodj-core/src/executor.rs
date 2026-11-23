@@ -160,6 +160,7 @@ impl<C: Clock> Executor<C> {
             // ONE short lock: collect fired ids + drop once/stale plans, mirroring
             // the timer live-set. No `.await` under this std Mutex.
             let mut g = pending.lock().unwrap();
+            let handler = &self.handler;
             g.retain_mut(|pp| match fires(&pp.armed, ev, &snap) {
                 Fire::Yes => {
                     fired.push((
@@ -167,13 +168,21 @@ impl<C: Clock> Executor<C> {
                         pp.armed.raw.action.clone(),
                         pp.armed.raw.origin.clone(),
                     ));
-                    // Every armed anchor here is single-use (a concrete
-                    // QueueId/AlbumId/absolute deadline fires exactly once), so a
-                    // fired plan is ALWAYS removed at selection (dropping its guard),
-                    // regardless of `once` - no un-fireable zombie lingers in the
-                    // list. `once` is reserved for future RECURRING triggers; until
-                    // one exists every armed plan is fire-once.
-                    false
+                    // An armed anchor (a concrete QueueId/AlbumId/absolute
+                    // deadline) fires exactly once. A single-use plan is removed
+                    // at selection (dropping its guard), regardless of `once` - no
+                    // un-fireable zombie lingers. A RECURRING trigger keeps its
+                    // registry slot and id: it is re-armed in place to its next
+                    // occurrence (and dropped, loudly, if none resolves).
+                    if pp.armed.raw.trigger.is_recurring() {
+                        let kept = handler.rearm_recurring(pp);
+                        if !kept {
+                            tracing::warn!(plan = pp.armed.id.0, "recurring plan could not re-arm; dropped");
+                        }
+                        kept
+                    } else {
+                        false
+                    }
                 }
                 Fire::Stale => {
                     tracing::warn!(
@@ -1259,4 +1268,47 @@ mod tests {
         settle().await;
         assert!(!rig.handler.fade_active_for_test().await, "no fire after wake cancel");
     }
+    // RECURRING wake: a Daily trigger fires at its local time-of-day, then stays
+    // in the registry under the SAME id, re-armed ~a day later (civil time follows
+    // the fake clock via `clock::civil_now`), and fires again the next day.
+    #[tokio::test(start_paused = true)]
+    async fn daily_wake_fires_then_rearms_for_the_next_day() {
+        use chrono::Timelike;
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let target = (crate::clock::civil_now() + chrono::Duration::hours(2)).with_timezone(&chrono::Local);
+        let trigger = RawTrigger::Daily {
+            hour: target.hour() as u8,
+            minute: target.minute() as u8,
+            days: crate::plan::DaySet::EVERY,
+        };
+        let id = rig.handler.wake_set_trigger(trigger, None, 0).unwrap();
+        let rem = rig.handler.wake_remaining().expect("armed");
+        assert!(rem > Duration::from_secs(7080) && rem <= Duration::from_secs(7200), "{rem:?}");
+
+        tokio::time::advance(rem + Duration::from_secs(1)).await;
+        settle().await;
+        assert!(rig.handler.fade_active_for_test().await, "wake ramp installed at the first fire");
+        let list = rig.handler.plan_list();
+        assert_eq!(list.len(), 1, "recurring plan kept after firing");
+        assert_eq!(list[0].0, id, "same plan id across the re-arm");
+        let rem2 = rig.handler.wake_remaining().expect("re-armed");
+        // A day later (DST can move it by an hour either way).
+        assert!(
+            rem2 > Duration::from_secs(22 * 3600) && rem2 <= Duration::from_secs(25 * 3600),
+            "{rem2:?}"
+        );
+
+        // The second day fires and re-arms again.
+        tokio::time::advance(rem2 + Duration::from_secs(1)).await;
+        settle().await;
+        let rem3 = rig.handler.wake_remaining().expect("re-armed again");
+        assert!(rem3 > Duration::from_secs(22 * 3600), "{rem3:?}");
+        assert_eq!(rig.handler.plan_list()[0].0, id);
+        assert!(rig.handler.wake_cancel(), "a recurring wake cancels like a one-shot");
+        assert!(rig.handler.plan_list().is_empty());
+    }
 }
+

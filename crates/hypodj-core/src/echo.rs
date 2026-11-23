@@ -4,7 +4,7 @@
 
 use crate::nl::NlSource;
 use crate::plan::{
-    Action, ClearScope, FadeIntentIr, MoveDest, PosBase, QueueSelector, RawPlan, RawTrigger,
+    Action, ClearScope, DaySet, FadeIntentIr, MoveDest, PosBase, QueueSelector, RawPlan, RawTrigger,
     Selector, TrackSel,
 };
 
@@ -45,6 +45,13 @@ fn trigger_dsl(t: &RawTrigger) -> Option<String> {
         },
         RawTrigger::SpanElapsed { secs: s } => format!("trigger in {}", secs(*s)),
         RawTrigger::WallClock { at } => format!("trigger at {}", at.to_rfc3339()),
+        RawTrigger::Daily { hour, minute, days } => {
+            if *days == DaySet::EVERY {
+                format!("trigger daily {hour:02}:{minute:02}")
+            } else {
+                format!("trigger daily {hour:02}:{minute:02} on {}", days.word())
+            }
+        }
         // TimeRemaining is not emitted by the rules grammar; not round-tripped.
         RawTrigger::TimeRemaining { .. } => return None,
     })
@@ -129,6 +136,17 @@ pub fn render_dsl(raw: &RawPlan) -> Option<String> {
     Some(s)
 }
 
+/// "every day at 07:00 local time" / "on weekdays at ..." / "on mon,wed at ...".
+pub fn describe_recurrence(hour: u8, minute: u8, days: DaySet) -> String {
+    let on = match days {
+        DaySet::EVERY => "every day".to_string(),
+        DaySet::WEEKDAYS => "every weekday".to_string(),
+        DaySet::WEEKENDS => "every weekend day".to_string(),
+        d => format!("every {}", d.word()),
+    };
+    format!("{on} at {hour:02}:{minute:02} local time (recurring)")
+}
+
 fn source_label(src: NlSource) -> &'static str {
     match src {
         NlSource::Rules => "via rules",
@@ -139,7 +157,14 @@ fn source_label(src: NlSource) -> &'static str {
 /// A short, honest human clause for one plan (the confirmation surface). Spells
 /// out a guessed fade direction, flags the append-only + not-yet-at-execute holes.
 pub fn describe_plan(raw: &RawPlan) -> String {
-    let when = match &raw.trigger {
+    let when = describe_when(&raw.trigger);
+    let what = describe_action(raw);
+    format!("{what} {when}")
+}
+
+/// The human WHEN clause of a trigger ("in 20m", "every weekday at 07:00 ...").
+pub fn describe_when(trigger: &RawTrigger) -> String {
+    match trigger {
         RawTrigger::Immediate => "now".to_string(),
         RawTrigger::QueuePosition { n, base } => match base {
             PosBase::CurrentIsOne => format!("when the {} track (counting current as #1) starts", ordinal(*n)),
@@ -149,9 +174,13 @@ pub fn describe_plan(raw: &RawPlan) -> String {
         RawTrigger::AlbumBoundary { .. } => "after the current album ends".to_string(),
         RawTrigger::SpanElapsed { secs: s } => format!("in {}", human_dur(*s)),
         RawTrigger::WallClock { at } => format!("at {} UTC", at.format("%Y-%m-%d %H:%M")),
+        RawTrigger::Daily { hour, minute, days } => describe_recurrence(*hour, *minute, *days),
         RawTrigger::TimeRemaining { secs: s, .. } => format!("with {} left on the track", human_dur(*s)),
-    };
-    let what = match &raw.action {
+    }
+}
+
+fn describe_action(raw: &RawPlan) -> String {
+    match &raw.action {
         Action::Fade(FadeIntentIr::Out { secs: s }) => format!("fade OUT over {}", human_dur(*s)),
         Action::Fade(FadeIntentIr::In { secs: s }) => format!("fade IN over {}", human_dur(*s)),
         Action::Fade(FadeIntentIr::To { vol, secs: s }) => {
@@ -222,8 +251,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
         Action::SetMode { mode, on } => {
             format!("turn {} mode {}", mode.word(), if *on { "ON" } else { "OFF" })
         }
-    };
-    format!("{what} {when}")
+    }
 }
 
 /// The full echo body for a translated batch: the source trust signal, each
@@ -386,6 +414,33 @@ mod tests {
             Some("trigger immediate action remove id 88")
         );
         assert!(describe_plan(&raw).contains("the track with id 88"), "{}", describe_plan(&raw));
+    }
+
+    // The recurring trigger round-trips through the DSL for every day-set shape,
+    // and its human clause says it repeats (the confirm prompt must not read as a
+    // one-shot).
+    #[test]
+    fn render_dsl_round_trips_daily_trigger() {
+        use crate::plan::DaySet;
+        for days in [DaySet::EVERY, DaySet::WEEKDAYS, DaySet::WEEKENDS, DaySet(0b0010101)] {
+            let raw = RawPlan {
+                version: 1,
+                trigger: RawTrigger::Daily { hour: 7, minute: 5, days },
+                action: Action::Fade(FadeIntentIr::Out { secs: 600.0 }),
+                once: false,
+                origin: String::new(),
+            };
+            assert_round_trip(&raw);
+        }
+        let raw = RawPlan {
+            version: 1,
+            trigger: RawTrigger::Daily { hour: 23, minute: 0, days: DaySet::WEEKDAYS },
+            action: Action::Stop,
+            once: false,
+            origin: String::new(),
+        };
+        assert_eq!(render_dsl(&raw).as_deref(), Some("trigger daily 23:00 on weekdays action stop"));
+        assert!(describe_plan(&raw).contains("every weekday at 23:00"), "{}", describe_plan(&raw));
     }
 
     #[test]

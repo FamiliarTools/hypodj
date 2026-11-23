@@ -400,6 +400,48 @@ mod tests {
         }
     }
 
+    // RECURRING phrasings arm a Daily trigger (local time-of-day + day set), not a
+    // one-shot instant; a recurrence with no time of day is Ambiguous, never a
+    // silent one-shot.
+    #[test]
+    fn corpus_recurring_schedules() {
+        use hypodj_core::plan::DaySet;
+        let c = ctx(Some("s1"), 5);
+        let daily = |p: &RawPlan| match p.trigger {
+            RawTrigger::Daily { hour, minute, days } => (hour, minute, days),
+            ref other => panic!("expected Daily, got {other:?}"),
+        };
+        let p = tr("wake me every weekday at 7", &c).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(daily(&p[0]), (7, 0, DaySet::WEEKDAYS));
+        assert!(matches!(p[0].action, Action::Wake { selector: None, .. }));
+
+        let p = tr("wake me at 7:30 every day with jazz", &c).unwrap();
+        assert_eq!(daily(&p[0]), (7, 30, DaySet::EVERY));
+        assert!(matches!(&p[0].action, Action::Wake { selector: Some(Selector::Genre(g)), .. } if g == "jazz"));
+
+        let p = tr("every day at 23:00 wind down", &c).unwrap();
+        assert_eq!(daily(&p[0]), (23, 0, DaySet::EVERY));
+        assert!(matches!(p[0].action, Action::Fade(FadeIntentIr::ToFloor { .. })));
+
+        let p = tr("stop every night at 11", &c).unwrap();
+        assert_eq!(daily(&p[0]), (23, 0, DaySet::EVERY));
+        assert!(matches!(p[0].action, Action::Stop));
+
+        let p = tr("fade out at 22:30 on weekends", &c).unwrap();
+        assert_eq!(daily(&p[0]), (22, 30, DaySet::WEEKENDS));
+
+        let p = tr("wake me at 8 every monday and friday", &c).unwrap();
+        assert_eq!(daily(&p[0]), (8, 0, DaySet(0b0010001)));
+
+        // A day name alone is a one-shot, never a recurrence.
+        let p = tr("wake me at 7", &c).unwrap();
+        assert!(matches!(p[0].trigger, RawTrigger::WallClock { .. }));
+
+        assert!(matches!(tr("wind down every day", &c), Err(NlError::Ambiguous(_))));
+        assert!(matches!(tr("pause every day in 10 minutes", &c), Err(NlError::Ambiguous(_))));
+    }
+
     #[test]
     fn corpus_wake_pm_meridian_rolls_to_next_day() {
         let c = ctx(Some("s1"), 5);

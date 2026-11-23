@@ -11,7 +11,7 @@ use chrono::{TimeZone, Utc};
 use hypodj_core::config::{DEFAULT_SLEEP_FADE_SECS, DEFAULT_WINDDOWN_FADE_SECS};
 use hypodj_core::nl::{NlContext, NlError, NlHit, NlQuery, NlSession, NlSource, Translator};
 use hypodj_core::plan::{
-    Action, FadeIntentIr, PlayMode, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
+    Action, DaySet, FadeIntentIr, PlayMode, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
 };
 
 /// The default fade duration a bare "fade out"/"fade in" emits. 30s matches the
@@ -386,8 +386,8 @@ fn fade_immediate(
                 i += 1 + c;
             }
             "at" => {
-                let (at, c) = parse_time(rest, i + 1, low, ctx).ok_or(NlError::NotUnderstood)?;
-                trigger = RawTrigger::WallClock { at };
+                let (_, _, c) = parse_clock(rest, i + 1, low).ok_or(NlError::NotUnderstood)?;
+                trigger = at_trigger(rest, i, low, ctx).ok_or(NlError::NotUnderstood)?;
                 i += 1 + c;
             }
             _ => {
@@ -438,13 +438,25 @@ fn boundary_or_time(
     }
     // An explicit "in"/"at" clause MUST parse: a misheard duration/time is a
     // NotUnderstood (punt to the model / loud ACK), NEVER a silent Immediate.
+    if recurrence(tv).is_some() {
+        let p = tv
+            .iter()
+            .position(|t| *t == "at")
+            .ok_or_else(|| NlError::Ambiguous("a repeating plan needs a time of day (at HH:MM)".into()))?;
+        return at_trigger(tv, p, low, ctx).ok_or(NlError::NotUnderstood);
+    }
     if let Some(p) = tv.iter().position(|t| *t == "in") {
         let (secs, _) = parse_dur(tv, p + 1).ok_or(NlError::NotUnderstood)?;
         return Ok(RawTrigger::SpanElapsed { secs });
     }
-    if let Some(p) = tv.iter().position(|t| *t == "at") {
-        let (at, _) = parse_time(tv, p + 1, low, ctx).ok_or(NlError::NotUnderstood)?;
-        return Ok(RawTrigger::WallClock { at });
+    let at = tv.iter().position(|t| *t == "at");
+    // A recurrence ("every day", "on weekdays") names a time-of-day schedule: it
+    // needs an "at <time>", and must never degrade to a one-shot "in"/Immediate.
+    if recurrence(tv).is_some() && at.is_none() {
+        return Err(NlError::Ambiguous("a repeating plan needs a time of day (at HH:MM)".into()));
+    }
+    if let Some(p) = at {
+        return at_trigger(tv, p, low, ctx).ok_or(NlError::NotUnderstood);
     }
     // A DEFERRAL conjunction we did not resolve above ("stop after the album ends",
     // "pause once this song finishes") is a deferred intent we could not parse -
@@ -506,15 +518,12 @@ fn leading_count(tv: &[&str]) -> Option<u32> {
 /// from silence. Matches the direct `wake` command (`HypodjHandler::wake_set`).
 fn wake(tv: &[&str], low: &str, text: &str, ctx: &NlContext) -> Result<Vec<RawPlan>, NlError> {
     let at_pos = tv.iter().position(|t| *t == "at").ok_or(NlError::NotUnderstood)?;
-    let (at, _) = parse_time(tv, at_pos + 1, low, ctx)
+    // "wake me every weekday at 7" is a RECURRING wake; a bare "at 7" is one-shot.
+    let trigger = at_trigger(tv, at_pos, low, ctx)
         .ok_or_else(|| NlError::Ambiguous("could not read the wake time".into()))?;
     // Optional "with <X>" selector; None means wake into the existing queue.
     let selector = with_selector(text);
-    Ok(vec![plan(
-        RawTrigger::WallClock { at },
-        Action::Wake { selector, count: DEFAULT_ENQUEUE_COUNT },
-        true,
-    )])
+    Ok(vec![plan(trigger, Action::Wake { selector, count: DEFAULT_ENQUEUE_COUNT }, true)])
 }
 
 /// The "with <X>" selector class: Genre only for the closed lexicon, else Query
@@ -629,13 +638,11 @@ fn is_unsupported_time_unit(w: &str) -> bool {
 
 /// Parse a clock time at `toks[i]` ("7", "7:30", "7pm", "7:30am") into the NEXT
 /// matching absolute UTC instant via `ctx.tz`. A bare hour with no meridian
-/// defaults to AM (a wake implies morning); "pm"/"tonight"/"evening" force PM.
-fn parse_time(
-    toks: &[&str],
-    i: usize,
-    low: &str,
-    ctx: &NlContext,
-) -> Option<(chrono::DateTime<Utc>, usize)> {
+/// defaults to AM (a wake implies morning); "pm"/"night"/"evening" force PM.
+///
+/// Read a clock time ("7", "7:30", "7pm", "7 pm", "23:00") at `toks[i]` as a
+/// 24h `(hour, minute, tokens consumed)`.
+fn parse_clock(toks: &[&str], i: usize, low: &str) -> Option<(u32, u32, usize)> {
     let mut raw = toks.get(i)?.to_string();
     let mut consumed = 1;
     let mut meridian: Option<bool> = None; // Some(true) = pm
@@ -660,12 +667,85 @@ fn parse_time(
             _ => {}
         }
     }
-    if meridian.is_none() && (low.contains("tonight") || low.contains("evening") || low.contains("pm")) {
+    if meridian.is_none() && (low.contains("night") || low.contains("evening") || low.contains("pm")) {
         meridian = Some(true);
     }
     let hour24 = apply_meridian(h, meridian.unwrap_or(false))?;
-    let at = resolve_next_local(ctx, hour24, m)?;
-    Some((at, consumed))
+    if m > 59 {
+        return None;
+    }
+    Some((hour24, m, consumed))
+}
+
+/// Read a clock time at `toks[i]` and resolve it to the next local occurrence.
+fn parse_time(
+    toks: &[&str],
+    i: usize,
+    low: &str,
+    ctx: &NlContext,
+) -> Option<(chrono::DateTime<Utc>, usize)> {
+    let (h, m, consumed) = parse_clock(toks, i, low)?;
+    Some((resolve_next_local(ctx, h, m)?, consumed))
+}
+
+/// The trigger for an "at <time>" clause whose "at" sits at `toks[at]`: a
+/// RECURRING [`RawTrigger::Daily`] when the utterance names a recurrence, else
+/// the one-shot next local occurrence. The recurrence is read from the WHOLE
+/// utterance (`low`), so it may come before or after the time.
+fn at_trigger(toks: &[&str], at: usize, low: &str, ctx: &NlContext) -> Option<RawTrigger> {
+    let all: Vec<&str> = low.split_whitespace().collect();
+    match recurrence(&all) {
+        Some(days) => {
+            let (h, m, _) = parse_clock(toks, at + 1, low)?;
+            Some(RawTrigger::Daily { hour: h as u8, minute: m as u8, days })
+        }
+        None => parse_time(toks, at + 1, low, ctx).map(|(at, _)| RawTrigger::WallClock { at }),
+    }
+}
+
+/// The recurrence an utterance names, if any: "every day"/"daily"/"every
+/// morning|night|evening"/"nightly" -> every day; "weekday(s)" -> Mon..Fri;
+/// "weekend(s)" -> Sat+Sun; "every monday" / "on mondays and fridays" -> those
+/// days. `None` means one-shot. A day NAME alone ("at 7 on monday") is not a
+/// recurrence - it needs "every" or the plural.
+fn recurrence(tv: &[&str]) -> Option<DaySet> {
+    let w: Vec<&str> = tv
+        .iter()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .collect();
+    let has = |x: &str| w.contains(&x);
+    if has("weekday") || has("weekdays") {
+        return Some(DaySet::WEEKDAYS);
+    }
+    if has("weekend") || has("weekends") {
+        return Some(DaySet::WEEKENDS);
+    }
+    const DAYS: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+    let every = has("every") || has("each");
+    let mut bits = 0u8;
+    for t in &w {
+        for (i, d) in DAYS.iter().enumerate() {
+            let plural = t.strip_suffix('s') == Some(*d);
+            if plural || (every && *t == *d) {
+                bits |= 1 << i;
+            }
+        }
+    }
+    if bits != 0 {
+        return Some(DaySet(bits));
+    }
+    if has("daily") || has("everyday") || has("nightly") {
+        return Some(DaySet::EVERY);
+    }
+    if every
+        && w.windows(2).any(|p| {
+            matches!(p[0], "every" | "each")
+                && matches!(p[1], "day" | "morning" | "night" | "evening" | "afternoon")
+        })
+    {
+        return Some(DaySet::EVERY);
+    }
+    None
 }
 
 fn parse_hm(raw: &str) -> Option<(u32, u32)> {

@@ -93,6 +93,171 @@ pub enum RawTrigger {
     WallClock { at: chrono::DateTime<chrono::Utc> },
     /// Fire `secs` from now (a monotonic span).
     SpanElapsed { secs: f64 },
+    /// RECURRING: fire at the LOCAL time-of-day `hour:minute` on every day in
+    /// `days`, and re-arm for the next occurrence after each fire (the only
+    /// trigger that is not single-use; `once` does not apply to it). Each
+    /// occurrence is resolved against the system zone at arm time, so a DST
+    /// change between two fires moves the UTC instant, never the local time -
+    /// see [`next_daily_fire`] for the gap/overlap rule.
+    Daily { hour: u8, minute: u8, days: DaySet },
+}
+
+impl RawTrigger {
+    /// Whether this trigger re-arms after it fires (every other trigger's armed
+    /// anchor is single-use and is dropped at selection).
+    pub fn is_recurring(&self) -> bool {
+        matches!(self, RawTrigger::Daily { .. })
+    }
+}
+
+/// The weekdays a [`RawTrigger::Daily`] fires on: bit 0 is Monday, bit 6 Sunday.
+/// Serialized as the bare bitmask so the wire/persisted shape stays a number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DaySet(pub u8);
+
+const DAY_WORDS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+impl DaySet {
+    pub const EVERY: DaySet = DaySet(0x7f);
+    pub const WEEKDAYS: DaySet = DaySet(0x1f);
+    pub const WEEKENDS: DaySet = DaySet(0x60);
+
+    pub fn contains(self, wd: chrono::Weekday) -> bool {
+        self.0 & (1 << wd.num_days_from_monday()) != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 & 0x7f == 0
+    }
+
+    /// Parse the DSL spelling: `daily`, `weekdays`, `weekends`, or a comma list
+    /// of three-letter day names (`mon,wed,fri`). `None` for anything else or an
+    /// empty set.
+    pub fn parse(s: &str) -> Option<DaySet> {
+        let s = s.to_ascii_lowercase();
+        let set = match s.as_str() {
+            "daily" | "everyday" => DaySet::EVERY,
+            "weekdays" => DaySet::WEEKDAYS,
+            "weekends" => DaySet::WEEKENDS,
+            list => {
+                let mut bits = 0u8;
+                for w in list.split(',') {
+                    let i = DAY_WORDS.iter().position(|d| *d == w.trim())?;
+                    bits |= 1 << i;
+                }
+                DaySet(bits)
+            }
+        };
+        (!set.is_empty()).then_some(set)
+    }
+
+    /// The canonical DSL spelling, the inverse of [`Self::parse`].
+    pub fn word(self) -> String {
+        match DaySet(self.0 & 0x7f) {
+            DaySet::EVERY => "daily".into(),
+            DaySet::WEEKDAYS => "weekdays".into(),
+            DaySet::WEEKENDS => "weekends".into(),
+            d => (0..7)
+                .filter(|i| d.0 & (1 << i) != 0)
+                .map(|i| DAY_WORDS[i])
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    }
+}
+
+/// PURE. The first instant STRICTLY after `after` at which a daily trigger fires
+/// in zone `tz`: the next date (from `after`'s local date, up to 8 days on) whose
+/// weekday is in `days`, at local `hour:minute`.
+///
+/// DST, decided once here so every caller agrees:
+/// - a local time that occurs TWICE (the autumn overlap) fires at the EARLIER of
+///   the two, once - the later reading of the same date is never revisited
+///   because a re-arm always asks for the next occurrence after the fire;
+/// - a local time that does NOT exist (the spring gap) fires at the first minute
+///   that does exist after it (02:30 in a 02:00 -> 03:00 jump fires at 03:00),
+///   so a wake inside the gap is late by the gap, never skipped for the day.
+///
+/// `None` only for an out-of-range time or an empty day set.
+pub fn next_daily_fire<Tz: chrono::TimeZone>(
+    tz: &Tz,
+    hour: u8,
+    minute: u8,
+    days: DaySet,
+    after: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Datelike, LocalResult};
+    if hour > 23 || minute > 59 || days.is_empty() {
+        return None;
+    }
+    let start = after.with_timezone(tz).date_naive();
+    for off in 0..=8 {
+        let date = start.checked_add_signed(chrono::Duration::days(off))?;
+        if !days.contains(date.weekday()) {
+            continue;
+        }
+        let mut naive = date.and_hms_opt(hour.into(), minute.into(), 0)?;
+        // Walk forward out of a gap a minute at a time; no real zone has a gap
+        // longer than a few hours, and the bound keeps this total.
+        let mut inst = None;
+        for _ in 0..=24 * 60 {
+            match tz.from_local_datetime(&naive) {
+                LocalResult::Single(d) => {
+                    inst = Some(d);
+                    break;
+                }
+                LocalResult::Ambiguous(early, _) => {
+                    inst = Some(early);
+                    break;
+                }
+                LocalResult::None => naive += chrono::Duration::minutes(1),
+            }
+        }
+        let inst = inst?.with_timezone(&chrono::Utc);
+        if inst > after {
+            return Some(inst);
+        }
+    }
+    None
+}
+
+/// Reduce a civil instant to a monotonic deadline on the shared clock. A
+/// non-positive delta is already in the past.
+fn civil_deadline(
+    at: chrono::DateTime<chrono::Utc>,
+    now: Instant,
+    now_civil: chrono::DateTime<chrono::Utc>,
+) -> Result<Instant, PlanError> {
+    (at - now_civil).to_std().map(|d| now + d).map_err(|_| PlanError::PastDeadline)
+}
+
+/// The re-arm margin: after a recurring plan fires, the next occurrence is
+/// sought strictly after `now_civil + REARM_MARGIN`, so a timer that fires a
+/// moment EARLY on the civil clock (monotonic vs wall drift) can never resolve
+/// the very occurrence it just fired. Any real day set is >= ~23h apart.
+pub const REARM_MARGIN: chrono::Duration = chrono::Duration::hours(1);
+
+/// PURE (given the zone). The next armed anchor for a RECURRING trigger after it
+/// fired, or `None` for a single-use trigger (which is dropped at selection).
+pub fn rearm_in<Tz: chrono::TimeZone>(
+    tz: &Tz,
+    trigger: &RawTrigger,
+    now: Instant,
+    now_civil: chrono::DateTime<chrono::Utc>,
+) -> Option<Resolved> {
+    match trigger {
+        RawTrigger::Daily { hour, minute, days } => {
+            let at = next_daily_fire(tz, *hour, *minute, *days, now_civil + REARM_MARGIN)?;
+            civil_deadline(at, now, now_civil).ok().map(Resolved::OnDeadline)
+        }
+        _ => None,
+    }
+}
+
+/// [`rearm_in`] against the system zone (`chrono::Local`, DST-aware).
+pub fn rearm(trigger: &RawTrigger, now: Instant, now_civil: chrono::DateTime<chrono::Utc>) -> Option<Resolved> {
+    rearm_in(&chrono::Local, trigger, now, now_civil)
 }
 
 /// How a [`RawTrigger::QueuePosition`] counts.
@@ -697,11 +862,21 @@ pub fn validate(
         RawTrigger::WallClock { at } => {
             // Reduce civil time to a monotonic delay; the timeline never touches
             // wall-clock. A non-positive delta is already in the past.
-            let delta = *at - now_civil;
-            match delta.to_std() {
-                Ok(delay) => Ok(Resolved::OnDeadline(now + delay)),
-                Err(_) => Err(PlanError::PastDeadline),
+            civil_deadline(*at, now, now_civil).map(Resolved::OnDeadline)
+        }
+
+        RawTrigger::Daily { hour, minute, days } => {
+            if *hour > 23 || *minute > 59 {
+                return Err(PlanError::OutOfBounds { field: "time" });
             }
+            if days.is_empty() {
+                return Err(PlanError::OutOfBounds { field: "days" });
+            }
+            // The local zone is the one input read here besides the arguments:
+            // a "7:00" promise is local, DST-aware (see `next_daily_fire`).
+            let at = next_daily_fire(&chrono::Local, *hour, *minute, *days, now_civil)
+                .ok_or(PlanError::OutOfBounds { field: "days" })?;
+            civil_deadline(at, now, now_civil).map(Resolved::OnDeadline)
         }
 
         RawTrigger::SpanElapsed { secs } => {
@@ -1325,4 +1500,150 @@ mod tests {
         assert_eq!(by_id, vec![0]);
         assert_eq!(after_texts[by_id[0]], "Miles Davis - So What");
     }
+    // DaySet: every DSL spelling parses and renders back to itself; junk and the
+    // empty set are refused.
+    #[test]
+    fn dayset_parse_word_round_trip() {
+        for w in ["daily", "weekdays", "weekends", "mon,wed,fri", "sun"] {
+            let d = DaySet::parse(w).unwrap();
+            assert_eq!(d.word(), w);
+            assert_eq!(DaySet::parse(&d.word()), Some(d));
+        }
+        assert_eq!(DaySet::parse("sat,sun"), Some(DaySet::WEEKENDS));
+        assert!(DaySet::parse("funday").is_none());
+        assert!(DaySet::parse("").is_none());
+        assert!(DaySet(0).is_empty());
+    }
+
+    fn lisbon_utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono_tz::Europe::Lisbon
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .earliest()
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    // Next fire: later today when still ahead, tomorrow once passed, and a
+    // weekday set skips the weekend (2026-11-20 is a Friday).
+    #[test]
+    fn next_daily_fire_today_tomorrow_and_weekdays() {
+        let tz = chrono_tz::Europe::Lisbon;
+        let fri_6 = lisbon_utc(2026, 11, 20, 6, 0);
+        assert_eq!(
+            next_daily_fire(&tz, 7, 0, DaySet::EVERY, fri_6),
+            Some(lisbon_utc(2026, 11, 20, 7, 0))
+        );
+        let fri_8 = lisbon_utc(2026, 11, 20, 8, 0);
+        assert_eq!(
+            next_daily_fire(&tz, 7, 0, DaySet::EVERY, fri_8),
+            Some(lisbon_utc(2026, 11, 21, 7, 0))
+        );
+        // Friday 08:00, weekdays only -> Monday 23rd.
+        assert_eq!(
+            next_daily_fire(&tz, 7, 0, DaySet::WEEKDAYS, fri_8),
+            Some(lisbon_utc(2026, 11, 23, 7, 0))
+        );
+        // Exactly AT the fire instant is not "after" it: the next one is tomorrow.
+        assert_eq!(
+            next_daily_fire(&tz, 7, 0, DaySet::EVERY, lisbon_utc(2026, 11, 20, 7, 0)),
+            Some(lisbon_utc(2026, 11, 21, 7, 0))
+        );
+        assert!(next_daily_fire(&tz, 24, 0, DaySet::EVERY, fri_8).is_none());
+        assert!(next_daily_fire(&tz, 7, 0, DaySet(0), fri_8).is_none());
+    }
+
+    // DST: the local time is kept, the UTC instant moves. Lisbon is UTC+0 in
+    // winter and UTC+1 in summer; 2026-03-29 jumps 01:00 -> 02:00 and 2026-10-25
+    // repeats 01:00..02:00.
+    #[test]
+    fn next_daily_fire_dst_keeps_local_time() {
+        use chrono::TimeZone;
+        let tz = chrono_tz::Europe::Lisbon;
+        let utc = |y, mo, d, h, mi| chrono::Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap();
+        // 07:00 local the day before spring-forward is 07:00 UTC; the day after
+        // it is 06:00 UTC.
+        let sat = next_daily_fire(&tz, 7, 0, DaySet::EVERY, utc(2026, 3, 28, 0, 0)).unwrap();
+        assert_eq!(sat, utc(2026, 3, 28, 7, 0));
+        let sun = next_daily_fire(&tz, 7, 0, DaySet::EVERY, sat + REARM_MARGIN).unwrap();
+        assert_eq!(sun, utc(2026, 3, 29, 6, 0));
+        // A time inside the gap (01:30 does not exist) fires at the first real
+        // minute after it, 02:00 local = 01:00 UTC; never skipped for the day.
+        let gap = next_daily_fire(&tz, 1, 30, DaySet::EVERY, utc(2026, 3, 29, 0, 0)).unwrap();
+        assert_eq!(gap, utc(2026, 3, 29, 1, 0));
+        // A time inside the overlap (01:30 happens twice) fires at the EARLIER,
+        // once: 01:30 WEST = 00:30 UTC; the re-arm then lands on the next day.
+        let first = next_daily_fire(&tz, 1, 30, DaySet::EVERY, utc(2026, 10, 24, 23, 0)).unwrap();
+        assert_eq!(first, utc(2026, 10, 25, 0, 30));
+        let again = next_daily_fire(&tz, 1, 30, DaySet::EVERY, first + REARM_MARGIN).unwrap();
+        assert_eq!(again, utc(2026, 10, 26, 1, 30));
+    }
+
+    // Re-arm: a recurring trigger yields the NEXT occurrence (at least the margin
+    // past the fire, so never the one just fired); a single-use trigger yields
+    // nothing and is dropped by the executor.
+    #[test]
+    fn rearm_only_recurring_and_never_the_same_occurrence() {
+        let tz = chrono_tz::Europe::Lisbon;
+        let n = now();
+        // Fired at 07:00:00.5 local on Friday.
+        let fired = lisbon_utc(2026, 11, 20, 7, 0) + chrono::Duration::milliseconds(500);
+        let trig = RawTrigger::Daily { hour: 7, minute: 0, days: DaySet::EVERY };
+        match rearm_in(&tz, &trig, n, fired) {
+            Some(Resolved::OnDeadline(at)) => {
+                let d = at - n;
+                assert!(d > Duration::from_secs(86_390) && d < Duration::from_secs(86_400), "{d:?}");
+            }
+            other => panic!("expected OnDeadline, got {other:?}"),
+        }
+        // Fired a moment EARLY on the civil clock (06:59:59): still not today.
+        let early = lisbon_utc(2026, 11, 20, 7, 0) - chrono::Duration::seconds(1);
+        match rearm_in(&tz, &trig, n, early) {
+            Some(Resolved::OnDeadline(at)) => assert!(at - n > Duration::from_secs(86_000)),
+            other => panic!("expected OnDeadline, got {other:?}"),
+        }
+        assert!(rearm_in(&tz, &RawTrigger::WallClock { at: fired }, n, fired).is_none());
+        assert!(rearm_in(&tz, &RawTrigger::SpanElapsed { secs: 5.0 }, n, fired).is_none());
+        assert!(trig.is_recurring());
+        assert!(!RawTrigger::Immediate.is_recurring());
+    }
+
+    // validate: a Daily trigger arms an OnDeadline within the next 8 days; bad
+    // time / empty set fail loud.
+    #[test]
+    fn validate_daily_bounds() {
+        let snap = snap5(0);
+        let n = now();
+        let r = validate(
+            &raw(RawTrigger::Daily { hour: 7, minute: 30, days: DaySet::WEEKDAYS }),
+            &snap,
+            n,
+            civil(),
+            &bounds(),
+        )
+        .unwrap();
+        match r {
+            Resolved::OnDeadline(at) => assert!(at - n <= Duration::from_secs(8 * 86_400)),
+            other => panic!("expected OnDeadline, got {other:?}"),
+        }
+        let e = validate(
+            &raw(RawTrigger::Daily { hour: 25, minute: 0, days: DaySet::EVERY }),
+            &snap,
+            n,
+            civil(),
+            &bounds(),
+        )
+        .unwrap_err();
+        assert_eq!(e, PlanError::OutOfBounds { field: "time" });
+        let e = validate(
+            &raw(RawTrigger::Daily { hour: 7, minute: 0, days: DaySet(0) }),
+            &snap,
+            n,
+            civil(),
+            &bounds(),
+        )
+        .unwrap_err();
+        assert_eq!(e, PlanError::OutOfBounds { field: "days" });
+    }
 }
+
