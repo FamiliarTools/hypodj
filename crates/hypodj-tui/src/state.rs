@@ -784,6 +784,9 @@ pub struct TuiState {
     /// Set only when `status_msg` is a plan or daemon reply. Local notices leave it
     /// empty, so the bar does not invent a state for them.
     pub status_state: Option<hypodj_style::State>,
+    /// Every part of the reply on the bar. One part for an ordinary banner.
+    /// A confirm keeps one part per plan.
+    pub status_parts: Vec<hypodj_style::Spoken>,
     /// When Space last enqueued the LAST row of a list (`None` anywhere else) -
     /// only ever read to tell a held Space from a deliberate tap once the cursor
     /// can advance no further. See [`ENQUEUE_REPEAT_WINDOW`].
@@ -1037,6 +1040,7 @@ impl Default for TuiState {
             pending: None,
             status_msg: None,
             status_state: None,
+            status_parts: Vec::new(),
             last_enqueue: None,
             connected: true,
             queue_version: None,
@@ -2518,8 +2522,8 @@ impl TuiState {
     /// indicator), never set a mode he did not ask about.
     fn toggle_mode(&mut self, m: PlayMode) -> Option<Intent> {
         let line = self.now.modes.toggle_command(m);
-        let on = !self.now.modes.get(m);
-        self.status_msg = Some(format!("{} {}", m.verb(), if on { "on" } else { "off" }));
+        // The words wait for the daemon's OK. Saying them here would claim a
+        // flip the server has not accepted yet.
         Some(Intent::Command(line))
     }
 
@@ -2815,16 +2819,22 @@ impl TuiState {
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_msg = Some(msg.into());
         self.status_state = None;
+        self.status_parts.clear();
     }
 
-    pub fn set_reply(&mut self, spoken: hypodj_style::Spoken) {
-        self.status_state = Some(spoken.state);
-        self.status_msg = Some(spoken.text());
+    pub fn set_reply(&mut self, reply: hypodj_client::spoken::Reply) {
+        self.status_parts = reply.parts.clone();
+        self.status_state = match reply.parts.as_slice() {
+            [only] => Some(only.state),
+            _ => None,
+        };
+        self.status_msg = Some(reply.text());
     }
 
     pub fn clear_status(&mut self) {
         self.status_msg = None;
         self.status_state = None;
+        self.status_parts.clear();
     }
 
     /// Append one line to the DJ scrollback, bounding it so a long session never

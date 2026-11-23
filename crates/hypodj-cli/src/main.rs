@@ -380,8 +380,8 @@ fn run_verb(conn: &mut MpdConn, line: &str) -> Result<(), MpdError> {
     if let Some((_, sentence)) = pairs.iter().find(|(k, _)| k == "mark_result") {
         println!("{sentence}");
     }
-    if let Some(sentence) = model::schedule_reply(&pairs) {
-        println!("{sentence}");
+    if let Some(line) = render::render_command(line, &pairs, stdout_ansi()) {
+        println!("{line}");
     }
     print_card(conn)
 }
@@ -437,8 +437,8 @@ fn nl_handshake(
     };
 
     // A READ-side question is answered immediately (no plan, nothing to confirm).
-    if let Some(answer) = nl::answer_from_pairs(&pairs) {
-        println!("{answer}");
+    if let Some(line) = render::render_command("nl", &pairs, stdout_ansi()) {
+        println!("{line}");
         return Ok(());
     }
     let token = match nl::token_from_pairs(&pairs) {
@@ -461,10 +461,7 @@ fn nl_handshake(
     if read_answer() {
         match conn.command(&format!("nl confirm {token}")) {
             Ok(plan_pairs) => {
-                let ansi = stdout_ansi();
-                for spoken in hypodj_client::spoken::from_confirm(&plan_pairs) {
-                    println!("{}", ansi.render(&spoken));
-                }
+                println!("{}", render::render_confirm(&plan_pairs, stdout_ansi()));
                 print_card(conn)?;
             }
             Err(MpdError::Ack(msg)) => println!("{}", render::render_refusal(&msg, stdout_ansi())),

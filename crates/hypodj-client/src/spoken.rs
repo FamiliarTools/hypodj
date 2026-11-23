@@ -26,6 +26,8 @@ pub enum Act {
     SleepCancel,
     WinddownCancel,
     WakeCancel,
+    /// `undo` returned a `jdid`. The words are that id.
+    Undo,
 }
 
 impl Act {
@@ -36,6 +38,8 @@ impl Act {
             Act::SleepCancel => "Cancelled sleep.",
             Act::WinddownCancel => "Cancelled the wind-down.",
             Act::WakeCancel => "Cancelled the wake.",
+            // The sentence is the daemon's `jdid`, built in `noted`.
+            Act::Undo => "undone",
         }
     }
 }
@@ -50,6 +54,7 @@ pub fn act_from_command(command: &str) -> Option<Act> {
         "sleep" if matches!(next, Some("off" | "cancel")) => Some(Act::SleepCancel),
         "winddown" if matches!(next, Some("off" | "cancel")) => Some(Act::WinddownCancel),
         "wake" if matches!(next, Some("off" | "cancel")) => Some(Act::WakeCancel),
+        "undo" => Some(Act::Undo),
         _ => None,
     }
 }
@@ -73,30 +78,59 @@ pub fn plan_echo(parts: &EchoParts) -> Vec<Spoken> {
     out
 }
 
-/// An `nl confirm` reply, one utterance per plan, in wire order.
+/// One reply. A confirm is several parts (one per plan); everything else is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub parts: Vec<Spoken>,
+}
+
+impl Reply {
+    pub fn one(spoken: Spoken) -> Self {
+        Self {
+            parts: vec![spoken],
+        }
+    }
+
+    /// The status line: every part, joined the way master printed a confirm.
+    pub fn text(&self) -> String {
+        self.parts
+            .iter()
+            .map(Spoken::text)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+impl From<Spoken> for Reply {
+    fn from(spoken: Spoken) -> Self {
+        Self::one(spoken)
+    }
+}
+
+/// An `nl confirm` reply: one utterance, one part per plan, in wire order.
 ///
-/// A `result` that follows a `plan_id` replaces that plan's armed line: the
-/// plan ran, and the words are the daemon's. A `plan_id` with no following
-/// `result` is still armed. Anything else falls through to [`from_reply`].
-pub fn from_confirm(pairs: &[(String, String)]) -> Vec<Spoken> {
-    let mut out = Vec::new();
+/// A `result` that follows a `plan_id` replaces that plan's armed line. The
+/// words are the daemon's. A failure or a no-match is refused. A `plan_id`
+/// with no following `result` is armed: it is waiting, it has not run.
+pub fn from_confirm(pairs: &[(String, String)]) -> Reply {
+    let mut parts = Vec::new();
     for (k, v) in pairs {
         match k.as_str() {
-            "plan_id" => out.push(Spoken::new(State::Armed, vec![nl::armed_line(v)])),
+            "plan_id" => parts.push(Spoken::new(State::Armed, vec![nl::armed_line(v)])),
             "result" => {
-                let live = Spoken::new(State::Live, vec![v.clone()]);
-                match out.last_mut() {
-                    Some(last) => *last = live,
-                    None => out.push(live),
+                let spoken = Spoken::new(state_of_result(v), vec![v.clone()]);
+                match parts.last_mut() {
+                    Some(last) => *last = spoken,
+                    None => parts.push(spoken),
                 }
             }
             _ => {}
         }
     }
-    if out.is_empty() {
-        out.push(from_reply(pairs, None));
+    if parts.is_empty() {
+        parts.push(from_reply(pairs, None));
     }
-    out
+    Reply { parts }
 }
 
 /// What a confirm just did, from the pairs the daemon returned.
@@ -111,7 +145,15 @@ pub fn from_reply(pairs: &[(String, String)], act: Option<Act>) -> Spoken {
         .map(|(_, v)| v.clone())
         .collect();
     if !results.is_empty() {
-        return Spoken::new(State::Live, results);
+        let state = if results
+            .iter()
+            .all(|line| state_of_result(line) == State::Refused)
+        {
+            State::Refused
+        } else {
+            State::Live
+        };
+        return Spoken::new(state, results);
     }
     let ids: Vec<String> = pairs
         .iter()
@@ -122,7 +164,7 @@ pub fn from_reply(pairs: &[(String, String)], act: Option<Act>) -> Spoken {
         let lines = ids.iter().map(|id| nl::armed_line(id)).collect();
         return Spoken::new(State::Armed, lines);
     }
-    if let Some(spoken) = status_pair(pairs) {
+    if let Some(spoken) = noted(pairs, act) {
         return spoken;
     }
     match act {
@@ -133,30 +175,80 @@ pub fn from_reply(pairs: &[(String, String)], act: Option<Act>) -> Spoken {
     }
 }
 
-/// Sleep and wake status, from the keys the handler actually sends.
-fn status_pair(pairs: &[(String, String)]) -> Option<Spoken> {
+/// A result that did not happen: the handler's failure line, or a no-match.
+fn state_of_result(line: &str) -> State {
+    if line.starts_with("could not do that")
+        || line.starts_with("added 0 - no matches")
+        || line == "no matching track to play"
+    {
+        State::Refused
+    } else {
+        State::Live
+    }
+}
+
+/// Sleep, wake, a read-side answer, or an undo. A timer that is counting down
+/// is already acting, so it is live. Armed is only a plan that has not run.
+fn noted(pairs: &[(String, String)], act: Option<Act>) -> Option<Spoken> {
     if let Some((_, secs)) = pairs.iter().find(|(k, _)| k == "sleep_remaining") {
         return Some(Spoken::new(
-            State::Armed,
+            State::Live,
             vec![format!("sleep in {}", span(secs))],
         ));
     }
     if let Some((_, secs)) = pairs.iter().find(|(k, _)| k == "wake_remaining") {
         return Some(Spoken::new(
-            State::Armed,
+            State::Live,
             vec![format!("wake in {}", span(secs))],
         ));
     }
     if pairs.iter().any(|(k, v)| k == "sleep" && v == "none") {
-        return Some(Spoken::new(State::Live, vec!["sleep: none".into()]));
+        return Some(Spoken::new(
+            State::Live,
+            vec!["no sleep timer armed".into()],
+        ));
     }
     if pairs.iter().any(|(k, v)| k == "wake" && v == "none") {
-        return Some(Spoken::new(State::Live, vec!["wake: none".into()]));
+        return Some(Spoken::new(State::Live, vec!["no wake alarm armed".into()]));
     }
     if let Some((_, answer)) = pairs.iter().find(|(k, _)| k == "nl_answer") {
         return Some(Spoken::new(State::Live, vec![answer.clone()]));
     }
+    if act == Some(Act::Undo) {
+        if let Some((_, did)) = pairs.iter().find(|(k, _)| k == "jdid") {
+            return Some(Spoken::new(State::Live, vec![format!("undone: {did}")]));
+        }
+    }
     None
+}
+
+/// The sentence both surfaces speak for a successful command, when it has one.
+/// `None` for a verb whose answer is the queue itself (`play`, `next`).
+pub fn command_spoken(line: &str, pairs: &[(String, String)]) -> Option<Spoken> {
+    let act = act_from_command(line);
+    if noted(pairs, act).is_some() {
+        return Some(from_reply(pairs, act));
+    }
+    mode_sentence(line).map(|sentence| Spoken::new(State::Live, vec![sentence]))
+}
+
+/// `random 1` / `repeat 0` after the daemon has already said OK.
+fn mode_sentence(line: &str) -> Option<String> {
+    let mut words = line.split_whitespace();
+    let verb = words.next()?;
+    let bit = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    if !matches!(verb, "random" | "repeat" | "single" | "consume") {
+        return None;
+    }
+    let on = match bit {
+        "1" => "on",
+        "0" => "off",
+        _ => return None,
+    };
+    Some(format!("{verb} {on}"))
 }
 
 fn span(secs: &str) -> String {
@@ -217,6 +309,8 @@ pub struct ReplyShape {
     pub act: Option<Act>,
     pub state: State,
     pub lines: Vec<String>,
+    /// When set, [`command_spoken`] is what the CLI and the TUI call.
+    pub command: Option<&'static str>,
 }
 
 fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -241,6 +335,7 @@ fn shape(
         act,
         state,
         lines: lines.iter().map(|s| (*s).to_string()).collect(),
+        command: None,
     }
 }
 
@@ -294,7 +389,14 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         } else {
             &[("plan_id", "4"), ("result", line)]
         };
-        out.push(shape(name, pairs(keys), None, None, State::Live, &[line]));
+        out.push(shape(
+            name,
+            pairs(keys),
+            None,
+            None,
+            state_of_result(line),
+            &[line],
+        ));
     }
     // Playback modes. The handler writes `effect_mode(word, on)`.
     for mode in ["random", "repeat", "single", "consume"] {
@@ -316,6 +418,7 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
                 act: None,
                 state: State::Live,
                 lines: vec![line],
+                command: None,
             });
         }
     }
@@ -333,7 +436,7 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         pairs(&[("sleep_remaining", "720")]),
         None,
         None,
-        State::Armed,
+        State::Live,
         &["sleep in 12m"],
     ));
     out.push(shape(
@@ -342,14 +445,14 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         None,
         None,
         State::Live,
-        &["sleep: none"],
+        &["no sleep timer armed"],
     ));
     out.push(shape(
         "wake remaining",
         pairs(&[("wake_remaining", "45")]),
         None,
         None,
-        State::Armed,
+        State::Live,
         &["wake in 45s"],
     ));
     out.push(shape(
@@ -358,8 +461,17 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         None,
         None,
         State::Live,
-        &["wake: none"],
+        &["no wake alarm armed"],
     ));
+    out.push(ReplyShape {
+        name: "undo",
+        pairs: pairs(&[("jdid", "cleared 7")]),
+        ack: None,
+        act: Some(Act::Undo),
+        state: State::Live,
+        lines: vec!["undone: cleared 7".into()],
+        command: Some("undo"),
+    });
     // Bare OK. The sentence is the action kind, not the step text.
     out.push(shape(
         "clear",
@@ -452,17 +564,34 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
             act: None,
             state: State::Refused,
             lines,
+            command: None,
         });
+    }
+    for shape in &mut out {
+        shape.command = match shape.name {
+            "sleep remaining" | "sleep none" => Some("sleep"),
+            "wake remaining" | "wake none" => Some("wake"),
+            "nl answer" => Some("nl"),
+            "undo" => Some("undo"),
+            _ => shape.command,
+        };
     }
     out
 }
 
 /// Classify one catalog row the way the binaries do.
+///
+/// Rows with a `command` go through [`command_spoken`], the function the CLI
+/// and the TUI call for sleep, wake, an answer, and undo.
 pub fn speak_shape(shape: &ReplyShape) -> Spoken {
-    match &shape.ack {
-        Some(msg) => refusal_ack(msg),
-        None => from_reply(&shape.pairs, shape.act),
+    if let Some(msg) = &shape.ack {
+        return refusal_ack(msg);
     }
+    if let Some(cmd) = shape.command {
+        return command_spoken(cmd, &shape.pairs)
+            .unwrap_or_else(|| from_reply(&shape.pairs, shape.act));
+    }
+    from_reply(&shape.pairs, shape.act)
 }
 
 #[cfg(test)]
@@ -527,21 +656,25 @@ mod tests {
 
     #[test]
     fn a_mixed_confirm_keeps_each_plan() {
-        let spoken = from_confirm(&[
+        let reply = from_confirm(&[
             ("plan_id".into(), "1".into()),
             ("result".into(), "added 5 tracks".into()),
             ("plan_id".into(), "2".into()),
         ]);
-        assert_eq!(spoken.len(), 2);
-        assert_eq!(spoken[0].state, State::Live);
-        assert_eq!(spoken[0].lines, vec!["added 5 tracks".to_string()]);
-        assert_eq!(spoken[1].state, State::Armed);
-        assert_eq!(spoken[1].lines, vec!["armed (plan 2)".to_string()]);
-        let words: Vec<String> = spoken.into_iter().map(|s| s.text()).collect();
-        assert_eq!(words, nl::confirm_lines(&[
-            ("plan_id".into(), "1".into()),
-            ("result".into(), "added 5 tracks".into()),
-            ("plan_id".into(), "2".into()),
-        ]));
+        assert_eq!(reply.parts.len(), 2);
+        assert_eq!(reply.parts[0].state, State::Live);
+        assert_eq!(reply.parts[0].lines, vec!["added 5 tracks".to_string()]);
+        assert_eq!(reply.parts[1].state, State::Armed);
+        assert_eq!(reply.parts[1].lines, vec!["armed (plan 2)".to_string()]);
+        assert_eq!(reply.text(), "added 5 tracks; armed (plan 2)");
+        let words: Vec<String> = reply.parts.iter().map(Spoken::text).collect();
+        assert_eq!(
+            words,
+            nl::confirm_lines(&[
+                ("plan_id".into(), "1".into()),
+                ("result".into(), "added 5 tracks".into()),
+                ("plan_id".into(), "2".into()),
+            ])
+        );
     }
 }

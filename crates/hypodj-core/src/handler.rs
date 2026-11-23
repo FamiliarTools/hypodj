@@ -2170,6 +2170,7 @@ pub const PAIR_ORIGIN: &str = "origin";
 pub const PAIR_WHEN: &str = "when";
 pub const PAIR_NEXT_FIRE: &str = "next_fire";
 pub const PAIR_NL_ANSWER: &str = "nl_answer";
+pub const PAIR_JDID: &str = "jdid";
 
 impl PlanOutcome {
     /// The single human line the client shows after `y`/confirm. Speaks the REAL
@@ -5610,7 +5611,7 @@ impl HypodjHandler {
                 .pair("jage", v.age_secs.to_string())
                 .pair("jorigin", v.origin)
                 .pair("jact", v.act.to_string())
-                .pair("jdid", v.did)
+                .pair(PAIR_JDID, v.did)
                 .pair("jundoable", if v.undoable { "1" } else { "0" }.to_string());
         }
         b.build()
@@ -5659,7 +5660,7 @@ impl HypodjHandler {
         );
         MpdResponse::pairs()
             .pair("jid", taken.id.to_string())
-            .pair("jdid", taken.did)
+            .pair(PAIR_JDID, taken.did)
             .build()
     }
 

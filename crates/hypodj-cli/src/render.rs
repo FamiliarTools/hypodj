@@ -14,6 +14,21 @@ pub fn render_card(np: &NowPlaying) -> String {
 }
 
 /// The line the binary prints after a confirm. Same words on the CLI and the TUI.
+/// A confirm, one line, every plan, each in its own state.
+pub fn render_confirm(pairs: &[(String, String)], ansi: Ansi) -> String {
+    hypodj_client::spoken::from_confirm(pairs)
+        .parts
+        .iter()
+        .map(|part| ansi.render(part))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Sleep, wake, an answer, or undo. The same `command_spoken` the TUI calls.
+pub fn render_command(line: &str, pairs: &[(String, String)], ansi: Ansi) -> Option<String> {
+    hypodj_client::spoken::command_spoken(line, pairs).map(|spoken| ansi.render(&spoken))
+}
+
 pub fn render_outcome(
     pairs: &[(String, String)],
     act: Option<hypodj_client::spoken::Act>,
@@ -347,6 +362,48 @@ mod tests {
     }
 
     #[test]
+    fn a_confirm_and_a_status_use_the_same_words_on_the_cli() {
+        use hypodj_client::spoken::{command_spoken, from_confirm};
+        let mixed = [
+            ("plan_id".into(), "1".into()),
+            ("result".into(), "added 5 tracks".into()),
+            ("plan_id".into(), "2".into()),
+        ];
+        let off = render_confirm(&mixed, Ansi::off());
+        let on = render_confirm(&mixed, Ansi::on_truecolor());
+        assert_eq!(off, "added 5 tracks; armed (plan 2)");
+        assert_eq!(hypodj_style::ansi::strip(&on), off);
+        assert!(on.contains("\u{1b}[1m"), "the live plan is bold");
+        assert!(on.contains("38;2;"), "the armed plan is ember");
+
+        let batch = [
+            ("plan_id".into(), "7".into()),
+            ("plan_id".into(), "8".into()),
+        ];
+        let batch_off = render_confirm(&batch, Ansi::off());
+        assert_eq!(batch_off, from_confirm(&batch).text());
+        assert!(batch_off.contains("armed (plan 7)"));
+        assert!(batch_off.contains("armed (plan 8)"));
+
+        for (line, raw) in [
+            ("sleep", vec![("sleep_remaining".into(), "720".into())]),
+            ("wake", vec![("wake".into(), "none".into())]),
+            (
+                "nl",
+                vec![("nl_answer".into(), "yes, \"Blue\" is a favorite".into())],
+            ),
+            ("undo", vec![("jdid".into(), "cleared 7".into())]),
+        ] {
+            let spoken = command_spoken(line, &raw).unwrap();
+            assert_eq!(
+                render_command(line, &raw, Ansi::off()).as_deref(),
+                Some(spoken.text().as_str())
+            );
+            assert_eq!(spoken.state, hypodj_style::State::Live, "{line}");
+        }
+    }
+
+    #[test]
     fn armed_hud_on_the_card_is_ember_and_strips_clean() {
         let status = p(&[("state", "play"), ("X-hypodj-sleep-remaining", "720")]);
         let current = p(&[("file", "song/1"), ("Title", "X")]);
@@ -640,7 +697,10 @@ mod tests {
     #[test]
     fn card_shows_playback_modes_only_when_on() {
         let cur = p(&[("Title", "T")]);
-        let on = now_playing(&p(&[("state", "play"), ("random", "1"), ("repeat", "1")]), &cur);
+        let on = now_playing(
+            &p(&[("state", "play"), ("random", "1"), ("repeat", "1")]),
+            &cur,
+        );
         let card = render_card(&on);
         assert!(card.contains("| random repeat"), "card: {card}");
         let off = now_playing(&p(&[("state", "play"), ("random", "0")]), &cur);
@@ -648,5 +708,4 @@ mod tests {
         let stopped = now_playing(&p(&[("state", "stop"), ("single", "1")]), &[]);
         assert!(render_card(&stopped).contains("modes: single"));
     }
-
 }

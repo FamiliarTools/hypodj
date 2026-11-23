@@ -48,12 +48,10 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
 pub fn undo(conn: &mut MpdConn) -> Result<bool, MpdError> {
     match conn.command("undo") {
         Ok(pairs) => {
-            let did = pairs
-                .iter()
-                .find(|(k, _)| k == "jdid")
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("done");
-            println!("undone: {did}");
+            if let Some(line) = crate::render::render_command("undo", &pairs, crate::stdout_ansi())
+            {
+                println!("{line}");
+            }
             Ok(true)
         }
         Err(MpdError::Ack(msg)) => {

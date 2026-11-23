@@ -3065,7 +3065,7 @@ mod tests {
         let armed = hypodj_client::spoken::from_reply(&[("plan_id".into(), "4".into())], None);
         s.screen = crate::state::Screen::Queue;
         s.mode = crate::state::Mode::Normal;
-        s.set_reply(armed.clone());
+        s.set_reply(armed.clone().into());
         let bar = style_of_text(&s, 80, 24, &armed.text());
         assert_eq!(bar.fg, Some(hypodj_style::ratatui::ember_color(s.term_bg, true)));
         // A stopped deck still shows the wake/sleep hold, and it is ember too.
@@ -3559,6 +3559,22 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
             // lent it the blank breathing row), with any remaining truncation marked in
             // the text. `render` sizes the area; this only ever fills what it was given.
             Some(msg) => {
+                if !state.status_parts.is_empty() {
+                    let mut spans = Vec::new();
+                    for (i, part) in state.status_parts.iter().enumerate() {
+                        if i > 0 {
+                            spans.push(Span::raw("; "));
+                        }
+                        let style = hypodj_style::ratatui::style_for_state(
+                            part.state,
+                            state.term_bg,
+                            state.truecolor,
+                        );
+                        spans.push(Span::styled(part.text(), style));
+                    }
+                    f.render_widget(Paragraph::new(Line::from(spans)), area);
+                    return;
+                }
                 let rows = status_lines(msg, area.width as usize, area.height as usize);
                 let style = match state.status_state {
                     Some(st) => {
@@ -3667,10 +3683,12 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 };
                 let mut spans = vec![Span::styled(wave, wave_style)];
                 if let Some(badge) = badge {
-                    spans.push(Span::styled(
-                        badge,
-                        Style::default().quiet(),
-                    ));
+                    let quiet = hypodj_style::ratatui::style_for(
+                        hypodj_style::Role::InkQuiet,
+                        state.term_bg,
+                        state.truecolor,
+                    );
+                    spans.push(Span::styled(badge, quiet));
                 }
                 if hint_len > 0 {
                     spans.push(Span::styled(

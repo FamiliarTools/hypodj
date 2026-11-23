@@ -711,18 +711,19 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             clear_refresh_gate(tx, state);
         }
         RespKind::Confirm(pending) => state.enter_confirm(pending),
-        RespKind::Banner(spoken) => {
+        RespKind::Banner(reply) => {
             // A refresh that ACKed lands here (not as a Snapshot); clear the gate so a
             // rare status/currentsong ACK never permanently wedges wake-driven
             // refreshes. Clearing on an unrelated banner costs at most one extra cheap
             // refresh.
-            // On the DJ pane, also surface the arm ACK/result (armed / did-nothing /
-            // error) IN the scrollback where the user is looking, not only the bottom
-            // status bar - a no-op/failed arm otherwise gives no feedback in the pane.
+            // One reply, every part. The DJ scrollback and the status bar both keep
+            // the whole utterance, so a later plan cannot erase an earlier one.
             if state.screen == Screen::Dj {
-                state.push_spoken(spoken.clone());
+                for part in &reply.parts {
+                    state.push_spoken(part.clone());
+                }
             }
-            state.set_reply(spoken);
+            state.set_reply(reply);
             clear_refresh_gate(tx, state);
         }
         RespKind::Heard(lines) => {
@@ -1021,7 +1022,7 @@ mod tests {
 
         for shape in reply_shapes() {
             let spoken = speak_shape(&shape);
-            apply_resp(&tx, &mut state, RespKind::Banner(spoken.clone()));
+            apply_resp(&tx, &mut state, RespKind::Banner(spoken.clone().into()));
             assert_eq!(state.status_state, Some(shape.state), "{}", shape.name);
             assert_eq!(
                 state.status_msg.as_deref(),
@@ -1074,6 +1075,69 @@ mod tests {
             }
         }
         panic!("{needle:?} is not on screen:\n{text}");
+    }
+
+    #[test]
+    fn a_confirm_keeps_every_plan_on_the_bar_and_in_the_dj_pane() {
+        use hypodj_client::spoken::from_confirm;
+        use ratatui::style::Modifier;
+
+        let (tx, _rx) = mpsc::channel::<Req>();
+        let cases = [
+            (
+                vec![
+                    ("plan_id".into(), "1".into()),
+                    ("result".into(), "added 5 tracks".into()),
+                    ("plan_id".into(), "2".into()),
+                ],
+                "added 5 tracks; armed (plan 2)",
+            ),
+            (
+                vec![("plan_id".into(), "7".into()), ("plan_id".into(), "8".into())],
+                "armed (plan 7); armed (plan 8)",
+            ),
+        ];
+        for (pairs, joined) in cases {
+            let reply = from_confirm(&pairs);
+            assert_eq!(reply.text(), joined);
+            let mut state = TuiState::new();
+            state.truecolor = true;
+            state.screen = Screen::Queue;
+            apply_resp(&tx, &mut state, RespKind::Banner(reply.clone()));
+            assert_eq!(state.status_msg.as_deref(), Some(joined));
+            assert_eq!(state.status_parts.len(), reply.parts.len());
+            let (_text, live_or_first) = frame_style(&state, reply.parts[0].text().as_str());
+            if reply.parts[0].state == hypodj_style::State::Live {
+                assert!(live_or_first.add_modifier.contains(Modifier::BOLD));
+                assert_eq!(live_or_first.fg, Some(ratatui::style::Color::Reset));
+            }
+            if reply.parts.len() > 1 {
+                let (_text, second) = frame_style(&state, reply.parts[1].text().as_str());
+                if reply.parts[1].state == hypodj_style::State::Armed {
+                    let ember = hypodj_style::ratatui::ember_color(state.term_bg, true);
+                    assert_eq!(second.fg, Some(ember));
+                }
+            }
+            state.screen = Screen::Dj;
+            state.dj_log.clear();
+            apply_resp(&tx, &mut state, RespKind::Banner(reply.clone()));
+            let flat = {
+                use ratatui::backend::TestBackend;
+                use ratatui::Terminal;
+                let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+                terminal.draw(|f| ui::render(f, &state)).unwrap();
+                let buf = terminal.backend().buffer().clone();
+                (0..buf.area.height)
+                    .map(|y| {
+                        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            for part in &reply.parts {
+                assert!(flat.contains(&part.text()), "missing {}:\n{flat}", part.text());
+            }
+        }
     }
 
     /// Pressing `y` on the DJ confirm echoes "> y" into the chat immediately AND still

@@ -9,8 +9,8 @@ use hypodj_client::spoken::{reply_shapes, Act, State};
 use hypodj_core::handler::{
     effect_set_volume, PlanOutcome, ACK_NL_INVALID, ACK_NL_NO_TOKEN, ACK_NL_STALE, ACK_NO_PLAN,
     ACK_TRANSLATOR_TASK, ACK_WAKE_DURATION, ACK_WAKE_TIME, EFFECT_FADING, EFFECT_NOTHING,
-    EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_NL_ANSWER, PAIR_PLAN_ID, PAIR_RESULT,
-    PAIR_SLEEP, PAIR_SLEEP_REMAINING, PAIR_WAKE, PAIR_WAKE_REMAINING,
+    EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_JDID, PAIR_NL_ANSWER, PAIR_PLAN_ID,
+    PAIR_RESULT, PAIR_SLEEP, PAIR_SLEEP_REMAINING, PAIR_WAKE, PAIR_WAKE_REMAINING,
 };
 use hypodj_core::nl::NlError;
 use hypodj_core::plan::{PlanError, PlayMode};
@@ -151,6 +151,7 @@ fn the_catalog_speaks_the_handlers_sentences() {
         PAIR_WAKE_REMAINING,
         PAIR_WAKE,
         PAIR_NL_ANSWER,
+        PAIR_JDID,
     ];
     for shape in &shapes {
         for (k, _) in &shape.pairs {
