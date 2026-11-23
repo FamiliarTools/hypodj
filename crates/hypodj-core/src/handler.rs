@@ -16158,8 +16158,20 @@ fn search_all_pairs(
 /// Deliberately asymmetric with [`station_for_name`] (exact, ASCII-case-folded): FIND is
 /// substring, RESOLVE is exact. They never need to agree, because a hit row enqueues by
 /// the CANONICAL name baked into its uri, never by the typed query.
+///
+/// THE KIND TOKEN (task wxpnbso, part A): a query that is exactly `stations` (or `station`,
+/// trimmed, any case) matches EVERY saved station. "Show me all my stations" is a browse
+/// want, not a text match - a name substring can never answer it, because most stations
+/// are not named "radio". Additive, never a mode switch: search3 still runs on the same
+/// query, so an artist, album or song literally called "Stations" is not lost, and the
+/// station block sits between albums and songs exactly as for any other query.
 fn station_matches(s: &Station, query_lower: &str) -> bool {
-    s.name.to_lowercase().contains(query_lower)
+    is_station_kind_token(query_lower) || s.name.to_lowercase().contains(query_lower)
+}
+
+/// Is this (lowercased) query the station KIND token rather than a text query?
+fn is_station_kind_token(query_lower: &str) -> bool {
+    matches!(query_lower.trim(), "stations" | "station")
 }
 
 /// The host of a stream url, for the Find row's trailer: what actually distinguishes
@@ -24734,6 +24746,22 @@ mod tests {
         // The URL is NEVER searched: `searchall http` must not return every station.
         assert!(!station_matches(&s, "http"));
         assert!(!station_matches(&s, "ntslive.net"));
+    }
+
+    #[test]
+    fn the_stations_token_lists_every_saved_station() {
+        // wxpnbso (A): 'NTS 4 To The Floor' is a radio stream no name substring finds.
+        let all = [
+            st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
+            st("2", "KFJC 89.7 FM", "http://netcast.kfjc.org/kfjc-320k-aac"),
+            st("3", "The Lot Radio - NYC", "https://www.lvpr.tv/?v=x"),
+        ];
+        for q in ["stations", "station", " stations "] {
+            assert!(all.iter().all(|s| station_matches(s, q)), "{q:?} lists the whole set");
+        }
+        // Only the WHOLE token: a longer query is an ordinary name substring again.
+        assert!(!station_matches(&all[0], "stations nyc"));
+        assert!(!station_matches(&all[0], "stat"));
     }
 
     #[test]
