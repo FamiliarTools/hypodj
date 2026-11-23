@@ -95,9 +95,9 @@ detents, the same detents as the server.
 
 | Token | Rule |
 |---|---|
-| `type.face` | One monospace face. TUI: the terminal's own. GUI: JetBrains Mono (shared with the Abicoca Labs base). |
+| `type.face` | One monospace face. TUI: the terminal's own. GUI: JetBrains Mono. Monospace because HypoDJ is terminal-native and the GUI is the same instrument. |
 | `type.weights` | Regular and bold only. Emphasis is bold, reverse or underline, as in the TUI today. |
-| `grid.cell` | The terminal cell is the unit. The GUI maps 1 cell to 8 px wide (the shared 8 px grid), so layouts transfer. |
+| `grid.cell` | The terminal cell is the unit. The GUI maps 1 cell to 8 px wide, so layouts transfer. |
 | `glyph.sigil` | Truchet diagonals from the album hash, the HypoDJ mark for "no cover". |
 
 ### 7. Voice
@@ -106,11 +106,13 @@ One sentence that always says what happened, including why when nothing did.
 British English. No exclamation marks. No em dashes. Echo in the future tense,
 live in the present, done in the past.
 
-## What HypoDJ does not take from the shared base
+## Family
 
-It takes the structure of the Abicoca Labs base (monospace, 8 px grid). It does
-not take the black-and-white palette or the cube colours; those belong to yapp.
-HypoDJ sits under Familiar Tools, and its colour comes from the music.
+HypoDJ is a Familiar Tools product and stands on its own tokens. It does not
+depend on the Abicoca Labs brand system (forest, ochre, EB Garamond, the fox) or
+yapp's palette (black and white, the four cubes). If Familiar Tools later grows a
+shared surface-neutral base, HypoDJ's room, state and motion roles are a
+candidate for it.
 
 ## Implementation shape
 
