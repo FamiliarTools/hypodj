@@ -9,6 +9,7 @@ members = [
     "crates/hypodj-client",
     "crates/hypodj-mcp",
     "crates/hypodj-tui",
+    "crates/hypodj-search",
     "crates/hypodj-build-info",
 ]
 

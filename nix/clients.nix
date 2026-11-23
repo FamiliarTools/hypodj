@@ -43,14 +43,16 @@ rustPlatform.buildRustPackage {
   # MPD/TCP, no libmpv - `ldd` on it shows only libc and libgcc_s) and it shares the
   # one lock and the one source tree with the other two. Building it beside them
   # costs one extra link.
-  cargoBuildFlags = [ "--bin" "dj" "--bin" "dj-gui" "--bin" "dj-mcp" ];
+  # dj-search-provider (the GNOME Shell search provider) is the same kind of client:
+  # hypodj-client + zbus, no hypodj-core, no libmpv.
+  cargoBuildFlags = [ "--bin" "dj" "--bin" "dj-gui" "--bin" "dj-mcp" "--bin" "dj-search-provider" ];
 
   # Test only the client crates (offline, no network). The cc tests are pure - a
   # missing `claude` just means cc_available() is false, never a live call.
   # hypodj-mcp's integration test drives the real binary over a pipe against a
   # loopback stand-in daemon; both are inside the sandbox, so it needs no network.
   doCheck = true;
-  cargoTestFlags = [ "-p" "hypodj-client" "-p" "hypodj-cli" "-p" "dj-gui" "-p" "hypodj-mcp" ];
+  cargoTestFlags = [ "-p" "hypodj-client" "-p" "hypodj-cli" "-p" "dj-gui" "-p" "hypodj-mcp" "-p" "hypodj-search" ];
 
   # libmpv2-sys uses pkg-config to find mpv at build time.
   PKG_CONFIG_PATH = "${mpv-unwrapped.dev}/lib/pkgconfig";
@@ -76,10 +78,25 @@ rustPlatform.buildRustPackage {
     # the wrapper so libmpv.so.2 resolves.
     $out/bin/dj --completions fish > dj.fish
     installShellCompletion --fish dj.fish
+
+    # GNOME Shell search provider registration: the provider .ini (read by the Shell
+    # from share/gnome-shell/search-providers), the .desktop it names (the Shell
+    # requires an installed app id, and Settings > Search lists it by that app), and
+    # the D-Bus session activation file, so the service starts on the first search.
+    d=crates/hypodj-search/data
+    install -Dm644 $d/tech.familiartools.HypoDJ.SearchProvider.ini \
+      $out/share/gnome-shell/search-providers/tech.familiartools.HypoDJ.SearchProvider.ini
+    install -Dm644 $d/hypodj.desktop $out/share/applications/hypodj.desktop
+    substituteInPlace $out/share/applications/hypodj.desktop \
+      --replace-fail "Exec=dj-gui" "Exec=$out/bin/dj-gui"
+    install -Dm644 $d/tech.familiartools.HypoDJ.SearchProvider.service \
+      $out/share/dbus-1/services/tech.familiartools.HypoDJ.SearchProvider.service
+    substituteInPlace $out/share/dbus-1/services/tech.familiartools.HypoDJ.SearchProvider.service \
+      --replace-fail "@bindir@" "$out/bin"
   '';
 
   meta = {
-    description = "HypoDJ clients: the dj jukebox CLI, the dj-gui TUI, and the dj-mcp agent surface";
+    description = "HypoDJ clients: the dj jukebox CLI, the dj-gui TUI, the dj-mcp agent surface, and the GNOME search provider";
     mainProgram = "dj";
     license = with lib.licenses; [ mit asl20 ];
   };

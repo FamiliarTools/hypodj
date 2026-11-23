@@ -331,6 +331,25 @@ in
       '';
     };
 
+    searchProvider = {
+      enable = mkEnableOption ''
+        the GNOME Shell search provider (type "next song", "louder" or an album
+        name in Activities). Independent of `enable`: it is a client of whatever
+        daemon HYPODJ_HOST/HYPODJ_PORT point at (default 127.0.0.1:6600), and is
+        started on demand by D-Bus activation, so no service unit is needed
+      '';
+      package = mkOption {
+        type = types.package;
+        default = pkgs.hypodj-clients;
+        defaultText = literalExpression "pkgs.hypodj-clients";
+        description = ''
+          The package carrying `dj-search-provider` and its registration files
+          (share/gnome-shell/search-providers, share/applications,
+          share/dbus-1/services).
+        '';
+      };
+    };
+
     settings = mkOption {
       type = types.attrsOf types.anything;
       default = { };
@@ -343,7 +362,7 @@ in
     };
   };
 
-  config = mkIf cfg.enable (
+  config = lib.mkMerge [ (mkIf cfg.enable (
     {
       assertions = [
         {
@@ -377,5 +396,30 @@ in
     // lib.optionalAttrs (!isNixos) {
       systemd.user.services.hypodj = hmService;
     }
-  );
+  ))
+  # The GNOME search provider: the Shell finds the provider .ini and the .desktop
+  # it names under XDG data dirs, and the session bus starts the service from its
+  # activation file on the first search.
+  (mkIf cfg.searchProvider.enable (
+    let
+      sp = cfg.searchProvider.package;
+      busName = "tech.familiartools.HypoDJ.SearchProvider";
+    in
+    lib.optionalAttrs isNixos {
+      nixpkgs.overlays = mkIf (!cfg.enable) [ (import ./overlay.nix) ];
+      environment.systemPackages = [ sp ];
+      environment.pathsToLink = [ "/share/gnome-shell/search-providers" ];
+      services.dbus.packages = [ sp ];
+    }
+    // lib.optionalAttrs (!isNixos) {
+      home.packages = [ sp ];
+      # Linked into ~/.local/share as well, which the Shell and the session bus
+      # always scan, rather than relying on the profile being on XDG_DATA_DIRS.
+      xdg.dataFile."gnome-shell/search-providers/${busName}.ini".source =
+        "${sp}/share/gnome-shell/search-providers/${busName}.ini";
+      xdg.dataFile."dbus-1/services/${busName}.service".source =
+        "${sp}/share/dbus-1/services/${busName}.service";
+    }
+  ))
+  ];
 }
