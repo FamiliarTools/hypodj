@@ -581,6 +581,46 @@ mod tests {
     /// exact error), spanning every rules intent. A grammar change that shifts any
     /// row is a visible diff here.
     #[test]
+    fn corpus_curation_filters() {
+        use hypodj_core::plan::{CurateFilter as F, QueueSelector};
+        let c = ctx(Some("s1"), 10);
+        let rm = |f: F| raw(RawTrigger::Immediate, Action::Remove { sel: QueueSelector::Upcoming(f) });
+        let cases: &[(&str, RawPlan)] = &[
+            ("no remixes", rm(F::Remixes)),
+            ("No more remixes please", rm(F::Remixes)),
+            ("drop the remixes", rm(F::Remixes)),
+            ("no live versions", rm(F::Live)),
+            ("drop the rest of this album", rm(F::RestOfAlbum)),
+            ("skip the rest of the album", rm(F::RestOfAlbum)),
+            ("no Daft Punk", rm(F::Artist("Daft Punk".into()))),
+            ("no more Daft Punk", rm(F::Artist("Daft Punk".into()))),
+            ("no Pharrell as lead", rm(F::LeadArtist("Pharrell".into()))),
+            ("no Pharrell as the main artist", rm(F::LeadArtist("Pharrell".into()))),
+            ("drop everything by Aphex Twin", rm(F::Artist("Aphex Twin".into()))),
+        ];
+        for (u, want) in cases {
+            let got = tr(u, &c).unwrap_or_else(|e| panic!("{u}: {e:?}"));
+            assert_eq!(got.len(), 1, "{u}");
+            assert_eq!(j(&got[0]), j(want), "{u}");
+        }
+        for u in ["no voices", "no vocals please", "more motion", "less energy", "only instrumentals"] {
+            match tr(u, &c) {
+                Err(NlError::Unresolvable(m)) => assert!(m.contains("iwwy04x"), "{u}: {m}"),
+                other => panic!("{u}: must answer not-yet, got {other:?}"),
+            }
+        }
+        // Not curation: falls through (never an artist named "thanks" or "this").
+        for u in ["no thanks", "skip this", "remove the last 3 tracks"] {
+            if let Ok(p) = tr(u, &c) {
+                assert!(
+                    !p.iter().any(|p| matches!(&p.action, Action::Remove { sel: QueueSelector::Upcoming(_) })),
+                    "{u} read as curation"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn golden_corpus() {
         let c = ctx(Some("song-42"), 5);
         let fade_out = |s: f64| Action::Fade(FadeIntentIr::Out { secs: s });

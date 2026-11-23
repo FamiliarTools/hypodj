@@ -4,7 +4,7 @@
 
 use crate::nl::NlSource;
 use crate::plan::{
-    Action, ClearScope, DaySet, FadeIntentIr, MoveDest, PosBase, QueueSelector, RawPlan, RawTrigger,
+    Action, ClearScope, DaySet, FadeIntentIr, MoveDest, PosBase, QueueSelector, CurateFilter, RawPlan, RawTrigger,
     Selector, TrackSel,
 };
 
@@ -120,6 +120,13 @@ fn qselector_dsl(sel: &QueueSelector) -> Option<String> {
         QueueSelector::Range { start, end } => format!("range {start} {end}"),
         QueueSelector::QueryMatch(q) => format!("match {}", dsl_value(q)?),
         QueueSelector::Qid(id) => format!("id {id}"),
+        QueueSelector::Upcoming(f) => match f {
+            CurateFilter::Remixes => "upcoming remixes".into(),
+            CurateFilter::Live => "upcoming live".into(),
+            CurateFilter::RestOfAlbum => "upcoming album".into(),
+            CurateFilter::Artist(a) => format!("upcoming artist {}", dsl_value(a)?),
+            CurateFilter::LeadArtist(a) => format!("upcoming lead {}", dsl_value(a)?),
+        },
     })
 }
 
@@ -292,6 +299,16 @@ fn describe_qselector(sel: &QueueSelector) -> String {
         QueueSelector::Range { start, end } => format!("tracks {start} through {end}"),
         QueueSelector::QueryMatch(q) => format!("tracks matching \"{q}\""),
         QueueSelector::Qid(id) => format!("the track with id {id}"),
+        QueueSelector::Upcoming(f) => {
+            let what = match f {
+                CurateFilter::Remixes => "remixes".to_string(),
+                CurateFilter::Live => "live versions".to_string(),
+                CurateFilter::RestOfAlbum => "the rest of this album".to_string(),
+                CurateFilter::Artist(a) => format!("anything credited to \"{a}\""),
+                CurateFilter::LeadArtist(a) => format!("tracks led by \"{a}\" (features stay)"),
+            };
+            format!("{what} from the UPCOMING tracks (never the one playing)")
+        }
     }
 }
 
@@ -461,6 +478,11 @@ mod tests {
             QueueSelector::Range { start: 2, end: 5 },
             QueueSelector::QueryMatch("blue in green".into()),
             QueueSelector::Qid(88),
+            QueueSelector::Upcoming(CurateFilter::Remixes),
+            QueueSelector::Upcoming(CurateFilter::Live),
+            QueueSelector::Upcoming(CurateFilter::RestOfAlbum),
+            QueueSelector::Upcoming(CurateFilter::Artist("Daft Punk".into())),
+            QueueSelector::Upcoming(CurateFilter::LeadArtist("Pharrell".into())),
         ] {
             assert_round_trip(&imm(Action::Remove { sel }));
         }

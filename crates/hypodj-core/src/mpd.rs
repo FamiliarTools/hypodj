@@ -1058,6 +1058,17 @@ fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
             end: toks.get(2)?.parse().ok()?,
         }),
         "match" => Some(QueueSelector::QueryMatch(toks.get(1)?.clone())),
+        "upcoming" => {
+            use crate::plan::CurateFilter;
+            Some(QueueSelector::Upcoming(match toks.get(1)?.to_lowercase().as_str() {
+                "remixes" => CurateFilter::Remixes,
+                "live" => CurateFilter::Live,
+                "album" => CurateFilter::RestOfAlbum,
+                "artist" => CurateFilter::Artist(toks.get(2)?.clone()),
+                "lead" => CurateFilter::LeadArtist(toks.get(2)?.clone()),
+                _ => return None,
+            }))
+        }
         _ => None,
     }
 }

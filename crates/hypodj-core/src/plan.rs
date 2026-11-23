@@ -424,6 +424,128 @@ pub enum QueueSelector {
     /// every index while the ids stay put. A gone id resolves to the empty set -
     /// a clean no-op, never the row that inherited the position.
     Qid(u64),
+    /// The UPCOMING rows (strictly after the current one, or every row when nothing
+    /// is current) that a [`CurateFilter`] matches on structured metadata. Never
+    /// the playing row, by construction: a refinement sculpts what is still to
+    /// come, it does not yank the music out from under him. Resolves only through
+    /// [`resolve_selector_rows`] (it needs fields, not one flattened string);
+    /// [`resolve_selector`] has only text and so resolves it to the empty set - a
+    /// clean no-op, never a guess.
+    Upcoming(CurateFilter),
+}
+
+/// A subtractive curation predicate over queue metadata hypodj actually HAS
+/// (title, the artist credit string, album id). Anything needing audio content
+/// ("no voices", "more motion") is deliberately NOT representable here - that is
+/// task iwwy04x, and the NL layer answers it as not-yet-supported.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "filter", content = "v", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CurateFilter {
+    /// Titles carrying a remix marker (`remix`, `rmx`, `re-mix`, `rework`).
+    Remixes,
+    /// Titles carrying a live-version marker (`(live`, `[live`, ` - live`).
+    Live,
+    /// Rows on the current track's album (same album id). Empty with nothing current.
+    RestOfAlbum,
+    /// Any credit for this artist: lead, co-lead, or featured (artist field or a
+    /// `feat.` segment in the title).
+    Artist(String),
+    /// Only rows where this artist is a LEAD credit (before any feat/ft/with
+    /// marker in the artist field); rows that merely feature them stay.
+    LeadArtist(String),
+}
+
+/// The per-row metadata [`resolve_selector_rows`] reads: `text` is the same
+/// flattened search text [`resolve_selector`] uses, the rest are the structured
+/// fields a [`CurateFilter`] needs. Taken from ONE queue snapshot.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowMeta {
+    pub text: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub album_id: Option<String>,
+}
+
+/// Credit markers that separate the lead credit from featured guests, matched on
+/// a lowercased string. Order does not matter: the EARLIEST hit splits.
+const FEAT_MARKERS: &[&str] = &[
+    " feat. ", " feat ", " ft. ", " ft ", " featuring ", " with ", "(feat. ", "(feat ",
+    "(ft. ", "(ft ", "(featuring ", "[feat. ", "[feat ", "[ft. ", "(with ",
+];
+
+/// Split a lowercased credit at its first feat marker: `(lead, featured)`.
+fn split_credit(low: &str) -> (&str, &str) {
+    match FEAT_MARKERS.iter().filter_map(|m| low.find(m)).min() {
+        Some(i) => (&low[..i], &low[i..]),
+        None => (low, ""),
+    }
+}
+
+/// Whole-word containment: `name` occurs in `hay` with no alphanumeric glued on
+/// either side, so "ane" never matches "kanye". Both already lowercased.
+fn has_name(hay: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(off) = hay[from..].find(name) {
+        let i = from + off;
+        let j = i + name.len();
+        let before = hay[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after = hay[j..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if before && after {
+            return true;
+        }
+        from = i + hay[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// PURE. Does one row match `f`? `cur_album` is the current row's album id (only
+/// [`CurateFilter::RestOfAlbum`] reads it).
+pub fn curate_matches(f: &CurateFilter, row: &RowMeta, cur_album: Option<&str>) -> bool {
+    let title = row.title.to_lowercase();
+    let artist = row.artist.as_deref().unwrap_or("").to_lowercase();
+    match f {
+        CurateFilter::Remixes => ["remix", "rmx", "re-mix", "rework"].iter().any(|m| title.contains(m)),
+        CurateFilter::Live => ["(live", "[live", " - live"].iter().any(|m| title.contains(m)),
+        CurateFilter::RestOfAlbum => {
+            matches!((cur_album, row.album_id.as_deref()), (Some(a), Some(b)) if a == b)
+        }
+        CurateFilter::Artist(n) => {
+            let n = n.trim().to_lowercase();
+            has_name(&artist, &n) || has_name(split_credit(&title).1, &n)
+        }
+        CurateFilter::LeadArtist(n) => has_name(split_credit(&artist).0, &n.trim().to_lowercase()),
+    }
+}
+
+/// PURE. [`resolve_selector`] over structured rows: identical for every text
+/// variant, and the only resolver for [`QueueSelector::Upcoming`], which matches
+/// strictly AFTER `current` (every row when nothing is current) - never the
+/// playing row.
+pub fn resolve_selector_rows(
+    sel: &QueueSelector,
+    rows: &[RowMeta],
+    qids: &[u64],
+    current: Option<usize>,
+) -> Vec<usize> {
+    match sel {
+        QueueSelector::Upcoming(f) => {
+            let cur_album = current.and_then(|c| rows.get(c)).and_then(|r| r.album_id.as_deref());
+            if matches!(f, CurateFilter::RestOfAlbum) && cur_album.is_none() {
+                return Vec::new();
+            }
+            let start = current.map_or(0, |c| c + 1);
+            (start..rows.len()).filter(|&i| curate_matches(f, &rows[i], cur_album)).collect()
+        }
+        other => {
+            let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
+            resolve_selector(other, &texts, qids, current)
+        }
+    }
 }
 
 /// Where an [`Action::Move`] places the selected entries.
@@ -501,6 +623,10 @@ pub fn resolve_selector(
             .filter(|(i, q)| *i < n && **q == *id)
             .map(|(i, _)| i)
             .collect(),
+        // Text alone cannot honour a structured filter: resolve to nothing (a clean
+        // no-op) rather than approximate. Callers that hold rows use
+        // [`resolve_selector_rows`].
+        QueueSelector::Upcoming(_) => Vec::new(),
     }
 }
 
@@ -1394,6 +1520,66 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, PlanError::OutOfBounds { .. }), "got {e:?}");
+    }
+
+    fn row(title: &str, artist: &str, album: &str) -> RowMeta {
+        RowMeta {
+            text: format!("{title} {artist}"),
+            title: title.into(),
+            artist: Some(artist.into()),
+            album_id: (!album.is_empty()).then(|| album.into()),
+        }
+    }
+
+    // The curation predicate: title markers, whole-word artist credits, and the
+    // lead-vs-featured split on feat/ft/with markers.
+    #[test]
+    fn curate_predicate_markers_and_credits() {
+        use CurateFilter as F;
+        let m = |f: &F, r: &RowMeta| curate_matches(f, r, None);
+        assert!(m(&F::Remixes, &row("Strobe (Deadmau5 Remix)", "x", "")));
+        assert!(m(&F::Remixes, &row("Song [RMX]", "x", "")));
+        assert!(m(&F::Remixes, &row("Song - Re-Mix", "x", "")));
+        assert!(!m(&F::Remixes, &row("Song (Original Mix)", "x", "")), "not every mix is a remix");
+        assert!(m(&F::Live, &row("Song (Live at Wembley)", "x", "")));
+        assert!(m(&F::Live, &row("Song - Live", "x", "")));
+        assert!(!m(&F::Live, &row("Live Forever", "x", "")), "a title word is not a version marker");
+
+        let feat = row("Get Lucky", "Daft Punk feat. Pharrell Williams", "");
+        let feat_title = row("Blurred Lines (feat. Pharrell)", "Robin Thicke", "");
+        let duo = row("Song", "Simon & Garfunkel", "");
+        assert!(m(&F::Artist("pharrell".into()), &feat));
+        assert!(m(&F::Artist("Pharrell".into()), &feat_title), "a title feat credit counts");
+        assert!(!m(&F::LeadArtist("pharrell".into()), &feat), "a feature is not a lead");
+        assert!(!m(&F::LeadArtist("pharrell".into()), &feat_title));
+        assert!(m(&F::LeadArtist("daft punk".into()), &feat));
+        assert!(m(&F::LeadArtist("garfunkel".into()), &duo), "a co-lead is a lead");
+        assert!(!m(&F::Artist("ane".into()), &row("x", "Kanye West", "")), "whole words only");
+        assert!(!m(&F::Artist("".into()), &duo), "an empty name matches nothing");
+    }
+
+    // Upcoming(..) never reaches the playing row or anything before it, and
+    // RestOfAlbum needs a current album.
+    #[test]
+    fn curate_resolves_only_upcoming_rows() {
+        let rows = vec![
+            row("A (Remix)", "x", "al1"),
+            row("B (Remix)", "x", "al1"),
+            row("C", "x", "al1"),
+            row("D (Remix)", "y", "al2"),
+            row("E", "x", "al1"),
+        ];
+        let q: Vec<u64> = (1..=5).collect();
+        let up = |f| QueueSelector::Upcoming(f);
+        assert_eq!(resolve_selector_rows(&up(CurateFilter::Remixes), &rows, &q, Some(1)), vec![3]);
+        assert_eq!(resolve_selector_rows(&up(CurateFilter::Remixes), &rows, &q, None), vec![0, 1, 3]);
+        assert_eq!(resolve_selector_rows(&up(CurateFilter::RestOfAlbum), &rows, &q, Some(1)), vec![2, 4]);
+        assert!(resolve_selector_rows(&up(CurateFilter::RestOfAlbum), &rows, &q, None).is_empty());
+        // Text-only resolution refuses rather than guesses.
+        let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
+        assert!(resolve_selector(&up(CurateFilter::Remixes), &texts, &q, Some(1)).is_empty());
+        // Non-curate selectors resolve exactly as before.
+        assert_eq!(resolve_selector_rows(&QueueSelector::Last(2), &rows, &q, Some(1)), vec![3, 4]);
     }
 
     // resolve_selector: every selector variant resolves to the intended 0-based

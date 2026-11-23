@@ -11,7 +11,8 @@ use chrono::{TimeZone, Utc};
 use hypodj_core::config::{DEFAULT_SLEEP_FADE_SECS, DEFAULT_WINDDOWN_FADE_SECS};
 use hypodj_core::nl::{NlContext, NlError, NlHit, NlQuery, NlSession, NlSource, Translator};
 use hypodj_core::plan::{
-    Action, DaySet, FadeIntentIr, PlayMode, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
+    Action, CurateFilter, DaySet, FadeIntentIr, PlayMode, PosBase, QueueSelector, RawPlan,
+    RawTrigger, Selector, TrackSel,
 };
 
 /// The default fade duration a bare "fade out"/"fade in" emits. 30s matches the
@@ -140,6 +141,13 @@ fn rules_body(
         return Ok(plans);
     }
 
+    // 1c'. subtractive curation over the UPCOMING queue ("no remixes", "no Daft
+    // Punk as lead", "drop the rest of this album"), and the honest not-yet for
+    // refinements that need audio-content metadata ("no voices", "more motion").
+    if let Some(plans) = curate(text)? {
+        return Ok(plans);
+    }
+
     // 1d. sessions: wind-down ("start a wind-down", "wind down in 10 minutes") and
     // the sleep timer ("sleep in 30 minutes").
     if low.contains("wind down") || low.contains("wind-down") || low.contains("winddown") {
@@ -257,6 +265,134 @@ fn modes(wv: &[&str]) -> Result<Option<Vec<RawPlan>>, NlError> {
         return Ok(Some(vec![set(PlayMode::Repeat), set(PlayMode::Single)]));
     }
     Ok(Some(vec![set(mode)]))
+}
+
+// ── curation ────────────────────────────────────────────────────────────────
+
+/// Case-insensitive ASCII prefix strip that keeps the ORIGINAL casing of the rest
+/// (an artist name is echoed as he typed it).
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+}
+
+/// Case-insensitive ASCII suffix strip, keeping the original casing.
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = s.len().checked_sub(suffix.len())?;
+    let tail = s.get(cut..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &s[..cut])
+}
+
+/// Refinements that need to HEAR the music (vocal presence, energy, motion).
+/// hypodj has no such metadata yet; answering them from titles would be a guess.
+const CONTENT_WORDS: &[&str] = &[
+    "voices", "voice", "vocals", "vocal", "singing", "singer", "lyrics", "words",
+    "instrumental", "instrumentals", "motion", "movement", "energy", "energetic",
+    "groove", "tempo", "faster", "slower", "brighter", "darker", "heavier",
+];
+
+/// Generic nouns that a bare "no X" must not read as an artist name.
+const NOT_ARTISTS: &[&str] = &[
+    "thanks", "thank you", "music", "songs", "tracks", "song", "track", "sound", "volume",
+    "more", "way", "problem", "idea", "", "this", "that", "it",
+];
+
+/// Subtractive curation over the UPCOMING queue. `Ok(None)` when the utterance is
+/// not a curation request (the caller falls through to the other rules). Every
+/// hit is one immediate `Remove { Upcoming(filter) }`, which the daemon journals,
+/// so `undo` restores the rows.
+fn curate(text: &str) -> Result<Option<Vec<RawPlan>>, NlError> {
+    let t = text.trim().trim_end_matches(['.', '!', '?']).trim();
+    let low = t.to_lowercase();
+    let lw = words(t);
+    let content = lw.iter().any(|w| CONTENT_WORDS.contains(&w.as_str()));
+    let refining = ["no ", "less ", "more ", "fewer ", "without ", "drop ", "skip ", "only "]
+        .iter()
+        .any(|p| low.starts_with(p));
+    if content && refining {
+        return Err(NlError::Unresolvable(
+            "that refinement needs audio-content metadata (vocals, energy, motion) hypodj does not have yet - see task iwwy04x".into(),
+        ));
+    }
+    let mut body = None;
+    let mut by_artist_only = false;
+    for p in ["no more ", "no ", "without ", "none of ", "lose the ", "drop ", "skip ", "remove ", "cut "] {
+        if let Some(rest) = strip_prefix_ci(t, p) {
+            by_artist_only = !matches!(p, "no more " | "no " | "without " | "none of ");
+            body = Some(rest.trim());
+            break;
+        }
+    }
+    let Some(mut body) = body else { return Ok(None) };
+    for tail in [" please", " anymore", " from the queue", " in the queue", " from the list"] {
+        if let Some(b) = strip_suffix_ci(body, tail) {
+            body = b.trim_end();
+        }
+    }
+    for lead in ["the ", "any ", "all "] {
+        if let Some(b) = strip_prefix_ci(body, lead) {
+            body = b;
+        }
+    }
+    let bl = body.to_lowercase();
+    let remove = |f: CurateFilter| {
+        Ok(Some(vec![plan(
+            RawTrigger::Immediate,
+            Action::Remove { sel: QueueSelector::Upcoming(f) },
+            true,
+        )]))
+    };
+    if matches!(bl.as_str(), "remixes" | "remix" | "remixed tracks" | "remixed stuff" | "rmx") {
+        return remove(CurateFilter::Remixes);
+    }
+    if matches!(
+        bl.as_str(),
+        "live" | "live versions" | "live tracks" | "live stuff" | "live recordings" | "live songs"
+    ) {
+        return remove(CurateFilter::Live);
+    }
+    if matches!(
+        bl.as_str(),
+        "rest of this album" | "rest of the album" | "rest of album" | "this album" | "more of this album"
+    ) || bl == "of this album"
+    {
+        return remove(CurateFilter::RestOfAlbum);
+    }
+    // "drop everything by X" / "skip anything by X": a verb-led removal must name
+    // its artist with "by", so a bare "skip this" never reads as an artist.
+    let mut name = body;
+    if by_artist_only {
+        let mut found = None;
+        for p in ["everything by ", "anything by ", "songs by ", "tracks by ", "stuff by ", "by "] {
+            if let Some(n) = strip_prefix_ci(body, p) {
+                found = Some(n.trim());
+                break;
+            }
+        }
+        match found {
+            Some(n) => name = n,
+            None => return Ok(None),
+        }
+    } else {
+        for p in ["more ", "songs by ", "tracks by ", "stuff by "] {
+            if let Some(n) = strip_prefix_ci(name, p) {
+                name = n.trim();
+            }
+        }
+    }
+    let mut lead_only = false;
+    for s in [" as the lead artist", " as lead artist", " as the main artist", " as main artist", " as the lead", " as lead", " leading"] {
+        if let Some(n) = strip_suffix_ci(name, s) {
+            name = n.trim_end();
+            lead_only = true;
+            break;
+        }
+    }
+    if NOT_ARTISTS.contains(&name.to_lowercase().as_str()) {
+        return Ok(None);
+    }
+    let name = name.to_string();
+    remove(if lead_only { CurateFilter::LeadArtist(name) } else { CurateFilter::Artist(name) })
 }
 
 /// "sleep in 30 minutes" / "sleep timer 45 minutes" / "go to sleep in an hour"
