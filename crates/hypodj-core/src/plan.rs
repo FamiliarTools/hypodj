@@ -155,7 +155,7 @@ pub enum Action {
     /// A gentle alarm: at the deadline, optionally enqueue `selector` (append-only,
     /// count-clamped), force playback to start from silence, then ramp IN to the
     /// saved comfort level. ONE atomic effect (enqueue -> silence -> play ->
-    /// WakeTo), so the ordering cannot be split across independent timers.
+    /// wake ramp), so the ordering cannot be split across independent timers.
     Wake { selector: Option<Selector>, count: u32 },
     /// Remove the entries a [`QueueSelector`] resolves against the LIVE queue. The
     /// selector resolves at EXECUTE time (like [`Action::Enqueue`]'s content
@@ -361,10 +361,6 @@ pub enum FadeIntentIr {
     /// leaving playback running. The floor is read from the LIVE config at spawn
     /// (never baked into the raw plan), so `secs` is the only knob carried here.
     ToFloor { secs: f64 },
-    /// Sub-JND wake ramp UP from silence to the SAVED comfort level, committing
-    /// `vol` as the restored baseline. Distinct from `In` (which targets the
-    /// comfort ceiling / vol 100): a wake restores the exact saved comfort volume.
-    WakeTo { vol: u8, secs: f64 },
 }
 
 /// A bounded content selector for [`Action::Enqueue`]. Unimplemented variants
@@ -511,10 +507,6 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
         Action::Fade(FadeIntentIr::ToFloor { secs }) => {
             Action::Fade(FadeIntentIr::ToFloor { secs: clamp_secs(*secs) })
         }
-        Action::Fade(FadeIntentIr::WakeTo { vol, secs }) => Action::Fade(FadeIntentIr::WakeTo {
-            vol: clamp_vol(*vol, bounds),
-            secs: clamp_secs(*secs),
-        }),
         Action::SetVolume(v) => Action::SetVolume((*v).min(100)),
         Action::Enqueue { selector, count } => Action::Enqueue {
             selector: selector.clone(),
@@ -1018,10 +1010,6 @@ mod tests {
             Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 50),
             other => panic!("got {other:?}"),
         }
-        match clamp_action(&Action::Fade(FadeIntentIr::WakeTo { vol: 90, secs: 5.0 }), &b) {
-            Action::Fade(FadeIntentIr::WakeTo { vol, .. }) => assert_eq!(vol, 50),
-            other => panic!("got {other:?}"),
-        }
         // Below the ceiling is untouched.
         match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 20, secs: 5.0 }), &b) {
             Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 20),
@@ -1035,21 +1023,13 @@ mod tests {
     }
 
     // The NEW convenience-feature IR variants clamp exactly like their siblings:
-    // ToFloor secs into [min,max]; WakeTo vol into 0..=the ceiling volume,
-    // secs clamped; Action::Wake count -> MAX_ENQUEUE.
+    // ToFloor secs into [min,max]; Action::Wake count -> MAX_ENQUEUE.
     #[test]
     fn clamp_convenience_fade_and_wake_variants() {
         let b = bounds();
         match clamp_action(&Action::Fade(FadeIntentIr::ToFloor { secs: 1e9 }), &b) {
             Action::Fade(FadeIntentIr::ToFloor { secs }) => {
                 assert!(secs >= b.min_dur.as_secs_f64() && secs <= b.max_dur.as_secs_f64());
-            }
-            other => panic!("got {other:?}"),
-        }
-        match clamp_action(&Action::Fade(FadeIntentIr::WakeTo { vol: 250, secs: 1e9 }), &b) {
-            Action::Fade(FadeIntentIr::WakeTo { vol, secs }) => {
-                assert_eq!(vol, 100);
-                assert!(secs <= b.max_dur.as_secs_f64());
             }
             other => panic!("got {other:?}"),
         }

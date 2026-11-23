@@ -389,11 +389,6 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
             dur: dur(*secs),
             commit_logical: None,
         },
-        FadeIntentIr::WakeTo { vol, secs } => FadeRequest {
-            intent: FadeIntent::WakeTo { target_db: mpv_volume_to_db(*vol as f64), vol: *vol },
-            dur: dur(*secs),
-            commit_logical: None,
-        },
     }
 }
 

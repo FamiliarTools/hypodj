@@ -2156,8 +2156,7 @@ impl PlanOutcome {
 /// which refuses rather than clobbers.
 fn fade_lands_at(action: &Action) -> Option<u8> {
     match action {
-        Action::Fade(FadeIntentIr::To { vol, .. })
-        | Action::Fade(FadeIntentIr::WakeTo { vol, .. }) => Some(*vol),
+        Action::Fade(FadeIntentIr::To { vol, .. }) => Some(*vol),
         _ => None,
     }
 }

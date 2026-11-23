@@ -97,11 +97,9 @@ fn action_dsl(a: &Action) -> Option<String> {
             };
             format!("action move {} to {}", qselector_dsl(sel)?, d)
         }
-        // ToFloor/WakeTo/Wake are built only by the convenience sleep/winddown/wake
-        // commands, not the keyword `plan add` DSL - so they are not round-tripped.
-        Action::Fade(FadeIntentIr::ToFloor { .. })
-        | Action::Fade(FadeIntentIr::WakeTo { .. })
-        | Action::Wake { .. } => return None,
+        // ToFloor/Wake are built only by the convenience winddown/wake commands,
+        // not the keyword `plan add` DSL - so they are not round-tripped.
+        Action::Fade(FadeIntentIr::ToFloor { .. }) | Action::Wake { .. } => return None,
     })
 }
 
@@ -177,9 +175,6 @@ pub fn describe_plan(raw: &RawPlan) -> String {
         }
         Action::Fade(FadeIntentIr::ToFloor { secs: s }) => {
             format!("wind DOWN to the quiet floor over {}", human_dur(*s))
-        }
-        Action::Fade(FadeIntentIr::WakeTo { vol, secs: s }) => {
-            format!("wake UP to {} over {}", level_phrase(*vol), human_dur(*s))
         }
         Action::Wake { selector, count } => match selector {
             Some(sel) => {
