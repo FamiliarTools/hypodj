@@ -65,15 +65,6 @@ fn echo(words: &str) -> Spoken {
     }
 }
 
-/// Armed, after a deferred act was confirmed. Present plan, past decision.
-pub fn armed(what: &str) -> Spoken {
-    Spoken {
-        state: State::Armed,
-        words: format!("Armed: {what}"),
-        undo: None,
-    }
-}
-
 /// A refusal is one calm sentence: what did not happen, and why.
 pub fn refused(why: &str) -> Spoken {
     Spoken {
@@ -83,11 +74,26 @@ pub fn refused(why: &str) -> Spoken {
     }
 }
 
-/// One sample of each state, for the cross-surface parity check.
-pub fn spoken_states() -> Vec<Spoken> {
+/// The confirm prompt both surfaces show. Echo: quiet ink, underlined.
+pub fn confirm_prompt() -> &'static str {
+    "confirm? [y/N]"
+}
+
+/// A note above a confirm. Words, no alarm mark.
+pub fn note_line(note: &str) -> String {
+    format!("Note: {note}")
+}
+
+/// An armed banner. Ember on every surface. Wording matches the clients.
+pub fn armed_banner(what: &str) -> String {
+    format!("armed: {what}")
+}
+
+/// One line of each state, the lines the CLI and the TUI both render.
+pub fn parity_lines() -> Vec<Spoken> {
     vec![
-        speak(Act::Stop),
-        armed("stop at the end of this track."),
+        Spoken { state: State::Echo, words: confirm_prompt().to_string(), undo: None },
+        Spoken { state: State::Armed, words: armed_banner("sleep in 12m"), undo: None },
         speak(Act::Pause),
         refused("That did not run, because nothing is playing."),
     ]
@@ -122,7 +128,7 @@ mod tests {
 
     #[test]
     fn samples_cover_every_state() {
-        let states: Vec<_> = spoken_states().into_iter().map(|s| s.state).collect();
+        let states: Vec<_> = parity_lines().into_iter().map(|s| s.state).collect();
         assert!(states.contains(&State::Echo));
         assert!(states.contains(&State::Armed));
         assert!(states.contains(&State::Live));

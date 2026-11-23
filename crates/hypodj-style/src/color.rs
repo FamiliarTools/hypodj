@@ -17,11 +17,6 @@ pub const XTERM_CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
 pub const NEUTRAL_VIBRANT: Rgb = [0x88, 0x88, 0x88];
 pub const NEUTRAL_MUTED: Rgb = [0x55, 0x55, 0x55];
 
-/// Swatch the TUI already feeds through the info policy for a confirm prompt.
-/// It is an input to [`fit_info`], not a second owned colour. Ember stays the
-/// only colour HypoDJ claims. Kept so that prompt does not change appearance.
-pub const CONFIRM_INFO_SWATCH: Rgb = [0xff, 0xd0, 0x66];
-
 /// Where a resolved background came from, in fallback order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BgSource {
@@ -106,6 +101,7 @@ pub fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
 }
 
 /// sRGB to OKLCH (Ottosson Oklab as lightness, chroma, hue).
+#[allow(clippy::excessive_precision)]
 pub fn srgb_to_oklch(c: Rgb) -> Oklch {
     let r = srgb_to_linear(c[0]);
     let g = srgb_to_linear(c[1]);
@@ -127,6 +123,7 @@ pub fn srgb_to_oklch(c: Rgb) -> Oklch {
 }
 
 /// OKLCH to sRGB, gamut-clamped on the linear channels.
+#[allow(clippy::excessive_precision)]
 pub fn oklch_to_srgb(o: Oklch) -> Rgb {
     let a = o.c * o.h.cos();
     let b = o.c * o.h.sin();
@@ -144,7 +141,7 @@ pub fn oklch_to_srgb(o: Oklch) -> Rgb {
 
 /// Luminance where contrast to black equals contrast to white (`L ~= 0.179`).
 /// Below it, push lightness up. Above it, push down. Not the 0.5 dark/light cut.
-const INFO_PIVOT: f32 = 0.179;
+pub const INFO_PIVOT: f32 = 0.179;
 
 fn info_dir(bg: TermBg) -> f32 {
     if bg.luminance < INFO_PIVOT {
@@ -222,14 +219,74 @@ pub fn ember_rgb(bg: TermBg) -> Rgb {
 }
 
 /// Primary ink. The extreme (white or black) in the high-headroom direction,
-/// then the info nudge if that extreme is still short of 7:1.
+/// then the info nudge if that extreme is still short of the token floor.
+/// If the floor cannot be met, keep the extreme: the neutral fallback is
+/// dimmer than black or white and must not lower the contrast.
 pub fn fit_ink_primary(bg: TermBg) -> Rgb {
     let seed = if bg.luminance < INFO_PIVOT {
         [0xff, 0xff, 0xff]
     } else {
         [0x00, 0x00, 0x00]
     };
-    fit_min_contrast(seed, bg, tokens().room.ink_primary_min_contrast)
+    let fitted = fit_min_contrast(seed, bg, tokens().room.ink_primary_min_contrast);
+    if contrast_ratio(fitted, bg.rgb) + 1e-3 < contrast_ratio(seed, bg.rgb) {
+        seed
+    } else {
+        fitted
+    }
+}
+
+/// One ember for the CLI, which cannot see the room. Hue stays 60 degrees.
+/// Lightness and chroma are searched so the colour, and its 256-colour cell,
+/// each clear the ember floor against pure black and pure white.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CliEmber {
+    pub l: f32,
+    pub c: f32,
+    pub rgb: Rgb,
+    pub index: u8,
+    pub indexed: Rgb,
+}
+
+pub fn cli_ember() -> &'static CliEmber {
+    static E: std::sync::OnceLock<CliEmber> = std::sync::OnceLock::new();
+    E.get_or_init(search_cli_ember)
+}
+
+fn search_cli_ember() -> CliEmber {
+    let hue = 60.0_f32.to_radians();
+    let floor = tokens().ember.min_contrast;
+    let black = [0u8, 0, 0];
+    let white = [255u8, 255, 255];
+    let [want_l, want_c, _] = tokens().ember.oklch;
+    let mut best: Option<(f32, CliEmber)> = None;
+    for li in 0..=100 {
+        for ci in 0..=40 {
+            let l = li as f32 / 100.0;
+            let c = ci as f32 / 100.0;
+            let rgb = oklch_to_srgb(Oklch { l, c, h: hue });
+            if contrast_ratio(rgb, black) < floor || contrast_ratio(rgb, white) < floor {
+                continue;
+            }
+            let back = srgb_to_oklch(rgb);
+            let deg = back.h.to_degrees();
+            let dh = (deg - 60.0).abs().min(360.0 - (deg - 60.0).abs());
+            if dh > 12.0 {
+                continue;
+            }
+            let (index, indexed) = quantize_256(rgb);
+            if contrast_ratio(indexed, black) < floor || contrast_ratio(indexed, white) < floor {
+                continue;
+            }
+            let score = (l - want_l).abs() + (c - want_c).abs();
+            let found = CliEmber { l, c, rgb, index, indexed };
+            if best.as_ref().map(|(s, _)| score < *s).unwrap_or(true) {
+                best = Some((score, found));
+            }
+        }
+    }
+    best.map(|(_, e)| e)
+        .unwrap_or_else(|| panic!("no hue-60 ember clears the floor on black and white"))
 }
 
 /// Quiet ink: step away from the room until the 4.5:1 floor is met, and stop.
@@ -268,6 +325,7 @@ pub fn fit_rule(bg: TermBg) -> Rgb {
 }
 
 /// Nearest xterm-256 colour: index and the RGB that cell actually shows.
+#[allow(clippy::needless_range_loop)]
 pub fn quantize_256(c: Rgb) -> (u8, Rgb) {
     let dist = |a: Rgb, b: Rgb| -> i32 {
         (0..3)
@@ -423,6 +481,38 @@ mod tests {
                 contrast_ratio(ember, bg.rgb)
             );
         }
+    }
+
+    #[test]
+    fn ink_primary_on_mid_grey_is_not_worse_than_black_or_white() {
+        for g in [140u8, 160, 180, 200] {
+            let bg = TermBg::from_rgb([g, g, g], BgSource::Provided);
+            let fitted = fit_ink_primary(bg);
+            let best = contrast_ratio([255, 255, 255], bg.rgb).max(contrast_ratio([0, 0, 0], bg.rgb));
+            assert!(
+                contrast_ratio(fitted, bg.rgb) + 1e-3 >= best,
+                "grey {g}: fitted {:?} contrast {:.2}, extreme {:.2}",
+                fitted,
+                contrast_ratio(fitted, bg.rgb),
+                best
+            );
+        }
+    }
+
+    #[test]
+    fn cli_ember_clears_both_extremes_in_truecolor_and_256() {
+        let e = cli_ember();
+        let floor = tokens().ember.min_contrast;
+        let black = [0u8, 0, 0];
+        let white = [255u8, 255, 255];
+        for rgb in [e.rgb, e.indexed] {
+            assert!(contrast_ratio(rgb, black) >= floor, "{rgb:?} on black");
+            assert!(contrast_ratio(rgb, white) >= floor, "{rgb:?} on white");
+        }
+        let deg = srgb_to_oklch(e.rgb).h.to_degrees();
+        let dh = (deg - 60.0).abs().min(360.0 - (deg - 60.0).abs());
+        assert!(dh <= 12.0, "hue drifted to {deg}");
+        assert_eq!(quantize_256(e.rgb).0, e.index);
     }
 
     #[test]

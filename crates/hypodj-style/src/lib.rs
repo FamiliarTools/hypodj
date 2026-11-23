@@ -4,9 +4,6 @@
 //! contrast policy, and motion constants live here. A surface (ratatui, egui,
 //! ANSI) only maps a role. It does not choose a colour.
 //!
-//! JetBrains Mono and the 8 px cell are HypoDJ's own choices. They are not
-//! borrowed from a shared brand base.
-//!
 //! Terminal IO (OSC 11, DA1) stays in the TUI. This crate is pure.
 
 pub mod ansi;
@@ -30,13 +27,15 @@ pub mod ratatui {
 
 pub use ansi::Ansi;
 pub use color::{
-    contrast_ratio, ember_rgb, fit_decoration, fit_ember, fit_info, fit_ink_primary, fit_ink_quiet,
-    fit_min_contrast, fit_rule, lerp_oklch_lightness, oklch_to_srgb, quantize_256,
-    relative_luminance, srgb_to_oklch, BgSource, Oklch, Rgb, TermBg, CONFIRM_INFO_SWATCH,
+    cli_ember, contrast_ratio, ember_rgb, fit_decoration, fit_ember, fit_info, fit_ink_primary,
+    fit_ink_quiet, fit_min_contrast, fit_rule, lerp_oklch_lightness, oklch_to_srgb, quantize_256,
+    relative_luminance, srgb_to_oklch, BgSource, CliEmber, Oklch, Rgb, TermBg, INFO_PIVOT,
     NEUTRAL_MUTED, NEUTRAL_VIBRANT, XTERM_CUBE,
 };
-pub use tokens::{tokens, Tokens};
-pub use voice::{speak, spoken_states, Act, Spoken, State};
+pub use tokens::{chrome_frame, chrome_secs, tokens, Tokens};
+pub use voice::{
+    armed_banner, confirm_prompt, note_line, parity_lines, speak, Act, Spoken, State,
+};
 
 /// A semantic role. The colour, if any, is resolved by an adapter against the room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

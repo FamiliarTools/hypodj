@@ -4,7 +4,6 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-/// GUI face and the 8 px cell are HypoDJ's own. Not a shared brand base.
 const TOML: &str = include_str!("../../../design/tokens.toml");
 
 /// Fade defaults, read as source so this crate does not link the player.
@@ -16,11 +15,7 @@ pub struct Tokens {
     pub room: RoomTokens,
     pub music: MusicTokens,
     pub ember: EmberTokens,
-    pub state: StateTokens,
     pub motion: MotionTokens,
-    #[serde(rename = "type")]
-    pub type_face: TypeTokens,
-    pub grid: GridTokens,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -41,24 +36,6 @@ pub struct EmberTokens {
     /// CSS-style OKLCH: lightness, chroma, hue in degrees.
     pub oklch: [f32; 3],
     pub min_contrast: f32,
-    pub uses: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct StateLook {
-    pub ink: String,
-    #[serde(default)]
-    pub decoration: Option<String>,
-    #[serde(default)]
-    pub weight: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct StateTokens {
-    pub echo: StateLook,
-    pub armed: StateLook,
-    pub live: StateLook,
-    pub refused: StateLook,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -70,17 +47,6 @@ pub struct MotionTokens {
     pub curve: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct TypeTokens {
-    pub gui_face: String,
-    pub weights: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct GridTokens {
-    pub gui_px_per_cell_x: u32,
-}
-
 /// The embedded token file. Panics if it does not parse: the file is part of
 /// the source tree, so a parse failure is a build error that surfaces at first use.
 pub fn tokens() -> &'static Tokens {
@@ -88,6 +54,23 @@ pub fn tokens() -> &'static Tokens {
     T.get_or_init(|| {
         toml::from_str(TOML).unwrap_or_else(|e| panic!("design/tokens.toml failed to parse: {e}"))
     })
+}
+
+/// Chrome frame index at `secs`, at most `max_chrome_hz`. The level meter does
+/// not use this; it is the one fast mover.
+pub fn chrome_frame(secs: f64, frames: usize) -> usize {
+    if frames == 0 {
+        return 0;
+    }
+    let hz = tokens().motion.max_chrome_hz.max(1) as f64;
+    ((secs.max(0.0) * hz) as usize) % frames
+}
+
+/// Quantise a clock to the chrome period so nothing visible steps faster than
+/// the motion token.
+pub fn chrome_secs(secs: f64) -> f64 {
+    let hz = tokens().motion.max_chrome_hz.max(1) as f64;
+    (secs.max(0.0) * hz).floor() / hz
 }
 
 /// `pub const NAME: <type> = <literal>;` from the fade config source.
@@ -124,22 +107,19 @@ mod tests {
         assert_eq!(t.music.decoration_max_contrast, 2.0);
         assert_eq!(t.ember.oklch, [0.74, 0.15, 60.0]);
         assert_eq!(t.ember.min_contrast, 3.0);
-        assert_eq!(t.ember.uses, ["armed", "on_air_marked", "kept"]);
-        assert_eq!(t.state.echo.ink, "quiet");
-        assert_eq!(t.state.echo.decoration.as_deref(), Some("underline"));
-        assert!(t.state.echo.weight.is_none());
-        assert_eq!(t.state.armed.ink, "ember");
-        assert!(t.state.armed.decoration.is_none());
-        assert_eq!(t.state.live.ink, "primary");
-        assert_eq!(t.state.live.weight.as_deref(), Some("bold"));
-        assert_eq!(t.state.refused.ink, "primary");
-        assert!(t.state.refused.decoration.is_none());
-        assert!(t.state.refused.weight.is_none());
         assert_eq!(t.motion.curve, "oklch_lightness");
         assert_eq!(t.motion.max_chrome_hz, 4);
-        assert_eq!(t.type_face.gui_face, "JetBrains Mono");
-        assert_eq!(t.type_face.weights, ["regular", "bold"]);
-        assert_eq!(t.grid.gui_px_per_cell_x, 8);
+    }
+
+    #[test]
+    fn chrome_does_not_step_faster_than_the_token() {
+        let hz = tokens().motion.max_chrome_hz.max(1) as f64;
+        let period = 1.0 / hz;
+        assert_eq!(chrome_secs(0.0), 0.0);
+        assert_eq!(chrome_secs(period * 0.99), 0.0);
+        assert_eq!(chrome_secs(period), period);
+        assert_eq!(chrome_frame(0.0, 4), chrome_frame(period * 0.99, 4));
+        assert_ne!(chrome_frame(0.0, 4), chrome_frame(period, 4));
     }
 
     /// Motion tokens are the fade defaults. Fails if either side drifts.

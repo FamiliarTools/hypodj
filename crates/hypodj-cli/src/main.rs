@@ -311,10 +311,7 @@ fn print_card(conn: &mut MpdConn) -> Result<(), MpdError> {
     let status = conn.command("status")?;
     let current = conn.command("currentsong")?;
     let np = model::now_playing(&status, &current);
-    let ansi = hypodj_style::Ansi::from_env(
-        std::io::IsTerminal::is_terminal(&std::io::stdout()),
-        std::env::var_os("NO_COLOR").is_some(),
-    );
+    let ansi = stdout_ansi();
     println!("{}", render::render_card_with(&np, ansi));
     Ok(())
 }
@@ -377,7 +374,11 @@ fn nl_handshake(
         }
         // Wake caveat surfaced as a warning ABOVE the prompt.
         if let Some(note) = &parts.note {
-            println!("\n! {note}");
+            println!("\n{}", stdout_ansi().paint(
+                hypodj_style::Role::Refused,
+                &hypodj_style::note_line(note),
+                hypodj_style::TermBg::dark_default(),
+            ));
         }
     }
 
@@ -655,8 +656,23 @@ mod tests {
 
 /// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm; bare
 /// Enter, "n", EOF (Ctrl-D), all mean No.
+fn stdout_ansi() -> hypodj_style::Ansi {
+    let no = std::env::var("NO_COLOR").ok();
+    let ct = std::env::var("COLORTERM").ok();
+    hypodj_style::Ansi::from_env(
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        no.as_deref(),
+        ct.as_deref(),
+    )
+}
+
 pub(crate) fn confirm(question: &str) -> bool {
-    print!("{question} [y/N] ");
+    let words = format!("{question} [y/N]");
+    debug_assert!(question != "confirm?" || words == hypodj_style::confirm_prompt());
+    print!(
+        "{} ",
+        stdout_ansi().paint(hypodj_style::Role::Echo, &words, hypodj_style::TermBg::dark_default())
+    );
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     match std::io::stdin().lock().read_line(&mut line) {

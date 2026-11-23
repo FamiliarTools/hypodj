@@ -687,7 +687,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
 /// Pure - unit-tested.
 fn command_armed_line(steps: &[String]) -> String {
     match steps.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
-        Some(s) => format!("armed: {s}"),
+        Some(s) => hypodj_style::armed_banner(s),
         None => "armed".to_string(),
     }
 }

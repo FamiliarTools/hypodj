@@ -18,7 +18,7 @@ pub fn render_card(np: &NowPlaying) -> String {
 pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
-    let armed = render_armed(&np.armed);
+    let armed = render_armed(&np.armed, ansi);
     let field = render_field(&np.field);
     if stopped || empty {
         // A stopped deck can still hold an armed wake alarm or a held pull - surface
@@ -49,6 +49,7 @@ pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
             // The heart is the kept mark. Ember when colour is on; the glyph stays
             // either way, so the line still says favourite with the colour stripped.
             let mark = ansi.paint(Role::Ember, "\u{2665}\u{FE0E}", TermBg::dark_default());
+            // Ember here is the CLI colour that clears both black and white.
             lines.push(format!("{mark} {t}"));
         } else {
             lines.push(t.clone());
@@ -163,7 +164,7 @@ fn render_field(field: &FieldState) -> Option<String> {
 /// `sleep in 12m \u{b7} winding down \u{b7} wake in 7h 00m`. `None` when nothing is
 /// armed. Worded exactly as the dj-gui's `armed_hud`: `in` marks every countdown, so
 /// `sleep 12m` cannot be read as a twelve-minute-long timer.
-fn render_armed(a: &ArmedFeatures) -> Option<String> {
+fn render_armed(a: &ArmedFeatures, ansi: Ansi) -> Option<String> {
     if !a.any() {
         return None;
     }
@@ -180,7 +181,19 @@ fn render_armed(a: &ArmedFeatures) -> Option<String> {
     if let Some(s) = a.wake_remaining {
         bits.push(format!("wake in {}", fmt_remaining(s)));
     }
-    Some(bits.join(" \u{00b7} "))
+    let line = bits.join(" \u{00b7} ");
+    Some(ansi.paint(Role::Armed, &line, TermBg::dark_default()))
+}
+
+/// One grammar line, painted the way the card paints state. Used by the CLI
+/// parity test and by any caller that prints a state sentence.
+pub fn render_spoken(spoken: &hypodj_style::Spoken, ansi: Ansi) -> String {
+    let mut out = ansi.paint(spoken.state.role(), &spoken.words, TermBg::dark_default());
+    if let Some(undo) = &spoken.undo {
+        out.push('\n');
+        out.push_str(&ansi.paint(Role::InkQuiet, undo, TermBg::dark_default()));
+    }
+    out
 }
 
 fn fmt_dur(secs: f64) -> String {
@@ -271,13 +284,40 @@ mod tests {
         ]);
         let np = now_playing(&status, &current);
         let off = render_card_with(&np, Ansi::off());
-        let on = render_card_with(&np, Ansi::on());
+        let on = render_card_with(&np, Ansi::on_truecolor());
         assert!(on.contains('\u{1b}'), "colour on actually emits an escape");
         assert_eq!(hypodj_style::ansi::strip(&on), off);
         assert_eq!(hypodj_style::ansi::strip(&off), off);
         assert!(off.contains("\u{2665}\u{FE0E} Blue in Green"));
-        assert!(!Ansi::from_env(false, false).enabled());
-        assert!(!Ansi::from_env(true, true).enabled());
+        assert!(!Ansi::from_env(false, None, None).enabled());
+        assert!(!Ansi::from_env(true, Some("1"), None).enabled());
+    }
+
+    #[test]
+    fn each_state_matches_once_colour_is_stripped() {
+        for spoken in hypodj_style::parity_lines() {
+            let off = render_spoken(&spoken, Ansi::off());
+            let on = render_spoken(&spoken, Ansi::on_truecolor());
+            let indexed = render_spoken(&spoken, Ansi::on_indexed());
+            assert!(off.contains(&spoken.words), "off missing words: {off}");
+            assert_eq!(hypodj_style::ansi::strip(&on), off, "truecolor {}", spoken.words);
+            assert_eq!(hypodj_style::ansi::strip(&indexed), off, "256 {}", spoken.words);
+            if spoken.state != hypodj_style::State::Refused {
+                assert_ne!(on, off, "colour on should differ for {}", spoken.words);
+            }
+        }
+    }
+
+    #[test]
+    fn armed_hud_on_the_card_is_ember_and_strips_clean() {
+        let status = p(&[("state", "play"), ("X-hypodj-sleep-remaining", "720")]);
+        let current = p(&[("file", "song/1"), ("Title", "X")]);
+        let np = now_playing(&status, &current);
+        let off = render_card_with(&np, Ansi::off());
+        let on = render_card_with(&np, Ansi::on_truecolor());
+        assert!(off.contains("sleep in 12m"));
+        assert_eq!(hypodj_style::ansi::strip(&on), off);
+        assert_ne!(on, off, "the armed line is coloured");
     }
 
     #[test]

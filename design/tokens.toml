@@ -13,13 +13,6 @@ decoration_max_contrast = 2.0  # DECO_CEILING
 [ember]
 oklch = [0.74, 0.15, 60.0]
 min_contrast = 3.0
-uses = ["armed", "on_air_marked", "kept"]
-
-[state]
-echo = { ink = "quiet", decoration = "underline" }
-armed = { ink = "ember" }
-live = { ink = "primary", weight = "bold" }
-refused = { ink = "primary" }
 
 [motion]
 floor_ms = 250       # FadeConfig.min_slew_ms
@@ -27,10 +20,3 @@ skip_ms = 350        # DEFAULT_SKIP_FADE_SECS
 pause_ms = 500       # DEFAULT_PAUSE_FADE_SECS
 max_chrome_hz = 4
 curve = "oklch_lightness"
-
-[type]
-gui_face = "JetBrains Mono"
-weights = ["regular", "bold"]
-
-[grid]
-gui_px_per_cell_x = 8

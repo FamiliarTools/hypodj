@@ -71,7 +71,7 @@ fn fitted_color(fitted: Rgb, bg: TermBg, target: f32, truecolor: bool) -> Color 
         return Color::Indexed(idx);
     }
     let mut o = srgb_to_oklch(fitted);
-    let dir = if bg.luminance < 0.179 { 1.0 } else { -1.0 };
+    let dir = if bg.luminance < crate::INFO_PIVOT { 1.0 } else { -1.0 };
     for _ in 0..50 {
         o.l = (o.l + dir * 0.02).clamp(0.0, 1.0);
         let (idx, realized) = quantize_256(oklch_to_srgb(o));
@@ -84,7 +84,7 @@ fn fitted_color(fitted: Rgb, bg: TermBg, target: f32, truecolor: bool) -> Color 
 
 fn neutral_for(bg: TermBg) -> Rgb {
     // Same legible neutral the info policy falls back to.
-    if bg.luminance < 0.179 {
+    if bg.luminance < crate::INFO_PIVOT {
         [0xe0, 0xe0, 0xe0]
     } else {
         [0x20, 0x20, 0x20]
@@ -109,7 +109,7 @@ pub fn style_for(role: Role, bg: TermBg, truecolor: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{spoken_states, BgSource, XTERM_CUBE};
+    use crate::{parity_lines, BgSource, XTERM_CUBE};
 
     fn idx_to_rgb(i: u8) -> Rgb {
         if i >= 232 {
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn state_words_keep_their_text_and_take_the_role_weight() {
         let bg = TermBg::dark_default();
-        for spoken in spoken_states() {
+        for spoken in parity_lines() {
             let style = style_for(spoken.state.role(), bg, true);
             match spoken.state {
                 crate::State::Echo => {

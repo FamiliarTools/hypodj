@@ -1033,9 +1033,9 @@ impl TuiState {
                 self.push_dj_log(step.clone());
             }
             if let Some(note) = &pending.note {
-                self.push_dj_log(format!("! {note}"));
+                self.push_dj_log(hypodj_style::note_line(note));
             }
-            self.push_dj_log("confirm? [y/N]".to_string());
+            self.push_dj_log(hypodj_style::confirm_prompt().to_string());
         }
         self.pending = Some(pending);
         self.mode = Mode::Confirm;
@@ -2847,7 +2847,7 @@ mod tests {
         assert_eq!(s.mode, Mode::Confirm);
         // The echo + y/N prompt landed inline in the chat scrollback, not only a popup.
         assert!(s.dj_log.iter().any(|l| l.contains("add 5 calmer tracks")));
-        assert!(s.dj_log.iter().any(|l| l == "! append-only"));
+        assert!(s.dj_log.iter().any(|l| l == "Note: append-only"));
         assert!(s.dj_log.iter().any(|l| l == "confirm? [y/N]"));
         // On a non-DJ screen the confirm does NOT touch the chat log (popup carries it).
         let mut q = TuiState::new();

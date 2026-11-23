@@ -50,8 +50,6 @@ pub fn visuals(bg: TermBg) -> Visuals {
     let ink = color32(fit_ink_primary(bg));
     let quiet = color32(fit_ink_quiet(bg));
     let rule = color32(fit_rule(bg));
-    let ember = color32(ember_rgb(bg));
-
     v.window_fill = room;
     v.panel_fill = room;
     v.extreme_bg_color = room;
@@ -78,9 +76,9 @@ pub fn visuals(bg: TermBg) -> Visuals {
     }
     v.widgets.inactive.fg_stroke.color = quiet;
     v.widgets.noninteractive.fg_stroke.color = quiet;
-    // Armed / kept affordances use ember for the selection stroke only.
-    v.selection.stroke = Stroke::new(1.0, ember);
-    v.selection.bg_fill = room;
+    // Selection is ink, reversed against the room. Ember stays reserved.
+    v.selection.stroke = Stroke::new(1.0, ink);
+    v.selection.bg_fill = ink;
     v
 }
 
@@ -99,7 +97,7 @@ pub fn role_color(role: Role, bg: TermBg) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{contrast_ratio, spoken_states, tokens, BgSource};
+    use crate::{contrast_ratio, ember_rgb, parity_lines, tokens, BgSource};
 
     fn rgb_of(c: Color32) -> Rgb {
         [c.r(), c.g(), c.b()]
@@ -116,10 +114,10 @@ mod tests {
             assert_eq!(v.error_fg_color, v.override_text_color.unwrap());
             let err = rgb_of(v.error_fg_color);
             assert!(contrast_ratio(err, bg.rgb) >= tokens().room.ink_primary_min_contrast);
-            // egui's preset error red is (255, 0, 0) or close. Ours is ink.
             assert_ne!(err, [255, 0, 0]);
-            let ember = rgb_of(v.selection.stroke.color);
-            assert!(contrast_ratio(ember, bg.rgb) >= tokens().ember.min_contrast);
+            assert_eq!(rgb_of(v.selection.stroke.color), err, "selection is ink");
+            assert_eq!(rgb_of(v.selection.bg_fill), err);
+            assert_ne!(rgb_of(v.selection.stroke.color), ember_rgb(bg));
         }
     }
 
@@ -137,7 +135,7 @@ mod tests {
     #[test]
     fn state_words_are_independent_of_the_colour() {
         let bg = TermBg::dark_default();
-        for spoken in spoken_states() {
+        for spoken in parity_lines() {
             let _colour = role_color(spoken.state.role(), bg);
             assert!(!spoken.words.is_empty());
         }
