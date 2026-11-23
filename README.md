@@ -16,7 +16,7 @@ MPD client ──MPD text/TCP──▶ hypodj daemon ──OpenSubsonic REST─�
                              libmpv audio                          server)
 ```
 
-![HypoDJ (dj-gui) in the DJ View - the Queue beside the natural-language Claude Code DJ, with the now-playing card, up-next preview, and a live level meter](Screenshots/dj-view.png)
+![HypoDJ (dj-gui) in the DJ View - the Queue beside the DJ pane after an echoed, confirmed "play something calmer", with the now-playing card and cover art, the field line, up-next preview, the album-tinted level meter and the undo pill](Screenshots/dj-view.png)
 
 *HypoDJ (`dj-gui`), the DJ View: the queue beside the natural-language DJ, with the now-playing card, up-next, and a live level meter.*
 
