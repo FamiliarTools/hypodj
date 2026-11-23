@@ -143,8 +143,8 @@ pub enum MpdCommand {
     /// `playlistadd Starred song/<id>` stars the song server-side.
     PlaylistAdd(String, String),
     /// `playlistdelete <name> <pos>` - position-based (MPD has no uri delete).
-    /// For `Starred`, the position maps back to a starred song id (re-fetched in
-    /// the same order `listplaylistinfo` returned) -> unstar.
+    /// For `Starred`, the position is read against the last listed order and
+    /// validated against a fresh fetch before the song is unstarred.
     PlaylistDelete(String, usize),
     /// `playlistclear <name>` - clear a stored playlist.
     PlaylistClear(String),

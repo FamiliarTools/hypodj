@@ -1,7 +1,7 @@
 //! Host/port resolution. Precedence: explicit flags > HYPODJ_HOST/HYPODJ_PORT >
 //! MPD_HOST/MPD_PORT > 127.0.0.1:6600. The default 6600 matches the LIVE deploy
-//! (the running daemon binds 127.0.0.1:6600); a DEV daemon defaults to 6601
-//! (mopidy owns 6600 on dev boxes) so point a dev run at it with HYPODJ_PORT=6601.
+//! and the daemon's own default bind (127.0.0.1:6600); a dev daemon on another
+//! port is reached with HYPODJ_PORT.
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 6600;

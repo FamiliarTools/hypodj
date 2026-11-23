@@ -279,7 +279,9 @@ struct State {
     cover_id_memo: Option<(String, String)>,
     /// The ordering of the last `listplaylistinfo Starred` response, so a
     /// position-based `playlistdelete Starred <pos>` can map back to a song id
-    /// for unstar (MPD playlist deletes are position-based, not uri-based).
+    /// for unstar (MPD playlist deletes are position-based, not uri-based). Only the
+    /// client's VIEW: every delete re-validates it against a fresh fetch and shifts
+    /// it like MPD shifts a playlist (see `resolve_starred_delete`).
     last_starred_order: Vec<SongId>,
     /// MPD `random` flag: pick the next entry at random instead of sequentially.
     random: bool,
@@ -2156,9 +2158,32 @@ impl PlanOutcome {
 /// which refuses rather than clobbers.
 fn fade_lands_at(action: &Action) -> Option<u8> {
     match action {
-        Action::Fade(FadeIntentIr::To { vol, .. })
-        | Action::Fade(FadeIntentIr::WakeTo { vol, .. }) => Some(*vol),
+        Action::Fade(FadeIntentIr::To { vol, .. }) => Some(*vol),
         _ => None,
+    }
+}
+
+/// Map a `playlistdelete Starred <pos>` to the song to unstar.
+///
+/// `snapshot` is the order of the last `listplaylistinfo` / `load` / `lsinfo` of
+/// Starred - what the client was looking at when it chose `pos`. `fresh` is what the
+/// server holds right now. The position is read against the snapshot (the user's
+/// view, which the server may have reordered or shrunk since), and the pick is
+/// accepted only if that song is STILL starred, so a stale view can fail loud but
+/// can never unstar a different song than the one the user pointed at. With no
+/// snapshot (a scripted client that deletes without listing first) the fresh order
+/// is the only view there is.
+fn resolve_starred_delete(
+    snapshot: &[SongId],
+    fresh: &[SongId],
+    pos: usize,
+) -> Result<SongId, &'static str> {
+    let view = if snapshot.is_empty() { fresh } else { snapshot };
+    let id = view.get(pos).ok_or("Bad song index")?;
+    if fresh.contains(id) {
+        Ok(id.clone())
+    } else {
+        Err("that song is no longer starred - list Starred again")
     }
 }
 
@@ -11123,11 +11148,15 @@ impl HypodjHandler {
         // was itself the active continuation stream - the ONE-SHOT re-entrancy guard
         // - and (b) whether the queue is GENUINELY exhausted (true drain) vs a
         // `single`-mode stop that left tracks queued.
-        let (finishing_is_continuation, true_drain) = {
+        let (finishing_is_continuation, true_drain, pausing) = {
             let mut st = self.state.lock().unwrap();
             if st.pending_skip.is_some() {
                 return;
             }
+            // A pause gesture whose PauseOut fade is still descending (or a halt's held
+            // pause): the user asked for quiet, so a drain must neither start a station
+            // nor leave that fade orphaned over the stopped deck.
+            let pausing = st.pending_pause;
             // Record the finishing track as the recency seed BEFORE the advance
             // repoints `current`. Only a real library Song counts: a live/continuous
             // stream has no id and must never become a similar seed, so a stream EOF
@@ -11154,7 +11183,7 @@ impl HypodjHandler {
             let finishing_is_continuation = st.continuation_active.is_some()
                 && st.current.and_then(|i| st.queue.get(i)).map(|it| it.id)
                     == st.continuation_active;
-            (finishing_is_continuation, st.is_true_drain())
+            (finishing_is_continuation, st.is_true_drain(), pausing)
         };
         // THE FUSE, checked BEFORE plan_next (which mutates the queue under `consume`):
         // count the unbroken run of errored ends WITH NO AUDIO IN BETWEEN (any live
@@ -11297,6 +11326,9 @@ impl HypodjHandler {
                     tracing::warn!(
                         "continuation stream ended (dropped / finite / unreachable); stopping honestly - one-shot, no re-fire"
                     );
+                } else if pausing {
+                    // The queue ran out under a pause: the user asked for quiet, so the
+                    // walk does not get to start music behind that gesture.
                 } else if true_drain
                     && mode == ContinuationMode::Autofill
                     && self.autofill_once(None, AutofillStart::Walk).await > 0
@@ -11325,6 +11357,22 @@ impl HypodjHandler {
                 // the deck reports Paused, exactly as [`Self::halt_failed_advance`] does;
                 // an ordinary end of queue is untouched, because the track that PLAYED to
                 // get here already ended the walk.
+                // A PauseOut fade still descending when the queue drained would
+                // otherwise outlive the stop: its Terminal::Pause lands on a stopped deck
+                // and, until then, the reported volume follows a dead envelope. Retire it
+                // the way `stop` does - abort+join and settle the baseline under one slot
+                // lock - then re-assert the real gain so any later play starts audible.
+                if pausing {
+                    self.fade
+                        .cancel_with(|| {
+                            let mut st = self.state.lock().unwrap();
+                            let v = st.target_volume;
+                            st.set_manual_volume(v, false);
+                        })
+                        .await;
+                    let v = self.state.lock().unwrap().target_volume;
+                    let _ = self.player.set_volume(v).await;
+                }
                 let origin = self.walk_origin();
                 let mut st = self.state.lock().unwrap();
                 let held = origin.is_some_and(|qid| st.point_current_at_qid(qid));
@@ -14512,14 +14560,38 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::PlaylistDelete(name, pos) if name == "Starred" => {
-                // Position-based: map to the song id from the last listed order.
+                // Position-based, so the position must be read against the order
+                // the CLIENT saw (the last listing), then validated against a FRESH
+                // fetch - see [`resolve_starred_delete`]. Starred is never cached, so
+                // this fetch is the authority on what is still starred. An index past
+                // the listed view is refused before any round trip.
+                {
+                    let st = self.state.lock().unwrap();
+                    if !st.last_starred_order.is_empty() && pos >= st.last_starred_order.len() {
+                        return ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index");
+                    }
+                }
+                let fresh = match self.client.starred_songs().await {
+                    Ok(songs) => songs.into_iter().map(|s| s.id).collect::<Vec<_>>(),
+                    Err(e) => return ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
+                };
                 let target = {
                     let st = self.state.lock().unwrap();
-                    st.last_starred_order.get(pos).cloned()
+                    resolve_starred_delete(&st.last_starred_order, &fresh, pos)
                 };
                 match target {
-                    Some(id) => match self.client.unstar(&Favorite::Song(id.clone())).await {
+                    Ok(id) => match self.client.unstar(&Favorite::Song(id.clone())).await {
                         Ok(()) => {
+                            {
+                                // Shift the snapshot exactly as MPD shifts a stored
+                                // playlist on delete, so a command list deleting
+                                // several rows maps each later position correctly.
+                                let mut st = self.state.lock().unwrap();
+                                if st.last_starred_order.is_empty() {
+                                    st.last_starred_order = fresh.clone();
+                                }
+                                st.last_starred_order.retain(|s| *s != id);
+                            }
                             self.bust_star_caches();
                             // Symmetrically clear the heart on any matching queued
                             // entry so it disappears LIVE (before a re-fetch). Only
@@ -14530,7 +14602,7 @@ impl MpdHandler for HypodjHandler {
                         }
                         Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
                     },
-                    None => ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index"),
+                    Err(msg) => ack(ACK_ERROR_NO_EXIST, "playlistdelete", msg),
                 }
             }
             MpdCommand::PlaylistDelete(name, pos) => {
@@ -16394,6 +16466,32 @@ mod tests {
         );
     }
     use super::*;
+
+    fn sids(v: &[&str]) -> Vec<SongId> {
+        v.iter().map(|s| SongId((*s).to_string())).collect()
+    }
+
+    // kdelwgx: an unstar by position reads the position against the order the
+    // client LISTED, and only ever unstars a song that is still starred.
+    #[test]
+    fn starred_delete_reads_the_listed_order_and_validates_against_fresh() {
+        let listed = sids(&["a", "b", "c"]);
+        // Unchanged server: plain positional mapping.
+        assert_eq!(resolve_starred_delete(&listed, &listed, 1), Ok(SongId("b".into())));
+        // The server reordered since the listing: the user still gets the row they
+        // pointed at, not whatever sits at that index now.
+        let reordered = sids(&["c", "a", "b"]);
+        assert_eq!(resolve_starred_delete(&listed, &reordered, 1), Ok(SongId("b".into())));
+        // The pointed-at song was unstarred elsewhere: fail loud, never unstar a
+        // neighbour.
+        let shrunk = sids(&["a", "c"]);
+        assert!(resolve_starred_delete(&listed, &shrunk, 1).is_err());
+        // Out of range of the listed view.
+        assert_eq!(resolve_starred_delete(&listed, &listed, 3), Err("Bad song index"));
+        // No listing at all (scripted client): the fresh order is the view.
+        assert_eq!(resolve_starred_delete(&[], &reordered, 0), Ok(SongId("c".into())));
+        assert_eq!(resolve_starred_delete(&[], &[], 0), Err("Bad song index"));
+    }
     use std::collections::HashSet;
     use std::path::Path;
     use crate::config::ServerConfig;
@@ -20860,10 +20958,12 @@ mod tests {
     #[tokio::test]
     async fn playlistdelete_starred_bad_index_acks_and_stays_special() {
         // `playlistdelete Starred <pos>` routes through the star order, NOT the
-        // real-playlist path. With no recorded order, pos 0 is a bad index -> a
-        // LOUD ack, proving Starred is still handled specially (no network).
+        // real-playlist path. An index past the listed order is a bad index -> a
+        // LOUD NO_EXIST ack before any round trip (the real-playlist path would
+        // reach the unreachable server and ack UNKNOWN instead).
         let Some((h, _events)) = handler_with_null_player() else { return };
-        let resp = h.handle(MpdCommand::PlaylistDelete("Starred".into(), 0)).await;
+        h.state.lock().unwrap().last_starred_order = vec![SongId("only".into())];
+        let resp = h.handle(MpdCommand::PlaylistDelete("Starred".into(), 1)).await;
         match resp {
             MpdResponse::Ack { command, code, .. } => {
                 assert_eq!(command, "playlistdelete");
@@ -29701,6 +29801,29 @@ mod tests {
         h.wait_for_fade().await;
         assert_eq!(h.reported_play_state(), PlayState::Paused, "and lands on the new track");
         assert_eq!(h.player.state(), PlayState::Paused, "which the PLAYER really froze");
+    }
+
+    /// gogss78: the LAST track hitting EOF while its PauseOut fade is still descending
+    /// must not orphan that fade over the stopped deck (its Terminal::Pause landing on
+    /// nothing, the reported volume following a dead envelope in the meantime), and
+    /// the drain must not start a continuation behind the pause.
+    #[tokio::test(start_paused = true)]
+    async fn an_end_of_queue_eof_under_a_pause_fade_retires_the_fade() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("last")).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        let baseline = h.state.lock().unwrap().target_volume;
+        h.set_pause(Some(true)).await.expect("pause");
+        pump(20, 2).await;
+        assert!(h.fade_active().await, "the PauseOut fade is descending");
+
+        h.advance_on_eof(EofSignal::default()).await;
+        assert!(!h.fade_active().await, "the drain retired the pause fade");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "end of queue stops the deck");
+        assert!(!st.fading, "no dead envelope drives the reported volume");
+        assert_eq!(st.reported_volume(), baseline, "getvol reads the baseline");
+        assert_eq!(st.queue.len(), 1, "no continuation was appended behind the pause");
     }
 
     /// The skip-pin SLOT must be leak-proof under CONCURRENCY - two connections issuing

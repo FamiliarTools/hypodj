@@ -197,7 +197,7 @@ let
       ProtectHome = true;
       PrivateTmp = true;
       NoNewPrivileges = true;
-      # Loopback bind (6601) + outbound HTTPS to the OpenSubsonic server.
+      # Loopback bind (6600) + outbound HTTPS to the OpenSubsonic server.
       RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
       # NOT set: MemoryDenyWriteExecute (would break libmpv codec paths).
     };
@@ -315,10 +315,10 @@ in
 
     mpd.bind = mkOption {
       type = types.str;
-      default = "127.0.0.1:6601";
+      default = "127.0.0.1:6600";
       description = ''
-        Address the MPD-protocol listener binds to. Default 127.0.0.1:6601 ON
-        PURPOSE: mopidy owns 6600 and must not be disturbed.
+        Address the MPD-protocol listener binds to. Default 127.0.0.1:6600, the
+        standard MPD port.
       '';
     };
 

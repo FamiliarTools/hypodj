@@ -1008,9 +1008,8 @@ pub struct ServerConfig {
 pub struct MpdConfig {
     /// Address the MPD-protocol listener binds to.
     ///
-    /// Default is 6601 ON PURPOSE: the real mopidy daemon owns 6600 and must
-    /// not be disturbed. Production parity flips this to 6600 once mopidy is
-    /// retired.
+    /// Default is 127.0.0.1:6600, the standard MPD port: mopidy is retired, so
+    /// hypodj IS the MPD server and clients find it without a port flag.
     #[serde(default = "default_mpd_bind")]
     pub bind: String,
 }
@@ -1052,7 +1051,7 @@ fn default_client_name() -> String {
 }
 
 fn default_mpd_bind() -> String {
-    "127.0.0.1:6601".to_string()
+    "127.0.0.1:6600".to_string()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1099,9 +1098,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_and_defaults_bind_to_6601_not_6600() {
-        // No [mpd] section -> the default must be 6601, honoring the hard
-        // constraint that mopidy owns 6600.
+    fn parses_and_defaults_bind_to_the_standard_mpd_port() {
+        // No [mpd] section -> the default is 6600, the port the live deploy and
+        // every client default (`hypodj_client::config::DEFAULT_PORT`) agree on.
         let cfg = Config::from_str(
             r#"
             [server]
@@ -1114,7 +1113,7 @@ mod tests {
         assert_eq!(cfg.server.url, "https://music.example.com");
         assert_eq!(cfg.server.username, "alice");
         assert_eq!(cfg.server.client_name, "hypodj");
-        assert_eq!(cfg.mpd.bind, "127.0.0.1:6601");
+        assert_eq!(cfg.mpd.bind, "127.0.0.1:6600");
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! SAFETY posture (identical to the local-model path): the `claude` output is
 //! UNTRUSTED. It is parsed through the ALWAYS-COMPILED, model-free
 //! [`crate::parse_llm_output`], whose dedicated subset enums serde-REJECT any
-//! off-surface act/dir/trigger (`Wake`, `WakeTo`/`ToFloor`, `WallClock`, id-bearing
+//! off-surface act/dir/trigger (`Wake`, `ToFloor`, `WallClock`, id-bearing
 //! selectors). A schema-violating or extra-text reply is FINE - it maps to a loud
 //! miss, never a fabricated plan. `--json-schema` is POST-HOC validation only (not
 //! constrained decoding), which is exactly why the subset re-parse is the real gate.

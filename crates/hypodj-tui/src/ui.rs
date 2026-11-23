@@ -3795,7 +3795,7 @@ fn render_sixel_art(
     art: &crate::art::AlbumArt,
     cell_px: Option<(u16, u16)>,
     gen: bool,
-    held: &std::cell::RefCell<Option<String>>,
+    held: &std::cell::RefCell<Option<crate::state::SixelHeld>>,
     covered: bool,
 ) -> bool {
     use crate::art::{art_mode, ArtMode};
@@ -3835,13 +3835,26 @@ fn render_sixel_art(
     // `TuiState::sixel_held`). Otherwise take the current payload, with the generation
     // mixed in as a trailing SGR reset that renders as nothing and exists only to differ
     // from what the diff already sent.
-    let symbol: String = match (covered, held.borrow().as_deref()) {
-        (true, Some(pinned)) => pinned.to_string(),
-        _ if gen => format!("{payload}\x1b[0m"),
-        _ => payload.to_string(),
+    //
+    // The pin is only valid for the geometry it was encoded for. A resize while the
+    // overlay is up moves or rescales the pane, and the pinned payload would then be
+    // emitted at a new anchor with the OLD pixel size - a mis-sized image, and drawn
+    // over the popup to boot. There is no correct sixel to send under a popup, so fall
+    // back to the cell renderer until it closes; the close frame flips the generation
+    // and re-sends a payload encoded for the new geometry.
+    let geometry = (rect, (cw, ch));
+    let pinned = match (covered, held.borrow().as_ref()) {
+        (true, Some(h)) if h.geometry == geometry => Some(h.payload.clone()),
+        (true, Some(_)) => return false,
+        _ => None,
+    };
+    let symbol: String = match pinned {
+        Some(p) => p,
+        None if gen => format!("{payload}\x1b[0m"),
+        None => payload.to_string(),
     };
     if !covered {
-        *held.borrow_mut() = Some(symbol.clone());
+        *held.borrow_mut() = Some(crate::state::SixelHeld { geometry, payload: symbol.clone() });
     }
     let payload = symbol;
     let buf = f.buffer_mut();
@@ -3997,6 +4010,56 @@ mod sixel_render_tests {
         let after = payload_of(&terminal);
         assert_ne!(under_popup, after, "the close frame re-sends the image");
         assert!(after.is_some(), "and there is still a cover on screen");
+    }
+
+    /// m2zhfld: the pin is keyed on GEOMETRY too. Resizing while a popup is open must
+    /// never emit the held payload, which was encoded for the old pixel size; the pane
+    /// falls back to cells under the popup, and the close re-sends at the new size.
+    #[test]
+    fn a_resize_under_an_open_popup_never_emits_the_stale_geometry_payload() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut s = TuiState::new();
+        s.sixel_cell_px = Some((8, 17));
+        s.now.state = Some("play".into());
+        s.now.title = Some("A".into());
+        s.art = Some(art());
+        let payload_of = |t: &Terminal<TestBackend>| -> Option<String> {
+            t.backend().buffer().content().iter()
+                .map(|c| c.symbol().to_string())
+                .find(|sym| sym.starts_with("\x1bP"))
+        };
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let before = payload_of(&terminal).expect("the cover is drawn as a sixel payload");
+
+        s.menu = Some(crate::menu::Menu::new(
+            crate::menu::Target {
+                kind: crate::menu::TargetKind::LibrarySong,
+                origin: crate::menu::Origin::NowPlaying,
+                label: "A".into(),
+                uri: Some("song/s1".into()),
+                album_uri: None,
+                artist: None,
+                artist_uri: None,
+                match_uri: None,
+            },
+            0,
+        ));
+        terminal.draw(|f| render(f, &s)).unwrap();
+
+        // The terminal is resized with the popup still up.
+        terminal.backend_mut().resize(100, 40);
+        terminal.resize(Rect::new(0, 0, 100, 40)).unwrap();
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert_ne!(
+            payload_of(&terminal).as_deref(),
+            Some(before.as_str()),
+            "the payload encoded for the old geometry must not be emitted at the new one"
+        );
+
+        s.menu = None;
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let after = payload_of(&terminal).expect("the close frame re-sends the cover");
+        assert_ne!(after, before, "re-encoded for the new geometry");
     }
 
     /// The payload goes in ONE cell and every other cell of the rect is skipped.

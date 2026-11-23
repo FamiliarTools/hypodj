@@ -7,8 +7,7 @@
 //! [`greet_server`]) - hypodj's own MPD surface does not depend on the music
 //! server being awake.
 //!
-//! HARD CONSTRAINT honored: default bind is 127.0.0.1:6601, NOT 6600 - the
-//! running mopidy service owns 6600 and must not be disturbed.
+//! Default bind is 127.0.0.1:6600, the standard MPD port (`[mpd].bind`).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

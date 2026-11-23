@@ -5,7 +5,7 @@
 //! `{"actions":[ {type, ...flat scalars} ]}` of FLAT, internally-tagged objects on
 //! a CLOSED string enum. Off-surface intents (an unknown action `type`, an
 //! absolute wall-clock instant, an identity-bearing `SongId` selector, or a
-//! `Wake`/`WakeTo`/`ToFloor` fade) are UNREPRESENTABLE in this DTO, so they cannot
+//! `Wake`/`ToFloor` fade) are UNREPRESENTABLE in this DTO, so they cannot
 //! be produced no matter what the backend emits. The DTO + the VALIDATING
 //! conversion + [`parse_llm_output`] are ALWAYS compiled and model-free
 //! (unit-testable with a canned JSON string, no model, no network).
@@ -21,7 +21,7 @@ use hypodj_core::plan::{
 };
 
 /// Closed action lexicon. fade_out/fade_in are SEPARATE variants (no nested dir
-/// tag), so To/ToFloor/WakeTo/Wake are unrepresentable. An unknown string fails
+/// tag), so To/ToFloor/Wake are unrepresentable. An unknown string fails
 /// serde -> rejected. Claude emits this under the key `type` (every live sample);
 /// `action`/`act` are drift aliases.
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -193,7 +193,7 @@ fn build_qsel(p: &LlmRawPlan) -> Result<QueueSelector, String> {
 
 /// VALIDATING conversion (fallible: a flat bag needs cross-field checks). Every
 /// candidate crosses here on the way to plan.rs validate/clamp. Nothing off-surface
-/// is constructible (no Wake action, no To/ToFloor/WakeTo fade, no SongId-bearing
+/// is constructible (no Wake action, no To/ToFloor fade, no SongId-bearing
 /// selector, no wall-clock). count is clamped to MAX_ENQUEUE downstream in
 /// plan::validate; version=1 and origin="" (the adapter stamps nl:cc:<model>).
 impl TryFrom<LlmRawPlan> for RawPlan {
