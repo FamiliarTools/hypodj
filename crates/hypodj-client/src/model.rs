@@ -1,7 +1,8 @@
 //! Pure parsing of `status` + `currentsong` + `playlistinfo` pairs into structured
 //! values. Model-free: just the parse half, no text formatting (the CLI card and
 //! queue text formatters live in hypodj-cli/render.rs on top of this). The server
-//! emits only a known subset of keys - there is NO `elapsed` and NO `time` key.
+//! emits only a known subset of keys; `elapsed` is present only while a track is
+//! loaded (an older daemon never sends it).
 
 /// The now-playing state assembled from `status` + `currentsong` pairs. Fully
 /// Option-typed - the server may omit any field.
@@ -12,6 +13,9 @@ pub struct NowPlaying {
     pub playlistlength: Option<usize>,
     pub song: Option<usize>,   // 0-based index of current
     pub duration: Option<f64>, // library songs only
+    /// The playhead in seconds at the moment `status` was read; `None` when stopped
+    /// or from an older daemon. A client extrapolates it while playing.
+    pub elapsed: Option<f64>,
     pub title: Option<String>,
     /// The station / show NAME for a raw stream, from the `currentsong` `Name` pair
     /// (real MPD radio convention: `Name:` = station, `Title:` = now-playing). Present
@@ -370,6 +374,9 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         playlistlength: find(status, "playlistlength").and_then(|v| v.parse().ok()),
         song: find(status, "song").and_then(|v| v.parse().ok()),
         duration: find(status, "duration").and_then(|v| v.parse().ok()),
+        elapsed: find(status, "elapsed")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|e| e.is_finite() && *e >= 0.0),
         title: find(current, "Title").map(str::to_string),
         name: find(current, "Name").map(str::to_string),
         artist: find(current, "Artist").map(str::to_string),
@@ -651,8 +658,18 @@ mod tests {
     }
 
     #[test]
+    fn nowplaying_parses_elapsed_and_rejects_garbage() {
+        let np = now_playing(&p(&[("state", "play"), ("elapsed", "83.500")]), &[]);
+        assert_eq!(np.elapsed, Some(83.5));
+        for bad in ["nan", "inf", "-1.0", "x"] {
+            let np = now_playing(&p(&[("elapsed", bad)]), &[]);
+            assert_eq!(np.elapsed, None, "{bad}");
+        }
+    }
+
+    #[test]
     fn nowplaying_playing() {
-        // Canned status WITHOUT elapsed/time (the server never emits them).
+        // Canned status WITHOUT elapsed (an older daemon never emits it).
         let status = p(&[
             ("volume", "70"),
             ("playlistlength", "12"),
@@ -674,6 +691,7 @@ mod tests {
         assert_eq!(np.playlistlength, Some(12));
         assert_eq!(np.song, Some(2));
         assert_eq!(np.duration, Some(215.0));
+        assert_eq!(np.elapsed, None);
         assert_eq!(np.title.as_deref(), Some("Blue in Green"));
         assert_eq!(np.artist.as_deref(), Some("Miles Davis"));
         assert_eq!(np.album.as_deref(), Some("Kind of Blue"));

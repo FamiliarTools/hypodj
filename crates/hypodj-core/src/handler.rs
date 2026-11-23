@@ -283,6 +283,12 @@ struct State {
     /// client's VIEW: every delete re-validates it against a fresh fetch and shifts
     /// it like MPD shifts a playlist (see `resolve_starred_delete`).
     last_starred_order: Vec<SongId>,
+    /// READ-YOUR-WRITES overlay for song stars: every CONFIRMED star/unstar this
+    /// daemon made, with when. Navidrome does not promise that a `getStarred2` right
+    /// after a star reflects it, so a verify read could disagree with the write it
+    /// follows (an unstar that "came back"). Every Starred read folds this in for
+    /// [`STAR_OVERLAY_TTL`]; past that the server is the authority again.
+    star_overlay: HashMap<SongId, (bool, Instant)>,
     /// The order each real playlist had in its last `listplaylistinfo`, keyed by
     /// playlist id: the client's VIEW a positional `playlistdelete` indexes, mapped
     /// onto a fresh fetch by [`resolve_playlist_delete`] so a concurrent edit
@@ -1303,6 +1309,7 @@ impl Default for State {
             binary_limit: 8192,
             cover_id_memo: None,
             last_starred_order: Vec::new(),
+            star_overlay: HashMap::new(),
             last_playlist_order: HashMap::new(),
             random: false,
             repeat: false,
@@ -1666,8 +1673,8 @@ fn drain_is_next(st: &State) -> bool {
 
 /// The continuation-warm ARM PREDICATE, shared by arm time
 /// ([`HypodjHandler::reschedule_continuation_warm`]) and fire time
-/// ([`HypodjHandler::on_continuation_warm_fire`]). Returns the current FINITE Song's
-/// `duration_secs` when a warm is armable, else `None`. Read under the caller's `State`
+/// ([`HypodjHandler::on_continuation_warm_fire`]). `None` when no warm is armable.
+/// Read under the caller's `State`
 /// lock; `station_ok` (a non-empty station configured) is passed in because
 /// `continuation_station` is a SEPARATE Mutex the caller reads first (never nested).
 /// `playing` (the deck is genuinely PLAYING) is passed in for the SAME reason: the
@@ -1686,12 +1693,9 @@ fn drain_is_next(st: &State) -> bool {
 /// occur for a continuation warm because the actor's `WarmKind::Continuation` ATTRIBUTES
 /// the auto-advance instead of swallowing it - so this predicate omits that guard on
 /// purpose.
-fn continuation_warm_ready(st: &State, station_ok: bool, playing: bool) -> Option<f64> {
-    warm_ready(st, station_ok, playing).map(|(d, _)| d)
-}
-
-/// The warm predicate, now answering BOTH handoffs: returns the current finite Song's
-/// duration plus WHICH target should be parked behind it.
+///
+/// It answers BOTH handoffs: the current finite Song's duration plus WHICH target
+/// should be parked behind it.
 ///
 /// The shared guards are the ones the station warm already carried and they are not
 /// negotiable for either target: a GENUINELY PLAYING deck (never behind a stopped -
@@ -2759,15 +2763,6 @@ fn crossfade_task(
     })
 }
 
-/// Build the bounded remote-cover HTTP client (task kmrhj8m + njvsh8w): a 2s connect /
-/// 2.5s total ceiling with a small redirect budget. HARD-FAILS at construction rather
-/// than degrading to an UNBOUNDED fallback: the bound is a load-bearing invariant (it is
-/// what stops a hung cover host from wedging the art worker), so a fallback that silently
-/// drops it would reintroduce the very hang the bound prevents. reqwest's own
-/// `Client::new()` panics in the identical TLS-backend-init failure this builder would
-/// hit (it is `builder().build().unwrap()` under the hood), so the old
-/// `unwrap_or_else(|_| Client::new())` was not even a graceful degrade - it was an
-/// unbounded client OR a panic. Expect is the honest choice: bounded, or nothing.
 /// The http-loopback exemption for [`HypodjHandler::fetch_remote_cover`] (task njvsh8w):
 /// plain `http://` is allowed ONLY for a genuine loopback host (local test servers / dev),
 /// everything else must be `https://`. PARSES the url and matches the exact host, so a
@@ -8164,9 +8159,28 @@ impl HypodjHandler {
     /// Shared by `listplaylistinfo Starred` and `load Starred` (which must agree on
     /// the exact order they present). Starred is NEVER cached (freshness-critical).
     async fn starred_songs_recording_order(&self) -> Result<Vec<Song>, SubsonicError> {
-        let songs = self.client.starred_songs().await?;
+        let songs = self.starred_songs_read_your_writes().await?;
         let mut st = self.state.lock().unwrap();
         st.last_starred_order = songs.iter().map(|s| s.id.clone()).collect();
+        Ok(songs)
+    }
+
+    /// `getStarred2` with this daemon's own recent star writes folded over it (see
+    /// `State::star_overlay`). A just-starred song the server has not indexed yet is
+    /// fetched by id and appended; one that fails to fetch is left out rather than
+    /// failing the listing - the next read has it once the server catches up.
+    async fn starred_songs_read_your_writes(&self) -> Result<Vec<Song>, SubsonicError> {
+        let songs = self.client.starred_songs().await?;
+        let (mut songs, missing) = {
+            let mut st = self.state.lock().unwrap();
+            fold_star_overlay(songs, &mut st.star_overlay, Instant::now())
+        };
+        for id in missing {
+            if let Ok(mut s) = self.client.song(&id).await {
+                s.starred = true;
+                songs.push(s);
+            }
+        }
         Ok(songs)
     }
 
@@ -8954,7 +8968,9 @@ impl HypodjHandler {
     pub fn set_continuation_mode(&self, mode: ContinuationMode, autofill_count: u32) {
         *self.continuation_mode.lock().unwrap() = mode;
         *self.configured_continuation_mode.lock().unwrap() = mode;
-        self.autofill_count.store(autofill_count.max(1), Ordering::Relaxed);
+        // Ceiling too: the refill over-fetches `2n` as an i32 page size, so an
+        // absurd configured count must not wrap negative or ask for the library.
+        self.autofill_count.store(autofill_count.clamp(1, MAX_AUTOFILL_COUNT), Ordering::Relaxed);
     }
 
     /// Force the LIVE continuation mode without touching the configured value - the
@@ -14108,7 +14124,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Ping => MpdResponse::ok(),
 
             MpdCommand::Status => {
-                let (vol, qlen, cur, ver, random, repeat, single, consume) = {
+                let (vol, qlen, cur, ver, random, repeat, single, consume, skipping) = {
                     let st = self.state.lock().unwrap();
                     (
                         // Derived from the live gain so status tracks an in-flight
@@ -14125,6 +14141,7 @@ impl MpdHandler for HypodjHandler {
                         st.repeat,
                         st.single,
                         st.consume,
+                        st.pending_skip.is_some(),
                     )
                 };
                 let flag = |b: bool| if b { "1" } else { "0" };
@@ -14153,9 +14170,23 @@ impl MpdHandler for HypodjHandler {
                             .pair("songid", item.id.to_string());
                         // Duration is only known for a library song; a live
                         // stream reports none (unknown length is valid MPD).
-                        if let QueueEntry::Song(s) = &item.entry {
-                            if let Some(d) = s.duration_secs {
-                                b = b.pair("duration", format!("{d}.000"));
+                        let duration = match &item.entry {
+                            QueueEntry::Song(s) => s.duration_secs,
+                            _ => None,
+                        };
+                        if let Some(d) = duration {
+                            b = b.pair("duration", format!("{d}.000"));
+                        }
+                        // The live playhead, so a client can show where a scrub
+                        // landed. Only while a track is loaded (MPD omits it on
+                        // stop), and 0 during an in-flight skip: `song` already
+                        // names the TARGET, and the lockless position still holds
+                        // the track being left.
+                        if state != PlayState::Stopped {
+                            let e = if skipping { 0.0 } else { self.last_elapsed_secs() };
+                            b = b.pair("elapsed", format!("{e:.3}"));
+                            if let Some(d) = duration {
+                                b = b.pair("time", format!("{}:{d}", e as u64));
                             }
                         }
                     }
@@ -14838,7 +14869,7 @@ impl MpdHandler for HypodjHandler {
                         return ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index");
                     }
                 }
-                let fresh = match self.client.starred_songs().await {
+                let fresh = match self.starred_songs_read_your_writes().await {
                     Ok(songs) => songs.into_iter().map(|s| s.id).collect::<Vec<_>>(),
                     Err(e) => return ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
                 };
@@ -15531,7 +15562,7 @@ impl HypodjHandler {
             // directory rows) with the starred-song `file:` rows. Albums/artists
             // are DIRECTORY entities, so they surface as subdirs (ncmpcpp expands
             // them on add), never as fake song rows in a stored playlist.
-            Some("Starred") => match self.client.starred_songs().await {
+            Some("Starred") => match self.starred_songs_read_your_writes().await {
                 Ok(songs) => {
                     {
                         let mut st = self.state.lock().unwrap();
@@ -16181,6 +16212,8 @@ impl HypodjHandler {
     /// taken and released synchronously here - never held across an `.await`.
     fn set_queue_starred(&self, id: &SongId, starred: bool) {
         let mut st = self.state.lock().unwrap();
+        // The same confirmation is what a Starred read must not contradict.
+        st.star_overlay.insert(id.clone(), (starred, Instant::now()));
         for item in st.queue.iter_mut() {
             if let QueueEntry::Song(song) = &mut item.entry {
                 if &song.id == id {
@@ -16602,6 +16635,36 @@ fn browse_song_pairs(s: &Song) -> Vec<(String, String)> {
 /// `now_unix` is INJECTED rather than read here so the day arithmetic on the play
 /// stats below is a pure function the tests can pin to a fixed date - the same reason
 /// the store's frontier takes its epoch as an argument.
+/// The largest honoured `[continuation].autofill_count`: a refill is a queue's worth,
+/// and `2 * MAX` stays far inside the i32 page size the over-fetch sends.
+const MAX_AUTOFILL_COUNT: u32 = 500;
+
+/// How long a confirmed star/unstar overrides what `getStarred2` says. Long enough
+/// to cover Navidrome's observed read-after-write lag (sub-second) with margin; short
+/// enough that a change made in another client is not masked for long. Entries are
+/// evicted only by age, never on the first agreeing read, so a read that flaps back
+/// after agreeing once is still covered.
+const STAR_OVERLAY_TTL: Duration = Duration::from_secs(5);
+
+/// Fold the read-your-writes overlay over one `getStarred2` result: drop expired
+/// entries, remove songs this daemon just unstarred, and return the ids it just
+/// starred that the server did not list (for the caller to fetch). Order of the
+/// server's rows is kept, so position-based deletes stay stable.
+fn fold_star_overlay(
+    mut songs: Vec<Song>,
+    overlay: &mut HashMap<SongId, (bool, Instant)>,
+    now: Instant,
+) -> (Vec<Song>, Vec<SongId>) {
+    overlay.retain(|_, (_, at)| now.saturating_duration_since(*at) < STAR_OVERLAY_TTL);
+    songs.retain(|s| !matches!(overlay.get(&s.id), Some((false, _))));
+    let missing = overlay
+        .iter()
+        .filter(|(id, (starred, _))| *starred && !songs.iter().any(|s| &s.id == *id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    (songs, missing)
+}
+
 fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
     // THE SERVER'S OWN LISTENING HISTORY, on every song row - browse, Find, the
     // queue, and `currentsong`. Both are emitted ONLY when the server actually has a
@@ -26441,6 +26504,56 @@ mod tests {
     }
 
     // ── SMOOTH-RESTART: resume composition (signal-free, no real process) ─────
+
+    // `status` carries the live playhead (`elapsed`, plus MPD's legacy `time`
+    // "e:d") while a track is loaded, so a client can show where a scrub landed.
+    // Stopped emits neither, as MPD does.
+    #[tokio::test]
+    async fn status_reports_elapsed_while_a_track_is_loaded() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "elapsed"), None, "stopped => no elapsed");
+
+        h.enqueue_song_for_test(mk_song("e1")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.pending_pause = true;
+        }
+        h.note_elapsed_ms(83_500);
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "elapsed"), Some("83.500"));
+        assert_eq!(pair(&status, "time"), Some("83:240"));
+    }
+
+    #[tokio::test]
+    async fn autofill_count_is_clamped_on_both_ends() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_continuation_mode(ContinuationMode::Autofill, u32::MAX);
+        assert_eq!(h.autofill_count.load(Ordering::Relaxed), MAX_AUTOFILL_COUNT);
+        h.set_continuation_mode(ContinuationMode::Autofill, 0);
+        assert_eq!(h.autofill_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn star_overlay_masks_a_lagging_read_then_expires() {
+        let mut ov = HashMap::new();
+        let t0 = Instant::now();
+        ov.insert(SongId("gone".into()), (false, t0));
+        ov.insert(SongId("new".into()), (true, t0));
+        ov.insert(SongId("kept".into()), (true, t0));
+        // The lagging server still lists the unstarred song and lacks the new one.
+        let server = vec![mk_song("kept"), mk_song("gone"), mk_song("other")];
+        let (songs, missing) = fold_star_overlay(server.clone(), &mut ov, t0);
+        let ids: Vec<_> = songs.iter().map(|s| s.id.0.as_str()).collect();
+        assert_eq!(ids, ["kept", "other"], "the unstar sticks, order kept");
+        assert_eq!(missing, vec![SongId("new".into())], "the star is fetched in");
+        // Past the TTL the server is the authority again and the overlay empties.
+        tokio::time::advance(STAR_OVERLAY_TTL).await;
+        let (songs, missing) = fold_star_overlay(server, &mut ov, Instant::now());
+        assert_eq!(songs.len(), 3);
+        assert!(missing.is_empty() && ov.is_empty());
+    }
 
     fn mk_song(id: &str) -> Song {
         Song {
