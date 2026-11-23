@@ -443,10 +443,8 @@ fn nl_handshake(
     if confirm("confirm?") {
         match conn.command(&format!("nl confirm {token}")) {
             Ok(plan_pairs) => {
-                for (k, v) in &plan_pairs {
-                    if k == "plan_id" {
-                        println!("{}", nl::armed_line(v));
-                    }
+                for line in nl::confirm_lines(&plan_pairs) {
+                    println!("{line}");
                 }
                 print_card(conn)?;
             }

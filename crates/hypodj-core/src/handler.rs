@@ -3708,19 +3708,36 @@ impl HypodjHandler {
         &self,
         raw: RawPlan,
     ) -> Result<(PlanId, Option<PlanOutcome>), PlanError> {
-        let (mut pendings, mut ids, immediates) = self.prepare_batch(vec![raw])?;
-        // Single-plan batch: exactly one id + one pending.
-        let id = ids.remove(0);
-        if immediates.contains(&id) {
-            // Immediate: run inline for the true outcome. An Immediate plan holds no
-            // timer guard, so dropping the (un-enrolled) pending disarms nothing.
-            let raw = pendings.remove(0).armed.raw;
-            let outcome = self.run_action_outcome(&raw.action, &raw.origin).await;
-            Ok((id, Some(outcome)))
-        } else {
-            self.plan_pending.lock().unwrap().extend(pendings);
-            Ok((id, None))
+        let mut armed = self.plan_add_batch_reporting(vec![raw]).await?;
+        // Single-plan batch: exactly one entry.
+        Ok(armed.remove(0))
+    }
+
+    /// The batch form of [`Self::plan_add_reporting`], backing `nl confirm`: every
+    /// plan is validated against ONE snapshot first (all or none, as
+    /// [`Self::plan_add_batch`]), the deferred ones are enrolled, and then each
+    /// Immediate runs inline IN ORDER for its real outcome. An Immediate plan holds
+    /// no timer guard, so dropping its (never enrolled) pending disarms nothing.
+    pub async fn plan_add_batch_reporting(
+        &self,
+        raws: Vec<RawPlan>,
+    ) -> Result<Vec<(PlanId, Option<PlanOutcome>)>, PlanError> {
+        let (pendings, ids, immediates) = self.prepare_batch(raws)?;
+        let mut run = Vec::new();
+        let mut deferred = Vec::new();
+        for p in pendings {
+            if immediates.contains(&p.armed.id) {
+                run.push(p.armed.raw);
+            } else {
+                deferred.push(p);
+            }
         }
+        self.plan_pending.lock().unwrap().extend(deferred);
+        let mut outcomes = std::collections::HashMap::new();
+        for (id, raw) in immediates.iter().zip(run) {
+            outcomes.insert(*id, self.run_action_outcome(&raw.action, &raw.origin).await);
+        }
+        Ok(ids.into_iter().map(|id| (id, outcomes.remove(&id))).collect())
     }
 
     /// Execute one immediate plan [`Action`] against the existing primitives,
@@ -5463,7 +5480,7 @@ impl HypodjHandler {
     async fn handle_nl(&self, cmd: NlCmd) -> MpdResponse {
         match cmd {
             NlCmd::Translate { req, owner } => self.nl_translate(req, owner).await,
-            NlCmd::Confirm { token, owner } => self.nl_confirm(&token, owner),
+            NlCmd::Confirm { token, owner } => self.nl_confirm(&token, owner).await,
             NlCmd::Cancel { token, owner } => self.nl_cancel(&token, owner),
         }
     }
@@ -5598,7 +5615,11 @@ impl HypodjHandler {
     /// Confirm: pop the (single-use) token and RE-VALIDATE + arm each plan against
     /// the CURRENT snapshot via `plan_add`. A queue mutation since the echo that
     /// invalidates a target -> loud ACK (per-plan), nothing stale armed.
-    fn nl_confirm(&self, token: &str, owner: u64) -> MpdResponse {
+    ///
+    /// Like `plan add`, an Immediate plan runs INLINE and its real execute-time
+    /// outcome comes back as a `result` pair right after its `plan_id`, so a plain-NL
+    /// ask that resolves to nothing reads "added 0 - no matches for X", not "armed".
+    async fn nl_confirm(&self, token: &str, owner: u64) -> MpdResponse {
         // Pop ONLY when the token exists AND belongs to this connection. A confirm
         // from a different owner is treated as "no such token" (indistinguishable,
         // so it leaks nothing about another connection's pending plans).
@@ -5624,11 +5645,14 @@ impl HypodjHandler {
         // SAFETY (atomic batch): arm ALL plans or NONE. `plan_add_batch`
         // pre-validates every plan against ONE current snapshot and only then arms
         // them; a single invalid plan arms nothing (no partial, inconsistent arm).
-        match self.plan_add_batch(pending.plans) {
-            Ok(ids) => {
+        match self.plan_add_batch_reporting(pending.plans).await {
+            Ok(armed) => {
                 let mut b = MpdResponse::pairs();
-                for id in ids {
+                for (id, outcome) in armed {
                     b = b.pair("plan_id", id.0.to_string());
+                    if let Some(o) = outcome {
+                        b = b.pair("result", o.render());
+                    }
                 }
                 b.build()
             }
@@ -21311,10 +21335,12 @@ mod tests {
         assert!(pair(&resp, "nl_echo").is_some(), "an echo is rendered");
         assert!(handler.plan_list().is_empty(), "translate must NOT arm");
 
-        // Confirm arms via the P2 registry and returns a plan id.
+        // Confirm validates + mints a plan id; an Immediate plan runs inline and
+        // reports its real outcome (6ze6srz), so it is never left enrolled.
         let resp = handler.handle(nl_confirm(&token, 1)).await;
         assert!(pair(&resp, "plan_id").is_some(), "confirm arms + returns id");
-        assert_eq!(handler.plan_list().len(), 1, "exactly one plan armed");
+        assert_eq!(pair(&resp, "result"), Some("stopped"));
+        assert!(handler.plan_list().is_empty(), "an inline immediate is never enrolled");
 
         // The token is single-use: a second confirm fails loud.
         let resp = handler.handle(nl_confirm(&token, 1)).await;
@@ -21350,7 +21376,9 @@ mod tests {
         // 9999s fade out is well over the 1800s (max_dur) ceiling -> clamps.
         let plan = RawPlan {
             version: 1,
-            trigger: crate::plan::RawTrigger::Immediate,
+            // Deferred (not Immediate), so the armed plan stays in the registry to read
+            // back: an Immediate one runs inline at confirm and is never enrolled.
+            trigger: crate::plan::RawTrigger::SpanElapsed { secs: 600.0 },
             action: crate::plan::Action::Fade(crate::plan::FadeIntentIr::Out { secs: 9999.0 }),
             once: true,
             origin: String::new(),
@@ -21444,7 +21472,10 @@ mod tests {
         // The rightful owner still confirms + arms.
         let resp = handler.handle(nl_confirm(&token_a, 100)).await;
         assert!(pair(&resp, "plan_id").is_some(), "the owner can confirm");
-        assert_eq!(handler.plan_list().len(), 1);
+        // 6ze6srz: an Immediate plan ran INLINE and reports its real outcome, the
+        // same contract as `plan add` - nothing is left enrolled to run again.
+        assert_eq!(pair(&resp, "result"), Some("stopped"));
+        assert!(handler.plan_list().is_empty(), "an inline immediate is never enrolled");
 
         // Tokens are non-sequential + distinct across several mints.
         let mut toks = Vec::new();
