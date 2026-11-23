@@ -30,7 +30,7 @@ use hypodj_client::mpd::{MpdConn, MpdError};
 use hypodj_client::viz::{VizConn, VizSample};
 use hypodj_client::model::{now_playing, parse_queue, NowPlaying, QueueItem};
 use hypodj_client::nl::{
-    armed_line, echo_from_pairs, map_ack_reason, nl_request, quote_arg, result_line_from_pairs,
+    echo_from_pairs, map_ack_reason, nl_request, quote_arg,
     split_echo, token_from_pairs,
 };
 
@@ -138,7 +138,7 @@ pub enum Inbound {
 pub enum RespKind {
     Snapshot { now: NowPlaying, queue: Option<Vec<QueueItem>>, version: Option<u64> },
     Confirm(Pending),
-    Banner(String),
+    Banner(hypodj_client::Spoken),
     /// The daemon's `heard` render, one entry per line, for the scrollable overlay.
     /// Multi-line by construction (a one-line reply is a Banner), so it always has
     /// something the bottom bar could not have carried.
@@ -507,7 +507,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 false
             }
             Err(Fail::Ack(m)) => {
-                send(RespKind::Banner(m));
+                send(RespKind::Banner(hypodj_client::spoken::refused_text(m)));
                 false
             }
             Err(Fail::Down) => true,
@@ -521,7 +521,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 // and nothing on screen changed at all.
                 match command_reply(&line, &pairs) {
                     Some(Reply::Banner(b)) => {
-                        send(RespKind::Banner(b));
+                        send(RespKind::Banner(hypodj_client::spoken::live_text(b)));
                     }
                     Some(Reply::Heard(lines)) => {
                         send(RespKind::Heard(lines));
@@ -536,7 +536,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 if (line == "knob up" || line == "knob down") && m.contains("unknown command") {
                     send(RespKind::KnobUnknown(line));
                 } else {
-                    send(RespKind::Banner(map_ack_reason(&m)));
+                    send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m)));
                 }
                 false
             }
@@ -566,13 +566,15 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                         }));
                     }
                     None => {
-                        send(RespKind::Banner("the server returned no plan to confirm".into()));
+                        send(RespKind::Banner(hypodj_client::spoken::refused_text(
+                            "the server returned no plan to confirm",
+                        )));
                     }
                 }
                 false
             }
             Err(MpdError::Ack(m)) => {
-                send(RespKind::Banner(map_ack_reason(&m)));
+                send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m)));
                 false
             }
             Err(_) => true,
@@ -587,16 +589,11 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 // count. Fall back to the plan-time armed line only for a deferred plan
                 // (no `result`), where nothing has executed yet.
                 (Some(cmd), _) => conn.command(cmd).map(|pairs| {
-                    Some(
-                        result_line_from_pairs(&pairs)
-                            .unwrap_or_else(|| command_armed_line(&pending.steps)),
-                    )
+                    Some(hypodj_client::spoken::from_arm_pairs(&pairs, &pending.steps))
                 }),
-                (None, Some(token)) => {
-                    conn.command(&format!("nl confirm {token}")).map(|pairs| {
-                        pairs.iter().find(|(k, _)| k == "plan_id").map(|(_, v)| armed_line(v))
-                    })
-                }
+                (None, Some(token)) => conn.command(&format!("nl confirm {token}")).map(|pairs| {
+                    Some(hypodj_client::spoken::from_arm_pairs(&pairs, &pending.steps))
+                }),
                 (None, None) => Ok(None),
             };
             match result {
@@ -607,7 +604,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                     refresh_after(conn, tx, epoch)
                 }
                 Err(MpdError::Ack(m)) => {
-                    send(RespKind::Banner(map_ack_reason(&m)));
+                    send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m)));
                     false
                 }
                 Err(_) => true,
@@ -631,7 +628,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                             .unwrap_or(0),
                     ),
                     Err(Fail::Ack(m)) => {
-                        send(RespKind::Banner(m));
+                        send(RespKind::Banner(hypodj_client::spoken::refused_text(m)));
                         return false;
                     }
                     Err(Fail::Down) => return true,
@@ -642,7 +639,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             match cmd(conn, &format!("add {}", quote_arg(&uri))) {
                 Ok(_) => {}
                 Err(Fail::Ack(m)) => {
-                    send(RespKind::Banner(m));
+                    send(RespKind::Banner(hypodj_client::spoken::refused_text(m)));
                     return false;
                 }
                 Err(Fail::Down) => return true,
@@ -660,7 +657,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
         Req::Load(name) => match conn.command(&format!("load {}", quote_arg(&name))) {
             Ok(_) => refresh_after(conn, tx, epoch),
             Err(MpdError::Ack(m)) => {
-                send(RespKind::Banner(map_ack_reason(&m)));
+                send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m)));
                 false
             }
             Err(_) => true,
@@ -672,7 +669,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 false
             }
             Err(MpdError::Ack(m)) => {
-                send(RespKind::Banner(map_ack_reason(&m)));
+                send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m)));
                 false
             }
             Err(_) => true,
@@ -686,10 +683,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
 /// DJ chat gets no feedback after `y` (the token path echoes `armed_line` instead).
 /// Pure - unit-tested.
 fn command_armed_line(steps: &[String]) -> String {
-    match steps.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
-        Some(s) => hypodj_style::armed_banner(s),
-        None => "armed".to_string(),
-    }
+    hypodj_client::spoken::armed_fallback(steps).text()
 }
 
 /// A command outcome collapsed to the two render-visible cases.
@@ -716,7 +710,7 @@ fn refresh_after(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64) -> bool {
             false
         }
         Err(Fail::Ack(m)) => {
-            let _ = tx.send(Inbound::Resp { epoch, kind: RespKind::Banner(m) });
+            let _ = tx.send(Inbound::Resp { epoch, kind: RespKind::Banner(hypodj_client::spoken::refused_text(m)) });
             false
         }
         Err(Fail::Down) => true,

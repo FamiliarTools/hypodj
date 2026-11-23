@@ -350,7 +350,7 @@ fn nl_handshake(
         Ok(p) => p,
         // An ACK here is a translate failure: map to a friendly reason.
         Err(MpdError::Ack(msg)) => {
-            println!("{}", nl::map_ack_reason(&msg));
+            println!("{}", stdout_ansi().render(&hypodj_client::spoken::refusal_ack(&msg)));
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -359,40 +359,35 @@ fn nl_handshake(
     let token = match nl::token_from_pairs(&pairs) {
         Some(t) => t,
         None => {
-            println!("the server did not return a plan to confirm");
+            println!(
+                "{}",
+                stdout_ansi().render(&hypodj_client::spoken::refused_text(
+                    "the server did not return a plan to confirm",
+                ))
+            );
             return Ok(());
         }
     };
 
     if let Some(echo) = nl::echo_from_pairs(&pairs) {
-        let parts = nl::split_echo(&echo);
-        if let Some(trust) = &parts.trust {
-            println!("({trust})");
-        }
-        for step in &parts.steps {
-            println!("{step}");
-        }
-        // Wake caveat surfaced as a warning ABOVE the prompt.
-        if let Some(note) = &parts.note {
-            println!("\n{}", stdout_ansi().paint(
-                hypodj_style::Role::Refused,
-                &hypodj_style::note_line(note),
-                hypodj_style::TermBg::dark_default(),
-            ));
+        let ansi = stdout_ansi();
+        for spoken in hypodj_client::spoken::plan_echo(&nl::split_echo(&echo)) {
+            println!("{}", ansi.render(&spoken));
         }
     }
 
-    if confirm("confirm?") {
+    if read_answer() {
         match conn.command(&format!("nl confirm {token}")) {
             Ok(plan_pairs) => {
-                for (k, v) in &plan_pairs {
-                    if k == "plan_id" {
-                        println!("{}", nl::armed_line(v));
-                    }
-                }
+                println!(
+                    "{}",
+                    stdout_ansi().render(&hypodj_client::spoken::from_arm_pairs(&plan_pairs, &[]))
+                );
                 print_card(conn)?;
             }
-            Err(MpdError::Ack(msg)) => println!("{}", nl::map_ack_reason(&msg)),
+            Err(MpdError::Ack(msg)) => {
+                println!("{}", stdout_ansi().render(&hypodj_client::spoken::refusal_ack(&msg)))
+            }
             Err(e) => return Err(e),
         }
     } else {
@@ -463,28 +458,29 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
         }
     };
 
-    println!("(via Claude Code)");
-    println!("{}", hypodj_nl::describe_plan(&raw));
+    let mut lines = vec!["(via Claude Code)".to_string()];
+    lines.extend(hypodj_nl::describe_plan(&raw).lines().map(|l| l.to_string()));
+    lines.push(hypodj_client::spoken::CONFIRM_LINE.to_string());
+    println!(
+        "{}",
+        stdout_ansi().render(&hypodj_client::Spoken::new(hypodj_client::State::Echo, lines))
+    );
 
-    if confirm("confirm?") {
+    if read_answer() {
         match conn.command(&format!("plan add {dsl}")) {
             Ok(plan_pairs) => {
                 // Prefer the REAL execute-time outcome ("added N", "added 0 - no
                 // matches for X", "played X") the daemon returns for an immediate
                 // plan; fall back to the plan-time armed line for a deferred plan.
-                match nl::result_line_from_pairs(&plan_pairs) {
-                    Some(line) => println!("{line}"),
-                    None => {
-                        for (k, v) in &plan_pairs {
-                            if k == "plan_id" {
-                                println!("{}", nl::armed_line(v));
-                            }
-                        }
-                    }
-                }
+                println!(
+                    "{}",
+                    stdout_ansi().render(&hypodj_client::spoken::from_arm_pairs(&plan_pairs, &[]))
+                );
                 print_card(conn)?;
             }
-            Err(MpdError::Ack(msg)) => println!("{}", nl::map_ack_reason(&msg)),
+            Err(MpdError::Ack(msg)) => {
+                println!("{}", stdout_ansi().render(&hypodj_client::spoken::refusal_ack(&msg)))
+            }
             Err(e) => return Err(e),
         }
     } else {
@@ -666,13 +662,15 @@ fn stdout_ansi() -> hypodj_style::Ansi {
     )
 }
 
+/// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm.
 pub(crate) fn confirm(question: &str) -> bool {
-    let words = format!("{question} [y/N]");
-    debug_assert!(question != "confirm?" || words == hypodj_style::confirm_prompt());
-    print!(
-        "{} ",
-        stdout_ansi().paint(hypodj_style::Role::Echo, &words, hypodj_style::TermBg::dark_default())
-    );
+    let spoken = hypodj_client::spoken::confirm_question(question);
+    print!("{} ", stdout_ansi().render(&spoken));
+    read_answer()
+}
+
+/// Read a default-No answer. The prompt itself was already printed.
+fn read_answer() -> bool {
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     match std::io::stdin().lock().read_line(&mut line) {

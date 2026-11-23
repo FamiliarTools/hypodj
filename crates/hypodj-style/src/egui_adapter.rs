@@ -76,10 +76,30 @@ pub fn visuals(bg: TermBg) -> Visuals {
     }
     v.widgets.inactive.fg_stroke.color = quiet;
     v.widgets.noninteractive.fg_stroke.color = quiet;
-    // Selection is ink, reversed against the room. Ember stays reserved.
-    v.selection.stroke = Stroke::new(1.0, ink);
-    v.selection.bg_fill = ink;
+    let sel = selection(bg);
+    v.selection.stroke = Stroke::new(1.0, sel.stroke);
+    v.selection.bg_fill = sel.fill;
     v
+}
+
+/// Selection, inverted the way the TUI's REVERSED modifier is: the fill is
+/// primary ink, the text is the room, the stroke is primary ink.
+pub struct SelectionInk {
+    pub fill: Color32,
+    pub text: Color32,
+    pub stroke: Color32,
+}
+
+pub fn selection(bg: TermBg) -> SelectionInk {
+    let ink = color32(fit_ink_primary(bg));
+    let room = color32(bg.rgb);
+    SelectionInk { fill: ink, text: room, stroke: ink }
+}
+
+/// One colour per line. The words are unchanged.
+pub fn render(spoken: &hypodj_client::Spoken, bg: TermBg) -> Vec<(String, Color32)> {
+    let colour = role_color(crate::role_for(spoken.state), bg);
+    spoken.lines.iter().map(|line| (line.clone(), colour)).collect()
 }
 
 pub fn role_color(role: Role, bg: TermBg) -> Color32 {
@@ -97,7 +117,7 @@ pub fn role_color(role: Role, bg: TermBg) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{contrast_ratio, ember_rgb, parity_lines, tokens, BgSource};
+    use crate::{contrast_ratio, ember_rgb, tokens, BgSource};
 
     fn rgb_of(c: Color32) -> Rgb {
         [c.r(), c.g(), c.b()]
@@ -115,9 +135,15 @@ mod tests {
             let err = rgb_of(v.error_fg_color);
             assert!(contrast_ratio(err, bg.rgb) >= tokens().room.ink_primary_min_contrast);
             assert_ne!(err, [255, 0, 0]);
-            assert_eq!(rgb_of(v.selection.stroke.color), err, "selection is ink");
-            assert_eq!(rgb_of(v.selection.bg_fill), err);
-            assert_ne!(rgb_of(v.selection.stroke.color), ember_rgb(bg));
+            let sel = selection(bg);
+            assert_eq!(rgb_of(v.selection.bg_fill), rgb_of(sel.fill));
+            assert_eq!(rgb_of(sel.text), bg.rgb, "selected text is the room");
+            assert_eq!(rgb_of(v.selection.stroke.color), rgb_of(sel.stroke));
+            assert_ne!(rgb_of(sel.fill), ember_rgb(bg));
+            assert!(
+                contrast_ratio(bg.rgb, fit_ink_primary(bg)) >= tokens().room.ink_quiet_min_contrast,
+                "selected text on its fill"
+            );
         }
     }
 
@@ -133,11 +159,15 @@ mod tests {
     }
 
     #[test]
-    fn state_words_are_independent_of_the_colour() {
+    fn render_keeps_the_lines() {
         let bg = TermBg::dark_default();
-        for spoken in parity_lines() {
-            let _colour = role_color(spoken.state.role(), bg);
-            assert!(!spoken.words.is_empty());
-        }
+        let spoken = hypodj_client::Spoken::new(
+            hypodj_client::State::Echo,
+            vec!["[1] fade out".into(), hypodj_client::spoken::CONFIRM_LINE.into()],
+        );
+        let rows = render(&spoken, bg);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "[1] fade out");
+        assert_eq!(rows[1].0, hypodj_client::spoken::CONFIRM_LINE);
     }
 }

@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use hypodj_client::model::{
-    fmt_remaining, store_badge, store_badge_short, ArmedFeatures, FieldState, HintKind, NowPlaying,
+    store_badge, store_badge_short, FieldState, HintKind, NowPlaying,
 };
 
 use crate::keymap;
@@ -755,7 +755,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         return;
     }
 
-    let armed_line = armed_hud(&np.armed);
+    let armed_line = hypodj_client::spoken::armed_hold(&np.armed);
     // The active latent-field pull, as its own subtle line (the quietest voice),
     // mirroring the armed HUD: present ONLY when a pull is active, so a resting field
     // reserves no row and never jumps the layout.
@@ -776,10 +776,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
             Style::default().quiet(),
         )));
         if let Some(a) = &armed_line {
-            lines.push(Line::from(Span::styled(
-                a.clone(),
-                Style::default().quiet(),
-            )));
+            lines.extend(hypodj_style::ratatui::render(a, state.term_bg, state.truecolor));
         }
         if let Some(fl) = &field_line {
             lines.push(Line::from(Span::styled(
@@ -913,11 +910,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         Style::default().quiet(),
     )));
     if let Some(a) = armed_line {
-        // Sleep, wind-down, and wake are armed: ember, on this surface too.
-        lines.push(Line::from(Span::styled(
-            a,
-            Style::default().fg(hypodj_style::ratatui::ember_color(state.term_bg, state.truecolor)),
-        )));
+        lines.extend(hypodj_style::ratatui::render(&a, state.term_bg, state.truecolor));
     }
     // The field pull is the last, faintest line - the quietest voice in the pane.
     if let Some(fl) = field_line {
@@ -951,33 +944,6 @@ fn is_placeholder_artist(artist: &str) -> bool {
     )
 }
 
-/// The armed human-features (sleep / wind-down / wake) as one subtle HUD line, e.g.
-/// `sleep in 12m \u{b7} wake in 7h 00m`. `None` when nothing is armed, so a lean status
-/// renders no extra line. Surfaces the daemon's X- status pairs verbatim.
-///
-/// No `[armed]` prefix: the line is nothing BUT armed state, so the tag labelled a
-/// category instead of telling him anything, on the surface with the least room. Each
-/// clause now says "in" where it means a countdown - `sleep 12m` could be read as a
-/// sleep timer of twelve minutes' length rather than one that fires in twelve.
-fn armed_hud(a: &ArmedFeatures) -> Option<String> {
-    if !a.any() {
-        return None;
-    }
-    let mut bits = Vec::new();
-    if let Some(s) = a.sleep_remaining {
-        bits.push(format!("sleep in {}", fmt_remaining(s)));
-    }
-    if a.winddown_active {
-        match a.winddown_remaining {
-            Some(s) => bits.push(format!("wind-down in {}", fmt_remaining(s))),
-            None => bits.push("winding down".to_string()),
-        }
-    }
-    if let Some(s) = a.wake_remaining {
-        bits.push(format!("wake in {}", fmt_remaining(s)));
-    }
-    Some(bits.join(" \u{00b7} "))
-}
 
 /// The active latent-field pulls as one subtle HUD line, e.g.
 /// `toward calmer (58%, 3m ago) \u{b7} toward warmer (41%, 1m ago)`. `None` when no pull
@@ -1173,7 +1139,7 @@ fn volume_slider(vol: u8, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        armed_hud, dj_prompt_line, field_hud, hit_style, level_wave_row,
+        field_hud, hit_style, level_wave_row,
         match_spans, square_art_rows, status_line,
         stream_headline, track_seed, volume_slider, wave_glyphs, wave_row, window_title,
         BLOCK_GLYPHS,
@@ -1247,7 +1213,7 @@ mod tests {
 
     #[test]
     fn armed_hud_reads_human_and_absent_when_unarmed() {
-        assert_eq!(armed_hud(&ArmedFeatures::default()), None);
+        assert!(hypodj_client::spoken::armed_hold(&ArmedFeatures::default()).is_none());
         let a = ArmedFeatures {
             sleep_remaining: Some(720),
             winddown_active: true,
@@ -1255,7 +1221,7 @@ mod tests {
             wake_remaining: Some(25200),
             wake_at: Some(1750000000),
         };
-        let hud = armed_hud(&a).expect("armed");
+        let hud = hypodj_client::spoken::armed_hold(&a).expect("armed").text();
         assert!(
             !hud.contains("[armed]"),
             "no category tag on a line that is nothing but armed state: {hud}"
@@ -2913,52 +2879,49 @@ mod tests {
     }
 
     #[test]
-    fn dj_prompt_line_flags_only_interactive_lines() {
-        assert!(dj_prompt_line("confirm? [y/N]"));
-        assert!(dj_prompt_line("> y"));
-        assert!(dj_prompt_line("> n"));
-        assert!(dj_prompt_line("cancelled"));
-        assert!(!dj_prompt_line("> fade out"));
-        assert!(!dj_prompt_line("armed: add 5 tracks"));
-        assert!(!dj_prompt_line("ok: next"));
-    }
-
-    #[test]
-    fn each_state_renders_its_words_on_the_tui() {
-        use hypodj_style::{parity_lines, State};
+    fn a_canned_plan_renders_echo_note_and_armed_through_the_real_ui() {
+        use hypodj_client::nl::split_echo;
+        use hypodj_client::spoken::{plan_echo, State};
         use ratatui::style::Modifier;
-        let lines = parity_lines();
+        let parts = split_echo("via rules | [1] fade out | NOTE: a wake also needs a play");
+        let spoken = plan_echo(&parts);
         let mut s = TuiState::new();
         s.screen = crate::state::Screen::Dj;
         s.truecolor = true;
-        for spoken in &lines {
-            s.push_dj_log(spoken.words.clone());
-        }
-        let flat = render_to_lines_sized(&s, 100, 30).join("\n");
-        for spoken in &lines {
-            assert!(flat.contains(&spoken.words), "missing {}:\n{flat}", spoken.words);
-            let style = style_of_text(&s, 100, 30, &spoken.words);
-            match spoken.state {
-                State::Echo => {
-                    assert!(style.add_modifier.contains(Modifier::UNDERLINED));
-                    assert!(style.add_modifier.contains(Modifier::DIM));
+        s.enter_confirm(crate::state::Pending {
+            trust: parts.trust,
+            steps: parts.steps,
+            note: parts.note,
+            ..Default::default()
+        });
+        let flat = render_to_lines_sized(&s, 100, 40).join("\n");
+        for item in &spoken {
+            for line in &item.lines {
+                assert!(flat.contains(line), "missing {line}:\n{flat}");
+                let style = style_of_text(&s, 100, 40, line);
+                if item.state == State::Echo {
+                    assert!(style.add_modifier.contains(Modifier::DIM), "{line}");
+                    assert!(style.add_modifier.contains(Modifier::UNDERLINED), "{line}");
                 }
-                State::Armed => {
-                    let ember = hypodj_style::ratatui::ember_color(s.term_bg, true);
-                    assert_eq!(style.fg, Some(ember));
-                }
-                State::Live => assert!(style.add_modifier.contains(Modifier::BOLD)),
-                State::Refused => {
-                    // A rendered cell always reports a colour; Reset means we did not paint one.
-                    assert_eq!(style.fg, Some(ratatui::style::Color::Reset));
-                    assert!(!style.add_modifier.contains(Modifier::BOLD));
+                if item.state == State::Note {
+                    assert!(style.add_modifier.contains(Modifier::DIM), "{line}");
+                    assert!(!style.add_modifier.contains(Modifier::UNDERLINED), "{line}");
                 }
             }
         }
-        // The armed HUD on the now-playing card is the same ember, not a second colour.
+        // Off the DJ screen the same arm result is the status-bar banner, in ember.
+        let armed = hypodj_client::spoken::from_arm_pairs(
+            &[("plan_id".into(), "4".into())],
+            &[],
+        );
         s.screen = crate::state::Screen::Queue;
-        s.now.state = Some("play".into());
-        s.now.title = Some("Track".into());
+        s.mode = crate::state::Mode::Normal;
+        s.set_reply(armed.clone());
+        let bar = style_of_text(&s, 80, 24, &armed.text());
+        assert_eq!(bar.fg, Some(hypodj_style::ratatui::ember_color(s.term_bg, true)));
+        // A stopped deck still shows the wake/sleep hold, and it is ember too.
+        s.clear_status();
+        s.now.state = Some("stop".into());
         s.now.armed.sleep_remaining = Some(720);
         let hud = style_of_text(&s, 100, 40, "sleep in 12m");
         assert_eq!(hud.fg, Some(hypodj_style::ratatui::ember_color(s.term_bg, true)));
@@ -2978,10 +2941,13 @@ mod tests {
             note: None,
             trust: None,
         });
-        assert!(s.dj_log.iter().any(|l| l == hypodj_style::confirm_prompt()), "prompt pushed to chat");
+        assert!(
+            s.dj_log.iter().any(|l| l.contains(hypodj_client::spoken::CONFIRM_LINE)),
+            "prompt pushed to chat"
+        );
         // Echo: quiet ink, underlined. No second colour.
         use ratatui::style::Modifier;
-        let style = style_of_text(&s, 80, 30, hypodj_style::confirm_prompt());
+        let style = style_of_text(&s, 80, 30, hypodj_client::spoken::CONFIRM_LINE);
         assert!(style.add_modifier.contains(Modifier::UNDERLINED), "echo is underlined");
         assert!(style.add_modifier.contains(Modifier::DIM), "echo is quiet");
         assert_eq!(style.fg, Some(ratatui::style::Color::Reset), "echo does not paint a colour");
@@ -3247,19 +3213,27 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
 
     // Scrollback, bottom-pinned: show the last rows that fit.
     let log_h = log_row.height as usize;
-    let start = state.dj_log.len().saturating_sub(log_h);
-    let log_lines: Vec<Line> = if state.dj_log.is_empty() {
+    let mut visual: Vec<Line> = Vec::new();
+    for entry in &state.dj_log {
+        match entry {
+            crate::state::DjEntry::Text(s) => visual.push(Line::from(s.clone())),
+            crate::state::DjEntry::Spoken(spoken) => {
+                visual.extend(hypodj_style::ratatui::render(
+                    spoken,
+                    state.term_bg,
+                    state.truecolor,
+                ));
+            }
+        }
+    }
+    let start = visual.len().saturating_sub(log_h);
+    let log_lines: Vec<Line> = if visual.is_empty() {
         vec![Line::from(Span::styled(
             "ask me to DJ - e.g. \"fade out over 30s\"",
             Style::default().quiet(),
         ))]
     } else {
-        // Styling is decided at render time from the line, so dj_log stays
-        // Vec<String>. The confirm prompt is echo. An armed banner is ember.
-        state.dj_log[start..]
-            .iter()
-            .map(|l| Line::from(Span::styled(l.clone(), log_line_style(l, state))))
-            .collect()
+        visual[start..].to_vec()
     };
     f.render_widget(Paragraph::new(log_lines), log_row);
 
@@ -3307,35 +3281,6 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
 /// Whether a DJ scrollback line is an interactive-prompt line that should render
 /// DIFFERENTIATED (the `confirm? [y/N]` prompt and the y/n choice echo), so the
 /// confirm reads as a live prompt rather than plain chat. Pure - unit-tested.
-/// Style for one DJ scrollback line. Echo, armed, live, and refused come from
-/// the shared grammar. Anything else is the terminal's own ink.
-fn log_line_style(line: &str, state: &TuiState) -> Style {
-    use hypodj_style::{confirm_prompt, speak, Act, Role, State};
-    if line == confirm_prompt() {
-        return hypodj_style::ratatui::style_for(Role::Echo, state.term_bg, state.truecolor);
-    }
-    if line.starts_with("armed:") || line.starts_with("armed (") {
-        return Style::default().fg(hypodj_style::ratatui::ember_color(state.term_bg, state.truecolor));
-    }
-    if line.starts_with("Note:") {
-        return hypodj_style::ratatui::style_for(Role::Refused, state.term_bg, state.truecolor);
-    }
-    if [Act::Pause, Act::Skip, Act::Volume].iter().any(|a| speak(*a).words == line) {
-        return hypodj_style::ratatui::style_for(Role::Live, state.term_bg, state.truecolor);
-    }
-    if line == "> y" || line == "> n" {
-        return Style::default().bold();
-    }
-    if line == "cancelled" {
-        return hypodj_style::ratatui::style_for(State::Refused.role(), state.term_bg, state.truecolor);
-    }
-    Style::default()
-}
-
-fn dj_prompt_line(line: &str) -> bool {
-    line == "confirm? [y/N]" || line == "> y" || line == "> n" || line == "cancelled"
-}
-
 /// Whether to use unicode block glyphs for the ambient wave. Kept as a const so a
 /// terminal without good unicode can flip to the ASCII fallback ramp at build time.
 const USE_BLOCK_GLYPHS: bool = true;
@@ -3466,7 +3411,14 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
             // the text. `render` sizes the area; this only ever fills what it was given.
             Some(msg) => {
                 let rows = status_lines(msg, area.width as usize, area.height as usize);
-                let lines: Vec<Line> = rows.into_iter().map(Line::from).collect();
+                let style = match state.status_state {
+                    Some(st) => {
+                        hypodj_style::ratatui::style_for_state(st, state.term_bg, state.truecolor)
+                    }
+                    None => Style::default(),
+                };
+                let lines: Vec<Line> =
+                    rows.into_iter().map(|row| Line::from(Span::styled(row, style))).collect();
                 f.render_widget(Paragraph::new(lines), area);
                 return;
             }
@@ -3573,30 +3525,14 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
 fn render_confirm_popup(f: &mut Frame, region: Rect, state: &TuiState) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(p) = &state.pending {
-        if let Some(trust) = &p.trust {
-            lines.push(Line::from(Span::styled(
-                trust.clone(),
-                Style::default().quiet(),
-            )));
-        }
-        for step in &p.steps {
-            lines.push(Line::from(step.clone()));
-        }
-        if let Some(note) = &p.note {
-            lines.push(Line::from(Span::styled(
-                hypodj_style::note_line(note),
-                hypodj_style::ratatui::style_for(
-                    hypodj_style::Role::Refused,
-                    state.term_bg,
-                    state.truecolor,
-                ),
-            )));
+        for spoken in p.utterances() {
+            lines.extend(hypodj_style::ratatui::render(
+                &spoken,
+                state.term_bg,
+                state.truecolor,
+            ));
         }
     }
-    lines.push(Line::from(Span::styled(
-        hypodj_style::confirm_prompt(),
-        hypodj_style::ratatui::style_for(hypodj_style::Role::Echo, state.term_bg, state.truecolor),
-    )));
 
     // Size the popup to the content, clamped inside the region (with borders).
     let popup = centered_popup(region, &lines);

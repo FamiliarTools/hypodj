@@ -601,7 +601,7 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
             if state.card_uri.as_deref() == Some(uri.as_str()) {
                 let rows = state::card_rows_from_pairs(&pairs);
                 if rows.is_empty() {
-                    state.status_msg = Some("nothing known about that one".into());
+                    state.set_status("nothing known about that one");
                     state.card = None;
                     state.card_uri = None;
                 } else {
@@ -708,7 +708,7 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             clear_refresh_gate(tx, state);
         }
         RespKind::Confirm(pending) => state.enter_confirm(pending),
-        RespKind::Banner(msg) => {
+        RespKind::Banner(spoken) => {
             // A refresh that ACKed lands here (not as a Snapshot); clear the gate so a
             // rare status/currentsong ACK never permanently wedges wake-driven
             // refreshes. Clearing on an unrelated banner costs at most one extra cheap
@@ -717,9 +717,9 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             // error) IN the scrollback where the user is looking, not only the bottom
             // status bar - a no-op/failed arm otherwise gives no feedback in the pane.
             if state.screen == Screen::Dj {
-                state.push_dj_log(msg.clone());
+                state.push_spoken(spoken.clone());
             }
-            state.status_msg = Some(msg);
+            state.set_reply(spoken);
             clear_refresh_gate(tx, state);
         }
         RespKind::Heard(lines) => {
@@ -742,8 +742,7 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
                     request_refresh(tx, state);
                 }
                 _ => {
-                    state.status_msg =
-                        Some("volume unknown - can't step it on this older daemon".into())
+                    state.set_status("volume unknown - can't step it on this older daemon")
                 }
             }
         }
@@ -1015,7 +1014,7 @@ mod tests {
             trust: None,
         });
         dispatch(&tx, &cc_tx, &find_tx, &info_tx, &more_tx, &mut state, vec![Intent::ConfirmArm]);
-        assert!(state.dj_log.iter().any(|l| l == "> y"), "choice echoed to chat");
+        assert!(state.dj_log.iter().any(|l| l.contains("> y")), "choice echoed to chat");
         assert_eq!(state.mode, Mode::Normal, "confirm dismissed");
         assert!(state.pending.is_none(), "pending consumed");
         // Exactly one Req::Arm (no double-arm); a trailing Refresh is expected too.
@@ -1245,7 +1244,7 @@ mod tests {
             ..Default::default()
         });
         dispatch(&tx, &cc_tx, &find_tx, &info_tx, &more_tx, &mut state, vec![Intent::ConfirmCancel]);
-        assert!(state.dj_log.iter().any(|l| l == "cancelled"), "cancellation echoed");
+        assert!(state.dj_log.iter().any(|l| l.contains("cancelled")), "cancellation echoed");
         assert_eq!(state.mode, Mode::Normal);
         assert!(state.pending.is_none());
         let reqs: Vec<Req> = rx.try_iter().collect();

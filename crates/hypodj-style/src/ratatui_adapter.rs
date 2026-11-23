@@ -5,6 +5,7 @@
 //! the colours this adapter actually sets, fitted in this crate.
 
 use ::ratatui::style::{Color, Modifier, Style};
+use ::ratatui::text::{Line, Span};
 
 use crate::{
     contrast_ratio, ember_rgb, fit_decoration, fit_info, oklch_to_srgb, quantize_256,
@@ -91,6 +92,25 @@ fn neutral_for(bg: TermBg) -> Rgb {
     }
 }
 
+/// One style for every line of a [`hypodj_client::Spoken`].
+pub fn style_for_state(state: hypodj_client::State, bg: TermBg, truecolor: bool) -> Style {
+    style_for(crate::role_for(state), bg, truecolor)
+}
+
+/// Render a spoken reply. Each line carries the state's style.
+pub fn render(
+    spoken: &hypodj_client::Spoken,
+    bg: TermBg,
+    truecolor: bool,
+) -> Vec<Line<'static>> {
+    let style = style_for_state(spoken.state, bg, truecolor);
+    spoken
+        .lines
+        .iter()
+        .map(|line| Line::from(Span::styled(line.clone(), style)))
+        .collect()
+}
+
 /// Style for a role that does not need a cover swatch.
 /// Ink roles do not set a foreground: the terminal's own ink is the room's pair.
 /// Ember and armed do set a foreground.
@@ -109,7 +129,8 @@ pub fn style_for(role: Role, bg: TermBg, truecolor: bool) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{parity_lines, BgSource, XTERM_CUBE};
+    use crate::{BgSource, XTERM_CUBE};
+    use hypodj_client::{State, Spoken};
 
     fn idx_to_rgb(i: u8) -> Rgb {
         if i >= 232 {
@@ -178,32 +199,22 @@ mod tests {
     }
 
     #[test]
-    fn state_words_keep_their_text_and_take_the_role_weight() {
+    fn render_keeps_every_line_and_the_state_style() {
         let bg = TermBg::dark_default();
-        for spoken in parity_lines() {
-            let style = style_for(spoken.state.role(), bg, true);
-            match spoken.state {
-                crate::State::Echo => {
-                    assert!(style.add_modifier.contains(Modifier::DIM));
-                    assert!(style.add_modifier.contains(Modifier::UNDERLINED));
-                }
-                crate::State::Armed => {
-                    assert!(matches!(style.fg, Some(Color::Rgb(_, _, _))));
-                }
-                crate::State::Live => {
-                    assert!(style.add_modifier.contains(Modifier::BOLD));
-                }
-                crate::State::Refused => {
-                    assert!(style.fg.is_none());
-                    assert!(!style.add_modifier.contains(Modifier::BOLD));
-                }
-            }
-            assert_eq!(
-                spoken.words.clone(),
-                spoken.words,
-                "words are not rewritten by the adapter"
-            );
+        let echo = Spoken::new(
+            State::Echo,
+            vec!["(via rules)".into(), "[1] fade out".into(), "confirm? [y/N]".into()],
+        );
+        let lines = render(&echo, bg, true);
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            let style = line.spans[0].style;
+            assert!(style.add_modifier.contains(Modifier::DIM));
+            assert!(style.add_modifier.contains(Modifier::UNDERLINED));
         }
+        let armed = Spoken::new(State::Armed, vec!["armed (plan 4)".into()]);
+        let styled = render(&armed, bg, true);
+        assert!(matches!(styled[0].spans[0].style.fg, Some(Color::Rgb(_, _, _))));
     }
 
     #[test]

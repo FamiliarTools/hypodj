@@ -3,7 +3,7 @@
 //! NowPlaying + queue parsing lives in the client. A stopped/empty deck renders a
 //! friendly "nothing playing".
 
-use hypodj_client::model::{fmt_remaining, parse_queue, ArmedFeatures, FieldState, NowPlaying};
+use hypodj_client::model::{parse_queue, FieldState, NowPlaying};
 use hypodj_style::ansi::Ansi;
 use hypodj_style::{Role, TermBg};
 
@@ -18,7 +18,7 @@ pub fn render_card(np: &NowPlaying) -> String {
 pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
-    let armed = render_armed(&np.armed, ansi);
+    let armed = hypodj_client::spoken::armed_hold(&np.armed).map(|s| ansi.render(&s));
     let field = render_field(&np.field);
     if stopped || empty {
         // A stopped deck can still hold an armed wake alarm or a held pull - surface
@@ -164,37 +164,6 @@ fn render_field(field: &FieldState) -> Option<String> {
 /// `sleep in 12m \u{b7} winding down \u{b7} wake in 7h 00m`. `None` when nothing is
 /// armed. Worded exactly as the dj-gui's `armed_hud`: `in` marks every countdown, so
 /// `sleep 12m` cannot be read as a twelve-minute-long timer.
-fn render_armed(a: &ArmedFeatures, ansi: Ansi) -> Option<String> {
-    if !a.any() {
-        return None;
-    }
-    let mut bits = Vec::new();
-    if let Some(s) = a.sleep_remaining {
-        bits.push(format!("sleep in {}", fmt_remaining(s)));
-    }
-    if a.winddown_active {
-        match a.winddown_remaining {
-            Some(s) => bits.push(format!("wind-down in {}", fmt_remaining(s))),
-            None => bits.push("winding down".to_string()),
-        }
-    }
-    if let Some(s) = a.wake_remaining {
-        bits.push(format!("wake in {}", fmt_remaining(s)));
-    }
-    let line = bits.join(" \u{00b7} ");
-    Some(ansi.paint(Role::Armed, &line, TermBg::dark_default()))
-}
-
-/// One grammar line, painted the way the card paints state. Used by the CLI
-/// parity test and by any caller that prints a state sentence.
-pub fn render_spoken(spoken: &hypodj_style::Spoken, ansi: Ansi) -> String {
-    let mut out = ansi.paint(spoken.state.role(), &spoken.words, TermBg::dark_default());
-    if let Some(undo) = &spoken.undo {
-        out.push('\n');
-        out.push_str(&ansi.paint(Role::InkQuiet, undo, TermBg::dark_default()));
-    }
-    out
-}
 
 fn fmt_dur(secs: f64) -> String {
     let total = secs as u64;
@@ -294,16 +263,25 @@ mod tests {
     }
 
     #[test]
-    fn each_state_matches_once_colour_is_stripped() {
-        for spoken in hypodj_style::parity_lines() {
-            let off = render_spoken(&spoken, Ansi::off());
-            let on = render_spoken(&spoken, Ansi::on_truecolor());
-            let indexed = render_spoken(&spoken, Ansi::on_indexed());
-            assert!(off.contains(&spoken.words), "off missing words: {off}");
-            assert_eq!(hypodj_style::ansi::strip(&on), off, "truecolor {}", spoken.words);
-            assert_eq!(hypodj_style::ansi::strip(&indexed), off, "256 {}", spoken.words);
-            if spoken.state != hypodj_style::State::Refused {
-                assert_ne!(on, off, "colour on should differ for {}", spoken.words);
+    fn a_canned_plan_echo_strips_to_the_same_words() {
+        use hypodj_client::nl::split_echo;
+        use hypodj_client::spoken::{plan_echo, State};
+        let parts = split_echo("via rules | [1] fade out | NOTE: a wake also needs a play");
+        for spoken in plan_echo(&parts) {
+            let off = Ansi::off().render(&spoken);
+            let on = Ansi::on_truecolor().render(&spoken);
+            let indexed = Ansi::on_indexed().render(&spoken);
+            assert_eq!(off, spoken.text());
+            assert_eq!(hypodj_style::ansi::strip(&on), off);
+            assert_eq!(hypodj_style::ansi::strip(&indexed), off);
+            if spoken.state == State::Echo {
+                assert!(on.contains("\u{1b}[2;4m"), "echo is quiet and underlined");
+                assert!(off.contains("[1] fade out"));
+                assert!(off.contains("confirm? [y/N]"));
+            }
+            if spoken.state == State::Note {
+                assert_eq!(off, "NOTE: a wake also needs a play");
+                assert!(!on.contains("\u{1b}[4m"), "a note is not underlined");
             }
         }
     }

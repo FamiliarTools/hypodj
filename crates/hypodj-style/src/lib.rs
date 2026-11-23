@@ -9,7 +9,6 @@
 pub mod ansi;
 mod color;
 mod tokens;
-mod voice;
 
 #[cfg(feature = "egui")]
 mod egui_adapter;
@@ -33,9 +32,6 @@ pub use color::{
     NEUTRAL_MUTED, NEUTRAL_VIBRANT, XTERM_CUBE,
 };
 pub use tokens::{chrome_frame, chrome_secs, tokens, Tokens};
-pub use voice::{
-    armed_banner, confirm_prompt, note_line, parity_lines, speak, Act, Spoken, State,
-};
 
 /// A semantic role. The colour, if any, is resolved by an adapter against the room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,14 +62,14 @@ pub enum Role {
     Refused,
 }
 
-impl State {
-    /// The role that paints this state.
-    pub fn role(self) -> Role {
-        match self {
-            State::Echo => Role::Echo,
-            State::Armed => Role::Armed,
-            State::Live => Role::Live,
-            State::Refused => Role::Refused,
-        }
+/// The role an adapter paints for a [`hypodj_client::State`].
+pub fn role_for(state: hypodj_client::State) -> Role {
+    use hypodj_client::State;
+    match state {
+        State::Echo => Role::Echo,
+        State::Armed => Role::Armed,
+        State::Live => Role::Live,
+        State::Refused => Role::Refused,
+        State::Note => Role::InkQuiet,
     }
 }

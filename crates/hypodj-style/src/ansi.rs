@@ -54,6 +54,18 @@ impl Ansi {
         };
         format!("{open}{text}\u{1b}[0m")
     }
+
+    /// Paint every line of a [`hypodj_client::Spoken`]. The state picks the role.
+    pub fn render(self, spoken: &hypodj_client::Spoken) -> String {
+        let bg = TermBg::dark_default();
+        let role = crate::role_for(spoken.state);
+        spoken
+            .lines
+            .iter()
+            .map(|line| self.paint(role, line, bg))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 fn fg(ansi: Ansi, rgb: [u8; 3], index: u8) -> String {
@@ -126,7 +138,8 @@ pub fn strip(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{parity_lines, speak, Act, TermBg};
+    use crate::TermBg;
+    use hypodj_client::{State, Spoken};
 
     #[test]
     fn from_env_is_plain_off_a_tty_or_under_no_color() {
@@ -153,41 +166,13 @@ mod tests {
     }
 
     #[test]
-    fn colour_on_and_off_match_once_stripped() {
-        let bg = TermBg::dark_default();
-        let light = TermBg::from_rgb([0xff, 0xff, 0xff], crate::BgSource::Provided);
-        for spoken in parity_lines() {
-            for bg in [bg, light] {
-                let off = Ansi::off().paint(spoken.state.role(), &spoken.words, bg);
-                let on = Ansi::on_truecolor().paint(spoken.state.role(), &spoken.words, bg);
-                assert_eq!(off, spoken.words, "off mode is the words");
-                assert_eq!(strip(&on), spoken.words, "strip restores the words");
-                assert_eq!(strip(&on), strip(&off));
-                if let Some(undo) = &spoken.undo {
-                    let on_undo = Ansi::on_truecolor().paint(crate::Role::InkQuiet, undo, bg);
-                    assert_eq!(strip(&on_undo), *undo);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn immediate_and_deferred_lines_survive_colour() {
-        let bg = TermBg::dark_default();
-        for act in [
-            Act::Pause,
-            Act::Skip,
-            Act::Volume,
-            Act::Stop,
-            Act::Clear,
-            Act::WallClock,
-            Act::FutureTrigger,
-        ] {
-            let spoken = speak(act);
-            let on = Ansi::on_truecolor().paint(spoken.state.role(), &spoken.words, bg);
-            let off = Ansi::off().paint(spoken.state.role(), &spoken.words, bg);
-            assert_eq!(strip(&on), off);
-        }
+    fn render_strips_back_to_the_lines() {
+        let spoken = Spoken::new(State::Armed, vec!["armed (plan 4)".into()]);
+        let off = Ansi::off().render(&spoken);
+        let on = Ansi::on_truecolor().render(&spoken);
+        assert_eq!(off, spoken.text());
+        assert_eq!(strip(&on), off);
+        assert_ne!(on, off);
     }
 
     #[test]

@@ -253,6 +253,31 @@ pub enum Mode {
 
 /// A plan awaiting confirmation. Either an owner-scoped NL `token` (confirm via
 /// `nl confirm <token>`) OR a direct `command` (e.g. destructive `clear`).
+/// One DJ scrollback entry. Chat text has no state. A plan or a daemon reply
+/// is a [`hypodj_client::Spoken`], and the surface only renders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DjEntry {
+    Text(String),
+    Spoken(hypodj_client::Spoken),
+}
+
+impl DjEntry {
+    pub fn contains(&self, needle: &str) -> bool {
+        match self {
+            DjEntry::Text(s) => s == needle || s.contains(needle),
+            DjEntry::Spoken(s) => s.lines.iter().any(|l| l == needle || l.contains(needle)),
+        }
+    }
+
+    pub fn single(&self) -> Option<&str> {
+        match self {
+            DjEntry::Text(s) => Some(s),
+            DjEntry::Spoken(s) if s.lines.len() == 1 => Some(&s.lines[0]),
+            DjEntry::Spoken(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pending {
     pub token: Option<String>,
@@ -261,6 +286,17 @@ pub struct Pending {
     pub note: Option<String>,
     /// The "via rules" / "via local model" trust footnote from the nl echo.
     pub trust: Option<String>,
+}
+
+impl Pending {
+    /// The echo (and the wake note, when there is one) this confirm is showing.
+    pub fn utterances(&self) -> Vec<hypodj_client::Spoken> {
+        hypodj_client::spoken::plan_echo(&hypodj_client::nl::EchoParts {
+            trust: self.trust.clone(),
+            steps: self.steps.clone(),
+            note: self.note.clone(),
+        })
+    }
 }
 
 /// Which main view is showing. Queue is the live-refreshed default; Albums and
@@ -703,6 +739,9 @@ pub struct TuiState {
     pub input: String,
     pub pending: Option<Pending>,
     pub status_msg: Option<String>,
+    /// Set only when `status_msg` is a plan or daemon reply. Local notices leave it
+    /// empty, so the bar does not invent a state for them.
+    pub status_state: Option<hypodj_client::State>,
     /// When Space last enqueued the LAST row of a list (`None` anywhere else) -
     /// only ever read to tell a held Space from a deliberate tap once the cursor
     /// can advance no further. See [`ENQUEUE_REPEAT_WINDOW`].
@@ -773,7 +812,7 @@ pub struct TuiState {
     pub nl_translator: NlTranslatorPin,
     /// The DJ View scrollback: coarse CC progress + result lines, newest at the
     /// bottom. Bounded so a long session never grows without limit.
-    pub dj_log: Vec<String>,
+    pub dj_log: Vec<DjEntry>,
     /// The current CC phase line (e.g. "thinking..."), shown next to a spinner while
     /// a call is in flight; `None` when idle.
     pub dj_phase: Option<String>,
@@ -945,6 +984,7 @@ impl Default for TuiState {
             input: String::new(),
             pending: None,
             status_msg: None,
+            status_state: None,
             last_enqueue: None,
             connected: true,
             queue_version: None,
@@ -1026,16 +1066,9 @@ impl TuiState {
     pub fn enter_confirm(&mut self, pending: Pending) {
         self.take_screen();
         if self.screen == Screen::Dj {
-            if let Some(trust) = &pending.trust {
-                self.push_dj_log(trust.clone());
+            for spoken in pending.utterances() {
+                self.push_spoken(spoken);
             }
-            for step in &pending.steps {
-                self.push_dj_log(step.clone());
-            }
-            if let Some(note) = &pending.note {
-                self.push_dj_log(hypodj_style::note_line(note));
-            }
-            self.push_dj_log(hypodj_style::confirm_prompt().to_string());
         }
         self.pending = Some(pending);
         self.mode = Mode::Confirm;
@@ -1071,13 +1104,13 @@ impl TuiState {
             self.find.phase = crate::find::Phase::Done;
         }
         self.find.drill_loading = false;
-        self.status_msg = Some("connection lost - reconnecting...".to_string());
+        self.set_status("connection lost - reconnecting...".to_string());
     }
 
     /// Reconnected on a fresh socket: any old plan is gone, ask for a re-run.
     pub fn mark_connected(&mut self) {
         self.connected = true;
-        self.status_msg = Some("reconnected - re-run the phrase".to_string());
+        self.set_status("reconnected - re-run the phrase".to_string());
     }
 
     /// Park the daemon's `heard` read-back and open the overlay on it.
@@ -1173,7 +1206,7 @@ impl TuiState {
     /// Map a key to an Intent (or pure state change). The dispatch is per-mode.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
         // Any keypress dismisses a stale banner; the action below may set a new one.
-        self.status_msg = None;
+        self.clear_status();
         match self.mode {
             Mode::Normal => self.key_normal(key),
             Mode::Command => self.key_command(key),
@@ -1400,7 +1433,7 @@ impl TuiState {
                 if !uri.starts_with("song/") {
                     // An album or playlist row is not a song; say so rather than
                     // opening an empty box or silently doing nothing.
-                    self.status_msg = Some("no details for that row".into());
+                    self.set_status("no details for that row");
                     return None;
                 }
                 self.take_screen();
@@ -1431,7 +1464,7 @@ impl TuiState {
             Act::Menu => {
                 match self.cursor_target() {
                     Some(t) => self.open_menu(t),
-                    None => self.status_msg = Some("nothing here".into()),
+                    None => self.set_status("nothing here"),
                 }
                 None
             }
@@ -1441,7 +1474,7 @@ impl TuiState {
             Act::MenuCurrent => {
                 match self.now_target() {
                     Some(t) => self.open_menu(t),
-                    None => self.status_msg = Some("nothing is playing".into()),
+                    None => self.set_status("nothing is playing"),
                 }
                 None
             }
@@ -1624,7 +1657,7 @@ impl TuiState {
         // through to the QUEUE row while the visible list sat still).
         if self.screen == Screen::Find && !self.find.drilling {
             let Some(row) = self.find.current_row() else {
-                self.status_msg = Some("nothing here to star".into());
+                self.set_status("nothing here to star");
                 return None;
             };
             let (uri, label) = (row.uri.clone(), row.label.clone());
@@ -1637,14 +1670,14 @@ impl TuiState {
             // A Playlists row is a NAME, not a uri (see `BrowseRow::uri`), so there is
             // no id to star - the same reason `r` cannot seed a radio from one.
             Screen::Playlists => {
-                self.status_msg = Some("a playlist is a name, not a track - can't star it".into());
+                self.set_status("a playlist is a name, not a track - can't star it");
                 None
             }
             // Albums, and a Find drill, are real browse lists keyed by uri.
             Screen::Albums | Screen::Find => {
                 let Some(b) = self.active_browse() else { return None };
                 let Some(row) = b.rows.get(b.selected) else {
-                    self.status_msg = Some("nothing here to star".into());
+                    self.set_status("nothing here to star");
                     return None;
                 };
                 let (uri, label) = (row.uri.clone(), row.label.clone());
@@ -1652,7 +1685,7 @@ impl TuiState {
             }
             Screen::Queue => {
                 let Some(it) = self.queue.get(self.selected) else {
-                    self.status_msg = Some("nothing here to star".into());
+                    self.set_status("nothing here to star");
                     return None;
                 };
                 let (uri, label, is_current) = (
@@ -1670,12 +1703,13 @@ impl TuiState {
                     // only the PLAYING stream row marks; another one says what to do.
                     Some(_) if is_current => Some(Intent::Command("mark".into())),
                     Some(_) => {
-                        self.status_msg =
-                            Some("that row is a stream - play it, then s marks what is on".into());
+                        self.set_status(
+                            "that row is a stream - play it, then s marks what is on",
+                        );
                         None
                     }
                     None => {
-                        self.status_msg = Some(format!("{label} has no track to star"));
+                        self.set_status(format!("{label} has no track to star"));
                         None
                     }
                 }
@@ -1691,17 +1725,17 @@ impl TuiState {
         if uri.starts_with("song/") || uri.starts_with("album/") {
             return Some(Intent::Command(format!("playlistadd Starred {uri}")));
         }
-        self.status_msg = Some(if uri.starts_with("artist/") {
-            "can't star an artist - open it and star an album".into()
+        self.set_status(if uri.starts_with("artist/") {
+            "can't star an artist - open it and star an album".to_string()
         } else if uri.starts_with("list/") {
-            "can't star a smart list".into()
+            "can't star a smart list".to_string()
         } else if uri.starts_with("station/") {
             // Subsonic has no star endpoint for internet radio at all, but the thing
             // PLAYING on it is markable - so the refusal points at the verb that works
             // instead of stopping at "can't".
-            "a saved station is a stream - play it, then C-s marks what is on".into()
+            "a saved station is a stream - play it, then C-s marks what is on".to_string()
         } else if uri.contains("://") {
-            "that row is a stream - play it, then C-s marks what is on".into()
+            "that row is a stream - play it, then C-s marks what is on".to_string()
         } else {
             format!("can't star {label}")
         });
@@ -1724,7 +1758,7 @@ impl TuiState {
         // since `enqueue_uri` rejects `artist/<id>` outright.
         if self.screen == Screen::Find && !self.find.drilling {
             let Some(row) = self.find.current_row() else {
-                self.status_msg = Some("nothing here to start a radio from".into());
+                self.set_status("nothing here to start a radio from");
                 return None;
             };
             let (uri, label) = (row.uri.clone(), row.label.clone());
@@ -1737,14 +1771,14 @@ impl TuiState {
             // A Playlists row is a NAME, not a uri (see `BrowseRow::uri`), so there is
             // no id to seed a radio from.
             Screen::Playlists => {
-                self.status_msg = Some("can't start a radio from a playlist".into());
+                self.set_status("can't start a radio from a playlist");
                 None
             }
             // Albums, and a Find drill, are real browse lists keyed by uri.
             Screen::Albums | Screen::Find => {
                 let Some(b) = self.active_browse() else { return None };
                 let Some(row) = b.rows.get(b.selected) else {
-                    self.status_msg = Some("nothing here to start a radio from".into());
+                    self.set_status("nothing here to start a radio from");
                     return None;
                 };
                 let (uri, label) = (row.uri.clone(), row.label.clone());
@@ -1752,7 +1786,7 @@ impl TuiState {
             }
             Screen::Queue => {
                 let Some(it) = self.queue.get(self.selected) else {
-                    self.status_msg = Some("nothing here to start a radio from".into());
+                    self.set_status("nothing here to start a radio from");
                     return None;
                 };
                 let (uri, label) = (it.uri.clone(), it.title.clone());
@@ -1764,8 +1798,7 @@ impl TuiState {
                     // a SILENTLY dead key - it did nothing and said nothing, which
                     // reads as a broken binding rather than an inapplicable one.
                     None => {
-                        self.status_msg =
-                            Some("that row is a stream, not a library track".into());
+                        self.set_status("that row is a stream, not a library track");
                         None
                     }
                 }
@@ -1780,21 +1813,21 @@ impl TuiState {
     /// is the `then: more like <seed>` queue-tail hint the armed walk emits.
     fn radio_from_uri(&mut self, uri: &str, label: &str) -> Option<Intent> {
         if uri.starts_with("song/") || uri.starts_with("album/") || uri.starts_with("artist/") {
-            self.status_msg = Some(format!("radio from {label}"));
+            self.set_status(format!("radio from {label}"));
             return Some(Intent::Command(format!("radio {uri}")));
         }
-        self.status_msg = Some(if uri.starts_with("list/") {
-            "can't start a radio from a list".into()
+        self.set_status(if uri.starts_with("list/") {
+            "can't start a radio from a list".to_string()
         } else if uri.starts_with("station/") {
             // A saved station is a STREAM, not a library object, so there is no id for
             // the continuation walk to seed from - and `radio` here would be confused
             // with the algorithmic `radio/random` generator, which is a different thing
             // entirely. Enter is the verb that works on this row.
-            "a saved station is a stream, not a library seed - enter plays it".into()
+            "a saved station is a stream, not a library seed - enter plays it".to_string()
         } else if uri.contains("://") {
-            "that row is a stream, can't start a radio".into()
+            "that row is a stream, can't start a radio".to_string()
         } else {
-            "can't start a radio from that row".into()
+            "can't start a radio from that row".to_string()
         });
         None
     }
@@ -1862,8 +1895,7 @@ impl TuiState {
                 // paint an empty bordered box over the hits. Say why instead of going
                 // quiet, since the cursor can land here and `o` works on the rows above.
                 crate::find::FindKind::Station => {
-                    self.status_msg =
-                        Some("a station has nothing to open - enter plays it".into());
+                    self.set_status("a station has nothing to open - enter plays it");
                     None
                 }
                 crate::find::FindKind::Song => None,
@@ -2061,7 +2093,7 @@ impl TuiState {
         })?;
         match picked {
             Avail::No(why) => {
-                self.status_msg = Some(why.to_string());
+                self.set_status(why.to_string());
                 None
             }
             Avail::Yes(action) => {
@@ -2131,7 +2163,7 @@ impl TuiState {
         match self.queue.iter().find(|it| it.pos == pos) {
             Some(it) if it.uri == want => Some(pos),
             _ => {
-                self.status_msg = Some("the queue moved - reopen the menu".into());
+                self.set_status("the queue moved - reopen the menu");
                 None
             }
         }
@@ -2161,7 +2193,7 @@ impl TuiState {
             self.drop_stale_hits();
         }
         self.last_search.clear();
-        self.status_msg = Some(format!("showing {label}"));
+        self.set_status(format!("showing {label}"));
         Some(Intent::BrowseInto(uri))
     }
 
@@ -2395,7 +2427,7 @@ impl TuiState {
             Action::NowPlaying | Action::Queue => Some(Intent::Refresh),
             Action::Command(line) => Some(Intent::Command(line)),
             Action::Help => {
-                self.status_msg = Some(not_understood_hint());
+                self.set_status(not_understood_hint());
                 None
             }
             Action::ClearConfirm => {
@@ -2457,7 +2489,7 @@ impl TuiState {
             }
             Some(_) => Some(Intent::Command("mark".into())),
             None => {
-                self.status_msg = Some("nothing is playing to favorite".into());
+                self.set_status("nothing is playing to favorite");
                 None
             }
         }
@@ -2671,11 +2703,35 @@ impl TuiState {
         }
     }
 
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_msg = Some(msg.into());
+        self.status_state = None;
+    }
+
+    pub fn set_reply(&mut self, spoken: hypodj_client::Spoken) {
+        self.status_state = Some(spoken.state);
+        self.status_msg = Some(spoken.text());
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status_msg = None;
+        self.status_state = None;
+    }
+
     /// Append one line to the DJ scrollback, bounding it so a long session never
     /// grows without limit. Pure (no IO) - folded by the render thread on a CC frame.
     pub fn push_dj_log(&mut self, line: String) {
+        self.dj_log.push(DjEntry::Text(line));
+        self.trim_dj_log();
+    }
+
+    pub fn push_spoken(&mut self, spoken: hypodj_client::Spoken) {
+        self.dj_log.push(DjEntry::Spoken(spoken));
+        self.trim_dj_log();
+    }
+
+    fn trim_dj_log(&mut self) {
         const MAX_DJ_LOG: usize = 200;
-        self.dj_log.push(line);
         if self.dj_log.len() > MAX_DJ_LOG {
             let drop = self.dj_log.len() - MAX_DJ_LOG;
             self.dj_log.drain(0..drop);
@@ -2847,8 +2903,8 @@ mod tests {
         assert_eq!(s.mode, Mode::Confirm);
         // The echo + y/N prompt landed inline in the chat scrollback, not only a popup.
         assert!(s.dj_log.iter().any(|l| l.contains("add 5 calmer tracks")));
-        assert!(s.dj_log.iter().any(|l| l == "Note: append-only"));
-        assert!(s.dj_log.iter().any(|l| l == "confirm? [y/N]"));
+        assert!(s.dj_log.iter().any(|l| l.contains("append-only")));
+        assert!(s.dj_log.iter().any(|l| l.contains("confirm? [y/N]")));
         // On a non-DJ screen the confirm does NOT touch the chat log (popup carries it).
         let mut q = TuiState::new();
         q.enter_confirm(Pending { steps: vec!["clear".into()], ..Default::default() });
@@ -4338,7 +4394,7 @@ mod tests {
         assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(Intent::Cc("fade out".into())));
         assert_eq!(s.dj_input, "");
         assert_eq!(s.dj_phase.as_deref(), Some("thinking..."));
-        assert!(s.dj_log.iter().any(|l| l == "> fade out"));
+        assert!(s.dj_log.iter().any(|l| l.contains("> fade out")));
         // A blank Enter is a no-op (no spurious CC call).
         let mut s2 = TuiState::new();
         s2.handle_key(key(KeyCode::F(4)));
@@ -4377,7 +4433,7 @@ mod tests {
         // No CC thinking phase on the verb path.
         assert_eq!(s.dj_phase, None);
         // Feedback is surfaced in the DJ pane scrollback.
-        assert!(s.dj_log.iter().any(|l| l == "ok: next"));
+        assert!(s.dj_log.iter().any(|l| l.contains("ok: next")));
 
         // `clear` opens the destructive default-No confirm, NOT a silent run.
         let mut s = TuiState::new();
@@ -4442,8 +4498,8 @@ mod tests {
         }
         // Bounded at 200, newest kept.
         assert_eq!(s.dj_log.len(), 200);
-        assert_eq!(s.dj_log.last().unwrap(), "line 249");
-        assert_eq!(s.dj_log.first().unwrap(), "line 50");
+        assert_eq!(s.dj_log.last().unwrap().single(), Some("line 249"));
+        assert_eq!(s.dj_log.first().unwrap().single(), Some("line 50"));
     }
 
     #[test]
