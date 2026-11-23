@@ -244,7 +244,11 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         Action::Command(line) => run_verb(&mut conn, &line)?,
         Action::ClearConfirm => {
             if confirm("clear the whole queue?") {
-                conn.command("clear")?;
+                let pairs = conn.command("clear")?;
+                println!(
+                    "{}",
+                    render::render_outcome(&pairs, Some("clear"), &[], stdout_ansi())
+                );
                 print_card(&mut conn)?;
             } else {
                 println!("cancelled");
@@ -350,7 +354,7 @@ fn nl_handshake(
         Ok(p) => p,
         // An ACK here is a translate failure: map to a friendly reason.
         Err(MpdError::Ack(msg)) => {
-            println!("{}", stdout_ansi().render(&hypodj_client::spoken::refusal_ack(&msg)));
+            println!("{}", render::render_refusal(&msg, stdout_ansi()));
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -370,24 +374,16 @@ fn nl_handshake(
     };
 
     if let Some(echo) = nl::echo_from_pairs(&pairs) {
-        let ansi = stdout_ansi();
-        for spoken in hypodj_client::spoken::plan_echo(&nl::split_echo(&echo)) {
-            println!("{}", ansi.render(&spoken));
-        }
+        print_utterances(&hypodj_client::spoken::plan_echo(&nl::split_echo(&echo)));
     }
 
     if read_answer() {
         match conn.command(&format!("nl confirm {token}")) {
             Ok(plan_pairs) => {
-                println!(
-                    "{}",
-                    stdout_ansi().render(&hypodj_client::spoken::from_arm_pairs(&plan_pairs, &[]))
-                );
+                println!("{}", render::render_outcome(&plan_pairs, None, &[], stdout_ansi()));
                 print_card(conn)?;
             }
-            Err(MpdError::Ack(msg)) => {
-                println!("{}", stdout_ansi().render(&hypodj_client::spoken::refusal_ack(&msg)))
-            }
+            Err(MpdError::Ack(msg)) => println!("{}", render::render_refusal(&msg, stdout_ansi())),
             Err(e) => return Err(e),
         }
     } else {
@@ -460,27 +456,25 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
 
     let mut lines = vec!["(via Claude Code)".to_string()];
     lines.extend(hypodj_nl::describe_plan(&raw).lines().map(|l| l.to_string()));
-    lines.push(hypodj_client::spoken::CONFIRM_LINE.to_string());
-    println!(
-        "{}",
-        stdout_ansi().render(&hypodj_client::Spoken::new(hypodj_client::State::Echo, lines))
-    );
+    print_utterances(&[
+        hypodj_style::Spoken::new(hypodj_style::State::Echo, lines),
+        hypodj_style::Spoken::new(
+            hypodj_style::State::Echo,
+            vec![hypodj_client::spoken::CONFIRM_LINE.to_string()],
+        ),
+    ]);
 
     if read_answer() {
-        match conn.command(&format!("plan add {dsl}")) {
+        let cmd = format!("plan add {dsl}");
+        match conn.command(&cmd) {
             Ok(plan_pairs) => {
-                // Prefer the REAL execute-time outcome ("added N", "added 0 - no
-                // matches for X", "played X") the daemon returns for an immediate
-                // plan; fall back to the plan-time armed line for a deferred plan.
                 println!(
                     "{}",
-                    stdout_ansi().render(&hypodj_client::spoken::from_arm_pairs(&plan_pairs, &[]))
+                    render::render_outcome(&plan_pairs, Some(&cmd), &[], stdout_ansi())
                 );
                 print_card(conn)?;
             }
-            Err(MpdError::Ack(msg)) => {
-                println!("{}", stdout_ansi().render(&hypodj_client::spoken::refusal_ack(&msg)))
-            }
+            Err(MpdError::Ack(msg)) => println!("{}", render::render_refusal(&msg, stdout_ansi())),
             Err(e) => return Err(e),
         }
     } else {
@@ -662,7 +656,23 @@ fn stdout_ansi() -> hypodj_style::Ansi {
     )
 }
 
+/// Print utterances. The last line stays on the same row as the answer.
+fn print_utterances(items: &[hypodj_style::Spoken]) {
+    let ansi = stdout_ansi();
+    let last = items.len().saturating_sub(1);
+    for (i, spoken) in items.iter().enumerate() {
+        let text = ansi.render(spoken);
+        if i == last {
+            print!("{text} ");
+            let _ = std::io::stdout().flush();
+        } else {
+            println!("{text}");
+        }
+    }
+}
+
 /// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm.
+/// The question and the typed answer share one line.
 pub(crate) fn confirm(question: &str) -> bool {
     let spoken = hypodj_client::spoken::confirm_question(question);
     print!("{} ", stdout_ansi().render(&spoken));

@@ -994,6 +994,60 @@ mod tests {
     use std::sync::mpsc;
     use state::Pending;
 
+    #[test]
+    fn live_and_refused_render_through_apply_resp() {
+        use hypodj_client::spoken::{from_arm_pairs, refusal_ack};
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+        use ratatui::Terminal;
+
+        let (tx, _rx) = mpsc::channel::<Req>();
+        let mut state = TuiState::new();
+        state.screen = Screen::Queue;
+        state.truecolor = true;
+
+        let live = from_arm_pairs(&[], Some("clear"), &[]);
+        apply_resp(&tx, &mut state, RespKind::Banner(live.clone()));
+        let (text, style) = frame_style(&state, &live.text());
+        assert!(text.contains("Cleared the queue."));
+        let ink = hypodj_style::ratatui::style_for_state(
+            hypodj_style::State::Live,
+            state.term_bg,
+            true,
+        );
+        assert_eq!(style.fg, ink.fg, "live is primary ink");
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+
+        let refused = refusal_ack("no such nl token");
+        apply_resp(&tx, &mut state, RespKind::Banner(refused.clone()));
+        let (text, style) = frame_style(&state, &refused.text());
+        assert!(text.contains(&refused.text()), "missing refusal:\n{text}");
+        assert_eq!(style.fg, Some(ratatui::style::Color::Reset));
+        assert!(!style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    fn frame_style(state: &TuiState, needle: &str) -> (String, ratatui::style::Style) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui::render(f, state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let want: Vec<char> = needle.chars().collect();
+        for y in 0..buf.area.height {
+            let line: Vec<char> = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            if let Some(x) = line.windows(want.len()).position(|w| w == want.as_slice()) {
+                return (text, buf[(x as u16, y)].style());
+            }
+        }
+        panic!("{needle:?} is not on screen:\n{text}");
+    }
+
     /// Pressing `y` on the DJ confirm echoes "> y" into the chat immediately AND still
     /// arms via the SAME Req::Arm path (no new arming, no double-arm) - the keypress is
     /// acknowledged instantly while the armed banner follows from the worker.

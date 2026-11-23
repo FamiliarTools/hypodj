@@ -15,7 +15,6 @@ ratatui = ["dep:ratatui"]
 egui = ["dep:egui"]
 
 [dependencies]
-hypodj-client = { path = "../hypodj-client" }
 serde = { workspace = true }
 toml = { workspace = true }
 ratatui = { workspace = true, optional = true }

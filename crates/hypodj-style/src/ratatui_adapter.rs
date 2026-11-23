@@ -72,7 +72,11 @@ fn fitted_color(fitted: Rgb, bg: TermBg, target: f32, truecolor: bool) -> Color 
         return Color::Indexed(idx);
     }
     let mut o = srgb_to_oklch(fitted);
-    let dir = if bg.luminance < crate::INFO_PIVOT { 1.0 } else { -1.0 };
+    let dir = if bg.luminance < crate::INFO_PIVOT {
+        1.0
+    } else {
+        -1.0
+    };
     for _ in 0..50 {
         o.l = (o.l + dir * 0.02).clamp(0.0, 1.0);
         let (idx, realized) = quantize_256(oklch_to_srgb(o));
@@ -92,17 +96,13 @@ fn neutral_for(bg: TermBg) -> Rgb {
     }
 }
 
-/// One style for every line of a [`hypodj_client::Spoken`].
-pub fn style_for_state(state: hypodj_client::State, bg: TermBg, truecolor: bool) -> Style {
+/// One style for every line of a [`crate::Spoken`].
+pub fn style_for_state(state: crate::State, bg: TermBg, truecolor: bool) -> Style {
     style_for(crate::role_for(state), bg, truecolor)
 }
 
 /// Render a spoken reply. Each line carries the state's style.
-pub fn render(
-    spoken: &hypodj_client::Spoken,
-    bg: TermBg,
-    truecolor: bool,
-) -> Vec<Line<'static>> {
+pub fn render(spoken: &crate::Spoken, bg: TermBg, truecolor: bool) -> Vec<Line<'static>> {
     let style = style_for_state(spoken.state, bg, truecolor);
     spoken
         .lines
@@ -119,7 +119,10 @@ pub fn style_for(role: Role, bg: TermBg, truecolor: bool) -> Style {
         Role::InkPrimary | Role::Refused | Role::Room => Style::default(),
         Role::InkQuiet | Role::MusicNone => Style::default().quiet(),
         Role::Echo => Style::default().quiet().underline(),
-        Role::Live => Style::default().bold(),
+        Role::Live => {
+            let ink = crate::fit_ink_primary(bg);
+            Style::default().fg(to_color(ink, truecolor)).bold()
+        }
         Role::Ember | Role::Armed => Style::default().fg(ember_color(bg, truecolor)),
         Role::Rule => Style::default().fg(to_color(crate::fit_rule(bg), truecolor)),
         Role::MusicInfo | Role::MusicDecoration => Style::default(),
@@ -130,7 +133,7 @@ pub fn style_for(role: Role, bg: TermBg, truecolor: bool) -> Style {
 mod tests {
     use super::*;
     use crate::{BgSource, XTERM_CUBE};
-    use hypodj_client::{State, Spoken};
+    use crate::{Spoken, State};
 
     fn idx_to_rgb(i: u8) -> Rgb {
         if i >= 232 {
@@ -203,7 +206,11 @@ mod tests {
         let bg = TermBg::dark_default();
         let echo = Spoken::new(
             State::Echo,
-            vec!["(via rules)".into(), "[1] fade out".into(), "confirm? [y/N]".into()],
+            vec![
+                "(via rules)".into(),
+                "[1] fade out".into(),
+                "confirm? [y/N]".into(),
+            ],
         );
         let lines = render(&echo, bg, true);
         assert_eq!(lines.len(), 3);
@@ -214,7 +221,10 @@ mod tests {
         }
         let armed = Spoken::new(State::Armed, vec!["armed (plan 4)".into()]);
         let styled = render(&armed, bg, true);
-        assert!(matches!(styled[0].spans[0].style.fg, Some(Color::Rgb(_, _, _))));
+        assert!(matches!(
+            styled[0].spans[0].style.fg,
+            Some(Color::Rgb(_, _, _))
+        ));
     }
 
     #[test]

@@ -279,7 +279,13 @@ fn search_cli_ember() -> CliEmber {
                 continue;
             }
             let score = (l - want_l).abs() + (c - want_c).abs();
-            let found = CliEmber { l, c, rgb, index, indexed };
+            let found = CliEmber {
+                l,
+                c,
+                rgb,
+                index,
+                indexed,
+            };
             if best.as_ref().map(|(s, _)| score < *s).unwrap_or(true) {
                 best = Some((score, found));
             }
@@ -488,7 +494,8 @@ mod tests {
         for g in [140u8, 160, 180, 200] {
             let bg = TermBg::from_rgb([g, g, g], BgSource::Provided);
             let fitted = fit_ink_primary(bg);
-            let best = contrast_ratio([255, 255, 255], bg.rgb).max(contrast_ratio([0, 0, 0], bg.rgb));
+            let best =
+                contrast_ratio([255, 255, 255], bg.rgb).max(contrast_ratio([0, 0, 0], bg.rgb));
             assert!(
                 contrast_ratio(fitted, bg.rgb) + 1e-3 >= best,
                 "grey {g}: fitted {:?} contrast {:.2}, extreme {:.2}",

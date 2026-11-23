@@ -1040,6 +1040,7 @@ dependencies = [
 name = "hypodj-client"
 version = "0.2.0"
 dependencies = [
+ "hypodj-style",
  "thiserror",
 ]
 
@@ -1098,7 +1099,6 @@ name = "hypodj-style"
 version = "0.2.0"
 dependencies = [
  "egui",
- "hypodj-client",
  "ratatui",
  "serde",
  "toml",

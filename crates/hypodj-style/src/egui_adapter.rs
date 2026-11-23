@@ -55,7 +55,9 @@ pub fn visuals(bg: TermBg) -> Visuals {
     v.extreme_bg_color = room;
     v.faint_bg_color = room;
     v.code_bg_color = room;
-    v.override_text_color = Some(ink);
+    // Leave this unset. A forced ink colour paints selected text the same
+    // colour as the selection fill, which is ink on ink.
+    v.override_text_color = None;
     // A refusal and a warning are calm ink. No alarm colour.
     v.warn_fg_color = quiet;
     v.error_fg_color = ink;
@@ -76,30 +78,35 @@ pub fn visuals(bg: TermBg) -> Visuals {
     }
     v.widgets.inactive.fg_stroke.color = quiet;
     v.widgets.noninteractive.fg_stroke.color = quiet;
-    let sel = selection(bg);
-    v.selection.stroke = Stroke::new(1.0, sel.stroke);
-    v.selection.bg_fill = sel.fill;
+    // Selected rows copy `selection.stroke` onto the text and `bg_fill` onto
+    // the background (`Style::interact_selectable`). Text is the room, fill
+    // is primary ink: the same inversion as the TUI's reverse.
+    v.selection.bg_fill = ink;
+    v.selection.stroke = Stroke::new(1.0, room);
     v
 }
 
-/// Selection, inverted the way the TUI's REVERSED modifier is: the fill is
-/// primary ink, the text is the room, the stroke is primary ink.
-pub struct SelectionInk {
-    pub fill: Color32,
-    pub text: Color32,
-    pub stroke: Color32,
-}
-
-pub fn selection(bg: TermBg) -> SelectionInk {
-    let ink = color32(fit_ink_primary(bg));
-    let room = color32(bg.rgb);
-    SelectionInk { fill: ink, text: room, stroke: ink }
+/// One painted line. Echo is underlined so it is not a note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Painted {
+    pub text: String,
+    pub color: Color32,
+    pub underline: bool,
 }
 
 /// One colour per line. The words are unchanged.
-pub fn render(spoken: &hypodj_client::Spoken, bg: TermBg) -> Vec<(String, Color32)> {
+pub fn render(spoken: &crate::Spoken, bg: TermBg) -> Vec<Painted> {
     let colour = role_color(crate::role_for(spoken.state), bg);
-    spoken.lines.iter().map(|line| (line.clone(), colour)).collect()
+    let underline = spoken.state == crate::State::Echo;
+    spoken
+        .lines
+        .iter()
+        .map(|line| Painted {
+            text: line.clone(),
+            color: colour,
+            underline,
+        })
+        .collect()
 }
 
 pub fn role_color(role: Role, bg: TermBg) -> Color32 {
@@ -117,7 +124,7 @@ pub fn role_color(role: Role, bg: TermBg) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{contrast_ratio, ember_rgb, tokens, BgSource};
+    use crate::{contrast_ratio, tokens, BgSource};
 
     fn rgb_of(c: Color32) -> Rgb {
         [c.r(), c.g(), c.b()]
@@ -131,18 +138,26 @@ mod tests {
         ] {
             let v = visuals(bg);
             assert_eq!(rgb_of(v.panel_fill), bg.rgb);
-            assert_eq!(v.error_fg_color, v.override_text_color.unwrap());
+            assert!(
+                v.override_text_color.is_none(),
+                "must not force ink on selected text"
+            );
             let err = rgb_of(v.error_fg_color);
             assert!(contrast_ratio(err, bg.rgb) >= tokens().room.ink_primary_min_contrast);
             assert_ne!(err, [255, 0, 0]);
-            let sel = selection(bg);
-            assert_eq!(rgb_of(v.selection.bg_fill), rgb_of(sel.fill));
-            assert_eq!(rgb_of(sel.text), bg.rgb, "selected text is the room");
-            assert_eq!(rgb_of(v.selection.stroke.color), rgb_of(sel.stroke));
-            assert_ne!(rgb_of(sel.fill), ember_rgb(bg));
+            let fill = rgb_of(v.selection.bg_fill);
+            let text = rgb_of(v.selection.stroke.color);
+            assert_eq!(
+                fill,
+                rgb_of(color32(fit_ink_primary(bg))),
+                "fill is primary ink"
+            );
+            assert_eq!(text, bg.rgb, "selected text is the room");
+            assert_ne!(text, fill, "ink on ink");
             assert!(
-                contrast_ratio(bg.rgb, fit_ink_primary(bg)) >= tokens().room.ink_quiet_min_contrast,
-                "selected text on its fill"
+                contrast_ratio(text, fill) >= tokens().room.ink_quiet_min_contrast,
+                "selected text {:.2}:1 against its fill",
+                contrast_ratio(text, fill)
             );
         }
     }
@@ -161,13 +176,12 @@ mod tests {
     #[test]
     fn render_keeps_the_lines() {
         let bg = TermBg::dark_default();
-        let spoken = hypodj_client::Spoken::new(
-            hypodj_client::State::Echo,
-            vec!["[1] fade out".into(), hypodj_client::spoken::CONFIRM_LINE.into()],
-        );
-        let rows = render(&spoken, bg);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, "[1] fade out");
-        assert_eq!(rows[1].0, hypodj_client::spoken::CONFIRM_LINE);
+        let echo = crate::Spoken::new(crate::State::Echo, vec!["confirm? [y/N]".into()]);
+        let note = crate::Spoken::new(crate::State::Note, vec!["NOTE: a wake".into()]);
+        let echo_row = &render(&echo, bg)[0];
+        let note_row = &render(&note, bg)[0];
+        assert!(echo_row.underline);
+        assert!(!note_row.underline);
+        assert_eq!(echo_row.text, "confirm? [y/N]");
     }
 }

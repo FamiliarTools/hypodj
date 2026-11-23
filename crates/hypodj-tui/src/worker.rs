@@ -138,7 +138,7 @@ pub enum Inbound {
 pub enum RespKind {
     Snapshot { now: NowPlaying, queue: Option<Vec<QueueItem>>, version: Option<u64> },
     Confirm(Pending),
-    Banner(hypodj_client::Spoken),
+    Banner(hypodj_style::Spoken),
     /// The daemon's `heard` render, one entry per line, for the scrollable overlay.
     /// Multi-line by construction (a one-line reply is a Banner), so it always has
     /// something the bottom bar could not have carried.
@@ -589,10 +589,18 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 // count. Fall back to the plan-time armed line only for a deferred plan
                 // (no `result`), where nothing has executed yet.
                 (Some(cmd), _) => conn.command(cmd).map(|pairs| {
-                    Some(hypodj_client::spoken::from_arm_pairs(&pairs, &pending.steps))
+                    Some(hypodj_client::spoken::from_arm_pairs(
+                        &pairs,
+                        pending.command.as_deref(),
+                        &pending.steps,
+                    ))
                 }),
                 (None, Some(token)) => conn.command(&format!("nl confirm {token}")).map(|pairs| {
-                    Some(hypodj_client::spoken::from_arm_pairs(&pairs, &pending.steps))
+                    Some(hypodj_client::spoken::from_arm_pairs(
+                        &pairs,
+                        pending.command.as_deref(),
+                        &pending.steps,
+                    ))
                 }),
                 (None, None) => Ok(None),
             };
@@ -675,15 +683,6 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             Err(_) => true,
         },
     }
-}
-
-/// The human armed line for the DIRECT-COMMAND arm (the cc/DJ `plan add <dsl>`
-/// path). The command socket returns a bare OK with no plan_id to echo, so we
-/// synthesize the acknowledgment from the plan summary - without a banner here the
-/// DJ chat gets no feedback after `y` (the token path echoes `armed_line` instead).
-/// Pure - unit-tested.
-fn command_armed_line(steps: &[String]) -> String {
-    hypodj_client::spoken::armed_fallback(steps).text()
 }
 
 /// A command outcome collapsed to the two render-visible cases.
@@ -969,26 +968,6 @@ fn art_worker(rx: Receiver<(String, Option<String>)>, tx: Sender<Inbound>, host:
 
 #[cfg(test)]
 mod tests {
-    use super::command_armed_line;
-
-    #[test]
-    fn command_armed_line_echoes_plan_summary() {
-        // The cc/DJ direct-command arm path produces a human "armed:" banner from the
-        // plan summary (RespKind::Banner then routes it to the DJ chat) - the fix for
-        // the swallowed feedback bug.
-        assert_eq!(
-            command_armed_line(&["add 5 calmer tracks".to_string()]),
-            "armed: add 5 calmer tracks"
-        );
-        // Leading blank steps are skipped; the first real one wins.
-        assert_eq!(
-            command_armed_line(&["".to_string(), "fade out".to_string()]),
-            "armed: fade out"
-        );
-        // No steps at all still yields a generic acknowledgment (never silence).
-        assert_eq!(command_armed_line(&[]), "armed");
-    }
-
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
         items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }

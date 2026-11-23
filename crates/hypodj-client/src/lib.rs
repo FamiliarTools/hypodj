@@ -10,5 +10,4 @@ pub mod mpd;
 pub mod nl;
 pub mod route;
 pub mod spoken;
-pub use spoken::{State, Spoken};
 pub mod viz;

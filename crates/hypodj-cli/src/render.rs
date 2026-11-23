@@ -13,6 +13,21 @@ pub fn render_card(np: &NowPlaying) -> String {
     render_card_with(np, Ansi::off())
 }
 
+/// The line the binary prints after a confirm. Same words on the CLI and the TUI.
+pub fn render_outcome(
+    pairs: &[(String, String)],
+    command: Option<&str>,
+    steps: &[String],
+    ansi: Ansi,
+) -> String {
+    ansi.render(&hypodj_client::spoken::from_arm_pairs(pairs, command, steps))
+}
+
+/// The line the binary prints for a daemon ACK.
+pub fn render_refusal(msg: &str, ansi: Ansi) -> String {
+    ansi.render(&hypodj_client::spoken::refusal_ack(msg))
+}
+
 /// Same card as [`render_card`], with colour from the ANSI adapter when `ansi` is on.
 /// Off (not a TTY, or `NO_COLOR`) is the plain card. The words do not change.
 pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
@@ -265,7 +280,8 @@ mod tests {
     #[test]
     fn a_canned_plan_echo_strips_to_the_same_words() {
         use hypodj_client::nl::split_echo;
-        use hypodj_client::spoken::{plan_echo, State};
+        use hypodj_client::spoken::plan_echo;
+        use hypodj_style::State;
         let parts = split_echo("via rules | [1] fade out | NOTE: a wake also needs a play");
         for spoken in plan_echo(&parts) {
             let off = Ansi::off().render(&spoken);
@@ -276,14 +292,35 @@ mod tests {
             assert_eq!(hypodj_style::ansi::strip(&indexed), off);
             if spoken.state == State::Echo {
                 assert!(on.contains("\u{1b}[2;4m"), "echo is quiet and underlined");
-                assert!(off.contains("[1] fade out"));
-                assert!(off.contains("confirm? [y/N]"));
             }
             if spoken.state == State::Note {
                 assert_eq!(off, "NOTE: a wake also needs a play");
                 assert!(!on.contains("\u{1b}[4m"), "a note is not underlined");
             }
         }
+        let joined = plan_echo(&parts)
+            .into_iter()
+            .map(|s| s.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("[1] fade out"));
+        assert!(joined.trim_end().ends_with("confirm? [y/N]"));
+    }
+
+    #[test]
+    fn clear_is_live_and_a_refusal_has_no_colour() {
+        let cleared = render_outcome(&[], Some("clear"), &[], Ansi::off());
+        let cleared_on = render_outcome(&[], Some("clear"), &[], Ansi::on_truecolor());
+        assert_eq!(cleared, "Cleared the queue.");
+        assert!(!cleared.contains("armed"));
+        assert_eq!(hypodj_style::ansi::strip(&cleared_on), cleared);
+        assert!(cleared_on.contains('\u{1b}'), "live is primary ink");
+
+        let refused = render_refusal("not understood", Ansi::off());
+        let refused_on = render_refusal("not understood", Ansi::on_truecolor());
+        assert_eq!(refused_on, refused, "a refusal has no colour");
+        assert!(!refused_on.contains('\u{1b}'));
+        assert!(!refused.is_empty());
     }
 
     #[test]

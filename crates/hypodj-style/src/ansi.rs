@@ -15,15 +15,24 @@ pub struct Ansi {
 
 impl Ansi {
     pub fn off() -> Self {
-        Self { enabled: false, truecolor: false }
+        Self {
+            enabled: false,
+            truecolor: false,
+        }
     }
 
     pub fn on_truecolor() -> Self {
-        Self { enabled: true, truecolor: true }
+        Self {
+            enabled: true,
+            truecolor: true,
+        }
     }
 
     pub fn on_indexed() -> Self {
-        Self { enabled: true, truecolor: false }
+        Self {
+            enabled: true,
+            truecolor: false,
+        }
     }
 
     /// `no_color` is the `NO_COLOR` value. Empty or absent does not disable colour.
@@ -32,7 +41,10 @@ impl Ansi {
     pub fn from_env(is_tty: bool, no_color: Option<&str>, colorterm: Option<&str>) -> Self {
         let disabled = no_color.is_some_and(|v| !v.is_empty());
         let truecolor = matches!(colorterm, Some("truecolor") | Some("24bit"));
-        Self { enabled: is_tty && !disabled, truecolor }
+        Self {
+            enabled: is_tty && !disabled,
+            truecolor,
+        }
     }
 
     pub fn enabled(self) -> bool {
@@ -55,8 +67,8 @@ impl Ansi {
         format!("{open}{text}\u{1b}[0m")
     }
 
-    /// Paint every line of a [`hypodj_client::Spoken`]. The state picks the role.
-    pub fn render(self, spoken: &hypodj_client::Spoken) -> String {
+    /// Paint every line of a [`crate::Spoken`]. The state picks the role.
+    pub fn render(self, spoken: &crate::Spoken) -> String {
         let bg = TermBg::dark_default();
         let role = crate::role_for(spoken.state);
         spoken
@@ -79,7 +91,11 @@ fn fg(ansi: Ansi, rgb: [u8; 3], index: u8) -> String {
 fn open_code(ansi: Ansi, role: Role, bg: TermBg) -> Option<String> {
     match role {
         // The terminal's own foreground. Live adds bold; primary does not.
-        Role::Live => Some("\u{1b}[1m".to_string()),
+        Role::Live => {
+            let ink = crate::fit_ink_primary(TermBg::dark_default());
+            let (idx, _) = crate::quantize_256(ink);
+            Some(format!("{}\u{1b}[1m", fg(ansi, ink, idx)))
+        }
         Role::InkPrimary => None,
         Role::InkQuiet | Role::MusicNone => Some("\u{1b}[2m".to_string()),
         Role::Echo => Some("\u{1b}[2;4m".to_string()),
@@ -139,13 +155,16 @@ pub fn strip(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::TermBg;
-    use hypodj_client::{State, Spoken};
+    use crate::{Spoken, State};
 
     #[test]
     fn from_env_is_plain_off_a_tty_or_under_no_color() {
         assert!(!Ansi::from_env(false, None, None).enabled());
         assert!(!Ansi::from_env(true, Some("1"), None).enabled());
-        assert!(Ansi::from_env(true, Some(""), None).enabled(), "empty NO_COLOR is unset");
+        assert!(
+            Ansi::from_env(true, Some(""), None).enabled(),
+            "empty NO_COLOR is unset"
+        );
         assert!(Ansi::from_env(true, None, None).enabled());
         assert!(Ansi::from_env(true, None, Some("truecolor")).truecolor());
         assert!(Ansi::from_env(true, None, Some("24bit")).truecolor());

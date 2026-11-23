@@ -1,76 +1,73 @@
-//! A plan or a daemon reply, as words plus the state those words are in.
+//! Build a [`hypodj_style::Spoken`] from a daemon reply.
 //!
-//! The CLI, the TUI, and later the GUI all produce this and hand it to a
-//! surface adapter. A surface does not decide the state itself.
+//! The type lives in hypodj-style. This module only decides which state a
+//! reply is, so the CLI and the TUI print the same line for the same pairs.
+
+use hypodj_style::{Spoken, State};
 
 use crate::model::{fmt_remaining, ArmedFeatures};
 use crate::nl::{self, EchoParts};
 
-/// Echo, armed, live, refused. A wake caveat is a note: it is not a refusal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Echo,
-    Armed,
-    Live,
-    Refused,
-    Note,
-}
-
-/// One state and the lines that carry it. Every line shares the state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Spoken {
-    pub state: State,
-    pub lines: Vec<String>,
-}
-
-impl Spoken {
-    pub fn new(state: State, lines: Vec<String>) -> Self {
-        Self { state, lines }
-    }
-
-    pub fn text(&self) -> String {
-        self.lines.join("\n")
-    }
-}
-
 /// The y/N line both surfaces show under an unconfirmed plan.
 pub const CONFIRM_LINE: &str = "confirm? [y/N]";
 
-/// An unconfirmed plan: the trust footnote, the steps, and the confirm line
-/// are one echo. A wake caveat, when the echo has one, is a separate note.
+/// An unconfirmed plan. Steps are echo. A wake caveat is a note, and it comes
+/// before the confirm question. The question is always the last line.
 pub fn plan_echo(parts: &EchoParts) -> Vec<Spoken> {
     let mut lines = Vec::new();
     if let Some(trust) = &parts.trust {
         lines.push(format!("({trust})"));
     }
     lines.extend(parts.steps.iter().cloned());
-    lines.push(CONFIRM_LINE.to_string());
-    let mut out = vec![Spoken::new(State::Echo, lines)];
+    let mut out = Vec::new();
+    if !lines.is_empty() {
+        out.push(Spoken::new(State::Echo, lines));
+    }
     if let Some(note) = &parts.note {
         out.push(Spoken::new(State::Note, vec![note.clone()]));
     }
+    out.push(Spoken::new(State::Echo, vec![CONFIRM_LINE.to_string()]));
     out
 }
 
-/// What a confirm just did. A `result` pair already happened (live). A
-/// `plan_id` is armed. With neither, the steps are the armed banner, or the
-/// bare word "armed" when there is nothing to name.
-pub fn from_arm_pairs(pairs: &[(String, String)], steps: &[String]) -> Spoken {
-    if let Some(line) = nl::result_line_from_pairs(pairs) {
-        return Spoken::new(State::Live, vec![line]);
-    }
+/// What a confirm just did.
+///
+/// A `plan_id` is armed. A `result` already happened, so it is live in the
+/// daemon's own words. Anything else already happened too: live, in the past
+/// tense, never the word "armed".
+pub fn from_arm_pairs(
+    pairs: &[(String, String)],
+    command: Option<&str>,
+    steps: &[String],
+) -> Spoken {
     if let Some((_, id)) = pairs.iter().find(|(k, _)| k == "plan_id") {
         return Spoken::new(State::Armed, vec![nl::armed_line(id)]);
     }
-    armed_fallback(steps)
+    if let Some(line) = nl::result_line_from_pairs(pairs) {
+        return Spoken::new(State::Live, vec![line]);
+    }
+    Spoken::new(State::Live, vec![past_tense(command, steps)])
 }
 
-/// The armed banner built from the plan summary when the daemon sent no id.
-pub fn armed_fallback(steps: &[String]) -> Spoken {
-    match steps.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
-        Some(s) => Spoken::new(State::Armed, vec![format!("armed: {s}")]),
-        None => Spoken::new(State::Armed, vec!["armed".into()]),
+/// Past tense for a confirmed act that returned neither a plan id nor a result.
+fn past_tense(command: Option<&str>, steps: &[String]) -> String {
+    let command = command.unwrap_or("").trim();
+    let verb = command.split_whitespace().next().unwrap_or("");
+    let mentions_clear = verb == "clear"
+        || steps.iter().any(|s| {
+            let t = s.trim();
+            t == "clear" || t.contains("clear the queue") || t.contains("clear the whole")
+        });
+    if mentions_clear {
+        return "Cleared the queue.".to_string();
     }
+    if let Some(step) = steps.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
+        return format!("Done: {step}.");
+    }
+    if !command.is_empty() {
+        return format!("Done: {command}.");
+    }
+    "Done.".to_string()
 }
 
 /// A daemon ACK, mapped to one calm sentence.
@@ -119,39 +116,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_unconfirmed_plan_is_an_echo_plus_a_note() {
-        let parts = nl::split_echo(
-            "via rules | [1] fade out | NOTE: a wake also needs a play",
-        );
+    fn the_note_comes_before_the_question_and_the_question_is_last() {
+        let parts = nl::split_echo("via rules | [1] fade out | NOTE: a wake also needs a play");
         let spoken = plan_echo(&parts);
-        assert_eq!(spoken.len(), 2);
+        assert_eq!(spoken.len(), 3);
         assert_eq!(spoken[0].state, State::Echo);
         assert_eq!(
             spoken[0].lines,
-            vec![
-                "(via rules)".to_string(),
-                "[1] fade out".to_string(),
-                CONFIRM_LINE.to_string(),
-            ]
+            vec!["(via rules)".to_string(), "[1] fade out".to_string()]
         );
         assert_eq!(spoken[1].state, State::Note);
-        assert_eq!(spoken[1].lines, vec!["NOTE: a wake also needs a play".to_string()]);
+        assert_eq!(spoken[2].state, State::Echo);
+        assert_eq!(spoken[2].lines, vec![CONFIRM_LINE.to_string()]);
+        assert_eq!(spoken.last().unwrap().lines.last().unwrap(), CONFIRM_LINE);
     }
 
     #[test]
-    fn arm_pairs_distinguish_live_armed_and_the_bare_fallback() {
-        let live = from_arm_pairs(&[("result".into(), "played Blue".into())], &[]);
-        assert_eq!(live.state, State::Live);
-        assert_eq!(live.lines, vec!["played Blue".to_string()]);
+    fn only_a_plan_id_is_armed_and_clear_is_live() {
+        let played = from_arm_pairs(&[("result".into(), "played Blue".into())], None, &[]);
+        assert_eq!(played.state, State::Live);
+        assert_eq!(played.lines, vec!["played Blue".to_string()]);
 
-        let armed = from_arm_pairs(&[("plan_id".into(), "4".into())], &[]);
+        let armed = from_arm_pairs(&[("plan_id".into(), "4".into())], Some("clear"), &[]);
         assert_eq!(armed.state, State::Armed);
         assert_eq!(armed.lines, vec!["armed (plan 4)".to_string()]);
 
-        let bare = armed_fallback(&[]);
-        assert_eq!(bare.lines, vec!["armed".to_string()]);
-        let named = armed_fallback(&["fade out".into()]);
-        assert_eq!(named.lines, vec!["armed: fade out".to_string()]);
+        let cleared = from_arm_pairs(&[], Some("clear"), &[]);
+        assert_eq!(cleared.state, State::Live);
+        assert_eq!(cleared.lines, vec!["Cleared the queue.".to_string()]);
+        assert!(!cleared.text().contains("armed"));
     }
 
     #[test]

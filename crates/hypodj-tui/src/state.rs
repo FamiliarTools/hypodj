@@ -254,11 +254,11 @@ pub enum Mode {
 /// A plan awaiting confirmation. Either an owner-scoped NL `token` (confirm via
 /// `nl confirm <token>`) OR a direct `command` (e.g. destructive `clear`).
 /// One DJ scrollback entry. Chat text has no state. A plan or a daemon reply
-/// is a [`hypodj_client::Spoken`], and the surface only renders it.
+/// is a [`hypodj_style::Spoken`], and the surface only renders it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DjEntry {
     Text(String),
-    Spoken(hypodj_client::Spoken),
+    Spoken(hypodj_style::Spoken),
 }
 
 impl DjEntry {
@@ -290,7 +290,7 @@ pub struct Pending {
 
 impl Pending {
     /// The echo (and the wake note, when there is one) this confirm is showing.
-    pub fn utterances(&self) -> Vec<hypodj_client::Spoken> {
+    pub fn utterances(&self) -> Vec<hypodj_style::Spoken> {
         hypodj_client::spoken::plan_echo(&hypodj_client::nl::EchoParts {
             trust: self.trust.clone(),
             steps: self.steps.clone(),
@@ -741,7 +741,7 @@ pub struct TuiState {
     pub status_msg: Option<String>,
     /// Set only when `status_msg` is a plan or daemon reply. Local notices leave it
     /// empty, so the bar does not invent a state for them.
-    pub status_state: Option<hypodj_client::State>,
+    pub status_state: Option<hypodj_style::State>,
     /// When Space last enqueued the LAST row of a list (`None` anywhere else) -
     /// only ever read to tell a held Space from a deliberate tap once the cursor
     /// can advance no further. See [`ENQUEUE_REPEAT_WINDOW`].
@@ -2708,7 +2708,7 @@ impl TuiState {
         self.status_state = None;
     }
 
-    pub fn set_reply(&mut self, spoken: hypodj_client::Spoken) {
+    pub fn set_reply(&mut self, spoken: hypodj_style::Spoken) {
         self.status_state = Some(spoken.state);
         self.status_msg = Some(spoken.text());
     }
@@ -2725,7 +2725,7 @@ impl TuiState {
         self.trim_dj_log();
     }
 
-    pub fn push_spoken(&mut self, spoken: hypodj_client::Spoken) {
+    pub fn push_spoken(&mut self, spoken: hypodj_style::Spoken) {
         self.dj_log.push(DjEntry::Spoken(spoken));
         self.trim_dj_log();
     }

@@ -2881,7 +2881,8 @@ mod tests {
     #[test]
     fn a_canned_plan_renders_echo_note_and_armed_through_the_real_ui() {
         use hypodj_client::nl::split_echo;
-        use hypodj_client::spoken::{plan_echo, State};
+        use hypodj_client::spoken::plan_echo;
+        use hypodj_style::State;
         use ratatui::style::Modifier;
         let parts = split_echo("via rules | [1] fade out | NOTE: a wake also needs a play");
         let spoken = plan_echo(&parts);
@@ -2912,6 +2913,7 @@ mod tests {
         // Off the DJ screen the same arm result is the status-bar banner, in ember.
         let armed = hypodj_client::spoken::from_arm_pairs(
             &[("plan_id".into(), "4".into())],
+            None,
             &[],
         );
         s.screen = crate::state::Screen::Queue;
