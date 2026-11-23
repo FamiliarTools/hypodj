@@ -2,10 +2,12 @@
 resolver = "2"
 members = [
     "crates/hypodj-core",
+    "crates/hypodj-dsl",
     "crates/hypodj-nl",
     "crates/hypodj-daemon",
     "crates/hypodj-cli",
     "crates/hypodj-client",
+    "crates/hypodj-mcp",
     "crates/hypodj-tui",
     "crates/hypodj-build-info",
     "crates/hypodj-style",

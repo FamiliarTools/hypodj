@@ -4,7 +4,7 @@
 
 use crate::nl::NlSource;
 use crate::plan::{
-    Action, ClearScope, FadeIntentIr, MoveDest, PosBase, QueueSelector, RawPlan, RawTrigger,
+    Action, ClearScope, DaySet, FadeIntentIr, MoveDest, PosBase, QueueSelector, CurateFilter, RawPlan, RawTrigger,
     Selector, TrackSel,
 };
 
@@ -18,37 +18,14 @@ fn secs(s: f64) -> String {
     }
 }
 
-/// Quote + escape a selector value so a multi-word value ("good vibes", "drum
-/// and bass") survives the `plan add` tokenizer as ONE token (it splits on
-/// unquoted whitespace and unescapes `\"`/`\\` inside quotes). A single bare word
-/// is emitted verbatim; anything with whitespace/quote/backslash is quoted.
+/// Quote + escape a DSL value so a multi-word value survives the `plan add`
+/// tokenizer as ONE token, refusing (`None`) anything carrying a control char.
 ///
-/// Returns `None` when the value contains a control character (newline, CR, tab,
-/// etc.). The `plan add <dsl>` line is framed on the wire by a literal `\n`, and
-/// the tokenizer's `\`-escape only unescapes the NEXT char (never re-encodes a
-/// literal newline), so a value carrying a newline would smuggle EXTRA command
-/// lines past the single-owner confirm gate. Refusing to render it makes the
-/// caller fall back to direct arming (or a loud "cannot express" miss) - a
-/// control char is nonsense in a music selector anyway.
-fn dsl_value(s: &str) -> Option<String> {
-    if s.chars().any(|c| c.is_control()) {
-        return None;
-    }
-    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
-        let mut out = String::with_capacity(s.len() + 2);
-        out.push('"');
-        for c in s.chars() {
-            if c == '"' || c == '\\' {
-                out.push('\\');
-            }
-            out.push(c);
-        }
-        out.push('"');
-        Some(out)
-    } else {
-        Some(s.to_string())
-    }
-}
+/// RE-EXPORTED, not implemented here: the rule lives in [`hypodj_dsl`] so the
+/// daemon's echo and an out-of-process producer of a `plan add` line (which
+/// cannot link `libmpv`, so cannot depend on this crate) share one implementation
+/// and cannot drift. See that crate for the full why.
+pub use hypodj_dsl::dsl_value;
 
 /// Render the trigger portion of the `plan add` DSL.
 fn trigger_dsl(t: &RawTrigger) -> Option<String> {
@@ -68,6 +45,13 @@ fn trigger_dsl(t: &RawTrigger) -> Option<String> {
         },
         RawTrigger::SpanElapsed { secs: s } => format!("trigger in {}", secs(*s)),
         RawTrigger::WallClock { at } => format!("trigger at {}", at.to_rfc3339()),
+        RawTrigger::Daily { hour, minute, days } => {
+            if *days == DaySet::EVERY {
+                format!("trigger daily {hour:02}:{minute:02}")
+            } else {
+                format!("trigger daily {hour:02}:{minute:02} on {}", days.word())
+            }
+        }
         // TimeRemaining is not emitted by the rules grammar; not round-tripped.
         RawTrigger::TimeRemaining { .. } => return None,
     })
@@ -78,7 +62,7 @@ fn action_dsl(a: &Action) -> Option<String> {
     Some(match a {
         Action::Fade(FadeIntentIr::Out { secs: s }) => format!("action fade out {}", secs(*s)),
         Action::Fade(FadeIntentIr::In { secs: s }) => format!("action fade in {}", secs(*s)),
-        Action::Fade(FadeIntentIr::To { vol, secs: s, .. }) => {
+        Action::Fade(FadeIntentIr::To { vol, secs: s }) => {
             format!("action fade to {} {}", vol, secs(*s))
         }
         Action::Stop => "action stop".into(),
@@ -89,6 +73,7 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::Query(q) => format!("action enqueue query {} {count}", dsl_value(q)?),
             Selector::Genre(g) => format!("action enqueue genre {} {count}", dsl_value(g)?),
             Selector::SimilarToCurrent => format!("action enqueue similar_current {count}"),
+            Selector::Starred => format!("action enqueue starred {count}"),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -99,10 +84,14 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::Query(q) => format!("action playnow query {} {count}", dsl_value(q)?),
             Selector::Genre(g) => format!("action playnow genre {} {count}", dsl_value(g)?),
             Selector::SimilarToCurrent => format!("action playnow similar_current {count}"),
+            Selector::Starred => format!("action playnow starred {count}"),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
         Action::Noop => "action noop".into(),
+        Action::SetMode { mode, on } => {
+            format!("action mode {} {}", mode.word(), if *on { "on" } else { "off" })
+        }
         Action::Clear { scope } => match scope {
             ClearScope::All => "action clear all".into(),
             ClearScope::AfterCurrent => "action clear after".into(),
@@ -115,11 +104,9 @@ fn action_dsl(a: &Action) -> Option<String> {
             };
             format!("action move {} to {}", qselector_dsl(sel)?, d)
         }
-        // ToFloor/WakeTo/Wake are built only by the convenience sleep/winddown/wake
-        // commands, not the keyword `plan add` DSL - so they are not round-tripped.
-        Action::Fade(FadeIntentIr::ToFloor { .. })
-        | Action::Fade(FadeIntentIr::WakeTo { .. })
-        | Action::Wake { .. } => return None,
+        // ToFloor/Wake are built only by the convenience winddown/wake commands,
+        // not the keyword `plan add` DSL - so they are not round-tripped.
+        Action::Fade(FadeIntentIr::ToFloor { .. }) | Action::Wake { .. } => return None,
     })
 }
 
@@ -132,6 +119,14 @@ fn qselector_dsl(sel: &QueueSelector) -> Option<String> {
         QueueSelector::Last(n) => format!("last {n}"),
         QueueSelector::Range { start, end } => format!("range {start} {end}"),
         QueueSelector::QueryMatch(q) => format!("match {}", dsl_value(q)?),
+        QueueSelector::Qid(id) => format!("id {id}"),
+        QueueSelector::Upcoming(f) => match f {
+            CurateFilter::Remixes => "upcoming remixes".into(),
+            CurateFilter::Live => "upcoming live".into(),
+            CurateFilter::RestOfAlbum => "upcoming album".into(),
+            CurateFilter::Artist(a) => format!("upcoming artist {}", dsl_value(a)?),
+            CurateFilter::LeadArtist(a) => format!("upcoming lead {}", dsl_value(a)?),
+        },
     })
 }
 
@@ -148,6 +143,17 @@ pub fn render_dsl(raw: &RawPlan) -> Option<String> {
     Some(s)
 }
 
+/// "every day at 07:00 local time" / "on weekdays at ..." / "on mon,wed at ...".
+pub fn describe_recurrence(hour: u8, minute: u8, days: DaySet) -> String {
+    let on = match days {
+        DaySet::EVERY => "every day".to_string(),
+        DaySet::WEEKDAYS => "every weekday".to_string(),
+        DaySet::WEEKENDS => "every weekend day".to_string(),
+        d => format!("every {}", d.word()),
+    };
+    format!("{on} at {hour:02}:{minute:02} local time (recurring)")
+}
+
 fn source_label(src: NlSource) -> &'static str {
     match src {
         NlSource::Rules => "via rules",
@@ -158,7 +164,14 @@ fn source_label(src: NlSource) -> &'static str {
 /// A short, honest human clause for one plan (the confirmation surface). Spells
 /// out a guessed fade direction, flags the append-only + not-yet-at-execute holes.
 pub fn describe_plan(raw: &RawPlan) -> String {
-    let when = match &raw.trigger {
+    let when = describe_when(&raw.trigger);
+    let what = describe_action(raw);
+    format!("{what} {when}")
+}
+
+/// The human WHEN clause of a trigger ("in 20m", "every weekday at 07:00 ...").
+pub fn describe_when(trigger: &RawTrigger) -> String {
+    match trigger {
         RawTrigger::Immediate => "now".to_string(),
         RawTrigger::QueuePosition { n, base } => match base {
             PosBase::CurrentIsOne => format!("when the {} track (counting current as #1) starts", ordinal(*n)),
@@ -168,13 +181,17 @@ pub fn describe_plan(raw: &RawPlan) -> String {
         RawTrigger::AlbumBoundary { .. } => "after the current album ends".to_string(),
         RawTrigger::SpanElapsed { secs: s } => format!("in {}", human_dur(*s)),
         RawTrigger::WallClock { at } => format!("at {} UTC", at.format("%Y-%m-%d %H:%M")),
+        RawTrigger::Daily { hour, minute, days } => describe_recurrence(*hour, *minute, *days),
         RawTrigger::TimeRemaining { secs: s, .. } => format!("with {} left on the track", human_dur(*s)),
-    };
-    let what = match &raw.action {
+    }
+}
+
+fn describe_action(raw: &RawPlan) -> String {
+    match &raw.action {
         Action::Fade(FadeIntentIr::Out { secs: s }) => format!("fade OUT over {}", human_dur(*s)),
         Action::Fade(FadeIntentIr::In { secs: s }) => format!("fade IN over {}", human_dur(*s)),
-        Action::Fade(FadeIntentIr::To { vol, secs: s, .. }) => {
-            format!("fade to volume {} over {}", vol, human_dur(*s))
+        Action::Fade(FadeIntentIr::To { vol, secs: s }) => {
+            format!("fade to {} over {}", level_phrase(*vol), human_dur(*s))
         }
         Action::Stop => "stop playback".to_string(),
         Action::Pause => "pause playback".to_string(),
@@ -188,14 +205,12 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                 Selector::SimilarToCurrent => "tracks like the current one".to_string(),
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
+                Selector::Starred => "favorite (starred) tracks".to_string(),
             };
             format!("add {count} {sel} to the END of the queue (append-only)")
         }
         Action::Fade(FadeIntentIr::ToFloor { secs: s }) => {
             format!("wind DOWN to the quiet floor over {}", human_dur(*s))
-        }
-        Action::Fade(FadeIntentIr::WakeTo { vol, secs: s, .. }) => {
-            format!("wake UP to volume {} over {}", vol, human_dur(*s))
         }
         Action::Wake { selector, count } => match selector {
             Some(sel) => {
@@ -203,6 +218,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                     Selector::Genre(g) => format!("{g} tracks"),
                     Selector::Query(q) => format!("tracks matching \"{q}\""),
                     Selector::Radio => "random tracks".to_string(),
+                    Selector::Starred => "favorite (starred) tracks".to_string(),
                     _ => "tracks".to_string(),
                 };
                 format!("wake: enqueue {count} {what}, then ramp up from silence")
@@ -220,6 +236,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                 Selector::SimilarToCurrent => "tracks like the current one".to_string(),
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
+                Selector::Starred => "favorite (starred) tracks".to_string(),
             };
             format!("play {count} {sel} NOW (enqueue + start playback)")
         }
@@ -238,8 +255,10 @@ pub fn describe_plan(raw: &RawPlan) -> String {
             }
         },
         Action::Noop => "do nothing (no valid action for this request)".to_string(),
-    };
-    format!("{what} {when}")
+        Action::SetMode { mode, on } => {
+            format!("turn {} mode {}", mode.word(), if *on { "ON" } else { "OFF" })
+        }
+    }
 }
 
 /// The full echo body for a translated batch: the source trust signal, each
@@ -279,6 +298,28 @@ fn describe_qselector(sel: &QueueSelector) -> String {
         }
         QueueSelector::Range { start, end } => format!("tracks {start} through {end}"),
         QueueSelector::QueryMatch(q) => format!("tracks matching \"{q}\""),
+        QueueSelector::Qid(id) => format!("the track with id {id}"),
+        QueueSelector::Upcoming(f) => {
+            let what = match f {
+                CurateFilter::Remixes => "remixes".to_string(),
+                CurateFilter::Live => "live versions".to_string(),
+                CurateFilter::RestOfAlbum => "the rest of this album".to_string(),
+                CurateFilter::Artist(a) => format!("anything credited to \"{a}\""),
+                CurateFilter::LeadArtist(a) => format!("tracks led by \"{a}\" (features stay)"),
+            };
+            format!("{what} from the UPCOMING tracks (never the one playing)")
+        }
+    }
+}
+
+/// The human phrase for a fade's target level. Volume 0 IS the cubic-softvol
+/// floor (true silence), and "fade to volume 0" does not read as "this goes
+/// quiet" - name it, so an owner can tell a cue apart from a fade-out.
+fn level_phrase(vol: u8) -> String {
+    if vol == 0 {
+        "SILENCE (volume 0)".to_string()
+    } else {
+        format!("volume {vol}")
     }
 }
 
@@ -371,6 +412,54 @@ mod tests {
         });
     }
 
+    // The Qid selector renders as `id <n>` in the DSL and names the id in the
+    // human sentence - the agent-facing target the human reads back.
+    #[test]
+    fn qid_selector_renders_dsl_and_human_text() {
+        use crate::plan::QueueSelector;
+        assert_eq!(qselector_dsl(&QueueSelector::Qid(88)).as_deref(), Some("id 88"));
+        assert_eq!(describe_qselector(&QueueSelector::Qid(88)), "the track with id 88");
+        let raw = RawPlan {
+            version: 1,
+            trigger: RawTrigger::Immediate,
+            action: Action::Remove { sel: QueueSelector::Qid(88) },
+            once: false,
+            origin: String::new(),
+        };
+        assert_eq!(
+            render_dsl(&raw).as_deref(),
+            Some("trigger immediate action remove id 88")
+        );
+        assert!(describe_plan(&raw).contains("the track with id 88"), "{}", describe_plan(&raw));
+    }
+
+    // The recurring trigger round-trips through the DSL for every day-set shape,
+    // and its human clause says it repeats (the confirm prompt must not read as a
+    // one-shot).
+    #[test]
+    fn render_dsl_round_trips_daily_trigger() {
+        use crate::plan::DaySet;
+        for days in [DaySet::EVERY, DaySet::WEEKDAYS, DaySet::WEEKENDS, DaySet(0b0010101)] {
+            let raw = RawPlan {
+                version: 1,
+                trigger: RawTrigger::Daily { hour: 7, minute: 5, days },
+                action: Action::Fade(FadeIntentIr::Out { secs: 600.0 }),
+                once: false,
+                origin: String::new(),
+            };
+            assert_round_trip(&raw);
+        }
+        let raw = RawPlan {
+            version: 1,
+            trigger: RawTrigger::Daily { hour: 23, minute: 0, days: DaySet::WEEKDAYS },
+            action: Action::Stop,
+            once: false,
+            origin: String::new(),
+        };
+        assert_eq!(render_dsl(&raw).as_deref(), Some("trigger daily 23:00 on weekdays action stop"));
+        assert!(describe_plan(&raw).contains("every weekday at 23:00"), "{}", describe_plan(&raw));
+    }
+
     #[test]
     fn render_dsl_round_trips_queue_edit_actions() {
         use crate::plan::{ClearScope, MoveDest, QueueSelector};
@@ -388,6 +477,12 @@ mod tests {
             QueueSelector::Last(2),
             QueueSelector::Range { start: 2, end: 5 },
             QueueSelector::QueryMatch("blue in green".into()),
+            QueueSelector::Qid(88),
+            QueueSelector::Upcoming(CurateFilter::Remixes),
+            QueueSelector::Upcoming(CurateFilter::Live),
+            QueueSelector::Upcoming(CurateFilter::RestOfAlbum),
+            QueueSelector::Upcoming(CurateFilter::Artist("Daft Punk".into())),
+            QueueSelector::Upcoming(CurateFilter::LeadArtist("Pharrell".into())),
         ] {
             assert_round_trip(&imm(Action::Remove { sel }));
         }
@@ -408,6 +503,19 @@ mod tests {
         }));
         // Noop round-trips too.
         assert_round_trip(&imm(Action::Noop));
+        // Playback modes round-trip in both directions.
+        for mode in [
+            crate::plan::PlayMode::Random,
+            crate::plan::PlayMode::Repeat,
+            crate::plan::PlayMode::Single,
+            crate::plan::PlayMode::Consume,
+        ] {
+            assert_round_trip(&imm(Action::SetMode { mode, on: true }));
+            assert_round_trip(&imm(Action::SetMode { mode, on: false }));
+        }
+        // The starred (favorites) selector round-trips for enqueue and playnow.
+        assert_round_trip(&imm(Action::Enqueue { selector: Selector::Starred, count: 20 }));
+        assert_round_trip(&imm(Action::PlayNow { selector: Selector::Starred, count: 20 }));
         // PlayNow (library enqueue-then-start) round-trips its query/genre/radio DSL.
         assert_round_trip(&imm(Action::PlayNow {
             selector: Selector::Query("at the door".into()),
@@ -447,6 +555,74 @@ mod tests {
         });
         assert!(d.contains("start playback"), "not honest about starting: {d}");
         assert!(d.contains("at the door"));
+    }
+
+    /// The dB target a plan fade ACTUALLY drives toward, read off the same
+    /// [`crate::executor::map_fade`] seam the executor uses. `None` for a fade
+    /// whose target is not an explicit dB (Out/In/ToFloor).
+    fn real_fade_target_db(raw: &RawPlan) -> Option<f64> {
+        let ir = match &raw.action {
+            Action::Fade(ir) => ir,
+            other => panic!("not a fade: {other:?}"),
+        };
+        match crate::executor::map_fade(ir).intent {
+            crate::handler::FadeIntent::To { target_db, .. }
+            | crate::handler::FadeIntent::WakeTo { target_db, .. } => Some(target_db),
+            _ => None,
+        }
+    }
+
+    /// SAFETY (the echo cannot lie about loudness): two plans that render to the
+    /// SAME DSL / human sentence must drive the SAME fade. `FadeIntentIr::To`
+    /// carried a `target_db` INDEPENDENT of `vol` while only `vol` reached the
+    /// echo, so `fade to volume 40` and a fade to silence were indistinguishable
+    /// in the string a human approves - and `target_db` is what actually drives
+    /// the envelope. The JSON here is the real ingress (a serde-deserialized raw
+    /// plan), so a stale/hostile `target_db` key stays exercised after the field
+    /// is gone from the IR.
+    #[test]
+    fn fade_to_echo_cannot_hide_the_real_target() {
+        let plan = |target_db: &str| -> RawPlan {
+            let json = format!(
+                r#"{{"trigger":{{"kind":"immediate"}},"action":{{"act":"fade","v":{{"dir":"to","target_db":{target_db},"vol":40,"secs":10.0}}}}}}"#
+            );
+            serde_json::from_str(&json).expect("raw plan JSON")
+        };
+        let loud = plan("-8.0");
+        let silent = plan("-120.0");
+        // Both echo identically today (only `vol` is rendered) ...
+        assert_eq!(render_dsl(&loud), render_dsl(&silent));
+        assert_eq!(describe_plan(&loud), describe_plan(&silent));
+        // ... so they MUST also fade identically, or the echo is a lie.
+        assert_eq!(
+            real_fade_target_db(&loud),
+            real_fade_target_db(&silent),
+            "same echo, different real fade target: the approved string is a lie",
+        );
+        // And the rendered volume is the one actually driven (the cubic softvol
+        // seam), not an unrelated dB smuggled alongside it.
+        assert_eq!(
+            real_fade_target_db(&loud),
+            Some(crate::player::mpv_volume_to_db(40.0)),
+        );
+    }
+
+    /// A human must be able to tell "fade to volume 40" from "fade to silence":
+    /// vol 0 IS silence (the cubic softvol floor), so the sentence says so.
+    #[test]
+    fn describe_fade_to_zero_says_silence() {
+        let imm = |action| RawPlan {
+            version: 1,
+            trigger: RawTrigger::Immediate,
+            action,
+            once: false,
+            origin: String::new(),
+        };
+        let d = describe_plan(&imm(Action::Fade(FadeIntentIr::To { vol: 0, secs: 10.0 })));
+        assert!(d.to_lowercase().contains("silence"), "vol 0 must read as silence: {d}");
+        let d40 = describe_plan(&imm(Action::Fade(FadeIntentIr::To { vol: 40, secs: 10.0 })));
+        assert!(d40.contains("volume 40"), "{d40}");
+        assert!(!d40.to_lowercase().contains("silence"), "vol 40 is not silence: {d40}");
     }
 
     #[test]

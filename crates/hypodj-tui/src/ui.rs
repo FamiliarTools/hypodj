@@ -312,10 +312,13 @@ fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     // Record the measured max so the scroll keys can clamp against it: without it `j`
     // past the end keeps incrementing an offset only the renderer clamps, and `k` then
     // appears stuck at the bottom while it unwinds the phantom distance.
+    // Title and close key both come from the panel kind, so the overlay can never
+    // tell the human to press a letter that does not close what they are looking at.
+    let (name, key) = (state.panel.title(), state.panel.close_key());
     let title = if max_scroll > 0 {
-        format!("Marks ({}/{})  j/k scroll  t closes", scroll + 1, max_scroll + 1)
+        format!("{name} ({}/{})  j/k scroll  {key} closes", scroll + 1, max_scroll + 1)
     } else {
-        "Marks  t closes".to_string()
+        format!("{name}  {key} closes")
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -775,6 +778,17 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
             "F5 to search, F4 to ask the DJ",
             Style::default().quiet(),
         )));
+        // The modes still decide what the next play does, so a stopped deck says them.
+        if let Some(m) = np.modes.label() {
+            lines.push(Line::from(Span::styled(
+                format!("modes: {m}"),
+                hypodj_style::ratatui::style_for(
+                    hypodj_style::Role::InkQuiet,
+                    state.term_bg,
+                    state.truecolor,
+                ),
+            )));
+        }
         if let Some(a) = &armed_line {
             lines.extend(hypodj_style::ratatui::render(a, state.term_bg, state.truecolor));
         }
@@ -906,8 +920,16 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     }
     // Playback status: state | volume fader | N of M | M:SS.
     lines.push(Line::from(Span::styled(
-        status_line(np, text_area.width as usize),
-        Style::default().quiet(),
+        status_line(
+            np,
+            state.live_elapsed(std::time::Instant::now()),
+            text_area.width as usize,
+        ),
+        hypodj_style::ratatui::style_for(
+            hypodj_style::Role::InkQuiet,
+            state.term_bg,
+            state.truecolor,
+        ),
     )));
     if let Some(a) = armed_line {
         lines.extend(hypodj_style::ratatui::render(&a, state.term_bg, state.truecolor));
@@ -1047,7 +1069,7 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// "[playing|paused|stopped] · vol [==#--] V% · track N of M · M:SS total".
+/// "[playing|paused|stopped] · vol [==#--] V% · track N of M · M:SS / M:SS".
 ///
 /// Every number is LABELLED, because the unlabelled version lied. A bare
 /// `[======#-----] 56% | 1 of 5 | 7:14` sits exactly where a seek bar sits in every
@@ -1059,8 +1081,9 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
 /// The separator is a middle dot, not ` | `: three pipes in a forty-cell line read as
 /// table rules on a surface whose whole register is quiet.
 ///
-/// Volume is hidden when unknown, and elapsed is NEVER rendered (the server does not
-/// emit it) - which is precisely why the duration must say what it is.
+/// Volume is hidden when unknown. When the daemon reports a playhead the time reads
+/// `1:23 / 7:14` (a scrub's only feedback); without one (an older daemon) it stays
+/// `7:14 total`, because a bare duration is exactly what reads as elapsed.
 ///
 /// `width` is the pane's inner width, and the line SHEDS PARTS to fit it rather than
 /// being clipped. That is the whole reason width is a parameter: the paragraph does not
@@ -1073,8 +1096,9 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
 /// see change), then the queue position. Transport state and duration are never
 /// dropped - they are what the line is FOR. Each surviving part keeps its label; a
 /// half-labelled line is worse than a shorter one.
-fn status_line(np: &NowPlaying, width: usize) -> String {
+fn status_line(np: &NowPlaying, elapsed: Option<f64>, width: usize) -> String {
     let volume = np.volume.filter(|v| *v >= 0).map(|v| v.min(100) as u8);
+    let modes = np.modes.label();
     let compose = |fader: bool, show_volume: bool, show_position: bool| {
         let mut bits = Vec::new();
         match np.state.as_deref() {
@@ -1094,9 +1118,21 @@ fn status_line(np: &NowPlaying, width: usize) -> String {
         if let (Some(song), Some(m), true) = (np.song, np.playlistlength, show_position) {
             bits.push(format!("track {} of {}", song.saturating_add(1), m));
         }
-        if let Some(d) = np.duration {
-            let total = d as u64;
-            bits.push(format!("{}:{:02} total", total / 60, total % 60));
+        let mmss = |secs: f64| {
+            let t = secs as u64;
+            format!("{}:{:02}", t / 60, t % 60)
+        };
+        match (elapsed, np.duration) {
+            (Some(e), Some(d)) => bits.push(format!("{} / {}", mmss(e), mmss(d))),
+            (None, Some(d)) => bits.push(format!("{} total", mmss(d))),
+            (Some(e), None) => bits.push(format!("{} in", mmss(e))),
+            (None, None) => {}
+        }
+        // The ON playback modes. Never shed (they decide what happens when this track
+        // ends), but LAST, so a pane too narrow for anything clips them before it
+        // clips the labelled duration.
+        if let Some(m) = &modes {
+            bits.push(m.clone());
         }
         bits.join(" \u{00b7} ")
     };
@@ -1258,6 +1294,18 @@ mod tests {
         };
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(out.contains("toward calmer (58%, 3m ago)"), "field pull line drawn:\n{out}");
+    }
+
+    #[test]
+    fn now_playing_pane_draws_the_paused_playhead() {
+        let mut s = TuiState::new();
+        s.now.state = Some("pause".into());
+        s.now.title = Some("Blue in Green".into());
+        s.now.duration = Some(337.0);
+        s.now.elapsed = Some(83.0);
+        s.now_at = Some(std::time::Instant::now());
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("paused \u{b7} 1:23 / 5:37"), "playhead drawn:\n{out}");
     }
 
     #[test]
@@ -1466,13 +1514,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            status_line(&np, 80),
+            status_line(&np, None, 80),
             "playing \u{b7} vol [======#-----] 56% \u{b7} track 1 of 5 \u{b7} 7:14 total"
         );
 
         // And it stays honest as fields drop out: no volume, no queue, no duration.
         let lean = NowPlaying { state: Some("pause".into()), ..Default::default() };
-        assert_eq!(status_line(&lean, 80), "paused");
+        assert_eq!(status_line(&lean, None, 80), "paused");
 
         // An unknown volume (-1) is hidden rather than rendered as a fader at zero,
         // which would claim silence the daemon never reported.
@@ -1481,27 +1529,54 @@ mod tests {
             volume: Some(-1),
             ..Default::default()
         };
-        assert_eq!(status_line(&unknown, 80), "playing");
+        assert_eq!(status_line(&unknown, None, 80), "playing");
 
         // NARROW: the fader is the first thing to go, because it is the only part that
         // says nothing the number does not. Every label survives, which is the point -
         // clipping would have taken `total` off the end and restored the old lie.
-        let narrow = status_line(&np, 50);
+        let narrow = status_line(&np, None, 50);
         assert_eq!(narrow, "playing \u{b7} vol 56% \u{b7} track 1 of 5 \u{b7} 7:14 total");
         assert!(narrow.chars().count() <= 50, "and it now fits: {narrow}");
 
         // NARROWER STILL: the volume goes (he just set it, and can see it change), then
         // the queue position. Transport state and duration never go, and nothing that
         // survives loses its label.
-        let tight = status_line(&np, 38);
+        let tight = status_line(&np, None, 38);
         assert_eq!(tight, "playing \u{b7} track 1 of 5 \u{b7} 7:14 total");
         assert!(tight.chars().count() <= 38, "fits: {tight}");
-        let tighter = status_line(&np, 25);
+        let tighter = status_line(&np, None, 25);
         assert_eq!(tighter, "playing \u{b7} 7:14 total");
 
         // Below even that there is nothing left to drop, so the shortest honest line is
         // handed over and the terminal clips it - never a longer one.
-        assert_eq!(status_line(&np, 4), "playing \u{b7} 7:14 total");
+        assert_eq!(status_line(&np, None, 4), "playing \u{b7} 7:14 total");
+    }
+
+    #[test]
+    fn transport_line_names_the_modes_that_are_on() {
+        use hypodj_client::model::PlaybackModes;
+        let np = NowPlaying {
+            state: Some("play".into()),
+            duration: Some(434.0),
+            modes: PlaybackModes { random: true, consume: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(status_line(&np, None, 80), "playing \u{b7} 7:14 total \u{b7} random consume");
+        // All off adds nothing, so the default deck reads exactly as before.
+        let plain = NowPlaying { modes: PlaybackModes::default(), ..np };
+        assert_eq!(status_line(&plain, None, 80), "playing \u{b7} 7:14 total");
+    }
+
+    #[test]
+    fn status_line_shows_the_playhead_when_reported() {
+        let np = NowPlaying {
+            state: Some("play".into()),
+            duration: Some(434.0),
+            ..Default::default()
+        };
+        assert_eq!(status_line(&np, Some(83.9), 80), "playing \u{b7} 1:23 / 7:14");
+        let stream = NowPlaying { state: Some("play".into()), ..Default::default() };
+        assert_eq!(status_line(&stream, Some(65.0), 80), "playing \u{b7} 1:05 in");
     }
 
     #[test]
@@ -1551,6 +1626,7 @@ mod tests {
             artist: Some(artist.into()),
             uri: Some(format!("song/{pos}")),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         };
         s.queue = vec![
@@ -1733,6 +1809,7 @@ mod tests {
             artist: Some("Life Without Buildings".into()),
             uri: Some("song/1".into()),
             album_uri: None,
+            artist_uri: None,
             details: vec![
                 ("Album".into(), "Any Other City".into()),
                 ("X-Plays".into(), "12".into()),
@@ -1806,6 +1883,75 @@ mod tests {
             !out.contains("paused while streaming"),
             "the reason itself defers to `dj status` at this width:\n{out}"
         );
+    }
+
+    #[test]
+    fn the_footer_offers_the_retraction_in_the_daemons_own_words() {
+        // The badge text is produced by the SHARED formatter from the daemon's own
+        // `PlanOutcome::render()`; the TUI only places it. Nothing a model said can
+        // reach a character of this row.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.undo_offer = Some("agent removed 3 - u to undo (12s)".into());
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("agent removed 3 - u to undo (12s)"), "{out}");
+        // Nothing to retract -> no offer at all, rather than a dead one.
+        let mut s2 = TuiState::new();
+        s2.now.state = Some("play".into());
+        let out2 = render_to_lines(&s2).join("\n");
+        assert!(!out2.contains("to undo"), "{out2}");
+    }
+
+    #[test]
+    fn the_offer_takes_the_badge_slot_ahead_of_the_store_line() {
+        // Both want the one badge slot. The offer wins because it EXPIRES: the store
+        // numbers will still be true in a minute and this will not.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.store = Some("318 of 347 tracks, 12.1 of 16.0 GiB".into());
+        s.undo_offer = Some("agent cleared 7 - u to undo (4s)".into());
+        let out = render_to_lines_sized(&s, 80, 30).join("\n");
+        assert!(out.contains("agent cleared 7 - u to undo (4s)"), "{out}");
+        assert!(!out.contains("offline:"), "the store badge yields the slot:\n{out}");
+        // And it hands the slot straight back once there is nothing to retract.
+        s.undo_offer = None;
+        let out = render_to_lines_sized(&s, 80, 30).join("\n");
+        assert!(out.contains("offline: 318 of 347 tracks"), "{out}");
+    }
+
+    #[test]
+    fn a_narrow_bar_steps_the_offer_down_to_the_key_instead_of_dropping_it() {
+        // A retraction the human never learns about is the whole failure this badge
+        // exists to prevent, so the last thing shed is the sentence, never the offer.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.undo_offer = Some("agent removed The Man Machine - u to undo (12s)".into());
+        let out = render_to_lines_sized(&s, 44, 24).join("\n");
+        assert!(!out.contains("The Man Machine"), "the sentence does not fit:\n{out}");
+        assert!(out.contains("u to undo"), "but the offer survives:\n{out}");
+    }
+
+    #[test]
+    fn the_journal_overlay_says_its_own_name_and_its_own_close_key() {
+        // One overlay, two contents - so the title and the close key must both come
+        // from the panel kind, or it tells the human to press a letter that does not
+        // close what they are looking at.
+        let mut s = TuiState::new();
+        s.open_journal(vec![
+            "[ 12]    4s  agent sess-3f2a19bc     cleared 7  <- u".to_string(),
+            "[ 11]    2m  mpd                     added 3".to_string(),
+        ]);
+        let out = render_to_lines_sized(&s, 80, 24).join("\n");
+        assert!(out.contains("Journal"), "{out}");
+        assert!(out.contains("U closes"), "{out}");
+        assert!(out.contains("cleared 7"), "the daemon's own sentence renders:\n{out}");
+        assert!(!out.contains("Marks"), "it is not the ledger:\n{out}");
+        // The ledger still says its own name and key.
+        let mut s = TuiState::new();
+        s.open_heard(vec!["3 marks, oldest first".to_string(), "18:02  something".to_string()]);
+        let out = render_to_lines_sized(&s, 80, 24).join("\n");
+        assert!(out.contains("Marks"), "{out}");
+        assert!(out.contains("t closes"), "{out}");
     }
 
     fn render_to_lines(state: &TuiState) -> Vec<String> {
@@ -1960,6 +2106,7 @@ mod tests {
                 artist: Some("C418".into()),
                 uri: Some("song/1".into()),
                 album_uri: None,
+                artist_uri: None,
                 details: Vec::new(),
             }],
         );
@@ -2774,6 +2921,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }];
         s.now.hint = Some(AmbientHint {
@@ -2800,6 +2948,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }];
         s.now.continuation = Some("NTS 1".into());
@@ -2825,6 +2974,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }];
         let intent = s.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
@@ -2855,6 +3005,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }];
         s.now.continuation = Some("more like Roygbiv".into());
@@ -3451,10 +3602,27 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 // from the wave.
                 let fits = |b: &String| full > hint_len + b.chars().count() + MIN_WAVE_CELLS;
                 let store = state.now.store.as_deref();
-                let badge = store
-                    .and_then(store_badge)
-                    .map(|b| format!("  offline: {b}"))
+                // THE RETRACTION OFFER takes the badge slot whenever there is one,
+                // ahead of the store badge. It is the only badge here that EXPIRES -
+                // the store's numbers will still be true in a minute, this offer will
+                // not - and it is the one surface where the human decides whether to
+                // keep what an agent just did. Its text is the daemon's own sentence,
+                // rendered by the shared formatter, so nothing a model said can reach
+                // it. When it does not fit it steps down to the bare key hint rather
+                // than vanishing: a retraction the human never learns about is the
+                // whole failure this badge exists to prevent.
+                let badge = state
+                    .undo_offer
+                    .as_ref()
+                    .map(|b| format!("  {b}"))
                     .filter(fits)
+                    .or_else(|| Some("  u to undo".to_string()).filter(|_| state.undo_offer.is_some()).filter(fits))
+                    .or_else(|| {
+                        store
+                            .and_then(store_badge)
+                            .map(|b| format!("  offline: {b}"))
+                            .filter(fits)
+                    })
                     .or_else(|| {
                         store
                             .and_then(store_badge_short)
@@ -3707,7 +3875,7 @@ fn render_sixel_art(
     art: &crate::art::AlbumArt,
     cell_px: Option<(u16, u16)>,
     gen: bool,
-    held: &std::cell::RefCell<Option<String>>,
+    held: &std::cell::RefCell<Option<crate::state::SixelHeld>>,
     covered: bool,
 ) -> bool {
     use crate::art::{art_mode, ArtMode};
@@ -3747,13 +3915,26 @@ fn render_sixel_art(
     // `TuiState::sixel_held`). Otherwise take the current payload, with the generation
     // mixed in as a trailing SGR reset that renders as nothing and exists only to differ
     // from what the diff already sent.
-    let symbol: String = match (covered, held.borrow().as_deref()) {
-        (true, Some(pinned)) => pinned.to_string(),
-        _ if gen => format!("{payload}\x1b[0m"),
-        _ => payload.to_string(),
+    //
+    // The pin is only valid for the geometry it was encoded for. A resize while the
+    // overlay is up moves or rescales the pane, and the pinned payload would then be
+    // emitted at a new anchor with the OLD pixel size - a mis-sized image, and drawn
+    // over the popup to boot. There is no correct sixel to send under a popup, so fall
+    // back to the cell renderer until it closes; the close frame flips the generation
+    // and re-sends a payload encoded for the new geometry.
+    let geometry = (rect, (cw, ch));
+    let pinned = match (covered, held.borrow().as_ref()) {
+        (true, Some(h)) if h.geometry == geometry => Some(h.payload.clone()),
+        (true, Some(_)) => return false,
+        _ => None,
+    };
+    let symbol: String = match pinned {
+        Some(p) => p,
+        None if gen => format!("{payload}\x1b[0m"),
+        None => payload.to_string(),
     };
     if !covered {
-        *held.borrow_mut() = Some(symbol.clone());
+        *held.borrow_mut() = Some(crate::state::SixelHeld { geometry, payload: symbol.clone() });
     }
     let payload = symbol;
     let buf = f.buffer_mut();
@@ -3909,6 +4090,56 @@ mod sixel_render_tests {
         let after = payload_of(&terminal);
         assert_ne!(under_popup, after, "the close frame re-sends the image");
         assert!(after.is_some(), "and there is still a cover on screen");
+    }
+
+    /// m2zhfld: the pin is keyed on GEOMETRY too. Resizing while a popup is open must
+    /// never emit the held payload, which was encoded for the old pixel size; the pane
+    /// falls back to cells under the popup, and the close re-sends at the new size.
+    #[test]
+    fn a_resize_under_an_open_popup_never_emits_the_stale_geometry_payload() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut s = TuiState::new();
+        s.sixel_cell_px = Some((8, 17));
+        s.now.state = Some("play".into());
+        s.now.title = Some("A".into());
+        s.art = Some(art());
+        let payload_of = |t: &Terminal<TestBackend>| -> Option<String> {
+            t.backend().buffer().content().iter()
+                .map(|c| c.symbol().to_string())
+                .find(|sym| sym.starts_with("\x1bP"))
+        };
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let before = payload_of(&terminal).expect("the cover is drawn as a sixel payload");
+
+        s.menu = Some(crate::menu::Menu::new(
+            crate::menu::Target {
+                kind: crate::menu::TargetKind::LibrarySong,
+                origin: crate::menu::Origin::NowPlaying,
+                label: "A".into(),
+                uri: Some("song/s1".into()),
+                album_uri: None,
+                artist: None,
+                artist_uri: None,
+                match_uri: None,
+            },
+            0,
+        ));
+        terminal.draw(|f| render(f, &s)).unwrap();
+
+        // The terminal is resized with the popup still up.
+        terminal.backend_mut().resize(100, 40);
+        terminal.resize(Rect::new(0, 0, 100, 40)).unwrap();
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert_ne!(
+            payload_of(&terminal).as_deref(),
+            Some(before.as_str()),
+            "the payload encoded for the old geometry must not be emitted at the new one"
+        );
+
+        s.menu = None;
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let after = payload_of(&terminal).expect("the close frame re-sends the cover");
+        assert_ne!(after, before, "re-encoded for the new geometry");
     }
 
     /// The payload goes in ONE cell and every other cell of the rect is skipped.

@@ -35,7 +35,7 @@ role through its own adapter (ratatui, egui, ANSI or plain text).
 |---|---|
 | `room.bg` | The detected background: OSC 11, then `COLORFGBG`, then dark default (TUI); OS theme (GUI). HypoDJ never paints its own background. |
 | `ink.primary` | Highest-contrast text against `room.bg`, at least 7:1. |
-| `ink.quiet` | Secondary text (DIM), at least 4.5:1. Used for metadata, hints, and anything not yet real. |
+| `ink.quiet` | Secondary text, at least 4.5:1. Under a reported room (OSC 11) it is the fitted colour and not DIM. With no reported room it is DIM and the terminal's own foreground. Used for metadata, hints, and anything not yet real. |
 | `rule` | Hairlines and box-drawing, at most 2:1. Structure is felt, not seen. |
 
 ### 2. Music (borrowed from the cover)

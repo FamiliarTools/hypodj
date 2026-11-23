@@ -116,6 +116,13 @@ pub enum MpdCommand {
     Clear,
     /// `delete <pos|range>` - remove a queue entry.
     Delete(Option<String>),
+    /// `move FROM[:TO] TO` - move the half-open position range `start..end` so its
+    /// first entry lands at `to`. `end` is `None` for an open `START:` range.
+    Move { start: usize, end: Option<usize>, to: usize },
+    /// `moveid ID TO` - move the entry with MPD id `ID` to position `TO`.
+    MoveId(u64, usize),
+    /// `shuffle [START:END]` - shuffle the queue (or a half-open range of it) in place.
+    Shuffle(Option<(usize, Option<usize>)>),
     /// `playlistinfo [pos|range]` - the current queue.
     PlaylistInfo(Option<String>),
     /// `playlistid [id]` - the current queue, optionally one entry by id.
@@ -136,8 +143,8 @@ pub enum MpdCommand {
     /// `playlistadd Starred song/<id>` stars the song server-side.
     PlaylistAdd(String, String),
     /// `playlistdelete <name> <pos>` - position-based (MPD has no uri delete).
-    /// For `Starred`, the position maps back to a starred song id (re-fetched in
-    /// the same order `listplaylistinfo` returned) -> unstar.
+    /// For `Starred`, the position is read against the last listed order and
+    /// validated against a fresh fetch before the song is unstarred.
     PlaylistDelete(String, usize),
     /// `playlistclear <name>` - clear a stored playlist.
     PlaylistClear(String),
@@ -216,6 +223,17 @@ pub enum MpdCommand {
     /// ([`crate::plan`]). NOT a standard MPD command; a hypodj extension. See
     /// [`PlanCmd`] and [`parse_plan`].
     Plan(PlanCmd),
+
+    /// `journal` - the UNDO RING: the last 32 [`crate::plan::Action`] executions
+    /// with the daemon's own outcome text, newest first, each flagged with whether
+    /// it is undoable RIGHT NOW. NOT a standard MPD command; a hypodj extension.
+    Journal,
+    /// `undo [<jid>]` - retract the top undoable journal entry, or the named one
+    /// (which must BE the top). The argument is carried RAW rather than pre-parsed
+    /// so a non-numeric id can ACK instead of silently degrading to "the top" - the
+    /// one thing a retraction verb must never do. NOT a standard MPD command; a
+    /// hypodj extension.
+    Undo(Option<String>),
 
     /// `nl "<request>"` / `nl confirm <token>` / `nl cancel <token>` - the P3
     /// OPTIONAL natural-language surface. Translate EMITS a validated plan echoed
@@ -663,6 +681,8 @@ pub enum WakeWhen {
     At { h: u32, m: u32 },
     /// `wake in <dur>` - a monotonic span from now.
     In(Duration),
+    /// `wake daily <time> [on <days>]` - a RECURRING local `h:m` on `days`.
+    Daily { h: u32, m: u32, days: crate::plan::DaySet },
 }
 
 /// A parsed `wake` subcommand (the convenience wake ramp-in surface).
@@ -889,6 +909,20 @@ fn parse_trigger(toks: &[String]) -> Option<RawTrigger> {
         "in" => Some(RawTrigger::SpanElapsed {
             secs: parse_secs(toks.get(1)?)?,
         }),
+        // `daily <time> [on daily|weekdays|weekends|mon,wed,...]` - the RECURRING
+        // local time-of-day trigger (re-armed after every fire).
+        "daily" => {
+            let (hour, minute) = parse_civil_time(toks.get(1)?)?;
+            let days = match toks.get(2).map(|t| t.to_lowercase()).as_deref() {
+                None => crate::plan::DaySet::EVERY,
+                Some("on") => crate::plan::DaySet::parse(toks.get(3)?)?,
+                Some(_) => return None,
+            };
+            if toks.len() > 4 {
+                return None;
+            }
+            Some(RawTrigger::Daily { hour: hour as u8, minute: minute as u8, days })
+        }
         "at" => {
             let raw = toks.get(1)?;
             let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
@@ -942,13 +976,10 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
             "to" => {
                 let vol = toks.get(2)?.parse::<u8>().ok()?;
                 let secs = parse_secs(toks.get(3)?)?;
-                // The target dB is derived from the requested 0..=100 volume (the
-                // same cubic-softvol seam the handler uses); validate clamps it.
-                Some(Action::Fade(FadeIntentIr::To {
-                    target_db: crate::player::mpv_volume_to_db(vol as f64),
-                    vol,
-                    secs,
-                }))
+                // Only the 0..=100 volume is carried; the target dB is derived from
+                // it (the same cubic-softvol seam the handler uses) at execute time,
+                // so the echoed level cannot diverge from the driven one.
+                Some(Action::Fade(FadeIntentIr::To { vol, secs }))
             }
             _ => None,
         },
@@ -958,6 +989,7 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "query" => (Selector::Query(toks.get(2)?.clone()), 3),
                 "genre" => (Selector::Genre(toks.get(2)?.clone()), 3),
                 "similar_current" => (Selector::SimilarToCurrent, 2),
+                "starred" => (Selector::Starred, 2),
                 _ => return None,
             };
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
@@ -970,6 +1002,7 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "query" => (Selector::Query(toks.get(2)?.clone()), 3),
                 "genre" => (Selector::Genre(toks.get(2)?.clone()), 3),
                 "similar_current" => (Selector::SimilarToCurrent, 2),
+                "starred" => (Selector::Starred, 2),
                 _ => return None,
             };
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
@@ -979,6 +1012,15 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
         "remove" => Some(Action::Remove { sel: parse_qselector(&toks[1..])? }),
         "play" => Some(Action::Play { sel: parse_qselector(&toks[1..])? }),
         "noop" => Some(Action::Noop),
+        "mode" => {
+            let mode = crate::plan::PlayMode::from_word(&toks.get(1)?.to_lowercase())?;
+            let on = match toks.get(2)?.to_lowercase().as_str() {
+                "on" | "1" => true,
+                "off" | "0" => false,
+                _ => return None,
+            };
+            Some(Action::SetMode { mode, on })
+        }
         "clear" => match toks.get(1)?.to_lowercase().as_str() {
             "all" => Some(Action::Clear { scope: ClearScope::All }),
             "after" => Some(Action::Clear { scope: ClearScope::AfterCurrent }),
@@ -1001,10 +1043,14 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
 }
 
 /// Parse a queue selector off the leading tokens: `current` | `pos <n>` |
-/// `last <n>` | `range <start> <end>` | `match <query>`. Positions are 1-based.
+/// `last <n>` | `range <start> <end>` | `match <query>` | `id <qid>`. Positions
+/// are 1-based; `id` is the STABLE queue id (`Id:` on the wire), which is the
+/// only form that still names the row a caller read earlier - trimming and
+/// autofill shift every position.
 fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
     match toks.first()?.to_lowercase().as_str() {
         "current" => Some(QueueSelector::Current),
+        "id" => Some(QueueSelector::Qid(toks.get(1)?.parse().ok()?)),
         "pos" => Some(QueueSelector::Position(toks.get(1)?.parse().ok()?)),
         "last" => Some(QueueSelector::Last(toks.get(1)?.parse().ok()?)),
         "range" => Some(QueueSelector::Range {
@@ -1012,12 +1058,40 @@ fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
             end: toks.get(2)?.parse().ok()?,
         }),
         "match" => Some(QueueSelector::QueryMatch(toks.get(1)?.clone())),
+        "upcoming" => {
+            use crate::plan::CurateFilter;
+            Some(QueueSelector::Upcoming(match toks.get(1)?.to_lowercase().as_str() {
+                "remixes" => CurateFilter::Remixes,
+                "live" => CurateFilter::Live,
+                "album" => CurateFilter::RestOfAlbum,
+                "artist" => CurateFilter::Artist(toks.get(2)?.clone()),
+                "lead" => CurateFilter::LeadArtist(toks.get(2)?.clone()),
+                _ => return None,
+            }))
+        }
         _ => None,
     }
 }
 
 /// Parse a move destination: `pos <n>` (1-based absolute) | `rel <d>` (signed,
 /// relative to the current track).
+/// Parse an MPD position or half-open range: `N` is `(N, Some(N + 1))`, `N:M` is
+/// `(N, Some(M))`, and an open `N:` is `(N, None)` (to the end of the queue). A
+/// malformed spec or an inverted range (`M < N`) is `None` so the caller ACKs.
+pub fn parse_pos_range(spec: &str) -> Option<(usize, Option<usize>)> {
+    match spec.split_once(':') {
+        None => {
+            let n: usize = spec.parse().ok()?;
+            Some((n, Some(n.checked_add(1)?)))
+        }
+        Some((a, "")) => Some((a.parse().ok()?, None)),
+        Some((a, b)) => {
+            let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+            (b >= a).then_some((a, Some(b)))
+        }
+    }
+}
+
 fn parse_movedest(toks: &[String]) -> Option<MoveDest> {
     match toks.first()?.to_lowercase().as_str() {
         "pos" => Some(MoveDest::Position(toks.get(1)?.parse().ok()?)),
@@ -1258,6 +1332,23 @@ fn parse_wake(args: &[String], line: &str) -> MpdCommand {
                 count: DEFAULT_WAKE_ENQUEUE,
             })
         }
+        Some("daily") => {
+            let Some((h, m)) = args.get(1).and_then(|t| parse_civil_time(t)) else {
+                return unsupported();
+            };
+            let (days, rest) = match args.get(2).map(|t| t.to_lowercase()).as_deref() {
+                Some("on") => match args.get(3).and_then(|t| crate::plan::DaySet::parse(t)) {
+                    Some(d) => (d, 4),
+                    None => return unsupported(),
+                },
+                _ => (crate::plan::DaySet::EVERY, 2),
+            };
+            MpdCommand::Wake(WakeCmd::Set {
+                when: WakeWhen::Daily { h, m, days },
+                selector: parse_wake_selector(&args[rest.min(args.len())..]),
+                count: DEFAULT_WAKE_ENQUEUE,
+            })
+        }
         Some("in") => {
             let Some(d) = args.get(1).and_then(|t| parse_dur_hms(t)) else {
                 return unsupported();
@@ -1405,9 +1496,29 @@ pub fn parse(line: &str) -> MpdCommand {
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         "add" => MpdCommand::Add(arg(0).unwrap_or_default()),
-        "addid" => MpdCommand::AddId(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok())),
+        "addid" => match arg(1).map(|s| s.parse::<usize>()) {
+            None => MpdCommand::AddId(arg(0).unwrap_or_default(), None),
+            Some(Ok(pos)) => MpdCommand::AddId(arg(0).unwrap_or_default(), Some(pos)),
+            // A bad position is a loud ACK, never a silent append.
+            Some(Err(_)) => MpdCommand::Unsupported(line.to_string()),
+        },
         "clear" => MpdCommand::Clear,
         "delete" => MpdCommand::Delete(arg(0)),
+        "move" => match (arg(0).as_deref().and_then(parse_pos_range), arg(1).and_then(|s| s.parse().ok())) {
+            (Some((start, end)), Some(to)) => MpdCommand::Move { start, end, to },
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "moveid" => match (arg(0).and_then(|s| s.parse().ok()), arg(1).and_then(|s| s.parse().ok())) {
+            (Some(id), Some(to)) => MpdCommand::MoveId(id, to),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "shuffle" => match arg(0) {
+            None => MpdCommand::Shuffle(None),
+            Some(r) => match parse_pos_range(&r) {
+                Some(range) => MpdCommand::Shuffle(Some(range)),
+                None => MpdCommand::Unsupported(line.to_string()),
+            },
+        },
         "playlistinfo" => MpdCommand::PlaylistInfo(arg(0)),
         "playlistid" => MpdCommand::PlaylistId(arg(0).and_then(|s| s.parse().ok())),
         "plchanges" => MpdCommand::PlChanges(arg(0).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -1454,6 +1565,11 @@ pub fn parse(line: &str) -> MpdCommand {
         }
         "fade" => parse_fade(&args, line),
         "plan" => parse_plan(&args, line),
+        // The retraction surface. `journal` takes no argument; `undo` takes an
+        // OPTIONAL journal id, kept as a raw token so the handler can ACK a
+        // non-numeric one (see [`MpdCommand::Undo`]).
+        "journal" => MpdCommand::Journal,
+        "undo" => MpdCommand::Undo(arg(0)),
         "nl" => parse_nl(&args, line),
         "sleep" => parse_sleep(&args, line),
         "winddown" => parse_winddown(&args, line),
@@ -1495,6 +1611,25 @@ pub fn parse(line: &str) -> MpdCommand {
 #[cfg(test)]
 mod parse_tests {
     use super::*;
+
+    #[test]
+    fn queue_edit_commands_parse_positions_and_ranges() {
+        assert_eq!(parse_pos_range("3"), Some((3, Some(4))));
+        assert_eq!(parse_pos_range("2:5"), Some((2, Some(5))));
+        assert_eq!(parse_pos_range("2:"), Some((2, None)));
+        assert_eq!(parse_pos_range("5:2"), None);
+        assert_eq!(parse_pos_range("x"), None);
+        assert!(matches!(parse("move 1 3"), MpdCommand::Move { start: 1, end: Some(2), to: 3 }));
+        assert!(matches!(parse("move 1:4 0"), MpdCommand::Move { start: 1, end: Some(4), to: 0 }));
+        assert!(matches!(parse("move 1"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("move a 1"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("moveid 7 2"), MpdCommand::MoveId(7, 2)));
+        assert!(matches!(parse("moveid 7"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("shuffle"), MpdCommand::Shuffle(None)));
+        assert!(matches!(parse("shuffle 1:3"), MpdCommand::Shuffle(Some((1, Some(3))))));
+        assert!(matches!(parse("shuffle 3:1"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("addid song/1 2"), MpdCommand::AddId(_, Some(2))));
+    }
 
     #[test]
     fn searchall_takes_exactly_one_quoted_query() {
@@ -2257,6 +2392,21 @@ mod parse_tests {
             }
             other => panic!("got {other:?}"),
         }
+        match parse("wake daily 7:15 on weekdays with jazz") {
+            MpdCommand::Wake(WakeCmd::Set { when, selector, .. }) => {
+                assert_eq!(when, WakeWhen::Daily { h: 7, m: 15, days: crate::plan::DaySet::WEEKDAYS });
+                assert_eq!(selector.as_deref(), Some("jazz"));
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("wake daily 7am") {
+            MpdCommand::Wake(WakeCmd::Set { when, selector, .. }) => {
+                assert_eq!(when, WakeWhen::Daily { h: 7, m: 0, days: crate::plan::DaySet::EVERY });
+                assert!(selector.is_none());
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(matches!(parse("wake daily 7 on funday"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("wake at bogus"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("wake in nope"), MpdCommand::Unsupported(_)));
     }
@@ -2280,6 +2430,55 @@ mod parse_tests {
         // A malformed plan is a fail-loud Unsupported, never a panic.
         assert!(matches!(parse("plan add trigger track"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("plan frobnicate"), MpdCommand::Unsupported(_)));
+    }
+
+    // The retraction verbs. `undo`'s argument is carried RAW so the handler can ACK
+    // a non-numeric id: silently degrading it to "the top" would retract something
+    // the caller did not name, which is the one thing a retraction verb must never
+    // do. A quoted or spaced id is still just one token.
+    #[test]
+    fn parses_journal_and_undo() {
+        assert!(matches!(parse("journal"), MpdCommand::Journal));
+        assert!(matches!(parse("undo"), MpdCommand::Undo(None)));
+        match parse("undo 7") {
+            MpdCommand::Undo(Some(s)) => assert_eq!(s, "7"),
+            other => panic!("got {other:?}"),
+        }
+        match parse("undo not-a-number") {
+            MpdCommand::Undo(Some(s)) => assert_eq!(s, "not-a-number"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    // `id <qid>` parses to the stable-id selector: the only queue target that
+    // still names the row a caller read earlier, after a front trim shifted every
+    // position. A missing or non-numeric id is a fail-loud Unsupported.
+    #[test]
+    fn parses_qid_queue_selector() {
+        match parse("plan add trigger immediate action remove id 88") {
+            MpdCommand::Plan(PlanCmd::Add(raw)) => {
+                assert!(matches!(raw.action, Action::Remove { sel: QueueSelector::Qid(88) }));
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("plan add trigger immediate action play id 4294967296") {
+            MpdCommand::Plan(PlanCmd::Add(raw)) => {
+                assert!(matches!(raw.action, Action::Play { sel: QueueSelector::Qid(4294967296) }));
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id"),
+            MpdCommand::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id -1"),
+            MpdCommand::Unsupported(_)
+        ));
+        assert!(matches!(
+            parse("plan add trigger immediate action remove id nine"),
+            MpdCommand::Unsupported(_)
+        ));
     }
 
     #[test]
@@ -2634,6 +2833,11 @@ where
             break; // client closed
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
+
+        // MPD `close`: end the connection without a response.
+        if trimmed.trim() == "close" {
+            break;
+        }
 
         // ── command list batching ─────────────────────────────────────────
         if trimmed == "command_list_begin" || trimmed == "command_list_ok_begin" {

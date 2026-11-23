@@ -39,6 +39,8 @@ pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
         // them so the machine's hold stays visible even with nothing playing. Field,
         // then the ambient hint, are the last, quietest lines.
         let mut lines = vec!["nothing playing".to_string()];
+        // The modes still decide what the next `play` does, so a stopped deck says them.
+        lines.extend(np.modes.label().map(|m| format!("modes: {m}")));
         lines.extend(armed);
         lines.extend(field);
         if let Some(hint) = &np.hint {
@@ -96,6 +98,9 @@ pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     }
     if let Some(d) = np.duration {
         status_bits.push(fmt_dur(d));
+    }
+    if let Some(m) = np.modes.label() {
+        status_bits.push(m);
     }
     if !status_bits.is_empty() {
         lines.push(status_bits.join(" | "));
@@ -631,4 +636,17 @@ mod tests {
             "a stamp with no count invents no count: {yday}"
         );
     }
+
+    #[test]
+    fn card_shows_playback_modes_only_when_on() {
+        let cur = p(&[("Title", "T")]);
+        let on = now_playing(&p(&[("state", "play"), ("random", "1"), ("repeat", "1")]), &cur);
+        let card = render_card(&on);
+        assert!(card.contains("| random repeat"), "card: {card}");
+        let off = now_playing(&p(&[("state", "play"), ("random", "0")]), &cur);
+        assert!(!render_card(&off).contains("random"));
+        let stopped = now_playing(&p(&[("state", "stop"), ("single", "1")]), &[]);
+        assert!(render_card(&stopped).contains("modes: single"));
+    }
+
 }

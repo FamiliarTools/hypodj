@@ -35,6 +35,12 @@ pub fn token_from_pairs(pairs: &[(String, String)]) -> Option<String> {
     pairs.iter().find(|(k, _)| k == "nl_token").map(|(_, v)| v.clone())
 }
 
+/// Extract the immediate answer to a READ-side question (the daemon's
+/// `nl_answer` pair). A query has nothing to confirm, so it carries no token.
+pub fn answer_from_pairs(pairs: &[(String, String)]) -> Option<String> {
+    pairs.iter().find(|(k, _)| k == "nl_answer").map(|(_, v)| v.clone())
+}
+
 pub fn echo_from_pairs(pairs: &[(String, String)]) -> Option<String> {
     pairs.iter().find(|(k, _)| k == "nl_echo").map(|(_, v)| v.clone())
 }
@@ -74,6 +80,24 @@ pub fn split_echo(echo: &str) -> EchoParts {
 /// it reports what ACTUALLY happened, not the plan-asked count.
 pub fn result_line_from_pairs(pairs: &[(String, String)]) -> Option<String> {
     pairs.iter().find(|(k, _)| k == "result").map(|(_, v)| v.clone())
+}
+
+/// The human lines for an `nl confirm` response: one per plan, its REAL `result`
+/// when the daemon ran it inline (the `result` pair follows its `plan_id`), else the
+/// plan-time [`armed_line`] for a deferred plan that has not run yet.
+pub fn confirm_lines(pairs: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (k, v) in pairs {
+        match k.as_str() {
+            "plan_id" => out.push(armed_line(v)),
+            "result" => match out.last_mut() {
+                Some(last) => *last = v.clone(),
+                None => out.push(v.clone()),
+            },
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Map a plan_id value to a short human "armed" line (never a raw "plan_id: 3").
@@ -191,6 +215,21 @@ impl NlTranslatorPin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirm_lines_prefer_the_real_outcome_per_plan() {
+        let p = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        assert_eq!(
+            confirm_lines(&p(&[("plan_id", "3"), ("result", "added 0 - no matches for \"x\"")])),
+            vec!["added 0 - no matches for \"x\"".to_string()]
+        );
+        // A deferred plan has no result: it reads as armed.
+        assert_eq!(
+            confirm_lines(&p(&[("plan_id", "4"), ("plan_id", "5"), ("result", "played y")])),
+            vec!["armed (plan 4)".to_string(), "played y".to_string()]
+        );
+        assert!(confirm_lines(&[]).is_empty());
+    }
 
     #[test]
     fn nl_request_escapes_backslash_then_quote() {

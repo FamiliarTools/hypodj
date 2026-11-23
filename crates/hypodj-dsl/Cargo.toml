@@ -1,0 +1,13 @@
+[package]
+name = "hypodj-dsl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The ONE implementation of `plan add` DSL value quoting, shared by the daemon
+# (hypodj-core's echo) and by any out-of-process producer of a `plan add` line.
+# ZERO dependencies on purpose: hypodj-core hard-links libmpv2, so a producer that
+# must not link libmpv (a stdio MCP server, a script) can depend on THIS and still
+# quote exactly the way the daemon's tokenizer reads.
+[dependencies]

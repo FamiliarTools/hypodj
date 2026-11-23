@@ -54,6 +54,59 @@ impl Clock for TokioClock {
     }
 }
 
+/// The civil (wall-clock) "now" the plan layer reduces civil triggers against.
+///
+/// Production: plain `Utc::now()` - a civil promise ("07:00 local") must follow
+/// the real wall clock across NTP steps and suspend, which a monotonic-derived
+/// value would not.
+///
+/// Tests: the civil clock is DERIVED from the tokio timeline (anchored to the
+/// real wall clock at the first call on the test thread), so under
+/// `start_paused` + `advance` a recurring plan's re-arm sees civil time move by
+/// exactly the advanced amount - otherwise a fake-clocked "next morning" would
+/// still be resolved against the frozen real instant it was armed at.
+pub fn civil_now() -> chrono::DateTime<chrono::Utc> {
+    #[cfg(not(test))]
+    {
+        chrono::Utc::now()
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static ANCHOR: std::cell::Cell<Option<(Instant, chrono::DateTime<chrono::Utc>)>> =
+                const { std::cell::Cell::new(None) };
+        }
+        let now = Instant::now();
+        let (i0, c0) = ANCHOR.with(|a| match a.get() {
+            Some(v) => v,
+            None => {
+                let v = (now, chrono::Utc::now());
+                a.set(Some(v));
+                v
+            }
+        });
+        let skew = CIVIL_SKEW.with(|s| s.get());
+        let base = match now.checked_duration_since(i0) {
+            Some(d) => c0 + chrono::Duration::from_std(d).unwrap_or_default(),
+            None => c0 - chrono::Duration::from_std(i0 - now).unwrap_or_default(),
+        };
+        base + skew
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CIVIL_SKEW: std::cell::Cell<chrono::TimeDelta> = const { std::cell::Cell::new(chrono::TimeDelta::zero()) };
+}
+
+/// TEST-ONLY: move civil time by `by` WITHOUT advancing the monotonic clock -
+/// what a laptop suspend looks like to the daemon (CLOCK_MONOTONIC stops while
+/// asleep, the wall clock does not). Per-thread, like the anchor above.
+#[cfg(test)]
+pub fn skew_civil_for_test(by: chrono::Duration) {
+    CIVIL_SKEW.with(|s| s.set(s.get() + by));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

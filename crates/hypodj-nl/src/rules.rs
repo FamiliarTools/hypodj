@@ -8,8 +8,12 @@
 
 use chrono::{TimeZone, Utc};
 
-use hypodj_core::nl::{NlContext, NlError, NlHit, NlSource, Translator};
-use hypodj_core::plan::{Action, FadeIntentIr, PosBase, RawPlan, RawTrigger, Selector, TrackSel};
+use hypodj_core::config::{DEFAULT_SLEEP_FADE_SECS, DEFAULT_WINDDOWN_FADE_SECS};
+use hypodj_core::nl::{NlContext, NlError, NlHit, NlQuery, NlSession, NlSource, Translator};
+use hypodj_core::plan::{
+    Action, CurateFilter, DaySet, FadeIntentIr, PlayMode, PosBase, QueueSelector, RawPlan,
+    RawTrigger, Selector, TrackSel,
+};
 
 /// The default fade duration a bare "fade out"/"fade in" emits. 30s matches the
 /// P2 executor fixture (`fixture_track3_fade_out_on_track_start`), so the worked
@@ -18,6 +22,9 @@ pub const DEFAULT_FADE_SECS: f64 = 30.0;
 /// The default track count a bare Enqueue selector ("something calmer", "wake me
 /// with jazz") emits. Append-only + count-clamped keeps this a bounded hole.
 pub const DEFAULT_ENQUEUE_COUNT: u32 = 5;
+/// The default track count for a bare "play my favorites". Larger than a mood
+/// enqueue (favorites are a session, not a nudge); still clamped by `max_enqueue`.
+pub const DEFAULT_FAVORITES_COUNT: u32 = 20;
 
 /// The closed genre lexicon: "with <X>" maps to [`Selector::Genre`] only when X is
 /// one of these; anything else is the safe free-text [`Selector::Query`].
@@ -32,9 +39,61 @@ pub struct RulesTranslator;
 
 impl Translator for RulesTranslator {
     fn translate(&self, utterance: &str, ctx: &NlContext) -> Result<NlHit, NlError> {
-        let plans = translate_rules(utterance, ctx)?;
-        Ok(NlHit { plans, source: NlSource::Rules })
+        let mut session = None;
+        let plans = rules_body(utterance, ctx, &mut session)?;
+        Ok(NlHit { plans, source: NlSource::Rules, session })
     }
+
+    fn query(&self, utterance: &str) -> Option<NlQuery> {
+        query_rules(utterance)
+    }
+}
+
+/// Lowercased words with surrounding punctuation stripped ("favorited?" ->
+/// "favorited"), so questions and trailing punctuation match the lexicon.
+fn words(utterance: &str) -> Vec<String> {
+    utterance
+        .to_lowercase()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-').to_string())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// A favorites word: favorite(s)/favourite(s), favorited/favourited, starred, faves.
+fn is_fav_word(w: &str) -> bool {
+    matches!(
+        w,
+        "favorite" | "favorites" | "favourite" | "favourites" | "favorited" | "favourited"
+            | "starred" | "faves" | "fave"
+    )
+}
+
+/// The READ-side grammar: a QUESTION about favorites returns an [`NlQuery`] (an
+/// immediate answer, no plan). Only clearly interrogative shapes match, so an
+/// imperative ("play my favorites") stays on the action path.
+pub fn query_rules(utterance: &str) -> Option<NlQuery> {
+    let w = words(utterance);
+    let wv: Vec<&str> = w.iter().map(String::as_str).collect();
+    if !wv.iter().any(|t| is_fav_word(t)) {
+        return None;
+    }
+    let first = *wv.first()?;
+    let about_current = wv
+        .iter()
+        .any(|t| matches!(*t, "this" | "current" | "it" | "playing" | "song" | "track"));
+    // "is this favorited?", "is the current song starred?", "did i favorite this?"
+    if matches!(first, "is" | "isn't" | "did" | "have" | "was") && about_current {
+        return Some(NlQuery::IsCurrentFavorited);
+    }
+    // "what is favorited?", "list my favorites", "show favorites", "my favorites?",
+    // a bare "favorites".
+    let listing = matches!(first, "what" | "what's" | "whats" | "which" | "list" | "show")
+        || (wv.len() <= 2 && (first == "my" || is_fav_word(first)));
+    if listing && !about_current {
+        return Some(NlQuery::Favorites);
+    }
+    None
 }
 
 /// Emit a raw plan with `origin` left empty (the adapter stamps it) and `once`.
@@ -45,6 +104,16 @@ fn plan(trigger: RawTrigger, action: Action, once: bool) -> RawPlan {
 /// The single entry point: match the utterance to one of the closed corpus
 /// patterns, or fail with a SPECIFIC [`NlError`] (NotUnderstood falls through).
 pub fn translate_rules(utterance: &str, ctx: &NlContext) -> Result<Vec<RawPlan>, NlError> {
+    rules_body(utterance, ctx, &mut None)
+}
+
+/// [`translate_rules`], also reporting through `session` when the match was one of
+/// the daemon's single-instance features (see [`NlHit::session`]).
+fn rules_body(
+    utterance: &str,
+    ctx: &NlContext,
+    session: &mut Option<NlSession>,
+) -> Result<Vec<RawPlan>, NlError> {
     let text = utterance.trim();
     if text.is_empty() {
         return Err(NlError::NotUnderstood);
@@ -56,6 +125,42 @@ pub fn translate_rules(utterance: &str, ctx: &NlContext) -> Result<Vec<RawPlan>,
     // 1. wake ("wake me at 7 with jazz") - an ordered same-instant batch.
     if tv.contains(&"wake") && tv.contains(&"at") {
         return wake(&tv, &low, text, ctx);
+    }
+
+    // 1b. favorites actions ("play my favorites", "queue my favorites", "shuffle
+    // my favorites"). Questions about favorites never reach here (query path).
+    let wd = words(text);
+    let wdv: Vec<&str> = wd.iter().map(String::as_str).collect();
+    if wdv.iter().any(|t| is_fav_word(t)) {
+        return favorites(&wdv);
+    }
+
+    // 1c. playback modes ("shuffle on", "turn off random", "repeat this").
+    // Before stop/pause so "stop shuffling" is a mode change, not a stop.
+    if let Some(plans) = modes(&wdv)? {
+        return Ok(plans);
+    }
+
+    // 1c'. subtractive curation over the UPCOMING queue ("no remixes", "no Daft
+    // Punk as lead", "drop the rest of this album"), and the honest not-yet for
+    // refinements that need audio-content metadata ("no voices", "more motion").
+    if let Some(plans) = curate(text)? {
+        return Ok(plans);
+    }
+
+    // 1d. sessions: wind-down ("start a wind-down", "wind down in 10 minutes") and
+    // the sleep timer ("sleep in 30 minutes").
+    if low.contains("wind down") || low.contains("wind-down") || low.contains("winddown") {
+        let trigger = boundary_or_time(&tv, &low, text, ctx)?;
+        let secs = DEFAULT_WINDDOWN_FADE_SECS as f64;
+        *session = Some(NlSession::WindDown);
+        return one(plan(trigger, Action::Fade(FadeIntentIr::ToFloor { secs }), true));
+    }
+    if tv.first() == Some(&"sleep") || low.contains("sleep timer") || low.contains("go to sleep")
+    {
+        let p = sleep(&tv)?;
+        *session = Some(NlSession::Sleep);
+        return one(p);
     }
 
     // 2. calmer / similar ("something calmer", "more like this").
@@ -88,6 +193,222 @@ pub fn translate_rules(utterance: &str, ctx: &NlContext) -> Result<Vec<RawPlan>,
 
 fn one(p: RawPlan) -> Result<Vec<RawPlan>, NlError> {
     Ok(vec![p])
+}
+
+// ── favorites / modes / sleep ────────────────────────────────────────────────
+
+/// "play my favorites" -> PlayNow{Starred}; "queue|add my favorites" ->
+/// Enqueue{Starred} (append-only); "shuffle my favorites" -> random ON, then
+/// PlayNow{Starred}. Anything else naming favorites is not understood here (a
+/// "star this" write has no Action yet - punt rather than guess).
+fn favorites(wv: &[&str]) -> Result<Vec<RawPlan>, NlError> {
+    let count = leading_count(wv).unwrap_or(DEFAULT_FAVORITES_COUNT);
+    let first = wv.first().copied().unwrap_or("");
+    let play_now = || plan(RawTrigger::Immediate, Action::PlayNow { selector: Selector::Starred, count }, true);
+    match first {
+        "play" | "put" | "throw" | "start" => Ok(vec![play_now()]),
+        "shuffle" => Ok(vec![
+            plan(RawTrigger::Immediate, Action::SetMode { mode: PlayMode::Random, on: true }, true),
+            play_now(),
+        ]),
+        "queue" | "add" | "enqueue" | "append" => Ok(vec![plan(
+            RawTrigger::Immediate,
+            Action::Enqueue { selector: Selector::Starred, count },
+            true,
+        )]),
+        _ => Err(NlError::NotUnderstood),
+    }
+}
+
+/// Map a word to the playback mode it names, if any.
+fn mode_word(w: &str) -> Option<PlayMode> {
+    Some(match w {
+        "shuffle" | "shuffling" | "shuffled" | "random" | "randomize" | "unshuffle" => {
+            PlayMode::Random
+        }
+        "repeat" | "repeating" | "loop" | "looping" => PlayMode::Repeat,
+        "single" => PlayMode::Single,
+        "consume" | "consuming" => PlayMode::Consume,
+        _ => return None,
+    })
+}
+
+/// Playback modes. Exactly one mode word must appear (two is ambiguous, e.g.
+/// "repeat and shuffle"); the default direction is ON, flipped by an off-word.
+/// "repeat this [song|track]" means repeat-ONE: repeat ON + single ON (the MPD
+/// spelling of looping the current track). `Ok(None)` means no mode word.
+fn modes(wv: &[&str]) -> Result<Option<Vec<RawPlan>>, NlError> {
+    let mut found: Vec<PlayMode> = wv.iter().filter_map(|w| mode_word(w)).collect();
+    found.dedup();
+    let mode = match found.as_slice() {
+        [] => return Ok(None),
+        [m] => *m,
+        _ => return Err(NlError::Ambiguous("more than one playback mode named".into())),
+    };
+    // Utterances that only MENTION a mode word inside a longer content request
+    // ("play some random jazz") are not mode toggles: keep this to short commands
+    // whose other words are all from the closed mode-phrase vocabulary.
+    const FILLER: &[&str] = &[
+        "turn", "set", "switch", "put", "enable", "disable", "on", "off", "mode", "the",
+        "please", "playback", "this", "song", "track", "current", "one", "no", "stop",
+        "don't", "dont", "it", "now", "again", "queue", "and", "to",
+    ];
+    if wv.iter().any(|w| mode_word(w).is_none() && !FILLER.contains(w)) {
+        return Ok(None);
+    }
+    let off = wv
+        .iter()
+        .any(|w| matches!(*w, "off" | "disable" | "no" | "stop" | "don't" | "dont" | "unshuffle"));
+    let set = |mode| plan(RawTrigger::Immediate, Action::SetMode { mode, on: !off }, true);
+    let this = wv.iter().any(|w| matches!(*w, "this" | "song" | "track" | "current" | "one"));
+    if mode == PlayMode::Repeat && this && !off {
+        return Ok(Some(vec![set(PlayMode::Repeat), set(PlayMode::Single)]));
+    }
+    Ok(Some(vec![set(mode)]))
+}
+
+// ── curation ────────────────────────────────────────────────────────────────
+
+/// Case-insensitive ASCII prefix strip that keeps the ORIGINAL casing of the rest
+/// (an artist name is echoed as he typed it).
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+}
+
+/// Case-insensitive ASCII suffix strip, keeping the original casing.
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = s.len().checked_sub(suffix.len())?;
+    let tail = s.get(cut..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &s[..cut])
+}
+
+/// Refinements that need to HEAR the music (vocal presence, energy, motion).
+/// hypodj has no such metadata yet; answering them from titles would be a guess.
+const CONTENT_WORDS: &[&str] = &[
+    "voices", "voice", "vocals", "vocal", "singing", "singer", "lyrics", "words",
+    "instrumental", "instrumentals", "motion", "movement", "energy", "energetic",
+    "groove", "tempo", "faster", "slower", "brighter", "darker", "heavier",
+];
+
+/// Generic nouns that a bare "no X" must not read as an artist name.
+const NOT_ARTISTS: &[&str] = &[
+    "thanks", "thank you", "music", "songs", "tracks", "song", "track", "sound", "volume",
+    "more", "way", "problem", "idea", "", "this", "that", "it",
+];
+
+/// Subtractive curation over the UPCOMING queue. `Ok(None)` when the utterance is
+/// not a curation request (the caller falls through to the other rules). Every
+/// hit is one immediate `Remove { Upcoming(filter) }`, which the daemon journals,
+/// so `undo` restores the rows.
+fn curate(text: &str) -> Result<Option<Vec<RawPlan>>, NlError> {
+    let t = text.trim().trim_end_matches(['.', '!', '?']).trim();
+    let low = t.to_lowercase();
+    let lw = words(t);
+    let content = lw.iter().any(|w| CONTENT_WORDS.contains(&w.as_str()));
+    let refining = ["no ", "less ", "more ", "fewer ", "without ", "drop ", "skip ", "only "]
+        .iter()
+        .any(|p| low.starts_with(p));
+    if content && refining {
+        return Err(NlError::Unresolvable(
+            "that refinement needs audio-content metadata (vocals, energy, motion) hypodj does not have yet - see task iwwy04x".into(),
+        ));
+    }
+    let mut body = None;
+    let mut by_artist_only = false;
+    for p in ["no more ", "no ", "without ", "none of ", "lose the ", "drop ", "skip ", "remove ", "cut "] {
+        if let Some(rest) = strip_prefix_ci(t, p) {
+            by_artist_only = !matches!(p, "no more " | "no " | "without " | "none of ");
+            body = Some(rest.trim());
+            break;
+        }
+    }
+    let Some(mut body) = body else { return Ok(None) };
+    for tail in [" please", " anymore", " from the queue", " in the queue", " from the list"] {
+        if let Some(b) = strip_suffix_ci(body, tail) {
+            body = b.trim_end();
+        }
+    }
+    for lead in ["the ", "any ", "all "] {
+        if let Some(b) = strip_prefix_ci(body, lead) {
+            body = b;
+        }
+    }
+    let bl = body.to_lowercase();
+    let remove = |f: CurateFilter| {
+        Ok(Some(vec![plan(
+            RawTrigger::Immediate,
+            Action::Remove { sel: QueueSelector::Upcoming(f) },
+            true,
+        )]))
+    };
+    if matches!(bl.as_str(), "remixes" | "remix" | "remixed tracks" | "remixed stuff" | "rmx") {
+        return remove(CurateFilter::Remixes);
+    }
+    if matches!(
+        bl.as_str(),
+        "live" | "live versions" | "live tracks" | "live stuff" | "live recordings" | "live songs"
+    ) {
+        return remove(CurateFilter::Live);
+    }
+    if matches!(
+        bl.as_str(),
+        "rest of this album" | "rest of the album" | "rest of album" | "this album" | "more of this album"
+    ) || bl == "of this album"
+    {
+        return remove(CurateFilter::RestOfAlbum);
+    }
+    // "drop everything by X" / "skip anything by X": a verb-led removal must name
+    // its artist with "by", so a bare "skip this" never reads as an artist.
+    let mut name = body;
+    if by_artist_only {
+        let mut found = None;
+        for p in ["everything by ", "anything by ", "songs by ", "tracks by ", "stuff by ", "by "] {
+            if let Some(n) = strip_prefix_ci(body, p) {
+                found = Some(n.trim());
+                break;
+            }
+        }
+        match found {
+            Some(n) => name = n,
+            None => return Ok(None),
+        }
+    } else {
+        for p in ["more ", "songs by ", "tracks by ", "stuff by "] {
+            if let Some(n) = strip_prefix_ci(name, p) {
+                name = n.trim();
+            }
+        }
+    }
+    let mut lead_only = false;
+    for s in [" as the lead artist", " as lead artist", " as the main artist", " as main artist", " as the lead", " as lead", " leading"] {
+        if let Some(n) = strip_suffix_ci(name, s) {
+            name = n.trim_end();
+            lead_only = true;
+            break;
+        }
+    }
+    if NOT_ARTISTS.contains(&name.to_lowercase().as_str()) {
+        return Ok(None);
+    }
+    let name = name.to_string();
+    remove(if lead_only { CurateFilter::LeadArtist(name) } else { CurateFilter::Artist(name) })
+}
+
+/// "sleep in 30 minutes" / "sleep timer 45 minutes" / "go to sleep in an hour"
+/// -> after the span, fade OUT over the default sleep fade (the `sleep` command's
+/// shape). A sleep with no readable duration is Ambiguous: guessing a span would
+/// arm a timer the user never set.
+fn sleep(tv: &[&str]) -> Result<RawPlan, NlError> {
+    let secs = (0..tv.len())
+        .find_map(|i| parse_dur(tv, i).filter(|_| tv[i].starts_with(|c: char| c.is_ascii_digit())))
+        .map(|(s, _)| s)
+        .ok_or_else(|| NlError::Ambiguous("sleep for how long?".into()))?;
+    Ok(plan(
+        RawTrigger::SpanElapsed { secs },
+        Action::Fade(FadeIntentIr::Out { secs: DEFAULT_SLEEP_FADE_SECS as f64 }),
+        true,
+    ))
 }
 
 // ── ordinals ────────────────────────────────────────────────────────────────
@@ -201,8 +522,8 @@ fn fade_immediate(
                 i += 1 + c;
             }
             "at" => {
-                let (at, c) = parse_time(rest, i + 1, low, ctx).ok_or(NlError::NotUnderstood)?;
-                trigger = RawTrigger::WallClock { at };
+                let (_, _, c) = parse_clock(rest, i + 1, low).ok_or(NlError::NotUnderstood)?;
+                trigger = at_trigger(rest, i, low, ctx).ok_or(NlError::NotUnderstood)?;
                 i += 1 + c;
             }
             _ => {
@@ -253,13 +574,25 @@ fn boundary_or_time(
     }
     // An explicit "in"/"at" clause MUST parse: a misheard duration/time is a
     // NotUnderstood (punt to the model / loud ACK), NEVER a silent Immediate.
+    if recurrence(tv).is_some() {
+        let p = tv
+            .iter()
+            .position(|t| *t == "at")
+            .ok_or_else(|| NlError::Ambiguous("a repeating plan needs a time of day (at HH:MM)".into()))?;
+        return at_trigger(tv, p, low, ctx).ok_or(NlError::NotUnderstood);
+    }
     if let Some(p) = tv.iter().position(|t| *t == "in") {
         let (secs, _) = parse_dur(tv, p + 1).ok_or(NlError::NotUnderstood)?;
         return Ok(RawTrigger::SpanElapsed { secs });
     }
-    if let Some(p) = tv.iter().position(|t| *t == "at") {
-        let (at, _) = parse_time(tv, p + 1, low, ctx).ok_or(NlError::NotUnderstood)?;
-        return Ok(RawTrigger::WallClock { at });
+    let at = tv.iter().position(|t| *t == "at");
+    // A recurrence ("every day", "on weekdays") names a time-of-day schedule: it
+    // needs an "at <time>", and must never degrade to a one-shot "in"/Immediate.
+    if recurrence(tv).is_some() && at.is_none() {
+        return Err(NlError::Ambiguous("a repeating plan needs a time of day (at HH:MM)".into()));
+    }
+    if let Some(p) = at {
+        return at_trigger(tv, p, low, ctx).ok_or(NlError::NotUnderstood);
     }
     // A DEFERRAL conjunction we did not resolve above ("stop after the album ends",
     // "pause once this song finishes") is a deferred intent we could not parse -
@@ -321,15 +654,12 @@ fn leading_count(tv: &[&str]) -> Option<u32> {
 /// from silence. Matches the direct `wake` command (`HypodjHandler::wake_set`).
 fn wake(tv: &[&str], low: &str, text: &str, ctx: &NlContext) -> Result<Vec<RawPlan>, NlError> {
     let at_pos = tv.iter().position(|t| *t == "at").ok_or(NlError::NotUnderstood)?;
-    let (at, _) = parse_time(tv, at_pos + 1, low, ctx)
+    // "wake me every weekday at 7" is a RECURRING wake; a bare "at 7" is one-shot.
+    let trigger = at_trigger(tv, at_pos, low, ctx)
         .ok_or_else(|| NlError::Ambiguous("could not read the wake time".into()))?;
     // Optional "with <X>" selector; None means wake into the existing queue.
     let selector = with_selector(text);
-    Ok(vec![plan(
-        RawTrigger::WallClock { at },
-        Action::Wake { selector, count: DEFAULT_ENQUEUE_COUNT },
-        true,
-    )])
+    Ok(vec![plan(trigger, Action::Wake { selector, count: DEFAULT_ENQUEUE_COUNT }, true)])
 }
 
 /// The "with <X>" selector class: Genre only for the closed lexicon, else Query
@@ -444,13 +774,11 @@ fn is_unsupported_time_unit(w: &str) -> bool {
 
 /// Parse a clock time at `toks[i]` ("7", "7:30", "7pm", "7:30am") into the NEXT
 /// matching absolute UTC instant via `ctx.tz`. A bare hour with no meridian
-/// defaults to AM (a wake implies morning); "pm"/"tonight"/"evening" force PM.
-fn parse_time(
-    toks: &[&str],
-    i: usize,
-    low: &str,
-    ctx: &NlContext,
-) -> Option<(chrono::DateTime<Utc>, usize)> {
+/// defaults to AM (a wake implies morning); "pm"/"night"/"evening" force PM.
+///
+/// Read a clock time ("7", "7:30", "7pm", "7 pm", "23:00") at `toks[i]` as a
+/// 24h `(hour, minute, tokens consumed)`.
+fn parse_clock(toks: &[&str], i: usize, low: &str) -> Option<(u32, u32, usize)> {
     let mut raw = toks.get(i)?.to_string();
     let mut consumed = 1;
     let mut meridian: Option<bool> = None; // Some(true) = pm
@@ -475,12 +803,85 @@ fn parse_time(
             _ => {}
         }
     }
-    if meridian.is_none() && (low.contains("tonight") || low.contains("evening") || low.contains("pm")) {
+    if meridian.is_none() && (low.contains("night") || low.contains("evening") || low.contains("pm")) {
         meridian = Some(true);
     }
     let hour24 = apply_meridian(h, meridian.unwrap_or(false))?;
-    let at = resolve_next_local(ctx, hour24, m)?;
-    Some((at, consumed))
+    if m > 59 {
+        return None;
+    }
+    Some((hour24, m, consumed))
+}
+
+/// Read a clock time at `toks[i]` and resolve it to the next local occurrence.
+fn parse_time(
+    toks: &[&str],
+    i: usize,
+    low: &str,
+    ctx: &NlContext,
+) -> Option<(chrono::DateTime<Utc>, usize)> {
+    let (h, m, consumed) = parse_clock(toks, i, low)?;
+    Some((resolve_next_local(ctx, h, m)?, consumed))
+}
+
+/// The trigger for an "at <time>" clause whose "at" sits at `toks[at]`: a
+/// RECURRING [`RawTrigger::Daily`] when the utterance names a recurrence, else
+/// the one-shot next local occurrence. The recurrence is read from the WHOLE
+/// utterance (`low`), so it may come before or after the time.
+fn at_trigger(toks: &[&str], at: usize, low: &str, ctx: &NlContext) -> Option<RawTrigger> {
+    let all: Vec<&str> = low.split_whitespace().collect();
+    match recurrence(&all) {
+        Some(days) => {
+            let (h, m, _) = parse_clock(toks, at + 1, low)?;
+            Some(RawTrigger::Daily { hour: h as u8, minute: m as u8, days })
+        }
+        None => parse_time(toks, at + 1, low, ctx).map(|(at, _)| RawTrigger::WallClock { at }),
+    }
+}
+
+/// The recurrence an utterance names, if any: "every day"/"daily"/"every
+/// morning|night|evening"/"nightly" -> every day; "weekday(s)" -> Mon..Fri;
+/// "weekend(s)" -> Sat+Sun; "every monday" / "on mondays and fridays" -> those
+/// days. `None` means one-shot. A day NAME alone ("at 7 on monday") is not a
+/// recurrence - it needs "every" or the plural.
+fn recurrence(tv: &[&str]) -> Option<DaySet> {
+    let w: Vec<&str> = tv
+        .iter()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .collect();
+    let has = |x: &str| w.contains(&x);
+    if has("weekday") || has("weekdays") {
+        return Some(DaySet::WEEKDAYS);
+    }
+    if has("weekend") || has("weekends") {
+        return Some(DaySet::WEEKENDS);
+    }
+    const DAYS: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+    let every = has("every") || has("each");
+    let mut bits = 0u8;
+    for t in &w {
+        for (i, d) in DAYS.iter().enumerate() {
+            let plural = t.strip_suffix('s') == Some(*d);
+            if plural || (every && *t == *d) {
+                bits |= 1 << i;
+            }
+        }
+    }
+    if bits != 0 {
+        return Some(DaySet(bits));
+    }
+    if has("daily") || has("everyday") || has("nightly") {
+        return Some(DaySet::EVERY);
+    }
+    if every
+        && w.windows(2).any(|p| {
+            matches!(p[0], "every" | "each")
+                && matches!(p[1], "day" | "morning" | "night" | "evening" | "afternoon")
+        })
+    {
+        return Some(DaySet::EVERY);
+    }
+    None
 }
 
 fn parse_hm(raw: &str) -> Option<(u32, u32)> {

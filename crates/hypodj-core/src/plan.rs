@@ -35,9 +35,15 @@ use crate::model::{AlbumId, SongId};
 /// acceptable bounded hole in an otherwise fully-bounded IR.
 pub const MAX_ENQUEUE: u32 = 100;
 
-/// Reserved plan origins for the convenience sleep/winddown/wake features. Each
-/// names the SINGLE active instance of its feature in the registry, so a
-/// `find_by_origin` lookup can replace/cancel it (single-instance control).
+/// The origins the DAEMON stamps on the plans it arms for the convenience
+/// sleep/winddown/wake features, so its own single active instance of a feature
+/// is identifiable in the registry (replace/cancel/status).
+///
+/// `RawPlan::origin` is a free, producer-chosen string - a client can send
+/// `plan add ... origin sleep` - so these names are NOT a capability and the
+/// registry never treats the string alone as one. The single-instance lookups
+/// match a registry-side flag (`PendingPlan::reserved`, set only where the
+/// daemon itself arms the plan) AND the origin.
 pub const ORIGIN_SLEEP: &str = "sleep";
 pub const ORIGIN_WINDDOWN: &str = "winddown";
 pub const ORIGIN_WAKE: &str = "wake";
@@ -87,6 +93,171 @@ pub enum RawTrigger {
     WallClock { at: chrono::DateTime<chrono::Utc> },
     /// Fire `secs` from now (a monotonic span).
     SpanElapsed { secs: f64 },
+    /// RECURRING: fire at the LOCAL time-of-day `hour:minute` on every day in
+    /// `days`, and re-arm for the next occurrence after each fire (the only
+    /// trigger that is not single-use; `once` does not apply to it). Each
+    /// occurrence is resolved against the system zone at arm time, so a DST
+    /// change between two fires moves the UTC instant, never the local time -
+    /// see [`next_daily_fire`] for the gap/overlap rule.
+    Daily { hour: u8, minute: u8, days: DaySet },
+}
+
+impl RawTrigger {
+    /// Whether this trigger re-arms after it fires (every other trigger's armed
+    /// anchor is single-use and is dropped at selection).
+    pub fn is_recurring(&self) -> bool {
+        matches!(self, RawTrigger::Daily { .. })
+    }
+}
+
+/// The weekdays a [`RawTrigger::Daily`] fires on: bit 0 is Monday, bit 6 Sunday.
+/// Serialized as the bare bitmask so the wire/persisted shape stays a number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DaySet(pub u8);
+
+const DAY_WORDS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+impl DaySet {
+    pub const EVERY: DaySet = DaySet(0x7f);
+    pub const WEEKDAYS: DaySet = DaySet(0x1f);
+    pub const WEEKENDS: DaySet = DaySet(0x60);
+
+    pub fn contains(self, wd: chrono::Weekday) -> bool {
+        self.0 & (1 << wd.num_days_from_monday()) != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 & 0x7f == 0
+    }
+
+    /// Parse the DSL spelling: `daily`, `weekdays`, `weekends`, or a comma list
+    /// of three-letter day names (`mon,wed,fri`). `None` for anything else or an
+    /// empty set.
+    pub fn parse(s: &str) -> Option<DaySet> {
+        let s = s.to_ascii_lowercase();
+        let set = match s.as_str() {
+            "daily" | "everyday" => DaySet::EVERY,
+            "weekdays" => DaySet::WEEKDAYS,
+            "weekends" => DaySet::WEEKENDS,
+            list => {
+                let mut bits = 0u8;
+                for w in list.split(',') {
+                    let i = DAY_WORDS.iter().position(|d| *d == w.trim())?;
+                    bits |= 1 << i;
+                }
+                DaySet(bits)
+            }
+        };
+        (!set.is_empty()).then_some(set)
+    }
+
+    /// The canonical DSL spelling, the inverse of [`Self::parse`].
+    pub fn word(self) -> String {
+        match DaySet(self.0 & 0x7f) {
+            DaySet::EVERY => "daily".into(),
+            DaySet::WEEKDAYS => "weekdays".into(),
+            DaySet::WEEKENDS => "weekends".into(),
+            d => (0..7)
+                .filter(|i| d.0 & (1 << i) != 0)
+                .map(|i| DAY_WORDS[i])
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    }
+}
+
+/// PURE. The first instant STRICTLY after `after` at which a daily trigger fires
+/// in zone `tz`: the next date (from `after`'s local date, up to 8 days on) whose
+/// weekday is in `days`, at local `hour:minute`.
+///
+/// DST, decided once here so every caller agrees:
+/// - a local time that occurs TWICE (the autumn overlap) fires at the EARLIER of
+///   the two, once - the later reading of the same date is never revisited
+///   because a re-arm always asks for the next occurrence after the fire;
+/// - a local time that does NOT exist (the spring gap) fires at the first minute
+///   that does exist after it (02:30 in a 02:00 -> 03:00 jump fires at 03:00),
+///   so a wake inside the gap is late by the gap, never skipped for the day.
+///
+/// `None` only for an out-of-range time or an empty day set.
+pub fn next_daily_fire<Tz: chrono::TimeZone>(
+    tz: &Tz,
+    hour: u8,
+    minute: u8,
+    days: DaySet,
+    after: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Datelike, LocalResult};
+    if hour > 23 || minute > 59 || days.is_empty() {
+        return None;
+    }
+    let start = after.with_timezone(tz).date_naive();
+    for off in 0..=8 {
+        let date = start.checked_add_signed(chrono::Duration::days(off))?;
+        if !days.contains(date.weekday()) {
+            continue;
+        }
+        let mut naive = date.and_hms_opt(hour.into(), minute.into(), 0)?;
+        // Walk forward out of a gap a minute at a time; no real zone has a gap
+        // longer than a few hours, and the bound keeps this total.
+        let mut inst = None;
+        for _ in 0..=24 * 60 {
+            match tz.from_local_datetime(&naive) {
+                LocalResult::Single(d) => {
+                    inst = Some(d);
+                    break;
+                }
+                LocalResult::Ambiguous(early, _) => {
+                    inst = Some(early);
+                    break;
+                }
+                LocalResult::None => naive += chrono::Duration::minutes(1),
+            }
+        }
+        let inst = inst?.with_timezone(&chrono::Utc);
+        if inst > after {
+            return Some(inst);
+        }
+    }
+    None
+}
+
+/// Reduce a civil instant to a monotonic deadline on the shared clock. A
+/// non-positive delta is already in the past.
+fn civil_deadline(
+    at: chrono::DateTime<chrono::Utc>,
+    now: Instant,
+    now_civil: chrono::DateTime<chrono::Utc>,
+) -> Result<Instant, PlanError> {
+    (at - now_civil).to_std().map(|d| now + d).map_err(|_| PlanError::PastDeadline)
+}
+
+/// The re-arm margin: after a recurring plan fires, the next occurrence is
+/// sought strictly after `now_civil + REARM_MARGIN`, so a timer that fires a
+/// moment EARLY on the civil clock (monotonic vs wall drift) can never resolve
+/// the very occurrence it just fired. Any real day set is >= ~23h apart.
+pub const REARM_MARGIN: chrono::Duration = chrono::Duration::hours(1);
+
+/// PURE (given the zone). The next armed anchor for a RECURRING trigger after it
+/// fired, or `None` for a single-use trigger (which is dropped at selection).
+pub fn rearm_in<Tz: chrono::TimeZone>(
+    tz: &Tz,
+    trigger: &RawTrigger,
+    now: Instant,
+    now_civil: chrono::DateTime<chrono::Utc>,
+) -> Option<Resolved> {
+    match trigger {
+        RawTrigger::Daily { hour, minute, days } => {
+            let at = next_daily_fire(tz, *hour, *minute, *days, now_civil + REARM_MARGIN)?;
+            civil_deadline(at, now, now_civil).ok().map(Resolved::OnDeadline)
+        }
+        _ => None,
+    }
+}
+
+/// [`rearm_in`] against the system zone (`chrono::Local`, DST-aware).
+pub fn rearm(trigger: &RawTrigger, now: Instant, now_civil: chrono::DateTime<chrono::Utc>) -> Option<Resolved> {
+    rearm_in(&chrono::Local, trigger, now, now_civil)
 }
 
 /// How a [`RawTrigger::QueuePosition`] counts.
@@ -104,7 +275,7 @@ pub enum PosBase {
 /// avoid colliding with [`crate::event::TrackRef`].
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "sel", rename_all = "snake_case")]
+#[serde(tag = "sel", content = "v", rename_all = "snake_case")]
 pub enum TrackSel {
     /// The current track.
     Current,
@@ -117,9 +288,30 @@ pub enum TrackSel {
 /// A bounded plan action. Mirrors the [`crate::handler::FadeIntent`] seam EXACTLY
 /// for fades (no arbitrary curve, no Ramp), so nothing here can express an op the
 /// startle-safe primitive would refuse.
+///
+/// ## What "bounded" does and does NOT mean (read before trusting a comment here)
+///
+/// Bounded means EXPRESSIVE bounds: a producer can only name ops in this enum,
+/// numerics are clamped ([`clamp_action`]), and the queue-edit selectors resolve
+/// against the live queue at execute time (a no-match is a clean no-op, never a
+/// wrong-target edit). That is the guarantee this module actually enforces.
+///
+/// It is NOT an authorization boundary, and no variant here is gated by the
+/// daemon. The `nl` route does echo a translated plan and wait for an owner's
+/// y/N before arming, but that is ONE route: `plan add trigger immediate action
+/// clear all` arms and runs the same action with no echo and no confirm, the MPD
+/// socket has NO authentication of any kind, and the executor re-enters these
+/// actions internally on a timer with no client connected. So any process that
+/// can open the port can run the destructive ones. Treat the echo
+/// ([`crate::echo`]) as a FIDELITY mechanism - "what is armed is what was shown"
+/// - not as a permission check.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "act", rename_all = "snake_case")]
+// ADJACENTLY tagged (`content = "v"`), like the other enums here with newtype
+// variants over a primitive (`SetVolume(u8)`, `Query(String)`): serde cannot
+// serialize an INTERNALLY tagged newtype of a non-map, so the persisted plans
+// file (`crate::plan_store`) could not write those plans at all.
+#[serde(tag = "act", content = "v", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Action {
     Fade(FadeIntentIr),
@@ -132,19 +324,22 @@ pub enum Action {
     /// A gentle alarm: at the deadline, optionally enqueue `selector` (append-only,
     /// count-clamped), force playback to start from silence, then ramp IN to the
     /// saved comfort level. ONE atomic effect (enqueue -> silence -> play ->
-    /// WakeTo), so the ordering cannot be split across independent timers.
+    /// wake ramp), so the ordering cannot be split across independent timers.
     Wake { selector: Option<Selector>, count: u32 },
     /// Remove the entries a [`QueueSelector`] resolves against the LIVE queue. The
     /// selector resolves at EXECUTE time (like [`Action::Enqueue`]'s content
     /// selector), never pre-baked to indices, so a NO-MATCH is a clean no-op -
-    /// never a wrong-target delete. Destructive: only reachable through the
-    /// echo-before-arm + owner y/N gate.
+    /// never a wrong-target delete.
+    ///
+    /// DESTRUCTIVE, and NOT gated by the daemon (see the [`Action`] note): what
+    /// the selector buys is AIM, not authority.
     Remove { sel: QueueSelector },
     /// Move the selected entries to a destination position (order preserved). A
     /// no-match is a clean no-op. The currently-playing entry is tracked by stable
     /// id across the rebuild, so playback never jumps to a neighbour.
     Move { sel: QueueSelector, dest: MoveDest },
-    /// Clear part or all of the queue. Destructive: only through the confirm gate.
+    /// Clear part or all of the queue. DESTRUCTIVE, and NOT gated by the daemon
+    /// (see the [`Action`] note).
     Clear { scope: ClearScope },
     /// Jump playback to the FIRST entry the selector resolves. A no-match is a
     /// clean no-op (playback is left exactly where it was).
@@ -161,6 +356,46 @@ pub enum Action {
     /// that maps to NO valid action. Emitting this (honest "no action") is how the
     /// model avoids fabricating a wrong enqueue for a request it cannot express.
     Noop,
+    /// Set a playback mode (random/repeat/single/consume) on or off. Executes
+    /// through the SAME handler path as the MPD `random`/`repeat`/`single`/
+    /// `consume` commands, so NL and the direct verbs cannot diverge. Idempotent,
+    /// bounded (a bool), non-destructive.
+    SetMode { mode: PlayMode, on: bool },
+}
+
+/// A playback mode an [`Action::SetMode`] toggles. Mirrors the four MPD mode
+/// commands one-to-one.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PlayMode {
+    Random,
+    Repeat,
+    Single,
+    Consume,
+}
+
+impl PlayMode {
+    /// The MPD command word for this mode (also its `plan add` DSL spelling).
+    pub fn word(self) -> &'static str {
+        match self {
+            PlayMode::Random => "random",
+            PlayMode::Repeat => "repeat",
+            PlayMode::Single => "single",
+            PlayMode::Consume => "consume",
+        }
+    }
+
+    /// Parse the MPD command word back to a mode.
+    pub fn from_word(w: &str) -> Option<Self> {
+        match w {
+            "random" => Some(PlayMode::Random),
+            "repeat" => Some(PlayMode::Repeat),
+            "single" => Some(PlayMode::Single),
+            "consume" => Some(PlayMode::Consume),
+            _ => None,
+        }
+    }
 }
 
 /// Which queue entries a queue-edit action targets. Resolved DETERMINISTICALLY
@@ -169,7 +404,7 @@ pub enum Action {
 /// set - the caller treats that as a clean no-op, never a wrong-target edit.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "qsel", rename_all = "snake_case")]
+#[serde(tag = "qsel", content = "v", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum QueueSelector {
     /// The 1-based queue position `n`.
@@ -182,12 +417,141 @@ pub enum QueueSelector {
     Current,
     /// The last `n` entries in the queue.
     Last(usize),
+    /// The one entry carrying this STABLE queue id, whatever position it now sits
+    /// at. The only selector safe to aim from a reading taken earlier: every
+    /// position-based variant is invalidated by `State::trim_spent` draining spent
+    /// rows off the FRONT of the queue (and by autofill appending), which shifts
+    /// every index while the ids stay put. A gone id resolves to the empty set -
+    /// a clean no-op, never the row that inherited the position.
+    Qid(u64),
+    /// The UPCOMING rows (strictly after the current one, or every row when nothing
+    /// is current) that a [`CurateFilter`] matches on structured metadata. Never
+    /// the playing row, by construction: a refinement sculpts what is still to
+    /// come, it does not yank the music out from under him. Resolves only through
+    /// [`resolve_selector_rows`] (it needs fields, not one flattened string);
+    /// [`resolve_selector`] has only text and so resolves it to the empty set - a
+    /// clean no-op, never a guess.
+    Upcoming(CurateFilter),
+}
+
+/// A subtractive curation predicate over queue metadata hypodj actually HAS
+/// (title, the artist credit string, album id). Anything needing audio content
+/// ("no voices", "more motion") is deliberately NOT representable here - that is
+/// task iwwy04x, and the NL layer answers it as not-yet-supported.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "filter", content = "v", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CurateFilter {
+    /// Titles carrying a remix marker (`remix`, `rmx`, `re-mix`, `rework`).
+    Remixes,
+    /// Titles carrying a live-version marker (`(live`, `[live`, ` - live`).
+    Live,
+    /// Rows on the current track's album (same album id). Empty with nothing current.
+    RestOfAlbum,
+    /// Any credit for this artist: lead, co-lead, or featured (artist field or a
+    /// `feat.` segment in the title).
+    Artist(String),
+    /// Only rows where this artist is a LEAD credit (before any feat/ft/with
+    /// marker in the artist field); rows that merely feature them stay.
+    LeadArtist(String),
+}
+
+/// The per-row metadata [`resolve_selector_rows`] reads: `text` is the same
+/// flattened search text [`resolve_selector`] uses, the rest are the structured
+/// fields a [`CurateFilter`] needs. Taken from ONE queue snapshot.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowMeta {
+    pub text: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub album_id: Option<String>,
+}
+
+/// Credit markers that separate the lead credit from featured guests, matched on
+/// a lowercased string. Order does not matter: the EARLIEST hit splits.
+const FEAT_MARKERS: &[&str] = &[
+    " feat. ", " feat ", " ft. ", " ft ", " featuring ", " with ", "(feat. ", "(feat ",
+    "(ft. ", "(ft ", "(featuring ", "[feat. ", "[feat ", "[ft. ", "(with ",
+];
+
+/// Split a lowercased credit at its first feat marker: `(lead, featured)`.
+fn split_credit(low: &str) -> (&str, &str) {
+    match FEAT_MARKERS.iter().filter_map(|m| low.find(m)).min() {
+        Some(i) => (&low[..i], &low[i..]),
+        None => (low, ""),
+    }
+}
+
+/// Whole-word containment: `name` occurs in `hay` with no alphanumeric glued on
+/// either side, so "ane" never matches "kanye". Both already lowercased.
+fn has_name(hay: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(off) = hay[from..].find(name) {
+        let i = from + off;
+        let j = i + name.len();
+        let before = hay[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after = hay[j..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if before && after {
+            return true;
+        }
+        from = i + hay[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// PURE. Does one row match `f`? `cur_album` is the current row's album id (only
+/// [`CurateFilter::RestOfAlbum`] reads it).
+pub fn curate_matches(f: &CurateFilter, row: &RowMeta, cur_album: Option<&str>) -> bool {
+    let title = row.title.to_lowercase();
+    let artist = row.artist.as_deref().unwrap_or("").to_lowercase();
+    match f {
+        CurateFilter::Remixes => ["remix", "rmx", "re-mix", "rework"].iter().any(|m| title.contains(m)),
+        CurateFilter::Live => ["(live", "[live", " - live"].iter().any(|m| title.contains(m)),
+        CurateFilter::RestOfAlbum => {
+            matches!((cur_album, row.album_id.as_deref()), (Some(a), Some(b)) if a == b)
+        }
+        CurateFilter::Artist(n) => {
+            let n = n.trim().to_lowercase();
+            has_name(&artist, &n) || has_name(split_credit(&title).1, &n)
+        }
+        CurateFilter::LeadArtist(n) => has_name(split_credit(&artist).0, &n.trim().to_lowercase()),
+    }
+}
+
+/// PURE. [`resolve_selector`] over structured rows: identical for every text
+/// variant, and the only resolver for [`QueueSelector::Upcoming`], which matches
+/// strictly AFTER `current` (every row when nothing is current) - never the
+/// playing row.
+pub fn resolve_selector_rows(
+    sel: &QueueSelector,
+    rows: &[RowMeta],
+    qids: &[u64],
+    current: Option<usize>,
+) -> Vec<usize> {
+    match sel {
+        QueueSelector::Upcoming(f) => {
+            let cur_album = current.and_then(|c| rows.get(c)).and_then(|r| r.album_id.as_deref());
+            if matches!(f, CurateFilter::RestOfAlbum) && cur_album.is_none() {
+                return Vec::new();
+            }
+            let start = current.map_or(0, |c| c + 1);
+            (start..rows.len()).filter(|&i| curate_matches(f, &rows[i], cur_album)).collect()
+        }
+        other => {
+            let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
+            resolve_selector(other, &texts, qids, current)
+        }
+    }
 }
 
 /// Where an [`Action::Move`] places the selected entries.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "movedest", rename_all = "snake_case")]
+#[serde(tag = "movedest", content = "v", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MoveDest {
     /// To the 1-based absolute position among the remaining entries.
@@ -211,10 +575,18 @@ pub enum ClearScope {
 }
 
 /// PURE. Resolve a [`QueueSelector`] to a sorted set of 0-based queue indices
-/// against a queue described by its per-entry searchable text and current index.
-/// A no-match returns an EMPTY vec (the caller treats that as a clean no-op).
-/// Unit-testable with fabricated text - no queue, no player.
-pub fn resolve_selector(sel: &QueueSelector, texts: &[String], current: Option<usize>) -> Vec<usize> {
+/// against a queue described by its per-entry searchable text, per-entry stable
+/// queue id, and current index. `texts` and `qids` are parallel, taken from the
+/// SAME snapshot of the queue; a shorter `qids` simply makes those rows
+/// unaddressable by id (never mis-addressable). A no-match returns an EMPTY vec
+/// (the caller treats that as a clean no-op). Unit-testable with fabricated text -
+/// no queue, no player.
+pub fn resolve_selector(
+    sel: &QueueSelector,
+    texts: &[String],
+    qids: &[u64],
+    current: Option<usize>,
+) -> Vec<usize> {
     let n = texts.len();
     let idx1 = |p: usize| -> Option<usize> {
         if p >= 1 && p <= n { Some(p - 1) } else { None }
@@ -245,11 +617,31 @@ pub fn resolve_selector(sel: &QueueSelector, texts: &[String], current: Option<u
             let k = (*k).min(n);
             (n - k..n).collect()
         }
+        QueueSelector::Qid(id) => qids
+            .iter()
+            .enumerate()
+            .filter(|(i, q)| *i < n && **q == *id)
+            .map(|(i, _)| i)
+            .collect(),
+        // Text alone cannot honour a structured filter: resolve to nothing (a clean
+        // no-op) rather than approximate. Callers that hold rows use
+        // [`resolve_selector_rows`].
+        QueueSelector::Upcoming(_) => Vec::new(),
     }
 }
 
 /// A local serde mirror of [`crate::handler::FadeIntent`], plus the duration the
 /// bare handler intent leaves implicit. `secs` is CLAMPED to `[min_dur, max_dur]`.
+///
+/// INVARIANT (the echo cannot lie about loudness): a level-targeting variant
+/// carries ONLY `vol` (0..=100). The perceptual dB the envelope actually drives
+/// toward is DERIVED from it through the cubic-softvol seam
+/// ([`crate::player::mpv_volume_to_db`]) at execute time
+/// ([`crate::executor::map_fade`]) - it is never a second, independent field.
+/// It used to be one, and because only `vol` reached the echo, a plan a human
+/// read as "fade to volume 40" could carry `target_db: -120` and actually fade to
+/// silence. Deriving makes that divergence UNREPRESENTABLE rather than merely
+/// unlikely: the rendered number IS the driven level.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "dir", rename_all = "snake_case")]
@@ -259,15 +651,11 @@ pub enum FadeIntentIr {
     /// Wake ramp up to the comfort ceiling.
     In { secs: f64 },
     /// Deliberate cue to an explicit level, committing `vol` on completion.
-    To { target_db: f64, vol: u8, secs: f64 },
+    To { vol: u8, secs: f64 },
     /// Sub-JND wind-down to the configured non-silence floor (`floor_level_db`),
     /// leaving playback running. The floor is read from the LIVE config at spawn
     /// (never baked into the raw plan), so `secs` is the only knob carried here.
     ToFloor { secs: f64 },
-    /// Sub-JND wake ramp UP from silence to the SAVED comfort level, committing
-    /// `vol` as the restored baseline. Distinct from `In` (which targets the
-    /// comfort ceiling / vol 100): a wake restores the exact saved comfort volume.
-    WakeTo { target_db: f64, vol: u8, secs: f64 },
 }
 
 /// A bounded content selector for [`Action::Enqueue`]. Unimplemented variants
@@ -275,7 +663,7 @@ pub enum FadeIntentIr {
 /// behavior behind the same enum.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "select", rename_all = "snake_case")]
+#[serde(tag = "select", content = "v", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Selector {
     Query(String),
@@ -289,6 +677,9 @@ pub enum Selector {
     Calmer(SongId),
     Genre(String),
     Radio,
+    /// The user's starred (favorited) songs, resolved server-side at EXECUTE time
+    /// from the live star set. Carries no id, so it is model-safe.
+    Starred,
 }
 
 /// The numeric clamps, sourced from the SAME [`FadeConfig`] knobs the fade
@@ -404,32 +795,12 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
         Action::Fade(FadeIntentIr::In { secs }) => {
             Action::Fade(FadeIntentIr::In { secs: clamp_secs(*secs) })
         }
-        Action::Fade(FadeIntentIr::To { target_db, vol, secs }) => {
-            let td = if target_db.is_finite() {
-                target_db.clamp(bounds.synth_floor_db, bounds.wake_ceiling_db)
-            } else {
-                bounds.wake_ceiling_db
-            };
-            Action::Fade(FadeIntentIr::To {
-                target_db: td,
-                vol: (*vol).min(100),
-                secs: clamp_secs(*secs),
-            })
-        }
+        Action::Fade(FadeIntentIr::To { vol, secs }) => Action::Fade(FadeIntentIr::To {
+            vol: clamp_vol(*vol, bounds),
+            secs: clamp_secs(*secs),
+        }),
         Action::Fade(FadeIntentIr::ToFloor { secs }) => {
             Action::Fade(FadeIntentIr::ToFloor { secs: clamp_secs(*secs) })
-        }
-        Action::Fade(FadeIntentIr::WakeTo { target_db, vol, secs }) => {
-            let td = if target_db.is_finite() {
-                target_db.clamp(bounds.synth_floor_db, bounds.wake_ceiling_db)
-            } else {
-                bounds.wake_ceiling_db
-            };
-            Action::Fade(FadeIntentIr::WakeTo {
-                target_db: td,
-                vol: (*vol).min(100),
-                secs: clamp_secs(*secs),
-            })
         }
         Action::SetVolume(v) => Action::SetVolume((*v).min(100)),
         Action::Enqueue { selector, count } => Action::Enqueue {
@@ -455,7 +826,8 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
         | Action::Move { .. }
         | Action::Clear { .. }
         | Action::Play { .. }
-        | Action::Noop => action.clone(),
+        | Action::Noop
+        | Action::SetMode { .. } => action.clone(),
     }
 }
 
@@ -470,6 +842,23 @@ pub fn clamp_raw(raw: &RawPlan, bounds: &PlanBounds) -> RawPlan {
         _ => {}
     }
     out
+}
+
+/// Clamp a fade target volume into `0..=ceiling`, where the ceiling is the mpv
+/// volume equivalent of the configured `wake_ceiling_db` (the SAME comfort
+/// ceiling the old `target_db` clamp used, expressed in the one field that now
+/// carries the level). Clamping the VOLUME rather than a separate dB keeps the
+/// echoed number and the driven level in lockstep - clamping the dB alone used
+/// to leave `vol` reporting a level the envelope never reached. TOTAL: a
+/// non-finite configured ceiling falls back to the full 0..=100 range rather
+/// than feeding NaN into a comparison.
+fn clamp_vol(vol: u8, bounds: &PlanBounds) -> u8 {
+    let ceiling = if bounds.wake_ceiling_db.is_finite() {
+        crate::player::db_to_mpv_volume(bounds.wake_ceiling_db).round().clamp(0.0, 100.0) as u8
+    } else {
+        100
+    };
+    vol.min(100).min(ceiling)
 }
 
 fn clamp_secs_field(s: f64, bounds: &PlanBounds) -> f64 {
@@ -603,11 +992,21 @@ pub fn validate(
         RawTrigger::WallClock { at } => {
             // Reduce civil time to a monotonic delay; the timeline never touches
             // wall-clock. A non-positive delta is already in the past.
-            let delta = *at - now_civil;
-            match delta.to_std() {
-                Ok(delay) => Ok(Resolved::OnDeadline(now + delay)),
-                Err(_) => Err(PlanError::PastDeadline),
+            civil_deadline(*at, now, now_civil).map(Resolved::OnDeadline)
+        }
+
+        RawTrigger::Daily { hour, minute, days } => {
+            if *hour > 23 || *minute > 59 {
+                return Err(PlanError::OutOfBounds { field: "time" });
             }
+            if days.is_empty() {
+                return Err(PlanError::OutOfBounds { field: "days" });
+            }
+            // The local zone is the one input read here besides the arguments:
+            // a "7:00" promise is local, DST-aware (see `next_daily_fire`).
+            let at = next_daily_fire(&chrono::Local, *hour, *minute, *days, now_civil)
+                .ok_or(PlanError::OutOfBounds { field: "days" })?;
+            civil_deadline(at, now, now_civil).map(Resolved::OnDeadline)
         }
 
         RawTrigger::SpanElapsed { secs } => {
@@ -861,19 +1260,15 @@ mod tests {
         }
     }
 
-    // clamps: target_db to [synth_floor, wake_ceiling], vol/SetVolume to 100,
+    // clamps: fade vol into 0..=the ceiling volume, SetVolume to 100,
     // secs/span/count clamped (clamped, never rejected).
     #[test]
     fn clamps_every_numeric() {
         let b = bounds();
-        // target_db above the ceiling clamps down; vol clamps to 100.
-        let a = clamp_action(
-            &Action::Fade(FadeIntentIr::To { target_db: 999.0, vol: 250, secs: 1e9 }),
-            &b,
-        );
+        // vol clamps to the ceiling volume (100 at the default 0 dB ceiling).
+        let a = clamp_action(&Action::Fade(FadeIntentIr::To { vol: 250, secs: 1e9 }), &b);
         match a {
-            Action::Fade(FadeIntentIr::To { target_db, vol, secs }) => {
-                assert!(target_db <= b.wake_ceiling_db && target_db >= b.synth_floor_db);
+            Action::Fade(FadeIntentIr::To { vol, secs }) => {
                 assert_eq!(vol, 100);
                 assert!(secs <= b.max_dur.as_secs_f64());
             }
@@ -908,26 +1303,38 @@ mod tests {
         }
     }
 
+    // The comfort ceiling now bounds the fade target VOLUME (the single field that
+    // carries the level), so a ceiling below 0 dB is not a dead knob and the
+    // clamped number is still exactly what the envelope drives to. TOTAL: a
+    // non-finite ceiling degrades to the full 0..=100 range, never a NaN compare.
+    #[test]
+    fn fade_vol_clamped_by_the_comfort_ceiling() {
+        let mut b = bounds();
+        b.wake_ceiling_db = crate::player::mpv_volume_to_db(50.0);
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 100, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 50),
+            other => panic!("got {other:?}"),
+        }
+        // Below the ceiling is untouched.
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 20, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 20),
+            other => panic!("got {other:?}"),
+        }
+        b.wake_ceiling_db = f64::NAN;
+        match clamp_action(&Action::Fade(FadeIntentIr::To { vol: 200, secs: 5.0 }), &b) {
+            Action::Fade(FadeIntentIr::To { vol, .. }) => assert_eq!(vol, 100),
+            other => panic!("got {other:?}"),
+        }
+    }
+
     // The NEW convenience-feature IR variants clamp exactly like their siblings:
-    // ToFloor secs into [min,max]; WakeTo target_db into [synth_floor, ceiling],
-    // vol -> 100, secs clamped; Action::Wake count -> MAX_ENQUEUE.
+    // ToFloor secs into [min,max]; Action::Wake count -> MAX_ENQUEUE.
     #[test]
     fn clamp_convenience_fade_and_wake_variants() {
         let b = bounds();
         match clamp_action(&Action::Fade(FadeIntentIr::ToFloor { secs: 1e9 }), &b) {
             Action::Fade(FadeIntentIr::ToFloor { secs }) => {
                 assert!(secs >= b.min_dur.as_secs_f64() && secs <= b.max_dur.as_secs_f64());
-            }
-            other => panic!("got {other:?}"),
-        }
-        match clamp_action(
-            &Action::Fade(FadeIntentIr::WakeTo { target_db: 999.0, vol: 250, secs: 1e9 }),
-            &b,
-        ) {
-            Action::Fade(FadeIntentIr::WakeTo { target_db, vol, secs }) => {
-                assert!(target_db >= b.synth_floor_db && target_db <= b.wake_ceiling_db);
-                assert_eq!(vol, 100);
-                assert!(secs <= b.max_dur.as_secs_f64());
             }
             other => panic!("got {other:?}"),
         }
@@ -1115,6 +1522,66 @@ mod tests {
         assert!(matches!(e, PlanError::OutOfBounds { .. }), "got {e:?}");
     }
 
+    fn row(title: &str, artist: &str, album: &str) -> RowMeta {
+        RowMeta {
+            text: format!("{title} {artist}"),
+            title: title.into(),
+            artist: Some(artist.into()),
+            album_id: (!album.is_empty()).then(|| album.into()),
+        }
+    }
+
+    // The curation predicate: title markers, whole-word artist credits, and the
+    // lead-vs-featured split on feat/ft/with markers.
+    #[test]
+    fn curate_predicate_markers_and_credits() {
+        use CurateFilter as F;
+        let m = |f: &F, r: &RowMeta| curate_matches(f, r, None);
+        assert!(m(&F::Remixes, &row("Strobe (Deadmau5 Remix)", "x", "")));
+        assert!(m(&F::Remixes, &row("Song [RMX]", "x", "")));
+        assert!(m(&F::Remixes, &row("Song - Re-Mix", "x", "")));
+        assert!(!m(&F::Remixes, &row("Song (Original Mix)", "x", "")), "not every mix is a remix");
+        assert!(m(&F::Live, &row("Song (Live at Wembley)", "x", "")));
+        assert!(m(&F::Live, &row("Song - Live", "x", "")));
+        assert!(!m(&F::Live, &row("Live Forever", "x", "")), "a title word is not a version marker");
+
+        let feat = row("Get Lucky", "Daft Punk feat. Pharrell Williams", "");
+        let feat_title = row("Blurred Lines (feat. Pharrell)", "Robin Thicke", "");
+        let duo = row("Song", "Simon & Garfunkel", "");
+        assert!(m(&F::Artist("pharrell".into()), &feat));
+        assert!(m(&F::Artist("Pharrell".into()), &feat_title), "a title feat credit counts");
+        assert!(!m(&F::LeadArtist("pharrell".into()), &feat), "a feature is not a lead");
+        assert!(!m(&F::LeadArtist("pharrell".into()), &feat_title));
+        assert!(m(&F::LeadArtist("daft punk".into()), &feat));
+        assert!(m(&F::LeadArtist("garfunkel".into()), &duo), "a co-lead is a lead");
+        assert!(!m(&F::Artist("ane".into()), &row("x", "Kanye West", "")), "whole words only");
+        assert!(!m(&F::Artist("".into()), &duo), "an empty name matches nothing");
+    }
+
+    // Upcoming(..) never reaches the playing row or anything before it, and
+    // RestOfAlbum needs a current album.
+    #[test]
+    fn curate_resolves_only_upcoming_rows() {
+        let rows = vec![
+            row("A (Remix)", "x", "al1"),
+            row("B (Remix)", "x", "al1"),
+            row("C", "x", "al1"),
+            row("D (Remix)", "y", "al2"),
+            row("E", "x", "al1"),
+        ];
+        let q: Vec<u64> = (1..=5).collect();
+        let up = |f| QueueSelector::Upcoming(f);
+        assert_eq!(resolve_selector_rows(&up(CurateFilter::Remixes), &rows, &q, Some(1)), vec![3]);
+        assert_eq!(resolve_selector_rows(&up(CurateFilter::Remixes), &rows, &q, None), vec![0, 1, 3]);
+        assert_eq!(resolve_selector_rows(&up(CurateFilter::RestOfAlbum), &rows, &q, Some(1)), vec![2, 4]);
+        assert!(resolve_selector_rows(&up(CurateFilter::RestOfAlbum), &rows, &q, None).is_empty());
+        // Text-only resolution refuses rather than guesses.
+        let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
+        assert!(resolve_selector(&up(CurateFilter::Remixes), &texts, &q, Some(1)).is_empty());
+        // Non-curate selectors resolve exactly as before.
+        assert_eq!(resolve_selector_rows(&QueueSelector::Last(2), &rows, &q, Some(1)), vec![3, 4]);
+    }
+
     // resolve_selector: every selector variant resolves to the intended 0-based
     // index set, and a no-match (bad position, empty/absent query, empty queue)
     // is a clean EMPTY set - the caller's clean no-op, never a wrong-target edit.
@@ -1126,50 +1593,247 @@ mod tests {
             "Miles Davis - Blue in Green".into(),
             "Aphex Twin - Rhubarb".into(),
         ];
+        // Stable queue ids, parallel to `texts`, deliberately NOT 1..=4 and not in
+        // position order - a Qid must resolve by identity, never by arithmetic.
+        let qids: Vec<u64> = vec![41, 7, 900, 42];
         let cur = Some(1usize);
 
         // Position (1-based) -> single index; out-of-range -> empty.
-        assert_eq!(resolve_selector(&QueueSelector::Position(1), &texts, cur), vec![0]);
-        assert_eq!(resolve_selector(&QueueSelector::Position(4), &texts, cur), vec![3]);
-        assert!(resolve_selector(&QueueSelector::Position(9), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::Position(0), &texts, cur).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Position(1), &texts, &qids, cur), vec![0]);
+        assert_eq!(resolve_selector(&QueueSelector::Position(4), &texts, &qids, cur), vec![3]);
+        assert!(resolve_selector(&QueueSelector::Position(9), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Position(0), &texts, &qids, cur).is_empty());
 
         // Range inclusive, order-normalized, clamped to the queue.
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 2, end: 3 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 2, end: 3 }, &texts, &qids, cur),
             vec![1, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 3, end: 2 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 3, end: 2 }, &texts, &qids, cur),
             vec![1, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::Range { start: 3, end: 99 }, &texts, cur),
+            resolve_selector(&QueueSelector::Range { start: 3, end: 99 }, &texts, &qids, cur),
             vec![2, 3]
         );
 
         // QueryMatch: case-insensitive substring across all matching entries.
         assert_eq!(
-            resolve_selector(&QueueSelector::QueryMatch("miles".into()), &texts, cur),
+            resolve_selector(&QueueSelector::QueryMatch("miles".into()), &texts, &qids, cur),
             vec![0, 2]
         );
         assert_eq!(
-            resolve_selector(&QueueSelector::QueryMatch("rhubarb".into()), &texts, cur),
+            resolve_selector(&QueueSelector::QueryMatch("rhubarb".into()), &texts, &qids, cur),
             vec![3]
         );
         // No match / blank query -> clean empty set (the no-op).
-        assert!(resolve_selector(&QueueSelector::QueryMatch("nonesuch".into()), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::QueryMatch("   ".into()), &texts, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::QueryMatch("nonesuch".into()), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::QueryMatch("   ".into()), &texts, &qids, cur).is_empty());
 
         // Current -> the cursor index; guarded against a stale out-of-range cursor.
-        assert_eq!(resolve_selector(&QueueSelector::Current, &texts, cur), vec![1]);
-        assert!(resolve_selector(&QueueSelector::Current, &texts, None).is_empty());
-        assert!(resolve_selector(&QueueSelector::Current, &texts, Some(99)).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Current, &texts, &qids, cur), vec![1]);
+        assert!(resolve_selector(&QueueSelector::Current, &texts, &qids, None).is_empty());
+        assert!(resolve_selector(&QueueSelector::Current, &texts, &qids, Some(99)).is_empty());
 
         // Last(n) -> the tail; clamped to the queue length; 0 / empty -> empty.
-        assert_eq!(resolve_selector(&QueueSelector::Last(2), &texts, cur), vec![2, 3]);
-        assert_eq!(resolve_selector(&QueueSelector::Last(99), &texts, cur), vec![0, 1, 2, 3]);
-        assert!(resolve_selector(&QueueSelector::Last(0), &texts, cur).is_empty());
-        assert!(resolve_selector(&QueueSelector::Position(1), &[], None).is_empty());
+        assert_eq!(resolve_selector(&QueueSelector::Last(2), &texts, &qids, cur), vec![2, 3]);
+        assert_eq!(resolve_selector(&QueueSelector::Last(99), &texts, &qids, cur), vec![0, 1, 2, 3]);
+        assert!(resolve_selector(&QueueSelector::Last(0), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Position(1), &[], &[], None).is_empty());
+
+        // Qid -> the row carrying that id, wherever it sits; an id that is gone is
+        // the clean EMPTY set, never the row that inherited its position.
+        assert_eq!(resolve_selector(&QueueSelector::Qid(41), &texts, &qids, cur), vec![0]);
+        assert_eq!(resolve_selector(&QueueSelector::Qid(900), &texts, &qids, cur), vec![2]);
+        assert_eq!(resolve_selector(&QueueSelector::Qid(42), &texts, &qids, cur), vec![3]);
+        assert!(resolve_selector(&QueueSelector::Qid(1), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Qid(0), &texts, &qids, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Qid(41), &[], &[], None).is_empty());
+        // A short qids slice makes those rows unaddressable, never mis-addressable.
+        assert!(resolve_selector(&QueueSelector::Qid(900), &texts, &qids[..2], cur).is_empty());
+    }
+
+    // THE point of Qid: a position read earlier names a DIFFERENT row after
+    // `trim_spent` drains spent rows off the FRONT, while the id still names the
+    // row that was read. This is the whole reason an agent-facing target is an id.
+    #[test]
+    fn qid_survives_a_front_trim_that_invalidates_positions() {
+        let before_texts: Vec<String> = vec![
+            "spent one".into(),
+            "spent two".into(),
+            "Miles Davis - So What".into(),
+            "Aphex Twin - Rhubarb".into(),
+        ];
+        let before_qids: Vec<u64> = vec![10, 11, 12, 13];
+        // The caller reads "So What": position 3 (1-based), id 12.
+        assert_eq!(
+            resolve_selector(&QueueSelector::Position(3), &before_texts, &before_qids, Some(2)),
+            vec![2]
+        );
+        assert_eq!(
+            resolve_selector(&QueueSelector::Qid(12), &before_texts, &before_qids, Some(2)),
+            vec![2]
+        );
+
+        // The two spent rows are trimmed off the front; ids do not renumber.
+        let after_texts: Vec<String> = before_texts[2..].to_vec();
+        let after_qids: Vec<u64> = before_qids[2..].to_vec();
+
+        // Position 3 is now out of the queue entirely (and position 1 is a
+        // different row than it named before) - the id still lands on "So What".
+        assert!(
+            resolve_selector(&QueueSelector::Position(3), &after_texts, &after_qids, Some(0))
+                .is_empty()
+        );
+        let by_id = resolve_selector(&QueueSelector::Qid(12), &after_texts, &after_qids, Some(0));
+        assert_eq!(by_id, vec![0]);
+        assert_eq!(after_texts[by_id[0]], "Miles Davis - So What");
+    }
+    // DaySet: every DSL spelling parses and renders back to itself; junk and the
+    // empty set are refused.
+    #[test]
+    fn dayset_parse_word_round_trip() {
+        for w in ["daily", "weekdays", "weekends", "mon,wed,fri", "sun"] {
+            let d = DaySet::parse(w).unwrap();
+            assert_eq!(d.word(), w);
+            assert_eq!(DaySet::parse(&d.word()), Some(d));
+        }
+        assert_eq!(DaySet::parse("sat,sun"), Some(DaySet::WEEKENDS));
+        assert!(DaySet::parse("funday").is_none());
+        assert!(DaySet::parse("").is_none());
+        assert!(DaySet(0).is_empty());
+    }
+
+    fn lisbon_utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono_tz::Europe::Lisbon
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .earliest()
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    // Next fire: later today when still ahead, tomorrow once passed, and a
+    // weekday set skips the weekend (2026-11-20 is a Friday).
+    #[test]
+    fn next_daily_fire_today_tomorrow_and_weekdays() {
+        let tz = chrono_tz::Europe::Lisbon;
+        let fri_6 = lisbon_utc(2026, 11, 20, 6, 0);
+        assert_eq!(
+            next_daily_fire(&tz, 7, 0, DaySet::EVERY, fri_6),
+            Some(lisbon_utc(2026, 11, 20, 7, 0))
+        );
+        let fri_8 = lisbon_utc(2026, 11, 20, 8, 0);
+        assert_eq!(
+            next_daily_fire(&tz, 7, 0, DaySet::EVERY, fri_8),
+            Some(lisbon_utc(2026, 11, 21, 7, 0))
+        );
+        // Friday 08:00, weekdays only -> Monday 23rd.
+        assert_eq!(
+            next_daily_fire(&tz, 7, 0, DaySet::WEEKDAYS, fri_8),
+            Some(lisbon_utc(2026, 11, 23, 7, 0))
+        );
+        // Exactly AT the fire instant is not "after" it: the next one is tomorrow.
+        assert_eq!(
+            next_daily_fire(&tz, 7, 0, DaySet::EVERY, lisbon_utc(2026, 11, 20, 7, 0)),
+            Some(lisbon_utc(2026, 11, 21, 7, 0))
+        );
+        assert!(next_daily_fire(&tz, 24, 0, DaySet::EVERY, fri_8).is_none());
+        assert!(next_daily_fire(&tz, 7, 0, DaySet(0), fri_8).is_none());
+    }
+
+    // DST: the local time is kept, the UTC instant moves. Lisbon is UTC+0 in
+    // winter and UTC+1 in summer; 2026-03-29 jumps 01:00 -> 02:00 and 2026-10-25
+    // repeats 01:00..02:00.
+    #[test]
+    fn next_daily_fire_dst_keeps_local_time() {
+        use chrono::TimeZone;
+        let tz = chrono_tz::Europe::Lisbon;
+        let utc = |y, mo, d, h, mi| chrono::Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap();
+        // 07:00 local the day before spring-forward is 07:00 UTC; the day after
+        // it is 06:00 UTC.
+        let sat = next_daily_fire(&tz, 7, 0, DaySet::EVERY, utc(2026, 3, 28, 0, 0)).unwrap();
+        assert_eq!(sat, utc(2026, 3, 28, 7, 0));
+        let sun = next_daily_fire(&tz, 7, 0, DaySet::EVERY, sat + REARM_MARGIN).unwrap();
+        assert_eq!(sun, utc(2026, 3, 29, 6, 0));
+        // A time inside the gap (01:30 does not exist) fires at the first real
+        // minute after it, 02:00 local = 01:00 UTC; never skipped for the day.
+        let gap = next_daily_fire(&tz, 1, 30, DaySet::EVERY, utc(2026, 3, 29, 0, 0)).unwrap();
+        assert_eq!(gap, utc(2026, 3, 29, 1, 0));
+        // A time inside the overlap (01:30 happens twice) fires at the EARLIER,
+        // once: 01:30 WEST = 00:30 UTC; the re-arm then lands on the next day.
+        let first = next_daily_fire(&tz, 1, 30, DaySet::EVERY, utc(2026, 10, 24, 23, 0)).unwrap();
+        assert_eq!(first, utc(2026, 10, 25, 0, 30));
+        let again = next_daily_fire(&tz, 1, 30, DaySet::EVERY, first + REARM_MARGIN).unwrap();
+        assert_eq!(again, utc(2026, 10, 26, 1, 30));
+    }
+
+    // Re-arm: a recurring trigger yields the NEXT occurrence (at least the margin
+    // past the fire, so never the one just fired); a single-use trigger yields
+    // nothing and is dropped by the executor.
+    #[test]
+    fn rearm_only_recurring_and_never_the_same_occurrence() {
+        let tz = chrono_tz::Europe::Lisbon;
+        let n = now();
+        // Fired at 07:00:00.5 local on Friday.
+        let fired = lisbon_utc(2026, 11, 20, 7, 0) + chrono::Duration::milliseconds(500);
+        let trig = RawTrigger::Daily { hour: 7, minute: 0, days: DaySet::EVERY };
+        match rearm_in(&tz, &trig, n, fired) {
+            Some(Resolved::OnDeadline(at)) => {
+                let d = at - n;
+                assert!(d > Duration::from_secs(86_390) && d < Duration::from_secs(86_400), "{d:?}");
+            }
+            other => panic!("expected OnDeadline, got {other:?}"),
+        }
+        // Fired a moment EARLY on the civil clock (06:59:59): still not today.
+        let early = lisbon_utc(2026, 11, 20, 7, 0) - chrono::Duration::seconds(1);
+        match rearm_in(&tz, &trig, n, early) {
+            Some(Resolved::OnDeadline(at)) => assert!(at - n > Duration::from_secs(86_000)),
+            other => panic!("expected OnDeadline, got {other:?}"),
+        }
+        assert!(rearm_in(&tz, &RawTrigger::WallClock { at: fired }, n, fired).is_none());
+        assert!(rearm_in(&tz, &RawTrigger::SpanElapsed { secs: 5.0 }, n, fired).is_none());
+        assert!(trig.is_recurring());
+        assert!(!RawTrigger::Immediate.is_recurring());
+    }
+
+    // validate: a Daily trigger arms an OnDeadline within the next 8 days; bad
+    // time / empty set fail loud.
+    #[test]
+    fn validate_daily_bounds() {
+        let snap = snap5(0);
+        let n = now();
+        let r = validate(
+            &raw(RawTrigger::Daily { hour: 7, minute: 30, days: DaySet::WEEKDAYS }),
+            &snap,
+            n,
+            civil(),
+            &bounds(),
+        )
+        .unwrap();
+        match r {
+            Resolved::OnDeadline(at) => assert!(at - n <= Duration::from_secs(8 * 86_400)),
+            other => panic!("expected OnDeadline, got {other:?}"),
+        }
+        let e = validate(
+            &raw(RawTrigger::Daily { hour: 25, minute: 0, days: DaySet::EVERY }),
+            &snap,
+            n,
+            civil(),
+            &bounds(),
+        )
+        .unwrap_err();
+        assert_eq!(e, PlanError::OutOfBounds { field: "time" });
+        let e = validate(
+            &raw(RawTrigger::Daily { hour: 7, minute: 0, days: DaySet(0) }),
+            &snap,
+            n,
+            civil(),
+            &bounds(),
+        )
+        .unwrap_err();
+        assert_eq!(e, PlanError::OutOfBounds { field: "days" });
     }
 }
+

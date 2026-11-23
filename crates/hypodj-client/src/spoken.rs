@@ -73,6 +73,32 @@ pub fn plan_echo(parts: &EchoParts) -> Vec<Spoken> {
     out
 }
 
+/// An `nl confirm` reply, one utterance per plan, in wire order.
+///
+/// A `result` that follows a `plan_id` replaces that plan's armed line: the
+/// plan ran, and the words are the daemon's. A `plan_id` with no following
+/// `result` is still armed. Anything else falls through to [`from_reply`].
+pub fn from_confirm(pairs: &[(String, String)]) -> Vec<Spoken> {
+    let mut out = Vec::new();
+    for (k, v) in pairs {
+        match k.as_str() {
+            "plan_id" => out.push(Spoken::new(State::Armed, vec![nl::armed_line(v)])),
+            "result" => {
+                let live = Spoken::new(State::Live, vec![v.clone()]);
+                match out.last_mut() {
+                    Some(last) => *last = live,
+                    None => out.push(live),
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        out.push(from_reply(pairs, None));
+    }
+    out
+}
+
 /// What a confirm just did, from the pairs the daemon returned.
 ///
 /// `result` wins, even when a `plan_id` is also present: the action ran, and
@@ -126,6 +152,9 @@ fn status_pair(pairs: &[(String, String)]) -> Option<Spoken> {
     }
     if pairs.iter().any(|(k, v)| k == "wake" && v == "none") {
         return Some(Spoken::new(State::Live, vec!["wake: none".into()]));
+    }
+    if let Some((_, answer)) = pairs.iter().find(|(k, _)| k == "nl_answer") {
+        return Some(Spoken::new(State::Live, vec![answer.clone()]));
     }
     None
 }
@@ -267,6 +296,37 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         };
         out.push(shape(name, pairs(keys), None, None, State::Live, &[line]));
     }
+    // Playback modes. The handler writes `effect_mode(word, on)`.
+    for mode in ["random", "repeat", "single", "consume"] {
+        for bit in ["on", "off"] {
+            let line = format!("{mode} {bit}");
+            out.push(ReplyShape {
+                name: match (mode, bit) {
+                    ("random", "on") => "mode random on",
+                    ("random", "off") => "mode random off",
+                    ("repeat", "on") => "mode repeat on",
+                    ("repeat", "off") => "mode repeat off",
+                    ("single", "on") => "mode single on",
+                    ("single", "off") => "mode single off",
+                    ("consume", "on") => "mode consume on",
+                    _ => "mode consume off",
+                },
+                pairs: pairs(&[("plan_id", "4"), ("result", line.as_str())]),
+                ack: None,
+                act: None,
+                state: State::Live,
+                lines: vec![line],
+            });
+        }
+    }
+    out.push(shape(
+        "nl answer",
+        pairs(&[("nl_answer", "yes, \"Blue\" is a favorite")]),
+        None,
+        None,
+        State::Live,
+        &["yes, \"Blue\" is a favorite"],
+    ));
     // Status. The handler sends the seconds, or the word none.
     out.push(shape(
         "sleep remaining",
@@ -463,5 +523,25 @@ mod tests {
             .unwrap();
         assert!(hint.lines[0].contains("I did not understand"));
         assert!(!hint.lines[0].contains('!'));
+    }
+
+    #[test]
+    fn a_mixed_confirm_keeps_each_plan() {
+        let spoken = from_confirm(&[
+            ("plan_id".into(), "1".into()),
+            ("result".into(), "added 5 tracks".into()),
+            ("plan_id".into(), "2".into()),
+        ]);
+        assert_eq!(spoken.len(), 2);
+        assert_eq!(spoken[0].state, State::Live);
+        assert_eq!(spoken[0].lines, vec!["added 5 tracks".to_string()]);
+        assert_eq!(spoken[1].state, State::Armed);
+        assert_eq!(spoken[1].lines, vec!["armed (plan 2)".to_string()]);
+        let words: Vec<String> = spoken.into_iter().map(|s| s.text()).collect();
+        assert_eq!(words, nl::confirm_lines(&[
+            ("plan_id".into(), "1".into()),
+            ("result".into(), "added 5 tracks".into()),
+            ("plan_id".into(), "2".into()),
+        ]));
     }
 }

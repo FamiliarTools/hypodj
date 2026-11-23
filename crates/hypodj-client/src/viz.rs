@@ -4,7 +4,7 @@
 //! that does not expose the socket (old build) refuses the connect, which the
 //! caller treats as the clean "use the decorative fallback wave" signal.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -16,6 +16,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// fires we treat it as a clean disconnect (reconnect), NOT a panic. The viz wire
 /// is ~5 Hz, so a multi-second gap without any byte is a dead peer, not a lull.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest line the viz client will buffer. The read timeout bounds each READ,
+/// not the line: a peer trickling one byte every few seconds without a newline
+/// resets it forever while `read_line` keeps growing. A frame is a few dozen bytes,
+/// so anything this long is not a viz peer and reads as a disconnect.
+const MAX_LINE: usize = 4096;
+
+/// `read_line` capped at [`MAX_LINE`]: `Err(InvalidData)` once that many bytes
+/// arrive without a newline, so the buffer can never grow past the cap.
+fn read_bounded_line<R: BufRead>(r: &mut R, line: &mut String) -> std::io::Result<usize> {
+    let n = r.by_ref().take(MAX_LINE as u64).read_line(line)?;
+    if n == MAX_LINE && !line.ends_with('\n') {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "viz line too long"));
+    }
+    Ok(n)
+}
 
 /// The greeting the viz socket writes first. Anything else means it is not a viz
 /// endpoint, so the client should fall back to the decorative wave.
@@ -88,7 +104,7 @@ impl VizConn {
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
         let mut reader = BufReader::new(stream);
         let mut greeting = String::new();
-        reader.read_line(&mut greeting)?;
+        read_bounded_line(&mut reader, &mut greeting)?;
         if !greeting.starts_with(VIZ_GREETING_PREFIX) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -113,7 +129,7 @@ impl VizConn {
     /// wedging the worker thread forever.
     pub fn next_sample(&mut self) -> std::io::Result<Option<VizSample>> {
         let mut line = String::new();
-        let n = self.reader.read_line(&mut line)?;
+        let n = read_bounded_line(&mut self.reader, &mut line)?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -127,6 +143,21 @@ impl VizConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_endless_line_is_refused_at_the_cap_not_buffered() {
+        let endless = std::io::repeat(b'x');
+        let mut r = BufReader::new(endless);
+        let mut line = String::new();
+        let e = read_bounded_line(&mut r, &mut line).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(line.len(), MAX_LINE);
+        // A normal frame line still reads whole.
+        let mut ok = BufReader::new(&b"1 -20 -10 0 1\nrest"[..]);
+        let mut line = String::new();
+        assert_eq!(read_bounded_line(&mut ok, &mut line).unwrap(), 14);
+        assert_eq!(line, "1 -20 -10 0 1\n");
+    }
 
     #[test]
     fn decode_and_post_gain() {

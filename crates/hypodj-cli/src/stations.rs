@@ -72,11 +72,19 @@ fn list(conn: &mut MpdConn) -> Result<bool, MpdError> {
         println!("no saved stations");
         return Ok(true);
     }
-    let width = saved.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
+    let width = saved
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
     for (name, url) in &saved {
         println!("{name:<width$}  {url}");
     }
-    println!("{} station{}", saved.len(), if saved.len() == 1 { "" } else { "s" });
+    println!(
+        "{} station{}",
+        saved.len(),
+        if saved.len() == 1 { "" } else { "s" }
+    );
     Ok(true)
 }
 
@@ -116,13 +124,13 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
         }
     }
     if paths.is_empty() {
-        let env = hypodj_client::config::Env { get: &|k| std::env::var(k).ok() };
+        let env = hypodj_client::config::Env {
+            get: &|k| std::env::var(k).ok(),
+        };
         match hypodj_client::config::stations_dir(&env) {
             Some(d) => paths.push(d),
             None => {
-                eprintln!(
-                    "dj stations import: no PATH given and HYPODJ_STATIONS_DIR is not set"
-                );
+                eprintln!("dj stations import: no PATH given and HYPODJ_STATIONS_DIR is not set");
                 return Ok(false);
             }
         }
@@ -143,7 +151,11 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
     // A dry run decides CLIENT-side from one read of the saved set and sends zero
     // writes. The daemon stays the authority - it re-decides on the real write - so
     // this is a preview, never a substitute.
-    let saved = if dry_run { Some(saved_stations(conn)?) } else { None };
+    let saved = if dry_run {
+        Some(saved_stations(conn)?)
+    } else {
+        None
+    };
 
     let mut created = 0usize;
     let mut updated = 0usize;
@@ -156,7 +168,11 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
     let mut claimed: Vec<(String, String)> = Vec::new();
 
     for (idx, file) in files.iter().enumerate() {
-        let label = file.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        let label = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
         // Fail LOUD on invalid UTF-8 rather than lossy-converting: a mangled name is a
         // broken idempotency key, and a broken key mints a duplicate on every run.
         let text = match std::fs::read_to_string(file) {
@@ -181,7 +197,11 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
                 );
             }
         }
-        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or(&label).to_string();
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&label)
+            .to_string();
         for entry in entries {
             let (name, from_stem) = match entry.title {
                 Some(t) => (t, false),
@@ -189,7 +209,11 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
                 // over-produces urls, and a url is not a name a human can type.
                 None => (stem.clone(), true),
             };
-            let suffix = if from_stem { "  (no TitleN, used file name)" } else { "" };
+            let suffix = if from_stem {
+                "  (no TitleN, used file name)"
+            } else {
+                ""
+            };
             // Caught BEFORE the write, and identically under `--dry-run`: an entry that
             // fights an earlier one over a key is refused here rather than sent, because
             // the daemon would read it as a rename of the row that entry just saved - a
@@ -279,7 +303,13 @@ fn summary(
     unknown: usize,
     failed: usize,
 ) -> String {
-    let word = |would: &str, did: &str| if dry_run { format!("would {would}") } else { did.to_string() };
+    let word = |would: &str, did: &str| {
+        if dry_run {
+            format!("would {would}")
+        } else {
+            did.to_string()
+        }
+    };
     let mut parts = Vec::new();
     if created > 0 {
         parts.push(format!("{created} {}", word("create", "created")));
@@ -547,7 +577,9 @@ fn shell_expand_home(s: &str) -> String {
 /// without mutating the process environment. A tilde anywhere but the front is an
 /// ordinary character in an ordinary path and is left alone.
 fn expand_home_with(s: &str, home: Option<&str>) -> String {
-    let Some(home) = home else { return s.to_string() };
+    let Some(home) = home else {
+        return s.to_string();
+    };
     if s == "~" {
         return home.to_string();
     }
@@ -614,16 +646,25 @@ mod tests {
     #[test]
     fn preview_verdict_mirrors_the_daemon_rule() {
         let saved = vec![
-            ("NTS 4 To The Floor".to_string(), "https://n/mixtape5".to_string()),
+            (
+                "NTS 4 To The Floor".to_string(),
+                "https://n/mixtape5".to_string(),
+            ),
             ("KFJC 89.7 FM".to_string(), "http://k/live".to_string()),
         ];
-        assert_eq!(preview_verdict(&saved, "https://new/", "New One"), Verdict::Create);
+        assert_eq!(
+            preview_verdict(&saved, "https://new/", "New One"),
+            Verdict::Create
+        );
         assert_eq!(
             preview_verdict(&saved, "https://n/mixtape5", "NTS 4 To The Floor"),
             Verdict::Unchanged
         );
         // Renamed in the .pls: same url, new label.
-        assert_eq!(preview_verdict(&saved, "https://n/mixtape5", "NTS FTF"), Verdict::Update(None));
+        assert_eq!(
+            preview_verdict(&saved, "https://n/mixtape5", "NTS FTF"),
+            Verdict::Update(None)
+        );
         // The endpoint moved: same name, new url - the old url is echoed.
         assert_eq!(
             preview_verdict(&saved, "http://k/live-320", "kfjc 89.7 fm"),
@@ -641,20 +682,38 @@ mod tests {
         // The idempotence promise, previewed: after one import, every entry reads back
         // as Unchanged, so `--dry-run` re-run is itself the verification gesture.
         let pls = vec![
-            ("NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
-            ("Moon Mission Recordings, Tokyo Deep and Electronic", "http://uk5.internet-radio.com:8306/stream"),
-            ("Oxigenio 102.6 FM Lisboa", "http://proic1.evspt.com:80/oxigenio_aac"),
+            (
+                "NTS 4 To The Floor",
+                "https://stream-mixtape-geo.ntslive.net/mixtape5",
+            ),
+            (
+                "Moon Mission Recordings, Tokyo Deep and Electronic",
+                "http://uk5.internet-radio.com:8306/stream",
+            ),
+            (
+                "Oxigenio 102.6 FM Lisboa",
+                "http://proic1.evspt.com:80/oxigenio_aac",
+            ),
         ];
-        let saved: Vec<(String, String)> =
-            pls.iter().map(|(n, u)| (n.to_string(), u.to_string())).collect();
+        let saved: Vec<(String, String)> = pls
+            .iter()
+            .map(|(n, u)| (n.to_string(), u.to_string()))
+            .collect();
         for (name, url) in &pls {
-            assert_eq!(preview_verdict(&saved, url, name), Verdict::Unchanged, "{name}");
+            assert_eq!(
+                preview_verdict(&saved, url, name),
+                Verdict::Unchanged,
+                "{name}"
+            );
         }
     }
 
     #[test]
     fn the_summary_states_only_what_happened() {
-        assert_eq!(summary(false, 3, 1, 18, 0, 1), "3 created, 1 updated, 18 unchanged, 1 failed");
+        assert_eq!(
+            summary(false, 3, 1, 18, 0, 1),
+            "3 created, 1 updated, 18 unchanged, 1 failed"
+        );
         // The second import of the same collection: no write verbs at all.
         assert_eq!(summary(false, 0, 0, 22, 0, 0), "22 unchanged");
         assert_eq!(summary(true, 22, 0, 0, 0, 0), "22 would create");
@@ -676,7 +735,10 @@ mod tests {
     fn the_three_contract_words_classify_and_nothing_else_does() {
         assert_eq!(classify_station_outcome(Some("created")), Reported::Created);
         assert_eq!(classify_station_outcome(Some("updated")), Reported::Updated);
-        assert_eq!(classify_station_outcome(Some("unchanged")), Reported::Unchanged);
+        assert_eq!(
+            classify_station_outcome(Some("unchanged")),
+            Reported::Unchanged
+        );
     }
 
     #[test]
@@ -716,7 +778,10 @@ mod tests {
         ];
         assert_eq!(run_clash(&claimed, "http://new/", "New One"), Clash::None);
         // The same station listed twice: nothing to fight over.
-        assert_eq!(run_clash(&claimed, "http://mirror1/", "Some Station"), Clash::Duplicate);
+        assert_eq!(
+            run_clash(&claimed, "http://mirror1/", "Some Station"),
+            Clash::Duplicate
+        );
         // A second mirror url under the file-stem name - the multi-entry .pls shape.
         assert_eq!(
             run_clash(&claimed, "http://mirror2/", "Some Station"),
@@ -743,7 +808,10 @@ mod tests {
     #[test]
     fn tilde_expands_only_at_the_front() {
         let home = Some("/home/tester");
-        assert_eq!(expand_home_with("~/radio-streams", home), "/home/tester/radio-streams");
+        assert_eq!(
+            expand_home_with("~/radio-streams", home),
+            "/home/tester/radio-streams"
+        );
         assert_eq!(expand_home_with("~", home), "/home/tester");
         // A tilde anywhere else is a real character in a real path.
         assert_eq!(expand_home_with("/tmp/a~b", home), "/tmp/a~b");
@@ -787,7 +855,10 @@ mod import_over_a_socket {
     /// by a different row is refused.
     fn station_add(saved: &mut Saved, url: &str, name: &str) -> String {
         let by_url = saved.rows.iter().position(|r| r.url == url);
-        let by_name = saved.rows.iter().position(|r| r.name.eq_ignore_ascii_case(name));
+        let by_name = saved
+            .rows
+            .iter()
+            .position(|r| r.name.eq_ignore_ascii_case(name));
         let target = match (by_url, by_name) {
             (Some(u), Some(n)) if u == n => {
                 if saved.rows[u].name == name {
@@ -816,7 +887,10 @@ mod import_over_a_socket {
                 r
             }
             None => {
-                saved.rows.push(Row { url: url.to_string(), name: name.to_string() });
+                saved.rows.push(Row {
+                    url: url.to_string(),
+                    name: name.to_string(),
+                });
                 format!("X-Station: created\nName: {name}\nfile: {url}\nOK\n")
             }
         }
@@ -883,7 +957,9 @@ mod import_over_a_socket {
     /// than leaking a listener for the rest of the test binary's life.
     fn serve(listener: TcpListener, conns: usize, state: Arc<Mutex<Saved>>) {
         for _ in 0..conns {
-            let Ok((stream, _)) = listener.accept() else { return };
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
             let mut w = stream.try_clone().expect("clone");
             if w.write_all(b"OK MPD 0.24.0\n").is_err() {
                 continue;
@@ -927,7 +1003,12 @@ mod import_over_a_socket {
                 let state = Arc::clone(&state);
                 move || serve(listener, conns, state)
             });
-            Harness { dir, port, state, thread: Some(thread) }
+            Harness {
+                dir,
+                port,
+                state,
+                thread: Some(thread),
+            }
         }
 
         /// One `dj stations import <dir>` run: connect, import, hang up.
@@ -979,11 +1060,17 @@ mod import_over_a_socket {
 
         // Run 1: the first mirror lands, the other two are REFUSED and reported, so the
         // run exits non-zero rather than silently dropping two streams.
-        assert!(!h.import_run(), "a refused entry must make the run fail loudly");
+        assert!(
+            !h.import_run(),
+            "a refused entry must make the run fail loudly"
+        );
         assert_eq!(h.writes(), 1, "exactly one write on the first import");
         assert_eq!(
             h.rows(),
-            vec![("Some Station".to_string(), "http://mirror1.example/stream".to_string())]
+            vec![(
+                "Some Station".to_string(),
+                "http://mirror1.example/stream".to_string()
+            )]
         );
 
         // Run 2: the promise. Zero writes, same row, same url - converged.
@@ -991,7 +1078,10 @@ mod import_over_a_socket {
         assert_eq!(h.writes(), 1, "the second import must write NOTHING");
         assert_eq!(
             h.rows(),
-            vec![("Some Station".to_string(), "http://mirror1.example/stream".to_string())]
+            vec![(
+                "Some Station".to_string(),
+                "http://mirror1.example/stream".to_string()
+            )]
         );
         h.finish();
     }
@@ -1008,14 +1098,20 @@ mod import_over_a_socket {
         assert_eq!(h.writes(), 1);
         assert_eq!(
             h.rows(),
-            vec![("Duplicated Name".to_string(), "http://a.example/1".to_string())]
+            vec![(
+                "Duplicated Name".to_string(),
+                "http://a.example/1".to_string()
+            )]
         );
 
         assert!(!h.import_run());
         assert_eq!(h.writes(), 1, "the second import must write NOTHING");
         assert_eq!(
             h.rows(),
-            vec![("Duplicated Name".to_string(), "http://a.example/1".to_string())]
+            vec![(
+                "Duplicated Name".to_string(),
+                "http://a.example/1".to_string()
+            )]
         );
         h.finish();
     }
@@ -1033,7 +1129,10 @@ mod import_over_a_socket {
         assert_eq!(h.writes(), 1);
         assert_eq!(
             h.rows(),
-            vec![("First Name".to_string(), "http://one.example/stream".to_string())]
+            vec![(
+                "First Name".to_string(),
+                "http://one.example/stream".to_string()
+            )]
         );
 
         assert!(!h.import_run());
@@ -1086,7 +1185,10 @@ mod import_over_a_socket {
         assert_eq!(h.writes(), 1);
         assert_eq!(
             h.rows(),
-            vec![("Same Thing".to_string(), "http://one.example/stream".to_string())]
+            vec![(
+                "Same Thing".to_string(),
+                "http://one.example/stream".to_string()
+            )]
         );
         h.finish();
     }
@@ -1100,8 +1202,7 @@ mod import_over_a_socket {
                    File2=http://mirror2.example/stream\nVersion=2";
         let h = Harness::new("dryrun", 1, &[("Some Station.pls", pls)]);
         let mut conn = MpdConn::connect("127.0.0.1", h.port).expect("connect");
-        let args =
-            vec![h.dir.to_string_lossy().to_string(), "--dry-run".to_string()];
+        let args = vec![h.dir.to_string_lossy().to_string(), "--dry-run".to_string()];
         assert!(!import(&mut conn, &args).expect("import"));
         assert_eq!(h.writes(), 0, "a dry run sends no writes at all");
         assert!(h.rows().is_empty());
@@ -1121,6 +1222,9 @@ mod import_over_a_socket {
             split_args(&line),
             vec!["station", "add", "http://a/?v=1&x=2", "A \"quoted\" name"]
         );
-        assert_eq!(split_args("lsinfo \"Stations\""), vec!["lsinfo", "Stations"]);
+        assert_eq!(
+            split_args("lsinfo \"Stations\""),
+            vec!["lsinfo", "Stations"]
+        );
     }
 }

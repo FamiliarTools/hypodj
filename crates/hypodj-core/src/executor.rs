@@ -34,7 +34,7 @@ use crate::clock::Clock;
 use crate::event::{DjEvent, DjEventKind, QueueId};
 use crate::handler::{FadeIntent, FadeRequest, HypodjHandler, PlanOutcome};
 use crate::plan::{fires, Action, ArmedPlan, FadeIntentIr, Fire, PlanId, Resolved};
-use crate::player::PlayState;
+use crate::player::{mpv_volume_to_db, PlayState};
 use crate::timer::{TimerGuard, TimerHandle};
 
 /// A live-position jump larger than this (a seek, not the second-by-second
@@ -64,14 +64,36 @@ pub struct PendingPlan {
     /// position JUMPED (a seek) is detected and the timer re-armed; `None` when
     /// the plan is not a remaining-plan or is currently disarmed.
     pub remaining_deadline: Option<tokio::time::Instant>,
+    /// `true` only for a plan the DAEMON armed for one of its own reserved
+    /// convenience-feature origins (sleep / winddown / wake). Singleton identity
+    /// hangs off THIS, never off `armed.raw.origin` alone: `origin` is a free
+    /// string a client picks (`plan add ... origin sleep`), so a string-only
+    /// lookup let a client plan masquerade as the sleep timer - duplicating the
+    /// `X-hypodj-sleep-remaining` status key, surviving `sleep off` while still
+    /// counting down, and being swept away by an unrelated re-arm. Lives HERE
+    /// (registry-side) rather than in [`ArmedPlan`] so nothing serializable, and
+    /// therefore nothing a producer can author, can ever set it.
+    pub reserved: bool,
+    /// The CIVIL instant a [`Resolved::OnDeadline`] plan armed from a
+    /// [`crate::plan::RawTrigger::WallClock`] or `Daily` trigger is meant to fire
+    /// at. The timer itself runs on the monotonic clock, which STOPS during a
+    /// laptop suspend, so the deadline drifts late by the time asleep; this is
+    /// the truth [`HypodjHandler::resync_civil_deadlines`] re-derives it from.
+    /// `None` for every other shape (a span or a track edge is monotonic by
+    /// meaning, so a suspend correctly pauses it).
+    pub civil_at: Option<chrono::DateTime<chrono::Utc>>,
 }
+
+/// How often the executor re-derives civil deadlines from the wall clock (see
+/// [`HypodjHandler::resync_civil_deadlines`]). Bounds how late an alarm can ring
+/// after a resume; one cheap registry pass, so the cost is negligible.
+pub const CIVIL_RESYNC: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The executor task. Generic over the [`Clock`] so it runs identically under
 /// real time and paused fake time.
 pub struct Executor<C: Clock> {
     handler: Arc<HypodjHandler>,
     timers: TimerHandle,
-    #[allow(dead_code)]
     clock: C,
     triggers: mpsc::UnboundedReceiver<DjEvent>,
     ticks: Option<broadcast::Receiver<DjEvent>>,
@@ -110,8 +132,16 @@ impl<C: Clock> Executor<C> {
     }
 
     async fn run(mut self) {
+        let mut next_resync = self.clock.now() + CIVIL_RESYNC;
         loop {
             tokio::select! {
+                // Suspend safety: the monotonic clock every timer sleeps on stops
+                // while the machine is asleep, so periodically re-derive civil
+                // deadlines from the wall clock. Dependency-free (no logind).
+                _ = self.clock.sleep_until(next_resync) => {
+                    next_resync = self.clock.now() + CIVIL_RESYNC;
+                    self.handler.resync_civil_deadlines();
+                }
                 // The lossless edge/WallClock path is the lifeline: its close means
                 // the director spine is gone, so the executor winds down too.
                 ev = self.triggers.recv() => match ev {
@@ -143,23 +173,37 @@ impl<C: Clock> Executor<C> {
 
         let snap = self.handler.queue_snapshot();
         let pending = self.handler.plan_pending_handle();
-        let mut fired: Vec<(PlanId, Action)> = Vec::new();
+        // The plan's ORIGIN rides along with its action: the journal records who
+        // caused each effect, and this path fires with NO client connected.
+        let mut fired: Vec<(PlanId, Action, String)> = Vec::new();
+        let mut dropped = false;
         {
             // ONE short lock: collect fired ids + drop once/stale plans, mirroring
             // the timer live-set. No `.await` under this std Mutex.
             let mut g = pending.lock().unwrap();
+            let handler = &self.handler;
             g.retain_mut(|pp| match fires(&pp.armed, ev, &snap) {
                 Fire::Yes => {
-                    fired.push((pp.armed.id, pp.armed.raw.action.clone()));
-                    // Every armed anchor here is single-use (a concrete
-                    // QueueId/AlbumId/absolute deadline fires exactly once), so a
-                    // fired plan is ALWAYS removed at selection (dropping its guard),
-                    // regardless of `once` - no un-fireable zombie lingers in the
-                    // list. `once` is reserved for future RECURRING triggers; until
-                    // one exists every armed plan is fire-once.
-                    false
+                    fired.push((
+                        pp.armed.id,
+                        pp.armed.raw.action.clone(),
+                        pp.armed.raw.origin.clone(),
+                    ));
+                    // An armed anchor (a concrete QueueId/AlbumId/absolute
+                    // deadline) fires exactly once. A single-use plan is removed
+                    // at selection (dropping its guard), regardless of `once` - no
+                    // un-fireable zombie lingers. A RECURRING trigger keeps its
+                    // registry slot and id: it is re-armed in place to its next
+                    // occurrence (and dropped, loudly, if none resolves).
+                    let kept = pp.armed.raw.trigger.is_recurring() && handler.rearm_recurring(pp);
+                    if !kept && pp.armed.raw.trigger.is_recurring() {
+                        tracing::warn!(plan = pp.armed.id.0, "recurring plan could not re-arm; dropped");
+                    }
+                    dropped |= !kept;
+                    kept
                 }
                 Fire::Stale => {
+                    dropped = true;
                     tracing::warn!(
                         plan = pp.armed.id.0,
                         "plan expired: target queue id gone or already passed"
@@ -169,8 +213,13 @@ impl<C: Clock> Executor<C> {
                 Fire::No => true,
             });
         }
+        // A plan left the registry: the persisted copy must not outlive it (a
+        // fired one-shot wake restored after a restart would ring twice).
+        if dropped {
+            self.handler.persist_plans();
+        }
         // Stable total order: ascending PlanId, reproducible across runs.
-        fired.sort_by_key(|(id, _)| *id);
+        fired.sort_by_key(|(id, _, _)| *id);
         if !fired.is_empty() {
             self.execute_batch(fired);
         }
@@ -250,14 +299,17 @@ impl<C: Clock> Executor<C> {
     /// `once` - so a non-once Immediate plan never lingers as an un-fireable zombie.
     fn on_immediate(&self, id: PlanId) {
         let pending = self.handler.plan_pending_handle();
-        let action = {
+        let armed = {
             let mut g = pending.lock().unwrap();
-            g.iter().position(|pp| pp.armed.id == id).map(|pos| g.remove(pos).armed.raw.action)
+            g.iter().position(|pp| pp.armed.id == id).map(|pos| {
+                let raw = g.remove(pos).armed.raw;
+                (raw.action, raw.origin)
+            })
         };
         // Run OFF the select loop (an Immediate Enqueue does network calls): a slow
         // add-time action must not wedge the loop either.
-        if let Some(a) = action {
-            self.execute_batch(vec![(id, a)]);
+        if let Some((a, origin)) = armed {
+            self.execute_batch(vec![(id, a, origin)]);
         }
     }
 
@@ -301,11 +353,11 @@ impl<C: Clock> Executor<C> {
     /// are isolated (fades still serialize through the single
     /// [`HypodjHandler::start_fade_spec`] slot / one envelope), so the end state does
     /// not depend on completion order.
-    fn execute_batch(&self, fired: Vec<(PlanId, Action)>) {
-        for (id, action) in fired {
+    fn execute_batch(&self, fired: Vec<(PlanId, Action, String)>) {
+        for (id, action, origin) in fired {
             let h = self.handler.clone();
             tokio::spawn(async move {
-                let jh = tokio::spawn(run_action(h, id, action));
+                let jh = tokio::spawn(run_action(h, id, action, origin));
                 if let Err(e) = jh.await {
                     tracing::error!(plan = id.0, error = %e, "plan action task panicked");
                 }
@@ -355,8 +407,11 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
     match ir {
         FadeIntentIr::Out { secs } => FadeRequest { intent: FadeIntent::Out, dur: dur(*secs), commit_logical: None },
         FadeIntentIr::In { secs } => FadeRequest { intent: FadeIntent::In, dur: dur(*secs), commit_logical: None },
-        FadeIntentIr::To { target_db, vol, secs } => FadeRequest {
-            intent: FadeIntent::To { target_db: *target_db, vol: *vol },
+        // The dB target is DERIVED from the requested 0..=100 volume through the
+        // cubic-softvol seam - the plan IR carries no independent dB, so the level
+        // the echo shows is exactly the level the envelope drives to.
+        FadeIntentIr::To { vol, secs } => FadeRequest {
+            intent: FadeIntent::To { target_db: mpv_volume_to_db(*vol as f64), vol: *vol },
             dur: dur(*secs),
             commit_logical: None,
         },
@@ -367,11 +422,6 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
             dur: dur(*secs),
             commit_logical: None,
         },
-        FadeIntentIr::WakeTo { target_db, vol, secs } => FadeRequest {
-            intent: FadeIntent::WakeTo { target_db: *target_db, vol: *vol },
-            dur: dur(*secs),
-            commit_logical: None,
-        },
     }
 }
 
@@ -379,8 +429,8 @@ pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
 /// ([`HypodjHandler::run_action_outcome`]). An arm-and-forget plan ignores the
 /// outcome except to log a failure (log-and-continue); the `plan add` reporting path
 /// threads the same outcome back to the client.
-async fn run_action(handler: Arc<HypodjHandler>, id: PlanId, action: Action) {
-    if let PlanOutcome::Failed(e) = handler.run_action_outcome(&action).await {
+async fn run_action(handler: Arc<HypodjHandler>, id: PlanId, action: Action, origin: String) {
+    if let PlanOutcome::Failed(e) = handler.run_action_outcome(&action, &origin).await {
         tracing::error!(plan = id.0, error = %e, "plan action failed (log-and-continue)");
     }
 }
@@ -1202,6 +1252,59 @@ mod tests {
         assert!(rig.handler.plan_list().is_empty(), "once wake plan removed");
     }
 
+    // SUSPEND: the monotonic clock stops while the laptop sleeps, the wall clock
+    // does not. `wake in 2h`, then civil time jumps 2h minus 10s with NO monotonic
+    // progress (a suspend): the alarm must ring within one resync period, not 2h
+    // late. Then a wake slept THROUGH by more than the grace is dropped, never
+    // rung hours late.
+    #[tokio::test(start_paused = true)]
+    async fn wake_survives_suspend_civil_jump() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let at = crate::clock::civil_now() + chrono::Duration::seconds(7200);
+        rig.handler.wake_set(at, None, 0).unwrap();
+        settle().await;
+        crate::clock::skew_civil_for_test(chrono::Duration::seconds(7190));
+        // 9s of monotonic time: no resync yet, still armed for the old deadline.
+        tokio::time::advance(Duration::from_secs(9)).await;
+        settle().await;
+        assert!(!rig.handler.fade_active_for_test().await, "not before the civil target");
+        // Cross the resync period (30s): re-derived, and past the civil target.
+        tokio::time::advance(CIVIL_RESYNC).await;
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert!(rig.handler.fade_active_for_test().await, "wake rang after the suspend, not 2h late");
+        assert!(rig.handler.plan_list().is_empty(), "once wake plan removed");
+
+        // Slept through by an hour: dropped, not rung.
+        let at = crate::clock::civil_now() + chrono::Duration::seconds(600);
+        rig.handler.wake_set(at, None, 0).unwrap();
+        assert_eq!(rig.handler.plan_list().len(), 1);
+        crate::clock::skew_civil_for_test(chrono::Duration::seconds(600 + 3600));
+        tokio::time::advance(CIVIL_RESYNC + Duration::from_secs(1)).await;
+        settle().await;
+        assert!(rig.handler.plan_list().is_empty(), "missed-by-an-hour wake dropped");
+    }
+
+    // A steady run (no civil jump) re-derives nothing: the resync is a no-op and
+    // the deadline stays exactly where it was armed.
+    #[tokio::test(start_paused = true)]
+    async fn civil_resync_is_noop_without_jump() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let at = crate::clock::civil_now() + chrono::Duration::seconds(7200);
+        rig.handler.wake_set(at, None, 0).unwrap();
+        let before = rig.handler.plan_deadlines()[0].2;
+        tokio::time::advance(CIVIL_RESYNC * 4).await;
+        settle().await;
+        assert_eq!(rig.handler.plan_deadlines()[0].2, before, "no re-arm without drift");
+    }
+
     // WAKE: an enqueue failure ABORTS the ramp - never ramp silence over an empty
     // queue. Selector::Calmer must resolve its seed via client.song(id); against
     // the rig's non-live client that fetch errors, so plan_enqueue returns Err and
@@ -1242,4 +1345,47 @@ mod tests {
         settle().await;
         assert!(!rig.handler.fade_active_for_test().await, "no fire after wake cancel");
     }
+    // RECURRING wake: a Daily trigger fires at its local time-of-day, then stays
+    // in the registry under the SAME id, re-armed ~a day later (civil time follows
+    // the fake clock via `clock::civil_now`), and fires again the next day.
+    #[tokio::test(start_paused = true)]
+    async fn daily_wake_fires_then_rearms_for_the_next_day() {
+        use chrono::Timelike;
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let target = (crate::clock::civil_now() + chrono::Duration::hours(2)).with_timezone(&chrono::Local);
+        let trigger = RawTrigger::Daily {
+            hour: target.hour() as u8,
+            minute: target.minute() as u8,
+            days: crate::plan::DaySet::EVERY,
+        };
+        let id = rig.handler.wake_set_trigger(trigger, None, 0).unwrap();
+        let rem = rig.handler.wake_remaining().expect("armed");
+        assert!(rem > Duration::from_secs(7080) && rem <= Duration::from_secs(7200), "{rem:?}");
+
+        tokio::time::advance(rem + Duration::from_secs(1)).await;
+        settle().await;
+        assert!(rig.handler.fade_active_for_test().await, "wake ramp installed at the first fire");
+        let list = rig.handler.plan_list();
+        assert_eq!(list.len(), 1, "recurring plan kept after firing");
+        assert_eq!(list[0].0, id, "same plan id across the re-arm");
+        let rem2 = rig.handler.wake_remaining().expect("re-armed");
+        // A day later (DST can move it by an hour either way).
+        assert!(
+            rem2 > Duration::from_secs(22 * 3600) && rem2 <= Duration::from_secs(25 * 3600),
+            "{rem2:?}"
+        );
+
+        // The second day fires and re-arms again.
+        tokio::time::advance(rem2 + Duration::from_secs(1)).await;
+        settle().await;
+        let rem3 = rig.handler.wake_remaining().expect("re-armed again");
+        assert!(rem3 > Duration::from_secs(22 * 3600), "{rem3:?}");
+        assert_eq!(rig.handler.plan_list()[0].0, id);
+        assert!(rig.handler.wake_cancel(), "a recurring wake cancels like a one-shot");
+        assert!(rig.handler.plan_list().is_empty());
+    }
 }
+

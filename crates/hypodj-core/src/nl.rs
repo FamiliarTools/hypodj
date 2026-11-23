@@ -52,6 +52,21 @@ pub enum NlSource {
 pub struct NlHit {
     pub plans: Vec<RawPlan>,
     pub source: NlSource,
+    /// Set when the utterance names one of the daemon's single-instance FEATURES
+    /// rather than a one-off plan. The handler then ignores the plan's action and
+    /// arms the feature itself through its own singleton path (the one the direct
+    /// `sleep` / `winddown` commands use), keeping only the plan's trigger - so an
+    /// NL sleep supersedes the armed one and `sleep` status sees it.
+    pub session: Option<NlSession>,
+}
+
+/// A single-instance daemon feature an utterance can name (see [`NlHit::session`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NlSession {
+    /// The sleep timer: fade out and stop.
+    Sleep,
+    /// The wind-down: a long fade to the non-silence floor.
+    WindDown,
 }
 
 /// Why a translation failed. Distinguishes a fall-through miss from a real,
@@ -72,9 +87,28 @@ pub enum NlError {
     NotAvailable,
 }
 
+/// A READ-side request: a question that returns information NOW instead of a
+/// plan to arm. A query has no side effect, so it skips echo-before-arm entirely
+/// (there is nothing to confirm); the handler answers it immediately with an
+/// `nl_answer` pair and NO `nl_token`. Anything that mutates stays a [`RawPlan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NlQuery {
+    /// "what is favorited?" / "list my favorites": the starred songs.
+    Favorites,
+    /// "is this favorited?" / "is the current song starred?": yes/no for current.
+    IsCurrentFavorited,
+}
+
 /// The injected NL seam. SYNC + `Send + Sync` so the daemon can run it under
 /// `spawn_blocking` (a local model can take hundreds of ms): hypodj-core needs no
 /// model dep and no `std` Mutex is ever held across an await.
 pub trait Translator: Send + Sync {
     fn translate(&self, utterance: &str, ctx: &NlContext) -> Result<NlHit, NlError>;
+
+    /// Recognize a READ-side question (see [`NlQuery`]). Checked BEFORE
+    /// [`Translator::translate`]; `None` (the default) means "not a question I
+    /// know", and the utterance proceeds to the action path.
+    fn query(&self, _utterance: &str) -> Option<NlQuery> {
+        None
+    }
 }

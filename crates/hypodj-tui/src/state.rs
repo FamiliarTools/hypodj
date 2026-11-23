@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use hypodj_client::model::{NowPlaying, QueueItem};
+use hypodj_client::model::{Mode as PlayMode, NowPlaying, QueueItem};
 use hypodj_client::nl::{not_understood_hint, NlTranslatorPin};
 use hypodj_client::route::{route, Action};
 
@@ -385,6 +385,36 @@ impl Browse {
     }
 }
 
+/// Which read-back the full-frame overlay is currently showing. One overlay, two
+/// contents: a ledger and a journal are the same shape (many rows, read at leisure,
+/// dismissed by their own letter), and a second popup with its own scroll state and
+/// its own close-key pair is a second thing to keep in lockstep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    /// The `heard` ledger + tape read-back, opened with `t`.
+    Marks,
+    /// The undo ring, opened with `U`.
+    Journal,
+}
+
+impl Panel {
+    /// The overlay's heading word.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Panel::Marks => "Marks",
+            Panel::Journal => "Journal",
+        }
+    }
+
+    /// The letter that opened it, and so the letter that closes it.
+    pub fn close_key(&self) -> char {
+        match self {
+            Panel::Marks => 't',
+            Panel::Journal => 'U',
+        }
+    }
+}
+
 /// The side-effecting request handle_key emits for the event loop to run. IO lives
 /// entirely in the loop; the state machine only ever returns one of these.
 #[derive(Debug, PartialEq, Eq)]
@@ -534,7 +564,7 @@ pub fn more_rows_from_pairs(pairs: &[(String, String)]) -> Vec<(String, String)>
     // and no label. That distinction is what lets the renderer set headings flush and
     // bold while running text stays a plain block - without it both arrive as
     // indistinguishable empty-labelled rows and a heading reads as a stray value.
-    let mut section = |rows: &mut Vec<(String, String)>, title: &str| {
+    let section = |rows: &mut Vec<(String, String)>, title: &str| {
         if !rows.is_empty() {
             rows.push((String::new(), String::new()));
         }
@@ -718,8 +748,20 @@ impl ScrollBox {
     }
 }
 
+/// The sixel payload last put on screen, with the geometry it was encoded for (the
+/// pane rect and the cell size in pixels). See [`TuiState::sixel_held`]: the pin is
+/// only reusable while the geometry still matches.
+#[derive(Debug, Clone)]
+pub struct SixelHeld {
+    pub geometry: (ratatui::layout::Rect, (u16, u16)),
+    pub payload: String,
+}
+
 pub struct TuiState {
     pub now: NowPlaying,
+    /// When `now` was applied: the base `now.elapsed` is extrapolated from, so the
+    /// playhead moves between status reads without polling for it.
+    pub now_at: Option<Instant>,
     pub queue: Vec<QueueItem>,
     pub selected: usize,
     /// The active main view.
@@ -881,6 +923,15 @@ pub struct TuiState {
     /// the race, because the base reply then replaced the whole vector. Keeping them
     /// apart and concatenating at render makes order irrelevant.
     pub card_more: Vec<(String, String)>,
+    /// Which read-back [`Self::heard_lines`] currently holds, which decides the
+    /// overlay's title and the letter that closes it.
+    pub panel: Panel,
+    /// The retraction currently on offer, already rendered by the SHARED badge
+    /// formatter from the daemon's own `PlanOutcome::render()` and its own live
+    /// undoability - so nothing an agent said reaches a character of it, and the
+    /// footer never offers an undo the daemon would refuse. `None` when there is
+    /// nothing to retract (or the daemon is too old to keep a journal).
+    pub undo_offer: Option<String>,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -936,7 +987,7 @@ pub struct TuiState {
     /// [`sixel_gen`] anyway, which re-sends the now-current cover. The user never sees a
     /// stale cover: the only window it is stale in is the one where a popup is covering
     /// it.
-    pub sixel_held: RefCell<Option<String>>,
+    pub sixel_held: RefCell<Option<SixelHeld>>,
     /// Whether the terminal advertises truecolor (else colors quantize to xterm-256).
     pub truecolor: bool,
     /// The cached album sigil, rebuilt only when the album identity changes (static -
@@ -973,6 +1024,7 @@ impl Default for TuiState {
     fn default() -> Self {
         TuiState {
             now: NowPlaying::default(),
+            now_at: None,
             queue: Vec::new(),
             selected: 0,
             screen: Screen::Queue,
@@ -1016,6 +1068,8 @@ impl Default for TuiState {
             card_scroll: ScrollBox::default(),
             card_uri: None,
             card_more: Vec::new(),
+            panel: Panel::Marks,
+            undo_offer: None,
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             sixel_supported: false,
@@ -1037,7 +1091,7 @@ impl TuiState {
     /// Apply a fresh (now-playing, queue) snapshot. Clamps `selected` down when the
     /// queue shrinks so it never dangles past the end.
     pub fn apply_snapshot(&mut self, now: NowPlaying, queue: Vec<QueueItem>) {
-        self.now = now;
+        self.apply_now(now);
         self.queue = queue;
         if self.queue.is_empty() {
             self.selected = 0;
@@ -1050,6 +1104,23 @@ impl TuiState {
     /// Used by the fast refresh path when the queue version is unchanged.
     pub fn apply_now(&mut self, now: NowPlaying) {
         self.now = now;
+        self.now_at = Some(Instant::now());
+    }
+
+    /// The playhead as of `at`: the reported `elapsed` plus the time since it was
+    /// read, advancing only while playing and never past the track's duration. A
+    /// scrub or pause refreshes the snapshot, which rebases it.
+    pub fn live_elapsed(&self, at: Instant) -> Option<f64> {
+        let base = self.now.elapsed?;
+        let moved = match (self.now.state.as_deref(), self.now_at) {
+            (Some("play"), Some(t)) => at.saturating_duration_since(t).as_secs_f64(),
+            _ => 0.0,
+        };
+        let e = base + moved;
+        Some(match self.now.duration {
+            Some(d) => e.min(d),
+            None => e,
+        })
     }
 
     /// Enter the confirm for a pending plan. On the DJ (chat) screen the echo +
@@ -1194,10 +1265,20 @@ impl TuiState {
     }
 
     pub fn open_heard(&mut self, lines: Vec<String>) {
+        self.open_panel(Panel::Marks, lines);
+    }
+
+    /// The undo ring, in the same overlay under its own title. Opened by `U`.
+    pub fn open_journal(&mut self, lines: Vec<String>) {
+        self.open_panel(Panel::Journal, lines);
+    }
+
+    fn open_panel(&mut self, panel: Panel, lines: Vec<String>) {
         if lines.is_empty() {
             return;
         }
         self.take_screen();
+        self.panel = panel;
         self.heard_lines = lines;
         self.heard_open = true;
         self.heard.reset();
@@ -1253,7 +1334,13 @@ impl TuiState {
         if self.heard_open {
             // Offsets clamped against the renderer's measured max, same as help.
             match key.code {
-                KeyCode::Char('t') | KeyCode::Esc | KeyCode::Char('q') => {
+                // Its OWN letter closes it, so `t` and `U` each toggle the panel
+                // they opened and neither silently closes the other's.
+                KeyCode::Char(c) if c == self.panel.close_key() => {
+                    self.heard_open = false;
+                    self.heard.reset();
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
                     self.heard_open = false;
                     self.heard.reset();
                 }
@@ -1387,6 +1474,10 @@ impl TuiState {
             Act::VolumeUp => Some(Intent::Command("knob up".into())),
             Act::VolumeDown => Some(Intent::Command("knob down".into())),
             Act::Pause => Some(Intent::Command("pause".into())),
+            Act::ToggleRandom => self.toggle_mode(PlayMode::Random),
+            Act::ToggleRepeat => self.toggle_mode(PlayMode::Repeat),
+            Act::ToggleSingle => self.toggle_mode(PlayMode::Single),
+            Act::ToggleConsume => self.toggle_mode(PlayMode::Consume),
             Act::Next => Some(Intent::Command("next".into())),
             Act::Prev => Some(Intent::Command("previous".into())),
             // Scrub the current track (relative seekcur).
@@ -1441,6 +1532,12 @@ impl TuiState {
                 self.card = Some(vec![("".to_string(), "looking it up...".to_string())]);
                 Some(Intent::Info(uri))
             }
+            // `u` retracts, `U` shows what there is to retract. Both go straight to
+            // the daemon: the refusal is the daemon's to make (it checks the world
+            // key), and every refusal it makes is loud, so a stale offer answers with
+            // a sentence rather than with silence.
+            Act::Undo => Some(Intent::Command("undo".into())),
+            Act::Journal => Some(Intent::Command("journal".into())),
             Act::PlaySel => self.enter_action(),
             // `d` / Delete removes the selected QUEUE row (elsewhere a deliberate no-op:
             // a browse row is not IN the queue, so there is nothing to remove). The
@@ -1950,7 +2047,7 @@ impl TuiState {
                     uri: it.uri.clone(),
                     album_uri: it.album_uri.clone(),
                     artist: named(it.artist.clone()),
-                    artist_uri: None,
+                    artist_uri: it.artist_uri.clone(),
                     match_uri: None,
                 })
             }
@@ -2005,7 +2102,7 @@ impl TuiState {
             uri: Some(file),
             album_uri: self.now.album_uri.clone(),
             artist: named(self.now.artist.clone()),
-            artist_uri: None,
+            artist_uri: self.now.artist_uri.clone(),
             match_uri: self.now.match_uri.clone(),
         })
     }
@@ -2126,7 +2223,7 @@ impl TuiState {
                 let label = self.menu_label();
                 self.reveal(u, &label)
             }
-            // No artist uri exists on the wire yet, so this is a real library QUERY -
+            // The row carried no artist uri, so this is a real library QUERY -
             // it lands on the Find hits, whose first section is Artists. The query line
             // is filled with the name so the screen says what it asked.
             MenuAction::GoToArtist(ArtistRef::Name(n)) => {
@@ -2416,6 +2513,16 @@ impl TuiState {
         }
     }
 
+    /// Flip a playback mode against the last snapshot. A stale snapshot can only make
+    /// the flip a repeat of the current value (the next idle refresh corrects the
+    /// indicator), never set a mode he did not ask about.
+    fn toggle_mode(&mut self, m: PlayMode) -> Option<Intent> {
+        let line = self.now.modes.toggle_command(m);
+        let on = !self.now.modes.get(m);
+        self.status_msg = Some(format!("{} {}", m.verb(), if on { "on" } else { "off" }));
+        Some(Intent::Command(line))
+    }
+
     /// Route the typed line through the SAME client route() the CLI uses, so a bare
     /// verb goes to Command and a phrase goes to NL - one routing source.
     fn submit(&mut self) -> Option<Intent> {
@@ -2441,6 +2548,7 @@ impl TuiState {
                 None
             }
             Action::FavoriteCurrent => self.favorite_current(),
+            Action::ToggleMode(m) => self.toggle_mode(m),
             // Colon Auto stays on daemon `nl` (today's split). Pin overrides below.
             Action::Nl(phrase) => Some(self.nl_intent_for_colon(phrase)),
         }
@@ -2672,6 +2780,7 @@ impl TuiState {
                 // express favorite/clear and would degrade them to a no-op enqueue).
                 match route(&words) {
                     Action::FavoriteCurrent => self.favorite_current(),
+                    Action::ToggleMode(m) => self.toggle_mode(m),
                     Action::Command(line) => {
                         self.push_dj_log(format!("ok: {line}"));
                         Some(Intent::Command(line))
@@ -2742,6 +2851,27 @@ impl TuiState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn live_elapsed_advances_only_while_playing_and_stops_at_the_end() {
+        let mut st = TuiState::new();
+        st.now = NowPlaying {
+            state: Some("play".into()),
+            elapsed: Some(10.0),
+            duration: Some(12.0),
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        st.now_at = Some(t0);
+        assert_eq!(st.live_elapsed(t0), Some(10.0));
+        assert_eq!(st.live_elapsed(t0 + Duration::from_secs(1)), Some(11.0));
+        assert_eq!(st.live_elapsed(t0 + Duration::from_secs(9)), Some(12.0), "capped");
+        st.now.state = Some("pause".into());
+        assert_eq!(st.live_elapsed(t0 + Duration::from_secs(5)), Some(10.0), "paused holds");
+        st.now.elapsed = None;
+        assert_eq!(st.live_elapsed(t0), None);
+    }
+
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -2751,6 +2881,40 @@ mod tests {
 
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn u_and_shift_u_go_straight_to_the_daemon() {
+        // Neither is interpreted here. The daemon owns the refusal (it checks the
+        // world key), and every refusal it makes is loud - so a stale offer answers
+        // with a sentence rather than with a key that quietly did nothing.
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ch('u')), Some(Intent::Command("undo".into())));
+        assert_eq!(s.handle_key(ch('U')), Some(Intent::Command("journal".into())));
+    }
+
+    #[test]
+    fn each_read_back_panel_is_closed_by_its_own_letter() {
+        let mut s = TuiState::new();
+        s.open_journal(vec!["[ 12]  4s  mpd  added 3".to_string()]);
+        assert_eq!(s.panel, Panel::Journal);
+        // `t` is the LEDGER's letter; it must not close the journal, and it must not
+        // leak through to the daemon either.
+        assert_eq!(s.handle_key(ch('t')), None);
+        assert!(s.heard_open, "the wrong letter neither closes nor acts");
+        assert_eq!(s.handle_key(ch('U')), None);
+        assert!(!s.heard_open);
+        // And symmetrically for the ledger.
+        s.open_heard(vec!["3 marks, oldest first".to_string()]);
+        assert_eq!(s.panel, Panel::Marks);
+        assert_eq!(s.handle_key(ch('U')), None);
+        assert!(s.heard_open);
+        assert_eq!(s.handle_key(ch('t')), None);
+        assert!(!s.heard_open);
+        // Esc and q still close either one.
+        s.open_journal(vec!["x".to_string()]);
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), None);
+        assert!(!s.heard_open);
     }
 
     #[test]
@@ -2799,6 +2963,7 @@ mod tests {
             artist: None,
             uri: Some(format!("song/{pos}")),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }
     }
@@ -3696,6 +3861,7 @@ mod tests {
             artist: None,
             uri: Some(uri.into()),
             album_uri: Some(al.into()),
+            artist_uri: None,
             details: Vec::new(),
         };
         // Two distinct songs of album/1, plus a DUPLICATE of song/1 (must not

@@ -3,6 +3,7 @@
 , pkg-config
 , mpv-unwrapped
 , makeWrapper
+, installShellFiles
 # DISPLAY-only enrichment (from flake.nix): the semver read from Cargo.toml and
 # the HYPODJ_BUILD_INFO grammar baked into the runtime env (the nix sandbox has
 # no .git, so this is what `dj --version` / `dj-gui --version` shows).
@@ -33,23 +34,30 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../Cargo.lock;
 
-  nativeBuildInputs = [ pkg-config makeWrapper ];
+  nativeBuildInputs = [ pkg-config makeWrapper installShellFiles ];
   # mpv.pc (for libmpv2-sys at build, pulled transitively via hypodj-core) +
   # libmpv.so (DT_NEEDED at link/runtime).
   buildInputs = [ mpv-unwrapped ];
 
-  cargoBuildFlags = [ "--bin" "dj" "--bin" "dj-gui" ];
+  # dj-mcp rides along here rather than in its own derivation: it is a CLIENT (pure
+  # MPD/TCP, no libmpv - `ldd` on it shows only libc and libgcc_s) and it shares the
+  # one lock and the one source tree with the other two. Building it beside them
+  # costs one extra link.
+  cargoBuildFlags = [ "--bin" "dj" "--bin" "dj-gui" "--bin" "dj-mcp" ];
 
   # Test only the client crates (offline, no network). The cc tests are pure - a
   # missing `claude` just means cc_available() is false, never a live call.
+  # hypodj-mcp's integration test drives the real binary over a pipe against a
+  # loopback stand-in daemon; both are inside the sandbox, so it needs no network.
   doCheck = true;
   # hypodj-style's ratatui and egui adapters are features. The other packages
   # do not define those feature names; cargo applies --features to the
-  # selected packages that have them.
+  # selected packages that have them. hypodj-mcp is the agent client.
   cargoTestFlags = [
     "-p" "hypodj-client"
     "-p" "hypodj-cli"
     "-p" "dj-gui"
+    "-p" "hypodj-mcp"
     "-p" "hypodj-style"
     "--features" "ratatui,egui"
   ];
@@ -63,16 +71,25 @@ rustPlatform.buildRustPackage {
   # hard DT_NEEDED must still resolve).
   # --set-default so an explicit runtime HYPODJ_BUILD_INFO still wins; the baked
   # value is what makes `--version` show the hash on a nix build (no .git here).
+  # dj-mcp is deliberately NOT in this loop: it has no libmpv DT_NEEDED to resolve
+  # (it never pulls hypodj-core) and no `--version` enrichment to bake, and harn
+  # spawns it as a child with a cleared environment - so a shell wrapper would be a
+  # process and an indirection bought for nothing.
   postInstall = ''
     for b in dj dj-gui; do
       wrapProgram $out/bin/$b \
         --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
         --set-default HYPODJ_BUILD_INFO ${lib.escapeShellArg buildInfo}
     done
+    # Generated from the verb tables (route::ROUTED_VERBS + the CLI's own), never
+    # hand-written, so a rebuild ships completions that match the router. Run via
+    # the wrapper so libmpv.so.2 resolves.
+    $out/bin/dj --completions fish > dj.fish
+    installShellCompletion --fish dj.fish
   '';
 
   meta = {
-    description = "HypoDJ clients: the dj jukebox CLI + dj-gui interactive TUI";
+    description = "HypoDJ clients: the dj jukebox CLI, the dj-gui TUI, and the dj-mcp agent surface";
     mainProgram = "dj";
     license = with lib.licenses; [ mit asl20 ];
   };

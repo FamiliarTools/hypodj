@@ -1450,6 +1450,9 @@ pub struct StoreStatus {
     /// pending count that will NEVER reach zero is indistinguishable from one that
     /// is merely slow.
     pub given_up: usize,
+    /// Songs the server's index MIS-SIZES, by name. Not retried and not counted in
+    /// `given_up`: the fix is a server rescan, so the surface names WHICH songs.
+    pub size_disagreements: Vec<SizeDisagreement>,
     pub waiting: StoreWaiting,
 }
 
@@ -1585,6 +1588,9 @@ pub struct PassInput {
     /// asserts anything about neglect must set a real date. Only `run_pass` and those
     /// tests set it.
     pub now_unix: u64,
+    /// Ids this process will not attempt (given up on, or mis-sized by the server).
+    /// Never admitted to a download batch, so they cannot starve the ids behind them.
+    pub skip: HashSet<SongId>,
 }
 
 impl PassInput {
@@ -1610,6 +1616,7 @@ impl PassInput {
             defer_bulk: false,
             paused: false,
             now_unix: 0,
+            skip: HashSet::new(),
         }
     }
 }
@@ -2412,11 +2419,16 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
     fn push(
         downloads: &mut Vec<StoreAction>,
         seen: &mut HashSet<String>,
+        skip: &HashSet<SongId>,
         batch: usize,
         id: &SongId,
         reason: DownloadReason,
     ) -> bool {
-        if downloads.len() >= batch || !is_storable_id(&id.0) || !seen.insert(id.0.clone()) {
+        if downloads.len() >= batch
+            || !is_storable_id(&id.0)
+            || skip.contains(id)
+            || !seen.insert(id.0.clone())
+        {
             return false;
         }
         downloads.push(StoreAction::Download { id: id.clone(), reason });
@@ -2502,14 +2514,14 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
         // (a) Suspect replacements. A de-offered song is silent until this lands.
         for e in &input.entries {
             if e.suspect {
-                push(&mut downloads, &mut seen, batch, &e.id, DownloadReason::Suspect);
+                push(&mut downloads, &mut seen, &input.skip, batch, &e.id, DownloadReason::Suspect);
             }
         }
         // (b) Window ids with nothing cached at all. An id whose entry exists but is
         // stale keeps serving, so it is bulk work, not window work.
         for id in &input.window {
             if !by_id.contains_key(id.0.as_str()) {
-                push(&mut downloads, &mut seen, batch, id, DownloadReason::Window);
+                push(&mut downloads, &mut seen, &input.skip, batch, id, DownloadReason::Window);
             }
         }
     }
@@ -2528,7 +2540,7 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
             if grow > headroom {
                 continue;
             }
-            if push(&mut downloads, &mut seen, batch, &e.id, DownloadReason::Stale) {
+            if push(&mut downloads, &mut seen, &input.skip, batch, &e.id, DownloadReason::Stale) {
                 headroom = headroom.saturating_sub(grow);
             }
         }
@@ -2597,7 +2609,7 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
                 }
                 let mut admitted = false;
                 for s in missing {
-                    if push(&mut downloads, &mut seen, batch, &s.id, DownloadReason::Backfill) {
+                    if push(&mut downloads, &mut seen, &input.skip, batch, &s.id, DownloadReason::Backfill) {
                         admitted = true;
                     }
                 }
@@ -2718,6 +2730,7 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
             tier_bytes,
             frontier: front.ranked_groups(),
             given_up: 0,
+            size_disagreements: Vec::new(),
             waiting: if !writes_allowed {
                 StoreWaiting::ReserveBreached
             } else if input.paused {
@@ -3631,7 +3644,66 @@ pub trait PinSource: Send + Sync + 'static {
     /// Bounded: a per-chunk inactivity timeout and a running size cap, never a
     /// whole-file buffer in memory. The caller owns `tmp`'s cleanup on failure.
     fn fetch(&self, song: &Song, tmp: &Path)
-    -> impl Future<Output = Result<u64, String>> + Send;
+    -> impl Future<Output = Result<u64, DownloadError>> + Send;
+}
+
+/// Why a download did not land, CLASSIFIED - because the two kinds want opposite
+/// handling (task 01m2300p).
+///
+/// A [`DownloadError::SizeDisagreement`] is the server's index and the bytes it serves
+/// disagreeing about one file: observed live, all 13 give-ups on a real mirror were
+/// Navidrome index sizes recorded mid-copy (exact round-MiB values) for FLACs that are
+/// complete on disk. Retrying cannot change it - only a server rescan can - so it is
+/// not retried at all, and it is NAMED on the status surface, because the fix is an
+/// action on the server and the user needs to know which songs to look at.
+/// Everything else is [`DownloadError::Transient`] and walks the ordinary backoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadError {
+    /// The server's indexed `size` (`indexed`) is not what it serves. `served` is the
+    /// byte count it actually declared or delivered, `None` when the body blew past the
+    /// running cap and was abandoned before its end was seen.
+    SizeDisagreement { indexed: u64, served: Option<u64> },
+    Transient(String),
+}
+
+impl std::fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DownloadError::SizeDisagreement { indexed, served: Some(n) } => write!(
+                f,
+                "download: server index says {indexed} bytes, it serves {n}"
+            ),
+            DownloadError::SizeDisagreement { indexed, served: None } => write!(
+                f,
+                "download: server index says {indexed} bytes, it serves more than that"
+            ),
+            DownloadError::Transient(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for DownloadError {
+    fn from(e: String) -> Self {
+        DownloadError::Transient(e)
+    }
+}
+
+impl From<&str> for DownloadError {
+    fn from(e: &str) -> Self {
+        DownloadError::Transient(e.to_string())
+    }
+}
+
+/// One song the server's index mis-sizes: what the status surface NAMES.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizeDisagreement {
+    pub id: SongId,
+    pub title: String,
+    pub artist: Option<String>,
+    /// The `size` the server's index reports - the number a rescan would correct.
+    pub indexed: u64,
+    /// What the download actually declared or delivered (`None`: more than the cap).
+    pub served: Option<u64>,
 }
 
 /// The production [`PinSource`]: `getStarred2` / `getSong` through the shared
@@ -3946,7 +4018,7 @@ impl<C: Clock> PinSource for SubsonicPinSource<C> {
         self.client.song(id).await.map_err(|e| e.to_string())
     }
 
-    async fn fetch(&self, song: &Song, tmp: &Path) -> Result<u64, String> {
+    async fn fetch(&self, song: &Song, tmp: &Path) -> Result<u64, DownloadError> {
         let url = self
             .client
             .download_url(&song.id)
@@ -3982,22 +4054,20 @@ async fn fetch_original(
     url: &str,
     tmp: &Path,
     expected: u64,
-) -> Result<u64, String> {
+) -> Result<u64, DownloadError> {
     let cap = expected.saturating_add(DOWNLOAD_SIZE_SLACK);
     let mut resp = tokio::time::timeout(DOWNLOAD_CHUNK_TIMEOUT, http.get(url).send())
         .await
         .map_err(|_| "download: timed out connecting".to_string())?
         .map_err(|e| format!("download: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("download: HTTP {}", resp.status()));
+        return Err(format!("download: HTTP {}", resp.status()).into());
     }
     // A declared length that already disagrees is a wasted transfer: refuse before
     // a single byte lands.
     if let Some(len) = resp.content_length() {
         if len != expected {
-            return Err(format!(
-                "download: server declared {len} bytes, expected {expected}"
-            ));
+            return Err(DownloadError::SizeDisagreement { indexed: expected, served: Some(len) });
         }
     }
     let mut file = File::create(tmp).map_err(|e| format!("download: creating temp: {e}"))?;
@@ -4010,16 +4080,17 @@ async fn fetch_original(
         let Some(chunk) = chunk else { break };
         written = written.saturating_add(chunk.len() as u64);
         if written > cap {
-            return Err(format!("download: body exceeded {cap} bytes; abandoned"));
+            return Err(DownloadError::SizeDisagreement { indexed: expected, served: None });
         }
         file.write_all(&chunk)
             .map_err(|e| format!("download: writing temp: {e}"))?;
     }
     file.flush().map_err(|e| format!("download: flushing temp: {e}"))?;
+    // A CLEAN end of body (a dropped connection is an error from `chunk()` above, not
+    // a `None`) that is not the indexed length: the server served a whole file of a
+    // different size than it indexed.
     if written != expected {
-        return Err(format!(
-            "download: got {written} bytes, server reported {expected}"
-        ));
+        return Err(DownloadError::SizeDisagreement { indexed: expected, served: Some(written) });
     }
     Ok(written)
 }
@@ -4032,6 +4103,10 @@ async fn fetch_original(
 struct Backoff {
     /// id -> (consecutive failures, the instant it may be retried).
     entries: HashMap<SongId, (u32, tokio::time::Instant)>,
+    /// Ids whose server index mis-sizes them. NEVER retried while the index still
+    /// reports the same size; a pin set carrying a DIFFERENT size (the server was
+    /// rescanned) clears the entry so the song is tried again at once.
+    disagreements: HashMap<SongId, SizeDisagreement>,
 }
 
 /// Why an id is not being attempted right now.
@@ -4048,7 +4123,9 @@ enum Attempt {
 }
 
 impl Backoff {
-    /// Whether `id` may be attempted now.
+    /// Whether `id` may be attempted now. Production asks [`Backoff::attempt`], which
+    /// also says why not; this is the yes/no its tests read.
+    #[cfg(test)]
     fn ready(&self, id: &SongId, now: tokio::time::Instant) -> bool {
         matches!(self.attempt(id, now), Attempt::Now)
     }
@@ -4082,6 +4159,72 @@ impl Backoff {
     /// Forget `id`'s history: it succeeded.
     fn succeed(&mut self, id: &SongId) {
         self.entries.remove(id);
+        self.disagreements.remove(id);
+    }
+
+    /// Record a size disagreement. Returns true the FIRST time for this id, which is
+    /// what keeps the naming warn to once.
+    fn disagree(&mut self, song: &Song, indexed: u64, served: Option<u64>) -> bool {
+        // Not a transient failure, so it must not also count toward the give-up run.
+        self.entries.remove(&song.id);
+        self.disagreements
+            .insert(
+                song.id.clone(),
+                SizeDisagreement {
+                    id: song.id.clone(),
+                    title: song.title.clone(),
+                    artist: song.artist.clone(),
+                    indexed,
+                    served,
+                },
+            )
+            .is_none()
+    }
+
+    /// Drop every disagreement the server has since CORRECTED: a song in this pass's
+    /// pin set whose indexed size is no longer the one that disagreed. Ids absent
+    /// from the pins keep their verdict (nothing new is known about them).
+    fn revisit_disagreements(&mut self, pins: &PinSet) {
+        if self.disagreements.is_empty() {
+            return;
+        }
+        for g in &pins.groups {
+            for s in &g.songs {
+                if let Some(d) = self.disagreements.get(&s.id) {
+                    if s.size != Some(d.indexed) {
+                        self.disagreements.remove(&s.id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every id this process will not attempt: given up on, or mis-sized by the server.
+    /// The plan skips these so they never occupy a download-batch slot - otherwise a
+    /// handful of permanently failing ids at the head of the order would fill every
+    /// batch and stall the whole backfill behind them.
+    fn not_attempting(&self) -> HashSet<SongId> {
+        self.entries
+            .iter()
+            .filter(|(_, (n, _))| *n >= DOWNLOAD_GIVE_UP_AFTER)
+            .map(|(id, _)| id.clone())
+            .chain(self.disagreements.keys().cloned())
+            .collect()
+    }
+
+    /// How many ids are given up on (transient failures that ran out of budget).
+    fn given_up_count(&self) -> usize {
+        self.entries.values().filter(|(n, _)| *n >= DOWNLOAD_GIVE_UP_AFTER).count()
+    }
+
+    /// The mis-sized songs, in a stable order for the status surface.
+    fn disagreement_list(&self) -> Vec<SizeDisagreement> {
+        let mut v: Vec<SizeDisagreement> = self.disagreements.values().cloned().collect();
+        v.sort_by(|a, b| {
+            (a.artist.as_deref(), a.title.as_str(), a.id.0.as_str())
+                .cmp(&(b.artist.as_deref(), b.title.as_str(), b.id.0.as_str()))
+        });
+        v
     }
 }
 
@@ -4362,6 +4505,10 @@ async fn run_pass<C: Clock, P: PinSource>(
     input.entries = store.entries();
     input.window = store.window();
     input.protected = store.protected_ids();
+    if let Some(pins) = input.pins.as_ref() {
+        backoff.revisit_disagreements(pins);
+    }
+    input.skip = backoff.not_attempting();
 
     let (actions, status) = plan_pass_with_status(&input);
     let mut report = execute(store, source, &input, actions, clock, backoff).await;
@@ -4370,7 +4517,10 @@ async fn run_pass<C: Clock, P: PinSource>(
         // The one number the plan cannot know: ids this PROCESS has stopped
         // retrying. Without it a pending count that will never reach zero is
         // indistinguishable from one that is merely slow.
-        status.given_up = report.given_up;
+        // Read from the BACKOFF, not this pass's report: the plan no longer schedules
+        // these ids at all, so a pass never sees them.
+        status.given_up = backoff.given_up_count();
+        status.size_disagreements = backoff.disagreement_list();
         let before = store.status();
         if !before.known || before.digest() != status.digest() {
             tracing::info!(
@@ -4537,6 +4687,21 @@ async fn execute<C: Clock, P: PinSource>(
                             tracing::info!(id = %id.0, ?reason, path = %path.display(), "store: committed");
                         }
                     }
+                    Err(DownloadError::SizeDisagreement { indexed, served }) => {
+                        // NOT a transient: the server disagrees with itself, and no
+                        // retry can change that - only a rescan. Named ONCE, loudly;
+                        // then held off until a pin set reports a different size.
+                        if backoff.disagree(&song, indexed, served) {
+                            let e = DownloadError::SizeDisagreement { indexed, served };
+                            tracing::warn!(
+                                id = %id.0, title = %song.title,
+                                artist = song.artist.as_deref().unwrap_or(""),
+                                ?reason, error = %e,
+                                "store: the server's index mis-sizes this song; not retrying \
+                                 until a rescan corrects it"
+                            );
+                        }
+                    }
                     Err(e) => {
                         backoff.fail(&id, clock.now());
                         if backoff.just_gave_up(&id) {
@@ -4602,7 +4767,7 @@ async fn download_and_commit<P: PinSource>(
     source: &P,
     song: &Song,
     pinned: bool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, DownloadError> {
     let tmp = store.tmp_path();
     if let Err(e) = source.fetch(song, &tmp).await {
         let doomed = tmp.clone();
@@ -4614,11 +4779,11 @@ async fn download_and_commit<P: PinSource>(
         Ok(Ok(path)) => Ok(path),
         // `commit` removes the temp itself on every refusal, so there is nothing
         // left to clean here.
-        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Err(e)) => Err(DownloadError::Transient(e.to_string())),
         Err(e) => {
             let doomed = tmp.clone();
             let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(&doomed)).await;
-            Err(format!("commit task failed: {e}"))
+            Err(DownloadError::Transient(format!("commit task failed: {e}")))
         }
     }
 }
@@ -8446,6 +8611,8 @@ content_type = "audio/flac"
         catalog: Mutex<HashMap<String, Song>>,
         /// When false every fetch fails, which is how the backoff is exercised.
         fetch_ok: AtomicBool,
+        /// When set, every fetch answers a SIZE DISAGREEMENT serving this many bytes.
+        serves: Mutex<Option<u64>>,
         /// Fired at the START of every fetch. A test uses it to change the world
         /// MID-PASS - the deck goes remote, the user pauses - which is the only way
         /// to exercise the executor's re-check rather than the planner's once-per-pass
@@ -8476,6 +8643,7 @@ content_type = "audio/flac"
                 pins: Mutex::new(pins),
                 catalog: Mutex::new(catalog),
                 fetch_ok: AtomicBool::new(true),
+                serves: Mutex::new(None),
                 on_fetch: Mutex::new(None),
             }))
         }
@@ -8490,10 +8658,6 @@ content_type = "audio/flac"
             *self.0.pins.lock().unwrap() = pins.map(PinSet::of_songs);
         }
 
-        fn set_pin_set(&self, pins: Option<PinSet>) {
-            *self.0.pins.lock().unwrap() = pins;
-        }
-
         fn invalidations(&self) -> usize {
             self.0.log.lock().unwrap().invalidations
         }
@@ -8504,6 +8668,10 @@ content_type = "audio/flac"
 
         fn set_fetch_ok(&self, ok: bool) {
             self.0.fetch_ok.store(ok, Ordering::Relaxed);
+        }
+
+        fn set_serves(&self, n: Option<u64>) {
+            *self.0.serves.lock().unwrap() = n;
         }
 
         fn pins_calls(&self) -> usize {
@@ -8541,7 +8709,7 @@ content_type = "audio/flac"
             found.ok_or_else(|| format!("no such song: {}", id.0))
         }
 
-        async fn fetch(&self, song: &Song, tmp: &Path) -> Result<u64, String> {
+        async fn fetch(&self, song: &Song, tmp: &Path) -> Result<u64, DownloadError> {
             // Scoped, and there is no await inside: no std Mutex is ever held across
             // one, here or anywhere else in this file.
             {
@@ -8554,6 +8722,13 @@ content_type = "audio/flac"
             self.0.log.lock().unwrap().fetches.push(song.id.0.clone());
             if !ok {
                 return Err("scripted fetch failure".into());
+            }
+            let serves = *self.0.serves.lock().unwrap();
+            if let Some(n) = serves {
+                return Err(DownloadError::SizeDisagreement {
+                    indexed: song.size.unwrap_or(0),
+                    served: Some(n),
+                });
             }
             let size = song.size.ok_or_else(|| "no size".to_string())?;
             std::fs::write(tmp, vec![b'x'; size as usize]).map_err(|e| e.to_string())?;
@@ -9133,6 +9308,41 @@ content_type = "audio/flac"
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_mis_sized_song_is_named_and_not_retried_until_the_index_changes() {
+        let dir = tmpdir("loop-mis-sized");
+        let store = loop_store(&dir, 1_000_000, 3600);
+        let mis = song("bad", 12, "flac", Some("2024-05-01T12:00:00Z"));
+        let source = Arc::new(FakeSource::new(Some(vec![mis.clone()])));
+        source.set_serves(Some(40));
+        let mut backoff = Backoff::default();
+        async fn pass(store: &Arc<AudioStore>, source: &FakeSource, backoff: &mut Backoff) {
+            run_pass(store, source, PassMode::Full, &TokioClockForTest, backoff, DOWNLOAD_BATCH)
+                .await;
+        }
+        pass(&store, source.as_ref(), &mut backoff).await;
+        // Well past every transient backoff step: a disagreement is still not retried.
+        tokio::time::advance(DOWNLOAD_BACKOFF_MAX * 4).await;
+        pass(&store, source.as_ref(), &mut backoff).await;
+        assert_eq!(source.fetches(), vec!["bad".to_string()], "ONE attempt, never a retry");
+        let st = store.status();
+        assert_eq!(st.given_up, 0, "not a transient give-up");
+        assert_eq!(st.size_disagreements.len(), 1);
+        assert_eq!(st.size_disagreements[0].id, mis.id);
+        assert_eq!(st.size_disagreements[0].indexed, 12);
+        assert_eq!(st.size_disagreements[0].served, Some(40));
+
+        // The server is rescanned: the index now carries the true size, and the very
+        // next pass tries it again and lands it.
+        source.set_serves(None);
+        source.set_pins(Some(vec![song("bad", 40, "flac", Some("2024-05-01T12:00:00Z"))]));
+        pass(&store, source.as_ref(), &mut backoff).await;
+        assert_eq!(source.fetches().len(), 2, "a corrected index re-arms it at once");
+        assert_eq!(store.entries().len(), 1);
+        assert!(store.status().size_disagreements.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_failed_download_backs_off_instead_of_hammering() {
         let dir = tmpdir("loop-backoff");
         let store = loop_store(&dir, 1_000_000, 3600);
@@ -9238,6 +9448,53 @@ content_type = "audio/flac"
         b.fail(&id, t0);
         assert!(!b.just_gave_up(&id), "the give-up is reported ONCE, never every pass");
         assert_eq!(b.attempt(&id, t0 + DOWNLOAD_BACKOFF_MAX), Attempt::GivenUp);
+    }
+
+    #[test]
+    fn a_size_disagreement_is_not_a_give_up_and_clears_only_when_the_index_changes() {
+        let mut b = Backoff::default();
+        let song = song("x", 100, "flac", None);
+        let t0 = tokio::time::Instant::now();
+        b.fail(&song.id, t0);
+        assert!(b.disagree(&song, 100, Some(250)), "named the first time");
+        assert!(!b.disagree(&song, 100, Some(250)), "and only the first time");
+        assert_eq!(b.given_up_count(), 0, "it never counts toward the transient give-up");
+        assert!(b.not_attempting().contains(&song.id), "and it is not retried");
+        assert_eq!(b.disagreement_list()[0].served, Some(250));
+
+        let pins = |size| PinSet {
+            groups: vec![PinGroup {
+                kind: PinKind::Song,
+                id: "x".into(),
+                name: "Everest".into(),
+                tier: PinTier::Song,
+                songs: vec![Song { size: Some(size), ..song.clone() }],
+            }],
+        };
+        b.revisit_disagreements(&pins(100));
+        assert!(b.not_attempting().contains(&song.id), "same index size: still held");
+        b.revisit_disagreements(&pins(250));
+        assert!(!b.not_attempting().contains(&song.id), "a rescan re-arms it at once");
+        assert!(b.disagreement_list().is_empty());
+    }
+
+    #[test]
+    fn a_skipped_id_never_occupies_a_download_slot() {
+        // Without the skip, ids this process will never attempt sat at the head of the
+        // order and filled every batch, stalling the whole backfill behind them.
+        let mut input = PassInput::new(PassMode::Full, 1_000_000);
+        input.download_batch = 2;
+        input.window = vec![sid("a"), sid("b"), sid("c")];
+        input.skip = [sid("a")].into_iter().collect();
+        let (plan, _) = plan_pass_with_status(&input);
+        let ids: Vec<&str> = plan
+            .iter()
+            .filter_map(|a| match a {
+                StoreAction::Download { id, .. } => Some(id.0.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["b", "c"]);
     }
 
     #[test]

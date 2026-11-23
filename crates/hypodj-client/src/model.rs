@@ -1,7 +1,8 @@
 //! Pure parsing of `status` + `currentsong` + `playlistinfo` pairs into structured
 //! values. Model-free: just the parse half, no text formatting (the CLI card and
 //! queue text formatters live in hypodj-cli/render.rs on top of this). The server
-//! emits only a known subset of keys - there is NO `elapsed` and NO `time` key.
+//! emits only a known subset of keys; `elapsed` is present only while a track is
+//! loaded (an older daemon never sends it).
 
 /// The now-playing state assembled from `status` + `currentsong` pairs. Fully
 /// Option-typed - the server may omit any field.
@@ -12,6 +13,9 @@ pub struct NowPlaying {
     pub playlistlength: Option<usize>,
     pub song: Option<usize>,   // 0-based index of current
     pub duration: Option<f64>, // library songs only
+    /// The playhead in seconds at the moment `status` was read; `None` when stopped
+    /// or from an older daemon. A client extrapolates it while playing.
+    pub elapsed: Option<f64>,
     pub title: Option<String>,
     /// The station / show NAME for a raw stream, from the `currentsong` `Name` pair
     /// (real MPD radio convention: `Name:` = station, `Title:` = now-playing). Present
@@ -28,6 +32,10 @@ pub struct NowPlaying {
     /// a display string; this is the handle a client can navigate with. `None` for a raw
     /// stream (no library album).
     pub album_uri: Option<String>,
+    /// The playing track's artist as a BROWSE uri (`artist/<id>`), from the
+    /// `currentsong` `X-ArtistUri` pair. `artist` is the display NAME; this is the
+    /// navigable handle. `None` for a raw stream or a server without artist ids.
+    pub artist_uri: Option<String>,
     /// The current song's uri from `currentsong` `file` (`song/<id>` for a library
     /// track, an `http(s)://...` URL for a raw stream). Needed to favorite the
     /// current track (`playlistadd Starred <uri>`); a stream has no star surface.
@@ -100,6 +108,105 @@ pub struct NowPlaying {
     /// as a stamp, so one formatter serves every client and the date arithmetic has one
     /// implementation. `None` when there is no play record.
     pub last_played_days: Option<u32>,
+    /// The four MPD playback-mode flags from `status` (`random`/`repeat`/`single`/
+    /// `consume`). The daemon has always emitted them; a client that never read them
+    /// could neither show nor sensibly toggle them.
+    pub modes: PlaybackModes,
+}
+
+/// One MPD playback mode. The verb is the MPD command that sets it (`random 1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Random,
+    Repeat,
+    Single,
+    Consume,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 4] = [Mode::Random, Mode::Repeat, Mode::Single, Mode::Consume];
+
+    /// The MPD verb, which is also the status key and the human word.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Mode::Random => "random",
+            Mode::Repeat => "repeat",
+            Mode::Single => "single",
+            Mode::Consume => "consume",
+        }
+    }
+
+    pub fn from_word(w: &str) -> Option<Mode> {
+        Mode::ALL.into_iter().find(|m| m.verb() == w)
+    }
+}
+
+/// The playback-mode flags parsed from `status`. Absent or unparseable reads as off,
+/// which is what MPD means by a missing flag.
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
+pub struct PlaybackModes {
+    pub random: bool,
+    pub repeat: bool,
+    pub single: bool,
+    pub consume: bool,
+}
+
+impl PlaybackModes {
+    fn parse(status: &[(String, String)]) -> Self {
+        let on = |k: &str| find(status, k) == Some("1");
+        PlaybackModes {
+            random: on("random"),
+            repeat: on("repeat"),
+            single: on("single"),
+            consume: on("consume"),
+        }
+    }
+
+    pub fn get(&self, m: Mode) -> bool {
+        match m {
+            Mode::Random => self.random,
+            Mode::Repeat => self.repeat,
+            Mode::Single => self.single,
+            Mode::Consume => self.consume,
+        }
+    }
+
+    /// The command line that FLIPS `m` from what this snapshot says, e.g. `random 1`.
+    pub fn toggle_command(&self, m: Mode) -> String {
+        format!("{} {}", m.verb(), if self.get(m) { 0 } else { 1 })
+    }
+
+    /// The modes that are ON as words, e.g. `random repeat`. `None` when all are off,
+    /// so the default deck renders nothing.
+    pub fn label(&self) -> Option<String> {
+        let on: Vec<&str> = Mode::ALL
+            .into_iter()
+            .filter(|m| self.get(*m))
+            .map(Mode::verb)
+            .collect();
+        (!on.is_empty()).then(|| on.join(" "))
+    }
+}
+
+/// The sentence a `sleep` / `wake` STATUS reply deserves. The daemon answers
+/// `sleep_remaining: <secs>` or `sleep: none` (likewise `wake`); both clients print
+/// it through here so the words cannot drift. `None` for any other reply (a set
+/// answers `plan_id`, a cancel a bare OK - the card is the feedback there).
+pub fn schedule_reply(pairs: &[(String, String)]) -> Option<String> {
+    let num = |k: &str| find(pairs, k).and_then(|v| v.parse::<u64>().ok());
+    if let Some(s) = num("sleep_remaining") {
+        return Some(format!("sleep in {}", fmt_remaining(s)));
+    }
+    if find(pairs, "sleep") == Some("none") {
+        return Some("no sleep timer armed".into());
+    }
+    if let Some(s) = num("wake_remaining") {
+        return Some(format!("wake in {}", fmt_remaining(s)));
+    }
+    if find(pairs, "wake") == Some("none") {
+        return Some("no wake alarm armed".into());
+    }
+    None
 }
 
 /// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
@@ -253,7 +360,10 @@ fn parse_continuation(status: &[(String, String)]) -> Option<String> {
     }
 }
 
-fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+/// The FIRST value for `key` in a flat pair list. Public because every client that
+/// reads an MPD frame needs exactly this and nothing more - a second copy in another
+/// crate is a second place a key name can drift.
+pub fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
@@ -264,11 +374,15 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         playlistlength: find(status, "playlistlength").and_then(|v| v.parse().ok()),
         song: find(status, "song").and_then(|v| v.parse().ok()),
         duration: find(status, "duration").and_then(|v| v.parse().ok()),
+        elapsed: find(status, "elapsed")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|e| e.is_finite() && *e >= 0.0),
         title: find(current, "Title").map(str::to_string),
         name: find(current, "Name").map(str::to_string),
         artist: find(current, "Artist").map(str::to_string),
         album: find(current, "Album").map(str::to_string),
         album_uri: find(current, "X-AlbumUri").map(str::to_string),
+        artist_uri: find(current, "X-ArtistUri").map(str::to_string),
         file: find(current, "file").map(str::to_string),
         starred: find(current, "X-Starred").is_some(),
         cover: find(current, "X-CoverArt").map(str::to_string),
@@ -282,6 +396,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         // when the server actually has a record.
         plays: find(current, "X-Plays").and_then(|v| v.parse().ok()),
         last_played_days: find(current, "X-LastPlayed").and_then(|v| v.parse().ok()),
+        modes: PlaybackModes::parse(status),
     }
 }
 
@@ -373,6 +488,9 @@ pub struct QueueItem {
     /// the daemon emits per library song, so the TUI can group the queue by album
     /// for the browse queue markers. `None` for a raw stream (no album).
     pub album_uri: Option<String>,
+    /// The artist browse uri (`artist/<id>`) from the non-standard `X-ArtistUri`
+    /// pair, so "go to artist" can navigate rather than search by name.
+    pub artist_uri: Option<String>,
     /// EVERY OTHER PAIR the daemon sent for this row, in wire order, minus the ones
     /// already structured above.
     ///
@@ -390,7 +508,7 @@ pub struct QueueItem {
 /// Parse the flat `playlistinfo` pair list into structured queue items. Each entry
 /// begins at a `file` key; group by that boundary and pull Pos/Title/Artist.
 pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
-    group_blocks(pairs)
+    group_blocks_on(pairs, "file")
         .iter()
         .enumerate()
         .map(|(i, b)| QueueItem {
@@ -399,6 +517,7 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
             artist: find(b, "Artist").map(str::to_string),
             uri: find(b, "file").map(str::to_string),
             album_uri: find(b, "X-AlbumUri").map(str::to_string),
+            artist_uri: find(b, "X-ArtistUri").map(str::to_string),
             // Everything not already promoted to a field above. Filtered rather than
             // cloned wholesale, so the card cannot show the same fact twice.
             details: b
@@ -406,7 +525,7 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
                 .filter(|(k, _)| {
                     !matches!(
                         k.as_str(),
-                        "file" | "Pos" | "Id" | "Title" | "Artist" | "X-AlbumUri"
+                        "file" | "Pos" | "Id" | "Title" | "Artist" | "X-AlbumUri" | "X-ArtistUri"
                     )
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -415,11 +534,13 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
         .collect()
 }
 
-/// Split a flat pair list into per-song blocks, each beginning at a `file` key.
-fn group_blocks(pairs: &[(String, String)]) -> Vec<Vec<(String, String)>> {
+/// Split a flat pair list into records, each beginning at the `start` key. The MPD
+/// wire carries no record separator; the first key of a record IS the separator.
+/// `file` for a song list, `jid` for the journal.
+pub fn group_blocks_on(pairs: &[(String, String)], start: &str) -> Vec<Vec<(String, String)>> {
     let mut blocks: Vec<Vec<(String, String)>> = Vec::new();
     for (k, v) in pairs {
-        if k == "file" {
+        if k == start {
             blocks.push(Vec::new());
         }
         if let Some(cur) = blocks.last_mut() {
@@ -427,6 +548,105 @@ fn group_blocks(pairs: &[(String, String)]) -> Vec<Vec<(String, String)>> {
         }
     }
     blocks
+}
+
+/// One `journal` entry as the daemon reported it, newest first on the wire.
+///
+/// `did` is the daemon's own `PlanOutcome::render()`. It is the ONLY string any
+/// surface may show as what happened - never a DSL echo (which is a partial,
+/// non-injective renderer and not an inverse of the parser) and never a caller's
+/// claim about its own action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalEntry {
+    pub id: u64,
+    pub age_s: u64,
+    /// Who armed the plan: `mpd` for a hand-typed one, `mcp:sess-<hex>` for an
+    /// agent, a feature name for a daemon singleton.
+    pub origin: String,
+    pub act: String,
+    pub did: String,
+    /// Computed by the daemon against the LIVE world at read time, so a surface
+    /// that offers "u to undo" is only ever offering one that would be accepted.
+    pub undoable: bool,
+}
+
+impl JournalEntry {
+    /// True when this entry was caused by an agent (any session), which is what a
+    /// badge means by "agent". Derived from the origin string alone.
+    pub fn from_agent(&self) -> bool {
+        self.origin.starts_with("mcp:")
+    }
+}
+
+/// Parse a `journal` response. A record starts at `jid`; a record with a missing or
+/// unparseable id is DROPPED rather than defaulted, because a defaulted id is what
+/// `undo <jid>` would then aim at.
+pub fn parse_journal(pairs: &[(String, String)]) -> Vec<JournalEntry> {
+    group_blocks_on(pairs, "jid")
+        .iter()
+        .filter_map(|b| {
+            Some(JournalEntry {
+                id: find(b, "jid")?.parse().ok()?,
+                age_s: find(b, "jage").and_then(|v| v.parse().ok()).unwrap_or(0),
+                origin: find(b, "jorigin").unwrap_or("").to_string(),
+                act: find(b, "jact").unwrap_or("").to_string(),
+                did: find(b, "jdid").unwrap_or("").to_string(),
+                undoable: find(b, "jundoable") == Some("1"),
+            })
+        })
+        .collect()
+}
+
+/// Who caused a journal entry, from the origin string alone.
+///
+/// An agent session is named as one; every other origin is shown VERBATIM rather
+/// than translated into "you", because `mpd`, `sleep` and `winddown` are three
+/// different things and guessing which of them was a human is exactly the drift
+/// this surface exists to remove.
+pub fn journal_who(e: &JournalEntry) -> String {
+    match e.origin.strip_prefix("mcp:") {
+        Some(sess) => format!("agent {sess}"),
+        None if e.origin.trim().is_empty() => "(no origin)".to_string(),
+        None => e.origin.clone(),
+    }
+}
+
+/// The journal as listing rows, newest first, one line per entry.
+///
+/// Exactly ONE row is marked retractable, and it is the newest whose `undoable` is
+/// live: the ring is a stack, so `undo` takes the top and refuses anything under it.
+/// A listing that offered the mark on four rows would be advertising three refusals.
+/// `mark` is the suffix the caller's own surface uses to say how ("<- dj undo",
+/// "<- u").
+pub fn journal_lines(entries: &[JournalEntry], mark: &str) -> Vec<String> {
+    let top = entries.iter().position(|e| e.undoable);
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let suffix = if Some(i) == top { mark } else { "" };
+            format!(
+                "[{:>3}] {:>5}  {:<22}  {}{}",
+                e.id,
+                fmt_remaining(e.age_s),
+                journal_who(e),
+                e.did,
+                suffix
+            )
+        })
+        .collect()
+}
+
+/// The one-line footer badge for the retraction currently on offer, or `None` when
+/// there is none. Drawn from the daemon's own `did` and its own live undoability, so
+/// no surface can offer an undo that would be refused, and nothing an agent said
+/// reaches a character of it.
+pub fn undo_badge(entries: &[JournalEntry], key: char) -> Option<String> {
+    let e = entries.iter().find(|e| e.undoable)?;
+    let who = if e.from_agent() { "agent" } else { e.origin.as_str() };
+    let who = if who.trim().is_empty() { "" } else { who };
+    let lead = if who.is_empty() { String::new() } else { format!("{who} ") };
+    Some(format!("{lead}{} - {key} to undo ({})", e.did, fmt_remaining(e.age_s)))
 }
 
 #[cfg(test)]
@@ -438,8 +658,18 @@ mod tests {
     }
 
     #[test]
+    fn nowplaying_parses_elapsed_and_rejects_garbage() {
+        let np = now_playing(&p(&[("state", "play"), ("elapsed", "83.500")]), &[]);
+        assert_eq!(np.elapsed, Some(83.5));
+        for bad in ["nan", "inf", "-1.0", "x"] {
+            let np = now_playing(&p(&[("elapsed", bad)]), &[]);
+            assert_eq!(np.elapsed, None, "{bad}");
+        }
+    }
+
+    #[test]
     fn nowplaying_playing() {
-        // Canned status WITHOUT elapsed/time (the server never emits them).
+        // Canned status WITHOUT elapsed (an older daemon never emits it).
         let status = p(&[
             ("volume", "70"),
             ("playlistlength", "12"),
@@ -461,6 +691,7 @@ mod tests {
         assert_eq!(np.playlistlength, Some(12));
         assert_eq!(np.song, Some(2));
         assert_eq!(np.duration, Some(215.0));
+        assert_eq!(np.elapsed, None);
         assert_eq!(np.title.as_deref(), Some("Blue in Green"));
         assert_eq!(np.artist.as_deref(), Some("Miles Davis"));
         assert_eq!(np.album.as_deref(), Some("Kind of Blue"));
@@ -767,6 +998,7 @@ mod tests {
                 artist: Some("A".into()),
                 uri: Some("song/1".into()),
                 album_uri: None,
+                artist_uri: None,
                 details: Vec::new(),
             }
         );
@@ -779,6 +1011,7 @@ mod tests {
                 artist: None,
                 uri: Some("song/2".into()),
                 album_uri: None,
+                artist_uri: None,
                 details: Vec::new(),
             }
         );
@@ -791,6 +1024,7 @@ mod tests {
             ("file", "song/1"),
             ("Title", "One"),
             ("X-AlbumUri", "album/al-9"),
+            ("X-ArtistUri", "artist/ar-3"),
             ("Pos", "0"),
             ("Id", "1"),
             // A stream row carries no X-AlbumUri -> None.
@@ -802,6 +1036,10 @@ mod tests {
         let q = parse_queue(&pairs);
         assert_eq!(q[0].album_uri.as_deref(), Some("album/al-9"));
         assert_eq!(q[1].album_uri, None);
+        assert_eq!(q[0].artist_uri.as_deref(), Some("artist/ar-3"));
+        assert_eq!(q[1].artist_uri, None);
+        // Promoted to a field, so it is not repeated in the detail pairs.
+        assert!(!q[0].details.iter().any(|(k, _)| k == "X-ArtistUri"));
     }
 
     #[test]
@@ -814,13 +1052,16 @@ mod tests {
             ("Title", "Sweden"),
             ("Album", "Volume Alpha"),
             ("X-AlbumUri", "album/al-9"),
+            ("X-ArtistUri", "artist/ar-3"),
         ]);
         let np = now_playing(&[], &current);
+        assert_eq!(np.artist_uri.as_deref(), Some("artist/ar-3"));
         assert_eq!(np.album.as_deref(), Some("Volume Alpha"), "still the name");
         assert_eq!(np.album_uri.as_deref(), Some("album/al-9"), "and now the uri");
         // A raw stream carries no album at all -> None, never a guessed one.
         let stream = p(&[("file", "http://stream.example/live"), ("Title", "Live")]);
         assert_eq!(now_playing(&[], &stream).album_uri, None);
+        assert_eq!(now_playing(&[], &stream).artist_uri, None);
     }
 
     #[test]
@@ -906,5 +1147,136 @@ mod tests {
         // Total over anything the daemon might say, including nothing.
         assert_eq!(store_badge(""), None);
         assert_eq!(store_badge("starting").as_deref(), Some("starting"));
+    }
+
+    #[test]
+    fn playback_modes_parse_toggle_and_label() {
+        let np = now_playing(&p(&[("state", "play"), ("random", "1"), ("repeat", "0"), ("consume", "1")]), &[]);
+        assert!(np.modes.random && np.modes.consume);
+        assert!(!np.modes.repeat && !np.modes.single);
+        assert_eq!(np.modes.label().as_deref(), Some("random consume"));
+        assert_eq!(np.modes.toggle_command(Mode::Random), "random 0");
+        assert_eq!(np.modes.toggle_command(Mode::Single), "single 1");
+        // A lean status (no flags) is all off and renders nothing.
+        assert_eq!(now_playing(&p(&[("state", "stop")]), &[]).modes.label(), None);
+        assert_eq!(Mode::from_word("repeat"), Some(Mode::Repeat));
+        assert_eq!(Mode::from_word("shuffle"), None);
+    }
+
+    #[test]
+    fn schedule_reply_words_both_answers_and_ignores_others() {
+        assert_eq!(schedule_reply(&p(&[("sleep_remaining", "720")])).as_deref(), Some("sleep in 12m"));
+        assert_eq!(schedule_reply(&p(&[("sleep", "none")])).as_deref(), Some("no sleep timer armed"));
+        assert_eq!(schedule_reply(&p(&[("wake_remaining", "25200")])).as_deref(), Some("wake in 7h 00m"));
+        assert_eq!(schedule_reply(&p(&[("wake", "none")])).as_deref(), Some("no wake alarm armed"));
+        assert_eq!(schedule_reply(&p(&[("plan_id", "3")])), None);
+        assert_eq!(schedule_reply(&[]), None);
+    }
+
+    #[test]
+    fn the_journal_parses_newest_first_and_keeps_the_daemons_own_words() {
+        let pairs = p(&[
+            ("jid", "9"),
+            ("jage", "4"),
+            ("jorigin", "mcp:sess-aabbccdd"),
+            ("jact", "clear"),
+            ("jdid", "cleared 7"),
+            ("jundoable", "1"),
+            ("jid", "8"),
+            ("jage", "61"),
+            ("jorigin", "mpd"),
+            ("jact", "enqueue"),
+            ("jdid", "added 3"),
+            ("jundoable", "0"),
+        ]);
+        let js = parse_journal(&pairs);
+        assert_eq!(js.len(), 2);
+        assert_eq!(js[0].id, 9);
+        assert_eq!(js[0].did, "cleared 7");
+        assert!(js[0].undoable);
+        assert!(js[0].from_agent(), "an mcp: origin is an agent");
+        assert_eq!(js[1].origin, "mpd");
+        // `jundoable` is 1-or-nothing on the wire, never truthy-ish.
+        assert!(!js[1].undoable);
+        assert!(!js[1].from_agent(), "a hand-typed plan is not an agent");
+    }
+
+    #[test]
+    fn a_journal_record_without_a_usable_id_is_dropped_not_defaulted() {
+        // A defaulted 0 would make `undo 0` a plausible-looking aim at nothing.
+        let pairs = p(&[("jid", "x"), ("jdid", "who knows"), ("jid", "3"), ("jdid", "removed 1")]);
+        let js = parse_journal(&pairs);
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0].id, 3);
+        // The absent pairs read as empty/false rather than as a phantom claim.
+        assert_eq!(js[0].origin, "");
+        assert!(!js[0].undoable);
+    }
+
+    #[test]
+    fn an_empty_journal_is_an_empty_vec() {
+        assert!(parse_journal(&[]).is_empty());
+        assert!(parse_journal(&p(&[("OK", "")])).is_empty());
+    }
+
+    fn jentry(id: u64, age: u64, origin: &str, did: &str, undoable: bool) -> JournalEntry {
+        JournalEntry {
+            id,
+            age_s: age,
+            origin: origin.to_string(),
+            act: "clear".to_string(),
+            did: did.to_string(),
+            undoable,
+        }
+    }
+
+    #[test]
+    fn exactly_one_row_is_marked_retractable_because_undo_is_a_stack() {
+        let rows = [
+            jentry(12, 4, "mcp:sess-3f2a19bc", "cleared 7", true),
+            jentry(11, 130, "mpd", "added 3", true),
+            jentry(10, 400, "sleep", "faded out", false),
+        ];
+        let lines = journal_lines(&rows, " <- undo");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.iter().filter(|l| l.contains("<- undo")).count(), 1);
+        assert!(lines[0].contains("<- undo"), "the NEWEST undoable one: {lines:?}");
+        // A stale top hands the mark to the newest one that is not stale.
+        let rows = [
+            jentry(12, 4, "mcp:sess-1", "cleared 7", false),
+            jentry(11, 130, "mpd", "added 3", true),
+        ];
+        let lines = journal_lines(&rows, " <- undo");
+        assert!(!lines[0].contains("<- undo"));
+        assert!(lines[1].contains("<- undo"), "{lines:?}");
+        // Nothing undoable offers nothing.
+        assert!(journal_lines(&[jentry(1, 1, "mpd", "x", false)], " <- undo")
+            .iter()
+            .all(|l| !l.contains("<- undo")));
+    }
+
+    #[test]
+    fn the_origin_is_never_relabelled_into_a_guess_about_who() {
+        assert_eq!(journal_who(&jentry(1, 0, "mcp:sess-ab", "x", false)), "agent sess-ab");
+        // `sleep` is a daemon feature, not "you" - and an absent origin says so.
+        assert_eq!(journal_who(&jentry(1, 0, "sleep", "x", false)), "sleep");
+        assert_eq!(journal_who(&jentry(1, 0, "", "x", false)), "(no origin)");
+    }
+
+    #[test]
+    fn the_badge_offers_only_what_the_daemon_says_is_still_live() {
+        // Nothing undoable -> no badge at all, rather than a dead offer.
+        assert_eq!(undo_badge(&[], 'u'), None);
+        assert_eq!(undo_badge(&[jentry(1, 3, "mcp:sess-1", "cleared 7", false)], 'u'), None);
+        // The badge carries the daemon's OWN sentence and its age, and names the key.
+        let b = undo_badge(&[jentry(9, 12, "mcp:sess-1", "removed 3", true)], 'u').unwrap();
+        assert_eq!(b, "agent removed 3 - u to undo (12s)");
+        // A stale top still lets the live one under it be offered - that is the entry
+        // `undo` would actually take.
+        let rows = [
+            jentry(9, 3, "mcp:sess-1", "cleared 7", false),
+            jentry(8, 130, "winddown", "faded out", true),
+        ];
+        assert_eq!(undo_badge(&rows, 'u').unwrap(), "winddown faded out - u to undo (2m)");
     }
 }

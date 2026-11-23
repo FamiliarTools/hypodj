@@ -3,7 +3,9 @@
 //! runs directly; anything else is sent to the daemon as `nl "<phrase>"`, echoed,
 //! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
 
+mod completions;
 mod heard;
+mod journal;
 mod pls;
 mod render;
 mod stations;
@@ -39,6 +41,12 @@ USAGE:
   dj radio                endless radio from what is playing; it keeps going
                            (\"radio random\" to start cold, \"radio off\" to stop)
   dj vol <0-100>          set volume
+  dj random | repeat | single | consume [on|off]
+                          flip a playback mode (or set it); the card shows
+                           which are on
+  dj sleep | wake         what is armed: the sleep timer / the wake alarm
+                           (\"sleep off\", \"wake off\" cancel; arm one in words,
+                           e.g. \"sleep in 30 minutes\", \"wake me at 7\")
   dj clear                clear the queue (asks first)
   dj stations import [PATH ...] [--dry-run]
                           save every .pls under PATH as an internet radio
@@ -53,13 +61,17 @@ USAGE:
   dj store frontier       the whole ranked order, best to worst, with why
   dj store now | pause | resume
                           reconcile now / suspend bulk mirroring / resume it
+  dj journal              what the daemon did, newest first - each line is the
+                           daemon's OWN words for what happened, not a guess
+  dj undo                 retract the newest thing that can still be retracted
+                           (it expires the moment anything else touches the world)
   dj <anything else>      natural language: e.g. \"fade out\", \"stop after this
                            album\", \"wake me at 7 with jazz\" - echoed + confirmed
 
 OPTIONS:
   --host <h>    daemon host (default 127.0.0.1)
-  --port <p>    daemon port (default 6600, matches the live deploy; a DEV daemon
-                defaults to 6601 - point at it with HYPODJ_PORT=6601)
+  --port <p>    daemon port (default 6600, the daemon's default bind; a dev
+                daemon on another port: HYPODJ_PORT)
   --nl-translator <auto|rules|daemon|claude|cc>
                 pin the NL path (default auto = Claude Code when available,
                 else daemon nl; rules/daemon force daemon nl, claude/cc prefer
@@ -67,6 +79,8 @@ OPTIONS:
                 May appear before or after the phrase.
   -h, --help    this help
   -V, --version print version and exit
+  --completions fish
+                print the fish completion script
 
 CONFIG precedence: flags > HYPODJ_HOST/HYPODJ_PORT > MPD_HOST/MPD_PORT
                    > 127.0.0.1:6600
@@ -79,11 +93,19 @@ fn main() {
     if raw.iter().any(|a| a == "-V" || a == "--version") {
         println!(
             "dj {}",
-            hypodj_build_info::version(
-                env!("CARGO_PKG_VERSION"),
-                option_env!("HYPODJ_BUILD_INFO"),
-            )
+            hypodj_build_info::version(env!("CARGO_PKG_VERSION"), option_env!("HYPODJ_BUILD_INFO"),)
         );
+        return;
+    }
+    // `--completions fish` is generated from the verb tables, before any socket work.
+    if let Some(i) = raw.iter().position(|a| a == "--completions") {
+        match raw.get(i + 1).map(String::as_str) {
+            Some("fish") => print!("{}", completions::fish()),
+            _ => {
+                eprintln!("dj: --completions needs a shell (fish)");
+                std::process::exit(2);
+            }
+        }
         return;
     }
     match run(raw) {
@@ -123,10 +145,7 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
             continue;
         }
         if let Some(v) = a.strip_prefix("--port=") {
-            port = Some(
-                v.parse::<u16>()
-                    .map_err(|_| format!("bad port: {v}"))?,
-            );
+            port = Some(v.parse::<u16>().map_err(|_| format!("bad port: {v}"))?);
             continue;
         }
         match a.as_str() {
@@ -160,7 +179,13 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
             }
         }
     }
-    Ok(Parsed { host, port, nl_translator, help, words })
+    Ok(Parsed {
+        host,
+        port,
+        nl_translator,
+        help,
+        words,
+    })
 }
 
 fn run(raw: Vec<String>) -> Result<(), MpdError> {
@@ -178,7 +203,9 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
     // belong in it - and left to the fallthrough, "stations import" would be sent to
     // the NL translator.
     if parsed.words.first().is_some_and(|w| w == "stations") {
-        let env = Env { get: &|k| std::env::var(k).ok() };
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         // A partial import is reported in full and THEN exits non-zero, so a script
@@ -195,7 +222,9 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
     // pins - and left to the fallthrough, `heard limit 5` and `heard --all` would be
     // handed to the NL translator, which has no heard action at all.
     if parsed.words.first().is_some_and(|w| w == "heard") {
-        let env = Env { get: &|k| std::env::var(k).ok() };
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         if !heard::run(&mut conn, &parsed.words[1..])? {
@@ -208,10 +237,42 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
     // reason: route knows no store verb at all, so every form of this - including the
     // bare one - would be handed to the NL translator, which has no store action.
     if parsed.words.first().is_some_and(|w| w == "store") {
-        let env = Env { get: &|k| std::env::var(k).ok() };
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         if !store::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `journal` / `undo` are intercepted BEFORE route() for the fourth time and the
+    // same stated reason: route knows neither verb, so both would be handed to the
+    // NL translator, which has no journal action - and "undo" is the last phrase
+    // that should reach a model.
+    if parsed
+        .words
+        .first()
+        .is_some_and(|w| w == "journal" || w == "undo")
+    {
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        let ok = if parsed.words[0] == "journal" {
+            journal::run(&mut conn, &parsed.words[1..])?
+        } else if parsed.words.len() == 1 {
+            journal::undo(&mut conn)?
+        } else {
+            // `undo` takes no argument here on purpose: naming an entry that is not
+            // the top is a refusal, and the CLI has no listing open to name from.
+            println!("usage: dj undo (no arguments - it retracts the newest one)");
+            false
+        };
+        if !ok {
             std::process::exit(1);
         }
         return Ok(());
@@ -224,7 +285,9 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         return Ok(());
     }
 
-    let env = Env { get: &|k| std::env::var(k).ok() };
+    let env = Env {
+        get: &|k| std::env::var(k).ok(),
+    };
     let (host, port) = config::resolve(parsed.host, parsed.port, &env);
     let pin = match nl::NlTranslatorPin::resolve(
         parsed.nl_translator.as_deref(),
@@ -259,6 +322,12 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
             }
         }
         Action::FavoriteCurrent => favorite_current(&mut conn)?,
+        Action::ToggleMode(m) => {
+            // Resolve the flip against the daemon's CURRENT flag on this same socket.
+            let status = conn.command("status")?;
+            let line = model::now_playing(&status, &[]).modes.toggle_command(m);
+            run_verb(&mut conn, &line)?
+        }
         Action::Nl(phrase) => nl_handshake(&mut conn, &phrase, pin)?,
         Action::Help => unreachable!(),
     }
@@ -309,6 +378,9 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
 fn run_verb(conn: &mut MpdConn, line: &str) -> Result<(), MpdError> {
     let pairs = conn.command(line)?;
     if let Some((_, sentence)) = pairs.iter().find(|(k, _)| k == "mark_result") {
+        println!("{sentence}");
+    }
+    if let Some(sentence) = model::schedule_reply(&pairs) {
         println!("{sentence}");
     }
     print_card(conn)
@@ -364,6 +436,11 @@ fn nl_handshake(
         Err(e) => return Err(e),
     };
 
+    // A READ-side question is answered immediately (no plan, nothing to confirm).
+    if let Some(answer) = nl::answer_from_pairs(&pairs) {
+        println!("{answer}");
+        return Ok(());
+    }
     let token = match nl::token_from_pairs(&pairs) {
         Some(t) => t,
         None => {
@@ -384,7 +461,10 @@ fn nl_handshake(
     if read_answer() {
         match conn.command(&format!("nl confirm {token}")) {
             Ok(plan_pairs) => {
-                println!("{}", render::render_outcome(&plan_pairs, None, stdout_ansi()));
+                let ansi = stdout_ansi();
+                for spoken in hypodj_client::spoken::from_confirm(&plan_pairs) {
+                    println!("{}", ansi.render(&spoken));
+                }
                 print_card(conn)?;
             }
             Err(MpdError::Ack(msg)) => println!("{}", render::render_refusal(&msg, stdout_ansi())),
@@ -444,7 +524,9 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
     let raw = match result {
         Ok(raw) => raw,
         Err(e) => {
-            eprintln!("Claude Code could not translate that ({e}); trying the built-in translator.");
+            eprintln!(
+                "Claude Code could not translate that ({e}); trying the built-in translator."
+            );
             return Ok(false);
         }
     };
@@ -459,7 +541,11 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
     };
 
     let mut lines = vec!["(via Claude Code)".to_string()];
-    lines.extend(hypodj_nl::describe_plan(&raw).lines().map(|l| l.to_string()));
+    lines.extend(
+        hypodj_nl::describe_plan(&raw)
+            .lines()
+            .map(|l| l.to_string()),
+    );
     print_utterances(&[
         hypodj_style::Spoken::new(hypodj_style::State::Echo, lines),
         hypodj_style::Spoken::new(
@@ -561,7 +647,10 @@ mod tests {
             route::route(&v(&["heard", "limit", "5"])),
             Action::Nl("heard limit 5".into())
         );
-        assert_eq!(route::route(&v(&["heard", "--all"])), Action::Nl("heard --all".into()));
+        assert_eq!(
+            route::route(&v(&["heard", "--all"])),
+            Action::Nl("heard --all".into())
+        );
         // And the tokens survive parse_args intact, so the interception sees them.
         let p = parse_args(v(&["heard", "--all"])).unwrap();
         assert_eq!(p.words, v(&["heard", "--all"]));
@@ -570,8 +659,29 @@ mod tests {
         assert_eq!(p.port, Some(6699));
         assert_eq!(p.words, v(&["heard", "limit", "5"]));
         // The bare views DO route, which is what makes `:heard` work in the TUI.
-        assert_eq!(route::route(&v(&["heard"])), Action::Command("heard".into()));
-        assert_eq!(route::route(&v(&["heard", "all"])), Action::Command("heard all".into()));
+        assert_eq!(
+            route::route(&v(&["heard"])),
+            Action::Command("heard".into())
+        );
+        assert_eq!(
+            route::route(&v(&["heard", "all"])),
+            Action::Command("heard all".into())
+        );
+    }
+
+    #[test]
+    fn undo_must_be_intercepted_because_route_would_hand_it_to_a_model() {
+        // WHY `journal`/`undo` are claimed before route(): route knows neither verb,
+        // so both fall through to the NL translator. "undo" is the single last
+        // phrase that should reach a model - a retraction that got re-interpreted as
+        // an intent is worse than no retraction at all.
+        assert_eq!(route::route(&v(&["undo"])), Action::Nl("undo".into()));
+        assert_eq!(route::route(&v(&["journal"])), Action::Nl("journal".into()));
+        // And the tokens survive parse_args intact, so the interception sees them.
+        let p = parse_args(v(&["--port", "6699", "undo"])).unwrap();
+        assert_eq!(p.port, Some(6699));
+        assert_eq!(p.words, v(&["undo"]));
+        assert_eq!(p.words.first().map(String::as_str), Some("undo"));
     }
 
     #[test]
@@ -636,7 +746,14 @@ mod tests {
             nl::NlTranslatorPin::Rules
         );
         // Unquoted phrase words plus trailing pin behave the same.
-        let p = parse_args(v(&["play", "something", "calmer", "--nl-translator", "rules"])).unwrap();
+        let p = parse_args(v(&[
+            "play",
+            "something",
+            "calmer",
+            "--nl-translator",
+            "rules",
+        ]))
+        .unwrap();
         assert_eq!(p.nl_translator.as_deref(), Some("rules"));
         assert_eq!(p.words, v(&["play", "something", "calmer"]));
         // `--flag=value` spelling after the phrase also pins.

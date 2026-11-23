@@ -9,11 +9,11 @@ use hypodj_client::spoken::{reply_shapes, Act, State};
 use hypodj_core::handler::{
     effect_set_volume, PlanOutcome, ACK_NL_INVALID, ACK_NL_NO_TOKEN, ACK_NL_STALE, ACK_NO_PLAN,
     ACK_TRANSLATOR_TASK, ACK_WAKE_DURATION, ACK_WAKE_TIME, EFFECT_FADING, EFFECT_NOTHING,
-    EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_PLAN_ID, PAIR_RESULT, PAIR_SLEEP,
-    PAIR_SLEEP_REMAINING, PAIR_WAKE, PAIR_WAKE_REMAINING,
+    EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_NL_ANSWER, PAIR_PLAN_ID, PAIR_RESULT,
+    PAIR_SLEEP, PAIR_SLEEP_REMAINING, PAIR_WAKE, PAIR_WAKE_REMAINING,
 };
 use hypodj_core::nl::NlError;
-use hypodj_core::plan::PlanError;
+use hypodj_core::plan::{PlanError, PlayMode};
 
 fn outcome_lines() -> Vec<String> {
     let samples = [
@@ -56,6 +56,38 @@ fn outcome_lines() -> Vec<String> {
         PlanOutcome::Effect(EFFECT_WAKING.into()),
         PlanOutcome::Effect(EFFECT_NOTHING.into()),
         PlanOutcome::Failed("gone".into()),
+        PlanOutcome::Effect(hypodj_core::handler::effect_mode(
+            PlayMode::Random.word(),
+            true,
+        )),
+        PlanOutcome::Effect(hypodj_core::handler::effect_mode(
+            PlayMode::Random.word(),
+            false,
+        )),
+        PlanOutcome::Effect(hypodj_core::handler::effect_mode(
+            PlayMode::Repeat.word(),
+            true,
+        )),
+        PlanOutcome::Effect(hypodj_core::handler::effect_mode(
+            PlayMode::Repeat.word(),
+            false,
+        )),
+        PlanOutcome::Effect(hypodj_core::handler::effect_mode(
+            PlayMode::Single.word(),
+            true,
+        )),
+        PlanOutcome::Effect(hypodj_core::handler::effect_mode(
+            PlayMode::Single.word(),
+            false,
+        )),
+        PlanOutcome::Effect(hypodj_core::handler::effect_mode(
+            PlayMode::Consume.word(),
+            true,
+        )),
+        PlanOutcome::Effect(hypodj_core::handler::effect_mode(
+            PlayMode::Consume.word(),
+            false,
+        )),
     ];
     for sample in &samples {
         match sample {
@@ -118,6 +150,7 @@ fn the_catalog_speaks_the_handlers_sentences() {
         PAIR_SLEEP,
         PAIR_WAKE_REMAINING,
         PAIR_WAKE,
+        PAIR_NL_ANSWER,
     ];
     for shape in &shapes {
         for (k, _) in &shape.pairs {
@@ -153,6 +186,9 @@ fn the_catalog_speaks_the_handlers_sentences() {
     assert!(shapes
         .iter()
         .any(|s| s.pairs.iter().any(|(k, v)| k == PAIR_WAKE && v == "none")));
+    assert!(shapes
+        .iter()
+        .any(|s| s.pairs.iter().any(|(k, _)| k == PAIR_NL_ANSWER)));
     assert!(shapes
         .iter()
         .any(|s| s.act == Some(Act::Clear) && s.state == State::Live));

@@ -70,6 +70,11 @@ impl Translator for HybridTranslator {
             other => other,
         }
     }
+
+    /// Questions are rules-only: the read grammar is closed and deterministic.
+    fn query(&self, utterance: &str) -> Option<hypodj_core::nl::NlQuery> {
+        self.rules.query(utterance)
+    }
 }
 
 #[cfg(test)]
@@ -79,7 +84,7 @@ mod tests {
     use hypodj_core::model::SongId;
     use hypodj_core::nl::{NlSource, Translator};
     use hypodj_core::plan::{
-        Action, FadeIntentIr, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
+        Action, FadeIntentIr, PlayMode, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
     };
 
     /// A fixed civil clock (2026-07-15 05:30 UTC) + a UTC-relative +01:00 zone, so
@@ -395,6 +400,48 @@ mod tests {
         }
     }
 
+    // RECURRING phrasings arm a Daily trigger (local time-of-day + day set), not a
+    // one-shot instant; a recurrence with no time of day is Ambiguous, never a
+    // silent one-shot.
+    #[test]
+    fn corpus_recurring_schedules() {
+        use hypodj_core::plan::DaySet;
+        let c = ctx(Some("s1"), 5);
+        let daily = |p: &RawPlan| match p.trigger {
+            RawTrigger::Daily { hour, minute, days } => (hour, minute, days),
+            ref other => panic!("expected Daily, got {other:?}"),
+        };
+        let p = tr("wake me every weekday at 7", &c).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(daily(&p[0]), (7, 0, DaySet::WEEKDAYS));
+        assert!(matches!(p[0].action, Action::Wake { selector: None, .. }));
+
+        let p = tr("wake me at 7:30 every day with jazz", &c).unwrap();
+        assert_eq!(daily(&p[0]), (7, 30, DaySet::EVERY));
+        assert!(matches!(&p[0].action, Action::Wake { selector: Some(Selector::Genre(g)), .. } if g == "jazz"));
+
+        let p = tr("every day at 23:00 wind down", &c).unwrap();
+        assert_eq!(daily(&p[0]), (23, 0, DaySet::EVERY));
+        assert!(matches!(p[0].action, Action::Fade(FadeIntentIr::ToFloor { .. })));
+
+        let p = tr("stop every night at 11", &c).unwrap();
+        assert_eq!(daily(&p[0]), (23, 0, DaySet::EVERY));
+        assert!(matches!(p[0].action, Action::Stop));
+
+        let p = tr("fade out at 22:30 on weekends", &c).unwrap();
+        assert_eq!(daily(&p[0]), (22, 30, DaySet::WEEKENDS));
+
+        let p = tr("wake me at 8 every monday and friday", &c).unwrap();
+        assert_eq!(daily(&p[0]), (8, 0, DaySet(0b0010001)));
+
+        // A day name alone is a one-shot, never a recurrence.
+        let p = tr("wake me at 7", &c).unwrap();
+        assert!(matches!(p[0].trigger, RawTrigger::WallClock { .. }));
+
+        assert!(matches!(tr("wind down every day", &c), Err(NlError::Ambiguous(_))));
+        assert!(matches!(tr("pause every day in 10 minutes", &c), Err(NlError::Ambiguous(_))));
+    }
+
     #[test]
     fn corpus_wake_pm_meridian_rolls_to_next_day() {
         let c = ctx(Some("s1"), 5);
@@ -423,6 +470,227 @@ mod tests {
         assert_eq!(tr("do a barrel roll", &c).unwrap_err(), NlError::NotUnderstood);
     }
 
+    fn mode(mode: PlayMode, on: bool) -> RawPlan {
+        raw(RawTrigger::Immediate, Action::SetMode { mode, on })
+    }
+
+    #[test]
+    fn corpus_playback_modes() {
+        let c = ctx(Some("s1"), 5);
+        let one = |u: &str| tr(u, &c).unwrap().iter().map(j).collect::<Vec<_>>();
+        for (u, m, on) in [
+            ("shuffle on", PlayMode::Random, true),
+            ("shuffle", PlayMode::Random, true),
+            ("turn off random", PlayMode::Random, false),
+            ("stop shuffling", PlayMode::Random, false),
+            ("random off", PlayMode::Random, false),
+            ("repeat on", PlayMode::Repeat, true),
+            ("turn off repeat", PlayMode::Repeat, false),
+            ("loop the queue", PlayMode::Repeat, true),
+            ("single mode", PlayMode::Single, true),
+            ("single off", PlayMode::Single, false),
+            ("consume", PlayMode::Consume, true),
+            ("turn consume mode off", PlayMode::Consume, false),
+        ] {
+            assert_eq!(one(u), vec![j(&mode(m, on))], "{u}");
+        }
+        // "repeat this" is repeat-ONE: repeat ON + single ON, in that order.
+        assert_eq!(
+            one("repeat this song"),
+            vec![j(&mode(PlayMode::Repeat, true)), j(&mode(PlayMode::Single, true))]
+        );
+        // Two modes in one breath is ambiguous, never a guess.
+        assert!(matches!(tr("repeat and shuffle", &c), Err(NlError::Ambiguous(_))));
+        // A mode word inside a content request is NOT a mode toggle.
+        assert_eq!(tr("play some random jazz", &c).unwrap_err(), NlError::NotUnderstood);
+    }
+
+    #[test]
+    fn corpus_favorites_actions() {
+        let c = ctx(Some("s1"), 5);
+        let starred_now = raw(
+            RawTrigger::Immediate,
+            Action::PlayNow { selector: Selector::Starred, count: rules::DEFAULT_FAVORITES_COUNT },
+        );
+        assert_eq!(j(&tr("play my favorites", &c).unwrap()[0]), j(&starred_now));
+        assert_eq!(j(&tr("play my favourites please", &c).unwrap()[0]), j(&starred_now));
+        assert_eq!(
+            j(&tr("queue my favorites", &c).unwrap()[0]),
+            j(&raw(
+                RawTrigger::Immediate,
+                Action::Enqueue { selector: Selector::Starred, count: rules::DEFAULT_FAVORITES_COUNT }
+            ))
+        );
+        assert_eq!(
+            j(&tr("play 5 favorites", &c).unwrap()[0]),
+            j(&raw(RawTrigger::Immediate, Action::PlayNow { selector: Selector::Starred, count: 5 }))
+        );
+        // Shuffle my favorites: random ON, then start them.
+        let plans: Vec<_> = tr("shuffle my favorites", &c).unwrap().iter().map(j).collect();
+        assert_eq!(plans, vec![j(&mode(PlayMode::Random, true)), j(&starred_now)]);
+        // A favorites WRITE ("star this") has no Action yet: punt, never guess.
+        assert_eq!(tr("favorite this", &c).unwrap_err(), NlError::NotUnderstood);
+    }
+
+    #[test]
+    fn corpus_sessions_winddown_and_sleep() {
+        let c = ctx(Some("s1"), 5);
+        let floor = Action::Fade(FadeIntentIr::ToFloor {
+            secs: hypodj_core::config::DEFAULT_WINDDOWN_FADE_SECS as f64,
+        });
+        assert_eq!(j(&tr("wind down", &c).unwrap()[0]), j(&raw(RawTrigger::Immediate, floor.clone())));
+        assert_eq!(
+            j(&tr("start a wind-down session", &c).unwrap()[0]),
+            j(&raw(RawTrigger::Immediate, floor.clone()))
+        );
+        assert_eq!(
+            j(&tr("wind down in 10 minutes", &c).unwrap()[0]),
+            j(&raw(RawTrigger::SpanElapsed { secs: 600.0 }, floor))
+        );
+        let out = Action::Fade(FadeIntentIr::Out {
+            secs: hypodj_core::config::DEFAULT_SLEEP_FADE_SECS as f64,
+        });
+        for u in ["sleep in 30 minutes", "sleep timer 30 minutes", "go to sleep in 30 minutes"] {
+            assert_eq!(
+                j(&tr(u, &c).unwrap()[0]),
+                j(&raw(RawTrigger::SpanElapsed { secs: 1800.0 }, out.clone())),
+                "{u}"
+            );
+        }
+        // No duration: ambiguous, never an invented timer.
+        assert!(matches!(tr("sleep timer", &c), Err(NlError::Ambiguous(_))));
+    }
+
+    #[test]
+    fn query_class_favorites_questions() {
+        use hypodj_core::nl::NlQuery;
+        let t = HybridTranslator::rules_only();
+        for u in ["what is favorited?", "what's favorited", "list my favorites", "show favorites", "favorites", "my favorites?"] {
+            assert_eq!(t.query(u), Some(NlQuery::Favorites), "{u}");
+        }
+        for u in ["is this favorited?", "is the current song starred", "did i favorite this?", "is current favorited?"] {
+            assert_eq!(t.query(u), Some(NlQuery::IsCurrentFavorited), "{u}");
+        }
+        // Imperatives and unrelated asks are NOT questions (they stay on the action path).
+        for u in ["play my favorites", "shuffle my favorites", "stop", "what is this"] {
+            assert_eq!(t.query(u), None, "{u}");
+        }
+    }
+
+    /// GOLDEN corpus (5znoe5i): one table of utterance -> exact plan batch (or the
+    /// exact error), spanning every rules intent. A grammar change that shifts any
+    /// row is a visible diff here.
+    #[test]
+    fn corpus_curation_filters() {
+        use hypodj_core::plan::{CurateFilter as F, QueueSelector};
+        let c = ctx(Some("s1"), 10);
+        let rm = |f: F| raw(RawTrigger::Immediate, Action::Remove { sel: QueueSelector::Upcoming(f) });
+        let cases: &[(&str, RawPlan)] = &[
+            ("no remixes", rm(F::Remixes)),
+            ("No more remixes please", rm(F::Remixes)),
+            ("drop the remixes", rm(F::Remixes)),
+            ("no live versions", rm(F::Live)),
+            ("drop the rest of this album", rm(F::RestOfAlbum)),
+            ("skip the rest of the album", rm(F::RestOfAlbum)),
+            ("no Daft Punk", rm(F::Artist("Daft Punk".into()))),
+            ("no more Daft Punk", rm(F::Artist("Daft Punk".into()))),
+            ("no Pharrell as lead", rm(F::LeadArtist("Pharrell".into()))),
+            ("no Pharrell as the main artist", rm(F::LeadArtist("Pharrell".into()))),
+            ("drop everything by Aphex Twin", rm(F::Artist("Aphex Twin".into()))),
+        ];
+        for (u, want) in cases {
+            let got = tr(u, &c).unwrap_or_else(|e| panic!("{u}: {e:?}"));
+            assert_eq!(got.len(), 1, "{u}");
+            assert_eq!(j(&got[0]), j(want), "{u}");
+        }
+        for u in ["no voices", "no vocals please", "more motion", "less energy", "only instrumentals"] {
+            match tr(u, &c) {
+                Err(NlError::Unresolvable(m)) => assert!(m.contains("iwwy04x"), "{u}: {m}"),
+                other => panic!("{u}: must answer not-yet, got {other:?}"),
+            }
+        }
+        // Not curation: falls through (never an artist named "thanks" or "this").
+        for u in ["no thanks", "skip this", "remove the last 3 tracks"] {
+            if let Ok(p) = tr(u, &c) {
+                assert!(
+                    !p.iter().any(|p| matches!(&p.action, Action::Remove { sel: QueueSelector::Upcoming(_) })),
+                    "{u} read as curation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn golden_corpus() {
+        let c = ctx(Some("song-42"), 5);
+        let fade_out = |s: f64| Action::Fade(FadeIntentIr::Out { secs: s });
+        // Debug form, not JSON: the Calmer/Similar id selectors are not
+        // internally-tag serializable, and Debug covers every field.
+        let d = |p: &RawPlan| format!("{p:?}");
+        let ok = |ps: Vec<RawPlan>| -> Result<Vec<String>, NlError> { Ok(ps.iter().map(d).collect()) };
+        let imm = |a: Action| raw(RawTrigger::Immediate, a);
+        let rows: Vec<(&str, Result<Vec<String>, NlError>)> = vec![
+            ("fade out", ok(vec![imm(fade_out(30.0))])),
+            ("fade in", ok(vec![imm(Action::Fade(FadeIntentIr::In { secs: 30.0 }))])),
+            ("fade out over 20 minutes", ok(vec![imm(fade_out(1200.0))])),
+            ("fade out in 20 minutes", ok(vec![raw(RawTrigger::SpanElapsed { secs: 1200.0 }, fade_out(30.0))])),
+            ("fade the 3rd track", ok(vec![raw(RawTrigger::QueuePosition { n: 3, base: PosBase::Absolute }, fade_out(30.0))])),
+            ("stop", ok(vec![imm(Action::Stop)])),
+            ("pause", ok(vec![imm(Action::Pause)])),
+            ("stop after this album", ok(vec![raw(RawTrigger::AlbumBoundary { track: TrackSel::Current }, Action::Stop)])),
+            ("stop after this track", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Stop)])),
+            ("pause in 10 minutes", ok(vec![raw(RawTrigger::SpanElapsed { secs: 600.0 }, Action::Pause)])),
+            ("something calmer", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Enqueue { selector: Selector::Calmer(SongId("song-42".into())), count: 5 })])),
+            ("more like this", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Enqueue { selector: Selector::Similar(SongId("song-42".into())), count: 5 })])),
+            ("play something calmer", ok(vec![imm(Action::PlayNow { selector: Selector::Calmer(SongId("song-42".into())), count: 5 })])),
+            ("shuffle on", ok(vec![mode(PlayMode::Random, true)])),
+            ("turn off random", ok(vec![mode(PlayMode::Random, false)])),
+            ("repeat this", ok(vec![mode(PlayMode::Repeat, true), mode(PlayMode::Single, true)])),
+            ("single mode", ok(vec![mode(PlayMode::Single, true)])),
+            ("consume", ok(vec![mode(PlayMode::Consume, true)])),
+            ("play my favorites", ok(vec![imm(Action::PlayNow { selector: Selector::Starred, count: 20 })])),
+            ("queue my favorites", ok(vec![imm(Action::Enqueue { selector: Selector::Starred, count: 20 })])),
+            ("wind down", ok(vec![imm(Action::Fade(FadeIntentIr::ToFloor { secs: 300.0 }))])),
+            ("sleep in 30 minutes", ok(vec![raw(RawTrigger::SpanElapsed { secs: 1800.0 }, fade_out(480.0))])),
+            ("", Err(NlError::NotUnderstood)),
+            ("do a barrel roll", Err(NlError::NotUnderstood)),
+            ("fade the last track", Err(NlError::NotUnderstood)),
+            ("stop in a bit", Err(NlError::NotUnderstood)),
+            ("pause in 2 days", Err(NlError::NotUnderstood)),
+            ("sleep timer", Err(NlError::Ambiguous("sleep for how long?".into()))),
+            ("repeat and shuffle", Err(NlError::Ambiguous("more than one playback mode named".into()))),
+        ];
+        for (u, want) in rows {
+            let got = tr(u, &c).map(|ps| ps.iter().map(d).collect::<Vec<_>>());
+            assert_eq!(got, want, "golden row {u:?}");
+        }
+        // The wake row carries a clock-resolved instant; pinned under the fixed ctx.
+        let w = tr("wake me at 7 with jazz", &c).unwrap();
+        assert_eq!(
+            d(&w[0]),
+            d(&raw(
+                RawTrigger::WallClock { at: Utc.with_ymd_and_hms(2026, 7, 15, 7, 0, 0).unwrap() },
+                Action::Wake { selector: Some(Selector::Genre("jazz".into())), count: 5 }
+            ))
+        );
+    }
+
+    // Sleep and wind-down name the daemon's single-instance FEATURES, so the hit
+    // says so (the handler then arms them through its own singleton path). Nothing
+    // else does - not even a fade that happens to share the sleep shape.
+    #[test]
+    fn sleep_and_winddown_are_marked_as_sessions() {
+        use hypodj_core::nl::NlSession;
+        let c = ctx(Some("s1"), 5);
+        let s = |u: &str| RulesTranslator.translate(u, &c).unwrap().session;
+        assert_eq!(s("sleep in 30 minutes"), Some(NlSession::Sleep));
+        assert_eq!(s("sleep timer 45 minutes"), Some(NlSession::Sleep));
+        assert_eq!(s("wind down in 10 minutes"), Some(NlSession::WindDown));
+        assert_eq!(s("start a wind-down"), Some(NlSession::WindDown));
+        assert_eq!(s("stop"), None);
+        assert_eq!(s("shuffle on"), None);
+    }
+
     // ── HYBRID orchestration ──────────────────────────────────────────────────
 
     struct StubLlm;
@@ -431,6 +699,7 @@ mod tests {
             Ok(NlHit {
                 plans: vec![raw(RawTrigger::Immediate, Action::Stop)],
                 source: NlSource::Llm,
+                session: None,
             })
         }
     }
@@ -471,6 +740,11 @@ mod tests {
             "fade out in 20 minutes",
             "stop after this album",
             "stop after this track",
+            "shuffle on",
+            "turn off repeat",
+            "repeat this",
+            "play my favorites",
+            "queue my favorites",
         ] {
             let plans = tr(utterance, &c).unwrap();
             for p in &plans {

@@ -5,6 +5,8 @@
 //! This is the silent-wrong-action trap: bare `play <n>` would start the queue
 //! and drop intent, so "play something calmer" MUST route to NL.
 
+use crate::model::Mode;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Render the now-playing card (status + currentsong). Also the no-args case.
@@ -21,6 +23,10 @@ pub enum Action {
     /// the CLI must resolve the current song's uri at runtime and issue
     /// `playlistadd Starred <uri>`, so it carries no argument here.
     FavoriteCurrent,
+    /// Flip one playback mode. A bare `random` carries no target value, so the client
+    /// resolves it against the mode's CURRENT state (`PlaybackModes::toggle_command`).
+    /// `random on|off` is explicit and routes straight to a `Command` instead.
+    ToggleMode(Mode),
     /// Send the whole phrase to the NL handshake.
     Nl(String),
 }
@@ -127,6 +133,56 @@ fn is_identify_phrase(args: &[String]) -> bool {
     )
 }
 
+/// One routed first word, for the shell completions. `args` are the literal second
+/// tokens the router recognizes after it (empty when it takes none or a free scalar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerbSpec {
+    pub word: &'static str,
+    pub args: &'static [&'static str],
+    pub help: &'static str,
+}
+
+/// The routed verb set: every first word `route_one` / `route_two` / `route_three`
+/// match on. The single source the `dj` fish completions are generated from, pinned
+/// both ways by tests (each entry routes to a non-NL action, and every literal verb
+/// in the router bodies is listed here), so a new verb cannot ship uncompleted.
+pub const ROUTED_VERBS: &[VerbSpec] = &[
+    VerbSpec { word: "now", args: &[], help: "now-playing card" },
+    VerbSpec { word: "status", args: &[], help: "now-playing card" },
+    VerbSpec { word: "queue", args: &[], help: "list the queue" },
+    VerbSpec { word: "play", args: &[], help: "start playback" },
+    VerbSpec { word: "pause", args: &[], help: "pause (startle-safe fade)" },
+    VerbSpec { word: "resume", args: &[], help: "resume at the paused position" },
+    VerbSpec { word: "unpause", args: &[], help: "resume at the paused position" },
+    VerbSpec { word: "continue", args: &[], help: "resume at the paused position" },
+    VerbSpec { word: "stop", args: &[], help: "stop playback" },
+    VerbSpec { word: "next", args: &[], help: "skip to the next track" },
+    VerbSpec { word: "skip", args: &[], help: "skip to the next track" },
+    VerbSpec { word: "prev", args: &[], help: "previous track" },
+    VerbSpec { word: "previous", args: &[], help: "previous track" },
+    VerbSpec { word: "back", args: &[], help: "previous track" },
+    VerbSpec { word: "fav", args: &[], help: "favorite the current track" },
+    VerbSpec { word: "favorite", args: &[], help: "favorite the current track" },
+    VerbSpec { word: "favourite", args: &[], help: "favorite the current track" },
+    VerbSpec { word: "star", args: &[], help: "favorite the current track" },
+    VerbSpec { word: "radio", args: &["on", "off", "random", "status", "this"], help: "endless radio from what is playing" },
+    VerbSpec { word: "mark", args: &["this", "current", "previous", "prev", "last"], help: "mark what is playing" },
+    VerbSpec { word: "heard", args: &["all", "marks", "keep", "drop"], help: "what played tonight" },
+    VerbSpec { word: "clear", args: &[], help: "clear the queue (asks first)" },
+    VerbSpec { word: "help", args: &[], help: "show help" },
+    VerbSpec { word: "sleep", args: &["off", "cancel", "status", "list"], help: "sleep timer status" },
+    VerbSpec { word: "wake", args: &["off", "cancel", "status", "list"], help: "wake alarm status" },
+    VerbSpec { word: "alarm", args: &["off", "cancel", "status", "list"], help: "wake alarm status" },
+    VerbSpec { word: "vol", args: &[], help: "set volume 0-100" },
+    VerbSpec { word: "volume", args: &[], help: "set volume 0-100" },
+    VerbSpec { word: "random", args: &["on", "off"], help: "toggle random" },
+    VerbSpec { word: "repeat", args: &["on", "off"], help: "toggle repeat" },
+    VerbSpec { word: "single", args: &["on", "off"], help: "toggle single" },
+    VerbSpec { word: "consume", args: &["on", "off"], help: "toggle consume" },
+    VerbSpec { word: "store", args: &["limit"], help: "offline store" },
+    VerbSpec { word: "identify", args: &[], help: "identify what is playing" },
+];
+
 /// Route the argument vector (already split into tokens) to an Action.
 pub fn route(args: &[String]) -> Action {
     if is_identify_phrase(args) {
@@ -185,8 +241,17 @@ fn route_one(verb: &str, args: &[String]) -> Action {
         "heard" => Action::Command("heard".into()),
         "clear" => Action::ClearConfirm,
         "help" => Action::Help,
-        // vol/volume alone (no scalar) is under-specified -> NL.
-        _ => Action::Nl(args.join(" ")),
+        // The bare scheduling verbs REPORT: the daemon answers `sleep`/`wake` with
+        // what is armed. Arming stays NL ("sleep in 30 minutes", "wake me at 7").
+        "sleep" => Action::Command("sleep".into()),
+        "wake" | "alarm" => Action::Command("wake".into()),
+        // vol/volume alone (no scalar) is under-specified -> NL. A bare playback-mode
+        // word toggles it. `shuffle` is deliberately NOT a mode: in MPD it reorders
+        // the queue once, a different act from the `random` play order.
+        w => match Mode::from_word(w) {
+            Some(m) => Action::ToggleMode(m),
+            None => Action::Nl(args.join(" ")),
+        },
     }
 }
 
@@ -238,6 +303,20 @@ fn route_two(verb: &str, arg: &str, args: &[String]) -> Action {
         "mark" if is_filler_noun(arg) => Action::Command("mark this".into()),
         // The heard views the daemon's parser accepts, passed through verbatim.
         "heard" if matches!(arg, "all" | "marks") => Action::Command(format!("heard {arg}")),
+        // Explicit mode values: `random on`, `repeat off`, `single 1`.
+        m if Mode::from_word(m).is_some() => match arg {
+            "on" | "1" => Action::Command(format!("{m} 1")),
+            "off" | "0" => Action::Command(format!("{m} 0")),
+            _ => Action::Nl(args.join(" ")),
+        },
+        "sleep" | "wake" | "alarm" => {
+            let verb = if verb == "sleep" { "sleep" } else { "wake" };
+            match arg {
+                "off" | "cancel" => Action::Command(format!("{verb} off")),
+                "status" | "list" => Action::Command(verb.into()),
+                _ => Action::Nl(args.join(" ")),
+            }
+        }
         // Any other two-token phrase (including "play something") is NL.
         _ => Action::Nl(args.join(" ")),
     }
@@ -584,5 +663,97 @@ mod tests {
         assert_eq!(r("queue jazz"), Action::Nl("queue jazz".into()));
         // Unknown lone first word.
         assert_eq!(r("shuffle"), Action::Nl("shuffle".into()));
+    }
+
+    #[test]
+    fn route_playback_modes() {
+        assert_eq!(r("random"), Action::ToggleMode(Mode::Random));
+        assert_eq!(r("repeat"), Action::ToggleMode(Mode::Repeat));
+        assert_eq!(r("single"), Action::ToggleMode(Mode::Single));
+        assert_eq!(r("consume"), Action::ToggleMode(Mode::Consume));
+        assert_eq!(r("random on"), Action::Command("random 1".into()));
+        assert_eq!(r("repeat off"), Action::Command("repeat 0".into()));
+        assert_eq!(r("single 1"), Action::Command("single 1".into()));
+        assert_eq!(r("consume 0"), Action::Command("consume 0".into()));
+        // Anything else after a mode word is a phrase, not a value.
+        assert_eq!(r("repeat this album"), Action::Nl("repeat this album".into()));
+        assert_eq!(r("random jazz"), Action::Nl("random jazz".into()));
+        // `shuffle` is a queue reorder, not the random mode.
+        assert_eq!(r("shuffle"), Action::Nl("shuffle".into()));
+    }
+
+    #[test]
+    fn route_sleep_and_wake_report_and_cancel() {
+        assert_eq!(r("sleep"), Action::Command("sleep".into()));
+        assert_eq!(r("wake"), Action::Command("wake".into()));
+        assert_eq!(r("alarm"), Action::Command("wake".into()));
+        assert_eq!(r("sleep status"), Action::Command("sleep".into()));
+        assert_eq!(r("wake list"), Action::Command("wake".into()));
+        assert_eq!(r("sleep off"), Action::Command("sleep off".into()));
+        assert_eq!(r("wake cancel"), Action::Command("wake off".into()));
+        assert_eq!(r("alarm off"), Action::Command("wake off".into()));
+        // Arming is a phrase and stays NL.
+        assert_eq!(r("sleep 30m"), Action::Nl("sleep 30m".into()));
+        assert_eq!(r("wake me at 7"), Action::Nl("wake me at 7".into()));
+    }
+
+    /// The body of `fn name(` up to its closing brace at column 0.
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(&format!("fn {name}(")).expect(name);
+        let rest = &src[start..];
+        &rest[..rest.find("\n}\n").expect("fn end")]
+    }
+
+    /// Every quoted literal on a top-level match-arm line (8-space indent) of a
+    /// router body, before its guard or `=>`.
+    fn arm_literals(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let Some(t) = line.strip_prefix("        ") else { continue };
+            if !(t.starts_with('"') || t.starts_with("(\"")) {
+                continue;
+            }
+            let head = t.split(" if ").next().unwrap().split("=>").next().unwrap();
+            // route_three arms are (verb, word) tuples: only the verb is a first word.
+            let head = if t.starts_with('(') { head.split(',').next().unwrap() } else { head };
+            out.extend(head.split('"').skip(1).step_by(2).map(str::to_string));
+        }
+        out
+    }
+
+    #[test]
+    fn every_routed_verb_is_in_the_completion_table() {
+        let src = include_str!("route.rs");
+        let listed: Vec<&str> = ROUTED_VERBS.iter().map(|v| v.word).collect();
+        let mut found = Vec::new();
+        for f in ["route_one", "route_two", "route_three"] {
+            found.extend(arm_literals(fn_body(src, f)));
+        }
+        found.extend(Mode::ALL.iter().map(|m| m.verb().to_string()));
+        found.push("identify".into());
+        assert!(found.len() > 20, "scanner found too little: {found:?}");
+        for w in &found {
+            assert!(listed.contains(&w.as_str()), "routed verb `{w}` missing from ROUTED_VERBS");
+        }
+    }
+
+    #[test]
+    fn every_table_verb_routes_to_a_non_nl_action() {
+        for v in ROUTED_VERBS {
+            let ok = std::iter::once(r(v.word))
+                .chain(v.args.iter().map(|a| r(&format!("{} {a}", v.word))))
+                .chain([r(&format!("{} 50", v.word)), r(&format!("{} limit 1G", v.word))])
+                .any(|a| !matches!(a, Action::Nl(_)));
+            assert!(ok, "`{}` never routes off NL", v.word);
+            for a in v.args {
+                let two = r(&format!("{} {a}", v.word));
+                let three = r(&format!("{} {a} 1", v.word));
+                assert!(
+                    !matches!(two, Action::Nl(_)) || !matches!(three, Action::Nl(_)),
+                    "`{} {a}` is listed but routes to NL",
+                    v.word
+                );
+            }
+        }
     }
 }

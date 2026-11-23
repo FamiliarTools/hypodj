@@ -82,12 +82,11 @@ pub struct Target {
     /// The OWNING album (`X-AlbumUri`). Live today for a queue row, a Find song hit, an
     /// lsinfo song row and `currentsong` - the daemon already emits it on all four.
     pub album_uri: Option<String>,
-    /// The artist NAME. No artist uri exists on the wire yet, so this is what
-    /// "go to artist" navigates with (see [`ArtistRef`]).
+    /// The artist NAME. The fallback "go to artist" searches with when the row carries
+    /// no `artist_uri` (see [`ArtistRef`]).
     pub artist: Option<String>,
-    /// The artist's browse uri (`artist/<id>`). Nothing in the workspace emits one
-    /// today, so this is always `None` in this slice; the daemon slice fills it and
-    /// nothing else in this module changes.
+    /// The artist's browse uri (`artist/<id>`), from the daemon's `X-ArtistUri`. Filled
+    /// for a queue row and the playing track; `None` where the listing lacks it.
     pub artist_uri: Option<String>,
     /// The library counterpart of a RECOGNIZED radio track (`X-MatchUri`), so the
     /// now-playing menu can star and seed from what the radio is playing even though
@@ -109,10 +108,9 @@ pub enum PlayHow {
     LoadPlaylist(String),
 }
 
-/// What "go to artist" has to navigate with. There is NO artist uri on the wire today:
-/// core `Song` has no `artist_id`, `map_song` drops `Child.artist_id`, and nothing
-/// emits `X-ArtistUri`. So the NAME path is the primary path, not a bolted-on
-/// fallback, and `Uri` is the door the daemon slice walks through with no change here.
+/// What "go to artist" has to navigate with. The daemon emits `X-ArtistUri` when the
+/// server knows the artist id, which makes the jump a real browse; a row without one
+/// (a Find hit, a drilled listing, a server without ids) falls back to the NAME.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtistRef {
     /// A real browse path (`artist/<id>`): navigates.

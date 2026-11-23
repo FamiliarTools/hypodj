@@ -58,10 +58,14 @@ pub fn parse_pls(text: &str) -> Vec<PlsEntry> {
             continue;
         }
         // FIRST '=' only: a url value legitimately contains more of them.
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         let value = value.trim();
-        let Some((kind, index)) = split_indexed_key(key) else { continue };
+        let Some((kind, index)) = split_indexed_key(key) else {
+            continue;
+        };
         let slot = slots.entry(index).or_default();
         match kind {
             IndexedKey::File => slot.0 = Some(value.to_string()),
@@ -73,7 +77,10 @@ pub fn parse_pls(text: &str) -> Vec<PlsEntry> {
         .into_values()
         .filter_map(|(url, title)| {
             let url = url.filter(|u| !u.is_empty())?;
-            Some(PlsEntry { url, title: title.filter(|t| !t.is_empty()) })
+            Some(PlsEntry {
+                url,
+                title: title.filter(|t| !t.is_empty()),
+            })
         })
         .collect()
 }
@@ -84,7 +91,9 @@ pub fn parse_pls(text: &str) -> Vec<PlsEntry> {
 pub fn declared_entry_count(text: &str) -> Option<usize> {
     for raw in text.split('\n') {
         let line = raw.trim();
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         if key.trim().eq_ignore_ascii_case("NumberOfEntries") {
             return value.trim().parse().ok();
         }
@@ -145,7 +154,10 @@ mod tests {
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].url, "http://s2.stationplaylist.com:7178/listen.mp3");
         assert!(!e[0].url.contains('\r'));
-        assert_eq!(e[0].title.as_deref(), Some("Savage Radio - The Soul of the Pacific"));
+        assert_eq!(
+            e[0].title.as_deref(),
+            Some("Savage Radio - The Soul of the Pacific")
+        );
     }
 
     #[test]
@@ -177,7 +189,10 @@ mod tests {
         let text = "[playlist]\nNumberOfEntries=2\nFile1=http://uk5.internet-radio.com:8306/stream\nTitle1=Moon Mission Recordings, Tokyo Deep and Electronic\nLength1=-1\nFile2=http://proic1.evspt.com:80/oxigenio_aac\nTitle2=Oxigenio 102.6 FM Lisboa\nLength2=-1\nVersion=2";
         let e = parse_pls(text);
         assert_eq!(e.len(), 2);
-        assert_eq!(e[0].title.as_deref(), Some("Moon Mission Recordings, Tokyo Deep and Electronic"));
+        assert_eq!(
+            e[0].title.as_deref(),
+            Some("Moon Mission Recordings, Tokyo Deep and Electronic")
+        );
         assert_eq!(e[1].url, "http://proic1.evspt.com:80/oxigenio_aac");
     }
 
@@ -199,17 +214,25 @@ mod tests {
         assert_eq!(
             parse_pls(text),
             vec![
-                PlsEntry { url: "http://a/".into(), title: Some("First".into()) },
-                PlsEntry { url: "http://b/".into(), title: Some("Second".into()) },
+                PlsEntry {
+                    url: "http://a/".into(),
+                    title: Some("First".into())
+                },
+                PlsEntry {
+                    url: "http://b/".into(),
+                    title: Some("Second".into())
+                },
             ]
         );
     }
 
     #[test]
     fn a_missing_or_blank_title_is_none_never_a_guess() {
-        let text = "[playlist]\nNumberOfEntries=1\nFile1=http://earthsongradio.com\nLength1=-1\nVersion=2";
+        let text =
+            "[playlist]\nNumberOfEntries=1\nFile1=http://earthsongradio.com\nLength1=-1\nVersion=2";
         assert_eq!(parse_pls(text)[0].title, None);
-        let text = "[playlist]\nNumberOfEntries=1\nFile1=http://earthsongradio.com\nTitle1=   \nVersion=2";
+        let text =
+            "[playlist]\nNumberOfEntries=1\nFile1=http://earthsongradio.com\nTitle1=   \nVersion=2";
         assert_eq!(parse_pls(text)[0].title, None);
     }
 
@@ -224,10 +247,14 @@ mod tests {
 
     #[test]
     fn an_entry_without_a_url_is_dropped() {
-        let text = "[playlist]\nNumberOfEntries=2\nTitle1=Titled but urlless\nFile2=http://b/\nTitle2=B\n";
+        let text =
+            "[playlist]\nNumberOfEntries=2\nTitle1=Titled but urlless\nFile2=http://b/\nTitle2=B\n";
         assert_eq!(
             parse_pls(text),
-            vec![PlsEntry { url: "http://b/".into(), title: Some("B".into()) }]
+            vec![PlsEntry {
+                url: "http://b/".into(),
+                title: Some("B".into())
+            }]
         );
     }
 
@@ -245,8 +272,12 @@ mod tests {
     /// have the collection. Proves the real bytes without vendoring them into the repo.
     #[test]
     fn real_pls_corpus_parses() {
-        let Ok(dir) = std::env::var("HYPODJ_STATIONS_DIR") else { return };
-        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let Ok(dir) = std::env::var("HYPODJ_STATIONS_DIR") else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
         let mut names = Vec::new();
         let mut urls = Vec::new();
         let mut files = 0usize;
@@ -259,7 +290,11 @@ mod tests {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{} is not valid UTF-8 text: {e}", path.display()));
             let parsed = parse_pls(&text);
-            assert!(!parsed.is_empty(), "{} parsed to zero entries", path.display());
+            assert!(
+                !parsed.is_empty(),
+                "{} parsed to zero entries",
+                path.display()
+            );
             for entry in parsed {
                 assert!(
                     entry.url.starts_with("http://") || entry.url.starts_with("https://"),
@@ -267,7 +302,12 @@ mod tests {
                     path.display(),
                     entry.url
                 );
-                assert_eq!(entry.url.trim(), entry.url, "{}: url carries whitespace", path.display());
+                assert_eq!(
+                    entry.url.trim(),
+                    entry.url,
+                    "{}: url carries whitespace",
+                    path.display()
+                );
                 if let Some(t) = entry.title {
                     assert_eq!(t.trim(), t, "{}: title carries whitespace", path.display());
                     names.push(t.to_lowercase());
@@ -278,7 +318,10 @@ mod tests {
         // The env var is the gate; once it points somewhere readable, an EMPTY answer is
         // a misconfiguration worth failing on, not a silent pass.
         assert!(files > 0, "{dir} holds no .pls files");
-        eprintln!("real_pls_corpus_parses: {files} files, {} entries", urls.len());
+        eprintln!(
+            "real_pls_corpus_parses: {files} files, {} entries",
+            urls.len()
+        );
         // Both idempotency keys must be unambiguous across the whole collection.
         let unique_names: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(unique_names.len(), names.len(), "two stations share a name");

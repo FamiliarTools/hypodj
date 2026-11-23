@@ -828,6 +828,17 @@ impl SubsonicClient {
             .map_err(|e| SubsonicError::Request(e.to_string()))
     }
 
+    /// Truncate an EXISTING playlist to empty, keeping it (Subsonic
+    /// `updatePlaylist` removing every index `0..len`). Backs `playlistclear`,
+    /// which in MPD empties a playlist rather than deleting it.
+    pub async fn clear_playlist(&self, id: &PlaylistId, len: usize) -> Result<(), SubsonicError> {
+        let all: Vec<i32> = (0..len as i32).collect();
+        self.inner
+            .update_playlist(&id.0, None, None, None, &[], &all)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
     /// All of the user's stored playlists (Subsonic `getPlaylists`). Songs are
     /// NOT included (`song_count` carries the count); use [`get_playlist`](Self::get_playlist)
     /// for the tracks. NEVER cached here - the handler owns any caching.

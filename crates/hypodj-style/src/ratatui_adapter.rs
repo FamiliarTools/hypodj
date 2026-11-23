@@ -139,7 +139,13 @@ fn ink_style(bg: TermBg, truecolor: bool) -> Style {
 /// alacritty. Underline stays, so echo and a note still differ.
 fn quiet_ink(bg: TermBg, truecolor: bool, underline: bool) -> Style {
     let mut style = if bg.source == crate::BgSource::Osc11 {
-        Style::default().fg(to_color(crate::fit_ink_quiet(bg), truecolor))
+        // Recheck after the 256-colour cube. A fitted RGB can quantise under 4.5:1.
+        Style::default().fg(fitted_color(
+            crate::fit_ink_quiet(bg),
+            bg,
+            tokens().room.ink_quiet_min_contrast,
+            truecolor,
+        ))
     } else {
         Style::default().quiet()
     };
@@ -301,6 +307,28 @@ mod tests {
             echo.fg.is_none(),
             "no room, so quiet is DIM and not a colour"
         );
+    }
+
+    #[test]
+    fn quiet_ink_256_still_clears_four_point_five() {
+        let floor = tokens().room.ink_quiet_min_contrast;
+        for rgb in [[0x12, 0x12, 0x12], [0xf7, 0xf4, 0xef], [0x80, 0x80, 0x80]] {
+            let bg = TermBg::from_rgb(rgb, BgSource::Osc11);
+            let style = style_for(Role::InkQuiet, bg, false);
+            assert!(
+                !style.add_modifier.contains(Modifier::DIM),
+                "indexed quiet is a colour, not DIM, on {rgb:?}"
+            );
+            let Color::Indexed(i) = style.fg.expect("indexed quiet") else {
+                panic!("256-colour quiet must be an indexed cell");
+            };
+            let realized = idx_to_rgb(i);
+            let ratio = contrast_ratio(realized, bg.rgb);
+            assert!(
+                ratio + 1e-3 >= floor,
+                "quiet on {rgb:?} quantised to {realized:?} at {ratio:.2}:1"
+            );
+        }
     }
 
     #[test]
