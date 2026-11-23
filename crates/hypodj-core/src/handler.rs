@@ -2172,27 +2172,33 @@ pub const PAIR_NEXT_FIRE: &str = "next_fire";
 pub const PAIR_NL_ANSWER: &str = "nl_answer";
 pub const PAIR_JDID: &str = "jdid";
 
+/// Fixed result sentences. The client refuses these by the constant, not by
+/// guessing at prose. `added 0` is structural and is not one of these.
+pub const RESULT_NO_JUMP: &str = "no matching track to play";
+pub const RESULT_FAILED: &str = "could not do that: ";
+pub const RESULT_ADDED_NONE: &str = "added 0 - no matches for ";
+
 impl PlanOutcome {
     /// The single human line the client shows after `y`/confirm. Speaks the REAL
     /// count/effect (0 when the selector resolved to nothing), NEVER the asked count.
     pub fn render(&self) -> String {
         match self {
             PlanOutcome::Added { n: 0, selector } => {
-                format!("added 0 - no matches for {selector}")
+                format!("{RESULT_ADDED_NONE}{selector}")
             }
             PlanOutcome::Added { n, .. } => format!("added {n} {}", tracks_word(*n)),
             PlanOutcome::Played { n: 0, selector, .. } => {
-                format!("added 0 - no matches for {selector}")
+                format!("{RESULT_ADDED_NONE}{selector}")
             }
             PlanOutcome::Played { title: Some(t), .. } => format!("played {t}"),
             PlanOutcome::Played { n, .. } => format!("played {n} {}", tracks_word(*n)),
             PlanOutcome::Removed(n) => format!("removed {n} {}", tracks_word(*n)),
             PlanOutcome::Moved(n) => format!("moved {n} {}", tracks_word(*n)),
             PlanOutcome::Cleared(n) => format!("cleared {n} {}", tracks_word(*n)),
-            PlanOutcome::Jumped(0) => "no matching track to play".to_string(),
+            PlanOutcome::Jumped(0) => RESULT_NO_JUMP.to_string(),
             PlanOutcome::Jumped(_) => "jumped to the matching track".to_string(),
             PlanOutcome::Effect(s) => s.clone(),
-            PlanOutcome::Failed(e) => format!("could not do that: {e}"),
+            PlanOutcome::Failed(e) => format!("{RESULT_FAILED}{e}"),
         }
     }
 }

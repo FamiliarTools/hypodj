@@ -10,6 +10,7 @@ use hypodj_core::handler::{
     effect_set_volume, PlanOutcome, ACK_NL_INVALID, ACK_NL_NO_TOKEN, ACK_NL_STALE, ACK_NO_PLAN,
     ACK_TRANSLATOR_TASK, ACK_WAKE_DURATION, ACK_WAKE_TIME, EFFECT_FADING, EFFECT_NOTHING,
     EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_JDID, PAIR_NL_ANSWER, PAIR_PLAN_ID,
+    RESULT_FAILED, RESULT_NO_JUMP,
     PAIR_RESULT, PAIR_SLEEP, PAIR_SLEEP_REMAINING, PAIR_WAKE, PAIR_WAKE_REMAINING,
 };
 use hypodj_core::nl::NlError;
@@ -116,6 +117,8 @@ fn the_catalog_speaks_the_handlers_sentences() {
                 .map(|(_, v)| v.as_str())
         })
         .collect();
+    assert_eq!(PlanOutcome::Jumped(0).render(), RESULT_NO_JUMP);
+    assert!(PlanOutcome::Failed("gone".into()).render().starts_with(RESULT_FAILED));
     for line in outcome_lines() {
         assert!(
             results.contains(&line.as_str()),

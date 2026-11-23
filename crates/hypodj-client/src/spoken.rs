@@ -175,41 +175,50 @@ pub fn from_reply(pairs: &[(String, String)], act: Option<Act>) -> Spoken {
     }
 }
 
-/// A result that did not happen: the handler's failure line, or a no-match.
+/// The handler's fixed failure sentences. `reply_shapes` locks these to the
+/// same constants in hypodj-core. A wording change there fails that test.
+const RESULT_NO_JUMP: &str = "no matching track to play";
+const RESULT_FAILED: &str = "could not do that: ";
+
+/// A result that did not happen.
+///
+/// `added 0` is the count the daemon reports, not a sentence we match.
+/// The other two are the handler's own constants, compared whole.
 fn state_of_result(line: &str) -> State {
-    if line.starts_with("could not do that")
-        || line.starts_with("added 0 - no matches")
-        || line == "no matching track to play"
-    {
+    let mut words = line.split_whitespace();
+    let added_none = words.next() == Some("added") && words.next() == Some("0");
+    if added_none || line == RESULT_NO_JUMP || line.starts_with(RESULT_FAILED) {
         State::Refused
     } else {
         State::Live
     }
 }
 
-/// Sleep, wake, a read-side answer, or an undo. A timer that is counting down
-/// is already acting, so it is live. Armed is only a plan that has not run.
+/// Sleep, wake, a read-side answer, or an undo.
+///
+/// A timer that is counting down is armed: it is set to fire and can be
+/// disarmed. Nothing pending is a note, not ember.
 fn noted(pairs: &[(String, String)], act: Option<Act>) -> Option<Spoken> {
     if let Some((_, secs)) = pairs.iter().find(|(k, _)| k == "sleep_remaining") {
         return Some(Spoken::new(
-            State::Live,
+            State::Armed,
             vec![format!("sleep in {}", span(secs))],
         ));
     }
     if let Some((_, secs)) = pairs.iter().find(|(k, _)| k == "wake_remaining") {
         return Some(Spoken::new(
-            State::Live,
+            State::Armed,
             vec![format!("wake in {}", span(secs))],
         ));
     }
     if pairs.iter().any(|(k, v)| k == "sleep" && v == "none") {
         return Some(Spoken::new(
-            State::Live,
+            State::Note,
             vec!["no sleep timer armed".into()],
         ));
     }
     if pairs.iter().any(|(k, v)| k == "wake" && v == "none") {
-        return Some(Spoken::new(State::Live, vec!["no wake alarm armed".into()]));
+        return Some(Spoken::new(State::Note, vec!["no wake alarm armed".into()]));
     }
     if let Some((_, answer)) = pairs.iter().find(|(k, _)| k == "nl_answer") {
         return Some(Spoken::new(State::Live, vec![answer.clone()]));
@@ -225,6 +234,9 @@ fn noted(pairs: &[(String, String)], act: Option<Act>) -> Option<Spoken> {
 /// The sentence both surfaces speak for a successful command, when it has one.
 /// `None` for a verb whose answer is the queue itself (`play`, `next`).
 pub fn command_spoken(line: &str, pairs: &[(String, String)]) -> Option<Spoken> {
+    if let Some((_, sentence)) = pairs.iter().find(|(k, _)| k == "mark_result") {
+        return Some(live_text(sentence.clone()));
+    }
     let act = act_from_command(line);
     if noted(pairs, act).is_some() {
         return Some(from_reply(pairs, act));
@@ -436,7 +448,7 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         pairs(&[("sleep_remaining", "720")]),
         None,
         None,
-        State::Live,
+        State::Armed,
         &["sleep in 12m"],
     ));
     out.push(shape(
@@ -444,7 +456,7 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         pairs(&[("sleep", "none")]),
         None,
         None,
-        State::Live,
+        State::Note,
         &["no sleep timer armed"],
     ));
     out.push(shape(
@@ -452,7 +464,7 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         pairs(&[("wake_remaining", "45")]),
         None,
         None,
-        State::Live,
+        State::Armed,
         &["wake in 45s"],
     ));
     out.push(shape(
@@ -460,7 +472,7 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         pairs(&[("wake", "none")]),
         None,
         None,
-        State::Live,
+        State::Note,
         &["no wake alarm armed"],
     ));
     out.push(ReplyShape {

@@ -188,19 +188,6 @@ impl PlaybackModes {
     }
 }
 
-/// The sentence a `sleep` / `wake` STATUS reply deserves. The daemon answers
-/// `sleep_remaining: <secs>` or `sleep: none` (likewise `wake`); both clients print
-/// it through here so the words cannot drift. `None` for any other reply (a set
-/// answers `plan_id`, a cancel a bare OK - the card is the feedback there).
-pub fn schedule_reply(pairs: &[(String, String)]) -> Option<String> {
-    let status = pairs.iter().any(|(k, v)| match k.as_str() {
-        "sleep_remaining" | "wake_remaining" => true,
-        "sleep" | "wake" => v == "none",
-        _ => false,
-    });
-    status.then(|| crate::spoken::from_reply(pairs, None).text())
-}
-
 /// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
 /// `strength` is a basis-of-100 integer (the wire value); render as `strength/100`.
 #[derive(Debug, Default, PartialEq, Clone)]
@@ -1229,25 +1216,18 @@ mod tests {
     }
 
     #[test]
-    fn schedule_reply_words_both_answers_and_ignores_others() {
-        assert_eq!(
-            schedule_reply(&p(&[("sleep_remaining", "720")])).as_deref(),
-            Some("sleep in 12m")
-        );
-        assert_eq!(
-            schedule_reply(&p(&[("sleep", "none")])).as_deref(),
-            Some("no sleep timer armed")
-        );
-        assert_eq!(
-            schedule_reply(&p(&[("wake_remaining", "25200")])).as_deref(),
-            Some("wake in 7h 00m")
-        );
-        assert_eq!(
-            schedule_reply(&p(&[("wake", "none")])).as_deref(),
-            Some("no wake alarm armed")
-        );
-        assert_eq!(schedule_reply(&p(&[("plan_id", "3")])), None);
-        assert_eq!(schedule_reply(&[]), None);
+    fn a_countdown_is_armed_in_the_same_words_as_the_hold() {
+        use crate::spoken::{armed_hold, command_spoken, State};
+        let sleep = p(&[("sleep_remaining", "720")]);
+        let spoken = command_spoken("sleep", &sleep).unwrap();
+        let hold = armed_hold(&ArmedFeatures { sleep_remaining: Some(720), ..ArmedFeatures::default() }).unwrap();
+        assert_eq!(spoken.state, State::Armed);
+        assert_eq!(hold.state, spoken.state);
+        assert_eq!(spoken.text(), "sleep in 12m");
+        assert!(hold.text().contains("sleep in 12m"));
+        let none = command_spoken("wake", &p(&[("wake", "none")])).unwrap();
+        assert_eq!(none.state, State::Note);
+        assert!(armed_hold(&ArmedFeatures::default()).is_none());
     }
 
     #[test]

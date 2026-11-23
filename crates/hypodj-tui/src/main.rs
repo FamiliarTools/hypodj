@@ -1078,6 +1078,29 @@ mod tests {
     }
 
     #[test]
+    fn a_long_mark_reaches_the_bar_through_apply_resp() {
+        use hypodj_client::spoken::live_text;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let (tx, _rx) = mpsc::channel::<Req>();
+        let mut state = TuiState::new();
+        let sentence = "noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it";
+        apply_resp(&tx, &mut state, RespKind::Banner(live_text(sentence).into()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| ui::render(f, &state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let flat = rows.join("\n");
+        assert!(flat.contains("kept 5m of audio"), "{flat}");
+        assert!(flat.contains("heard` has it"), "{flat}");
+        let head = rows.iter().position(|r| r.contains("kept 5m of audio")).unwrap();
+        let tail = rows.iter().position(|r| r.contains("heard` has it")).unwrap();
+        assert_eq!(tail, head + 1, "{rows:#?}");
+    }
+
+    #[test]
     fn a_confirm_keeps_every_plan_on_the_bar_and_in_the_dj_pane() {
         use hypodj_client::spoken::from_confirm;
         use ratatui::style::Modifier;

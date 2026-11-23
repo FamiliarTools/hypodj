@@ -61,7 +61,7 @@ HypoDJ is holding it for you.
 | State | Look | Words |
 |---|---|---|
 | `echo` (proposed, not armed) | `ink.quiet`, underlined or dotted outline | "Will do: ..." plus how to confirm |
-| `armed` (confirmed, scheduled) | `ember` | "Armed: ..." |
+| `armed` (set to fire in the future) | `ember` | a plan awaiting its time, or a sleep or wake timer that is counting down and can still be disarmed |
 | `live` (happening now) | `ink.primary`, bold | what is happening |
 | `refused` / `failed` | `ink.primary`, no colour, no alarm | one sentence: what did not happen and why |
 

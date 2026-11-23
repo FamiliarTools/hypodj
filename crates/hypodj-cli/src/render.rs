@@ -385,9 +385,26 @@ mod tests {
         assert!(batch_off.contains("armed (plan 7)"));
         assert!(batch_off.contains("armed (plan 8)"));
 
+        let sleep = vec![("sleep_remaining".into(), "720".into())];
+        let sleep_spoken = command_spoken("sleep", &sleep).unwrap();
+        let hold = hypodj_client::spoken::armed_hold(&hypodj_client::model::ArmedFeatures {
+            sleep_remaining: Some(720),
+            ..hypodj_client::model::ArmedFeatures::default()
+        })
+        .unwrap();
+        assert_eq!(sleep_spoken.state, hypodj_style::State::Armed);
+        assert_eq!(hold.state, sleep_spoken.state);
+        let sleep_on = render_command("sleep", &sleep, Ansi::on_truecolor()).unwrap();
+        assert!(sleep_on.contains("38;2;"), "a countdown is ember");
+        assert_eq!(hypodj_style::ansi::strip(&sleep_on), sleep_spoken.text());
+
+        let quiet = vec![("wake".into(), "none".into())];
+        let quiet_spoken = command_spoken("wake", &quiet).unwrap();
+        assert_eq!(quiet_spoken.state, hypodj_style::State::Note);
+        let quiet_on = render_command("wake", &quiet, Ansi::on_truecolor()).unwrap();
+        assert!(!quiet_on.contains("38;2;"), "nothing pending is not ember");
+
         for (line, raw) in [
-            ("sleep", vec![("sleep_remaining".into(), "720".into())]),
-            ("wake", vec![("wake".into(), "none".into())]),
             (
                 "nl",
                 vec![("nl_answer".into(), "yes, \"Blue\" is a favorite".into())],

@@ -489,11 +489,8 @@ pub enum Reply {
 ///
 /// Pure over the request and the pairs, so the whole rule is testable without a socket.
 pub fn command_reply(line: &str, pairs: &[(String, String)]) -> Option<Reply> {
-    if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "mark_result") {
-        return Some(Reply::Banner(hypodj_client::spoken::live_text(v.clone())));
-    }
-    // Sleep, wake, an answer, undo, and a mode flip that the daemon accepted.
-    // The same `command_spoken` the CLI calls.
+    // Mark, sleep, wake, an answer, undo, and a mode flip. The same
+    // `command_spoken` the CLI calls.
     if let Some(spoken) = hypodj_client::spoken::command_spoken(line, pairs) {
         return Some(Reply::Banner(spoken));
     }

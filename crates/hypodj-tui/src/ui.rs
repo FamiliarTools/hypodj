@@ -17,10 +17,12 @@ use crate::keymap;
 use crate::find::{FindRow, Focus, Phase};
 use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState};
 
-/// Draw the full jukebox: the screen-tab row, the active list
-/// (Queue/Albums/Playlists), then the Now Playing pane (album art + up-next
-/// preview), and the command/confirm line. Now Playing sits BELOW the list, just
-/// above the command box.
+/// The stretch of ambient wave the idle bottom bar keeps for itself, whatever else
+/// wants the row. The store badge is drawn only when it fits BESIDE this many cells,
+/// so a long mirror line can never turn the quietest row on the screen into a status
+/// bar.
+const MIN_WAVE_CELLS: usize = 16;
+
 /// Rows to give the Now Playing pane, scaled to the terminal height.
 ///
 /// The art slot is whatever is left after the pane's text rows, and pane size is the
@@ -30,12 +32,6 @@ use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState}
 /// short terminal keeps exactly the historical 12, because on 24 rows a bigger pane
 /// leaves the queue list unusable, and a cover is worth less than seeing what is playing
 /// next.
-/// The stretch of ambient wave the idle bottom bar keeps for itself, whatever else
-/// wants the row. The store badge is drawn only when it fits BESIDE this many cells,
-/// so a long mirror line can never turn the quietest row on the screen into a status
-/// bar.
-const MIN_WAVE_CELLS: usize = 16;
-
 fn now_playing_h(total: u16) -> u16 {
     match total {
         0..=29 => 12,
@@ -44,6 +40,10 @@ fn now_playing_h(total: u16) -> u16 {
     }
 }
 
+/// Draw the full jukebox: the screen-tab row, the active list
+/// (Queue/Albums/Playlists), then the Now Playing pane (album art + up-next
+/// preview), and the command/confirm line. Now Playing sits BELOW the list, just
+/// above the command box.
 pub fn render(f: &mut Frame, state: &TuiState) {
     // Decided BEFORE anything is drawn, because the art is painted early in this
     // function and the generation has to be right by the time it is: an overlay that
@@ -265,6 +265,100 @@ fn status_lines(msg: &str, width: usize, max_rows: usize) -> Vec<String> {
         }
     }
     rows
+}
+
+/// Wrap a reply's parts with the same breaks as [`status_lines`], keeping each
+/// part's style across the wrap. A later row is used when the area has one.
+fn styled_status_lines(
+    parts: &[hypodj_style::Spoken],
+    width: usize,
+    max_rows: usize,
+    bg: hypodj_style::TermBg,
+    truecolor: bool,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let max_rows = max_rows.max(1);
+    let mut cells: Vec<(char, Style)> = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            for ch in "; ".chars() {
+                cells.push((ch, Style::default()));
+            }
+        }
+        let style = hypodj_style::ratatui::style_for_state(part.state, bg, truecolor);
+        for ch in part.text().replace('\n', " ").chars() {
+            cells.push((ch, style));
+        }
+    }
+    if cells.is_empty() {
+        return vec![Line::from("")];
+    }
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut rest = cells.as_slice();
+    loop {
+        if rest.len() <= width {
+            rows.push(trim_styled_end(rest));
+            break;
+        }
+        let window = &rest[..width];
+        let (take, skip) = match window.iter().rposition(|(ch, _)| *ch == ' ') {
+            Some(i) if i > 0 => (i, i + 1),
+            _ => (width, width),
+        };
+        rows.push(trim_styled_end(&rest[..take]));
+        rest = &rest[skip..];
+        while rest.first().is_some_and(|(ch, _)| *ch == ' ') {
+            rest = &rest[1..];
+        }
+        if rest.is_empty() {
+            break;
+        }
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+        if width >= 3 {
+            if let Some(last) = rows.last_mut() {
+                while last.len() + 3 > width && !last.is_empty() {
+                    last.pop();
+                }
+                let style = last.last().map(|(_, s)| *s).unwrap_or_default();
+                for ch in "...".chars() {
+                    last.push((ch, style));
+                }
+            }
+        }
+    }
+    rows.into_iter().map(line_of_styled).collect()
+}
+
+fn trim_styled_end(row: &[(char, Style)]) -> Vec<(char, Style)> {
+    let end = row.iter().rposition(|(ch, _)| *ch != ' ').map(|i| i + 1).unwrap_or(0);
+    row[..end].to_vec()
+}
+
+fn line_of_styled(row: Vec<(char, Style)>) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut style = Style::default();
+    for (ch, st) in row {
+        if buf.is_empty() {
+            style = st;
+        }
+        if st == style {
+            buf.push(ch);
+        } else {
+            spans.push(Span::styled(std::mem::take(&mut buf), style));
+            style = st;
+            buf.push(ch);
+        }
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, style));
+    }
+    Line::from(spans)
 }
 
 /// The heard/tape read-back overlay: the daemon's own `heard` render, whole, in a
@@ -776,7 +870,11 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         // far corner of the bottom bar. Two verbs cost one dim line.
         lines.push(Line::from(Span::styled(
             "F5 to search, F4 to ask the DJ",
-            Style::default().quiet(),
+            hypodj_style::ratatui::style_for(
+                hypodj_style::Role::InkQuiet,
+                state.term_bg,
+                state.truecolor,
+            ),
         )));
         // The modes still decide what the next play does, so a stopped deck says them.
         if let Some(m) = np.modes.label() {
@@ -1063,7 +1161,11 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
         )));
         lines.push(Line::from(Span::styled(
             "F5 to search, F4 to ask the DJ",
-            Style::default().quiet(),
+            hypodj_style::ratatui::style_for(
+                hypodj_style::Role::InkQuiet,
+                state.term_bg,
+                state.truecolor,
+            ),
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -2449,20 +2551,26 @@ mod tests {
         // default 60x24, where the ambient wave would otherwise be. A press that
         // succeeds and shows nothing is the bug this replaces.
         let mut s = TuiState::new();
-        s.status_msg = Some("noted: Sun Ra - Space at 21:14".into());
+        s.set_reply(hypodj_client::spoken::Reply::one(hypodj_client::spoken::live_text(
+            "noted: Sun Ra - Space at 21:14",
+        )));
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("noted: Sun Ra - Space"), "the mark sentence is drawn:\n{out}");
 
         // The AMBIGUOUS answer is the one that stars nothing and asks for a word back,
         // so its lead must be legible at this width rather than starting off-screen.
         let mut s = TuiState::new();
-        s.status_msg = Some("marked, but which one: \"A - One\" started 6s ago".into());
+        s.set_reply(hypodj_client::spoken::Reply::one(hypodj_client::spoken::live_text(
+            "marked, but which one: \"A - One\" started 6s ago",
+        )));
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("marked, but which one"), "the ambiguity is stated:\n{out}");
 
         // And the refusal path: a row that cannot be starred says WHY on the same bar.
         let mut s = TuiState::new();
-        s.status_msg = Some("can't star a smart list".into());
+        s.set_reply(hypodj_client::spoken::Reply::one(hypodj_client::spoken::refused_text(
+            "can't star a smart list",
+        )));
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("can't star a smart list"), "the reason is drawn:\n{out}");
     }
@@ -2475,9 +2583,9 @@ mod tests {
         // success the gesture was built to end. The bar borrows the blank breathing row
         // below it (already reserved, so nothing moves) and the clause lands.
         let mut s = TuiState::new();
-        s.status_msg = Some(
-            "noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it".into(),
-        );
+        s.set_reply(hypodj_client::spoken::Reply::one(hypodj_client::spoken::live_text(
+            "noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it",
+        )));
         let out = render_flat(&s);
         assert!(
             out.contains("noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it"),
@@ -2493,9 +2601,9 @@ mod tests {
         // The inapplicable case is just as load-bearing: a press that could not keep
         // audio must say WHY, not fall silent about the half that failed.
         let mut s = TuiState::new();
-        s.status_msg = Some(
-            "noted: NTS 2 at 23:17 - no audio kept (only 3s is buffered so far)".into(),
-        );
+        s.set_reply(hypodj_client::spoken::Reply::one(hypodj_client::spoken::live_text(
+            "noted: NTS 2 at 23:17 - no audio kept (only 3s is buffered so far)",
+        )));
         let out = render_flat(&s);
         assert!(
             out.contains("no audio kept (only 3s is buffered so far)"),
@@ -2505,12 +2613,45 @@ mod tests {
         // The layout does NOT move to make room: the now-playing pane and the tab strip
         // sit on exactly the rows they sit on with a short banner.
         let mut short = TuiState::new();
-        short.status_msg = Some("noted".into());
+        short.set_reply(hypodj_client::spoken::Reply::one(hypodj_client::spoken::live_text(
+            "noted",
+        )));
         let a = render_to_lines(&short);
         let b = render_to_lines(&s);
         for row in 0..21 {
             assert_eq!(a[row], b[row], "row {row} moved when the banner grew");
         }
+    }
+
+    #[test]
+    fn a_long_mixed_confirm_wraps_and_keeps_both_states() {
+        use hypodj_client::spoken::from_confirm;
+        let pairs = vec![
+            ("plan_id".into(), "1".into()),
+            (
+                "result".into(),
+                "added 5 tracks and then a long clause that cannot fit on one sixty column row".into(),
+            ),
+            ("plan_id".into(), "2".into()),
+        ];
+        let reply = from_confirm(&pairs);
+        let mut s = TuiState::new();
+        s.truecolor = true;
+        s.set_reply(reply);
+        let rows = render_to_lines(&s);
+        let flat = rows.join("\n");
+        assert!(flat.contains("added 5 tracks"), "{flat}");
+        assert!(flat.contains("armed (plan 2)"), "{flat}");
+        let head = rows.iter().position(|r| r.contains("added 5 tracks")).unwrap();
+        let tail = rows.iter().position(|r| r.contains("armed (plan 2)")).unwrap();
+        assert!(tail > head, "the second plan wraps onto a later row:\n{rows:#?}");
+        let live = style_of_text(&s, 60, 24, "added 5 tracks");
+        let armed = style_of_text(&s, 60, 24, "armed (plan 2)");
+        assert!(live.add_modifier.contains(ratatui::style::Modifier::BOLD));
+        assert_eq!(
+            armed.fg,
+            Some(hypodj_style::ratatui::ember_color(s.term_bg, true))
+        );
     }
 
     #[test]
@@ -3560,19 +3701,14 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
             // the text. `render` sizes the area; this only ever fills what it was given.
             Some(msg) => {
                 if !state.status_parts.is_empty() {
-                    let mut spans = Vec::new();
-                    for (i, part) in state.status_parts.iter().enumerate() {
-                        if i > 0 {
-                            spans.push(Span::raw("; "));
-                        }
-                        let style = hypodj_style::ratatui::style_for_state(
-                            part.state,
-                            state.term_bg,
-                            state.truecolor,
-                        );
-                        spans.push(Span::styled(part.text(), style));
-                    }
-                    f.render_widget(Paragraph::new(Line::from(spans)), area);
+                    let lines = styled_status_lines(
+                        &state.status_parts,
+                        area.width as usize,
+                        area.height as usize,
+                        state.term_bg,
+                        state.truecolor,
+                    );
+                    f.render_widget(Paragraph::new(lines), area);
                     return;
                 }
                 let rows = status_lines(msg, area.width as usize, area.height as usize);

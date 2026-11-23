@@ -55,7 +55,13 @@ pub fn undo(conn: &mut MpdConn) -> Result<bool, MpdError> {
             Ok(true)
         }
         Err(MpdError::Ack(msg)) => {
-            println!("nothing undone: {msg}");
+            println!(
+                "{}",
+                crate::render::render_refusal(
+                    &format!("nothing undone: {msg}"),
+                    crate::stdout_ansi(),
+                )
+            );
             Ok(false)
         }
         Err(e) => Err(e),

@@ -362,7 +362,10 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
     match conn.command(&format!("playlistadd Starred {uri}")) {
         Ok(_) => {
             let label = np.title.as_deref().unwrap_or(uri);
-            println!("favorited: {label}");
+            println!(
+                "{}",
+                stdout_ansi().render(&hypodj_client::spoken::live_text(format!("favorited: {label}")))
+            );
             print_card(conn)?;
         }
         Err(MpdError::Ack(msg)) => println!("could not favorite: {msg}"),
@@ -377,11 +380,8 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
 /// `dj mark` succeed in silence, which is the precise bug the gesture exists to end.
 fn run_verb(conn: &mut MpdConn, line: &str) -> Result<(), MpdError> {
     let pairs = conn.command(line)?;
-    if let Some((_, sentence)) = pairs.iter().find(|(k, _)| k == "mark_result") {
-        println!("{sentence}");
-    }
-    if let Some(line) = render::render_command(line, &pairs, stdout_ansi()) {
-        println!("{line}");
+    if let Some(spoken) = render::render_command(line, &pairs, stdout_ansi()) {
+        println!("{spoken}");
     }
     print_card(conn)
 }
