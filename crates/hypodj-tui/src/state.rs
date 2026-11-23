@@ -1985,7 +1985,7 @@ impl TuiState {
                     uri: it.uri.clone(),
                     album_uri: it.album_uri.clone(),
                     artist: named(it.artist.clone()),
-                    artist_uri: None,
+                    artist_uri: it.artist_uri.clone(),
                     match_uri: None,
                 })
             }
@@ -2040,7 +2040,7 @@ impl TuiState {
             uri: Some(file),
             album_uri: self.now.album_uri.clone(),
             artist: named(self.now.artist.clone()),
-            artist_uri: None,
+            artist_uri: self.now.artist_uri.clone(),
             match_uri: self.now.match_uri.clone(),
         })
     }
@@ -2161,7 +2161,7 @@ impl TuiState {
                 let label = self.menu_label();
                 self.reveal(u, &label)
             }
-            // No artist uri exists on the wire yet, so this is a real library QUERY -
+            // The row carried no artist uri, so this is a real library QUERY -
             // it lands on the Find hits, whose first section is Artists. The query line
             // is filled with the name so the screen says what it asked.
             MenuAction::GoToArtist(ArtistRef::Name(n)) => {
@@ -2856,6 +2856,7 @@ mod tests {
             artist: None,
             uri: Some(format!("song/{pos}")),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }
     }
@@ -3753,6 +3754,7 @@ mod tests {
             artist: None,
             uri: Some(uri.into()),
             album_uri: Some(al.into()),
+            artist_uri: None,
             details: Vec::new(),
         };
         // Two distinct songs of album/1, plus a DUPLICATE of song/1 (must not

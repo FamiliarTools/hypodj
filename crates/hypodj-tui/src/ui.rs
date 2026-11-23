@@ -1610,6 +1610,7 @@ mod tests {
             artist: Some(artist.into()),
             uri: Some(format!("song/{pos}")),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         };
         s.queue = vec![
@@ -1792,6 +1793,7 @@ mod tests {
             artist: Some("Life Without Buildings".into()),
             uri: Some("song/1".into()),
             album_uri: None,
+            artist_uri: None,
             details: vec![
                 ("Album".into(), "Any Other City".into()),
                 ("X-Plays".into(), "12".into()),
@@ -2070,6 +2072,7 @@ mod tests {
                 artist: Some("C418".into()),
                 uri: Some("song/1".into()),
                 album_uri: None,
+                artist_uri: None,
                 details: Vec::new(),
             }],
         );
@@ -2865,6 +2868,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }];
         s.now.hint = Some(AmbientHint {
@@ -2891,6 +2895,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }];
         s.now.continuation = Some("NTS 1".into());
@@ -2916,6 +2921,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }];
         let intent = s.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
@@ -2946,6 +2952,7 @@ mod tests {
             artist: None,
             uri: Some("song/9".into()),
             album_uri: None,
+            artist_uri: None,
             details: Vec::new(),
         }];
         s.now.continuation = Some("more like Roygbiv".into());

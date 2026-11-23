@@ -16326,7 +16326,9 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
     }
     // THE ARTIST AS A URI, which the daemon has never emitted anywhere. Without it a
     // client's "go to artist" can only query by NAME, and a name is not a handle.
-    if let Some(a) = &s.artist_id {
+    // An empty id is not a handle (`artist/` would browse nowhere), so it is dropped
+    // the same way the empty text fields above are.
+    if let Some(a) = s.artist_id.as_ref().filter(|a| !a.0.trim().is_empty()) {
         p.push(("X-ArtistUri".to_string(), format!("artist/{}", a.0)));
     }
     // The file's own audio facts. Emitted here rather than only on the `info` answer
@@ -20452,6 +20454,20 @@ mod tests {
         let after = h.state.lock().unwrap().queue.len();
         assert_eq!(n, 0, "nothing playing/queued to seed from -> honest 0");
         assert_eq!(before, after, "a no-seed ask leaves the queue unchanged");
+    }
+
+    #[test]
+    fn push_song_tags_emits_x_artist_uri_only_when_the_artist_id_is_known() {
+        let mut s = playlist_test_song("s-1");
+        s.artist_id = None;
+        assert!(!browse_song_pairs(&s).iter().any(|(k, _)| k == "X-ArtistUri"));
+        s.artist_id = Some(ArtistId(String::new()));
+        assert!(!browse_song_pairs(&s).iter().any(|(k, _)| k == "X-ArtistUri"));
+        s.artist_id = Some(ArtistId("ar-7".into()));
+        let pairs = browse_song_pairs(&s);
+        let a: Vec<_> = pairs.iter().filter(|(k, _)| k == "X-ArtistUri").collect();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].1, "artist/ar-7");
     }
 
     #[test]

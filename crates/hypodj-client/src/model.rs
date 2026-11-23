@@ -28,6 +28,10 @@ pub struct NowPlaying {
     /// a display string; this is the handle a client can navigate with. `None` for a raw
     /// stream (no library album).
     pub album_uri: Option<String>,
+    /// The playing track's artist as a BROWSE uri (`artist/<id>`), from the
+    /// `currentsong` `X-ArtistUri` pair. `artist` is the display NAME; this is the
+    /// navigable handle. `None` for a raw stream or a server without artist ids.
+    pub artist_uri: Option<String>,
     /// The current song's uri from `currentsong` `file` (`song/<id>` for a library
     /// track, an `http(s)://...` URL for a raw stream). Needed to favorite the
     /// current track (`playlistadd Starred <uri>`); a stream has no star surface.
@@ -371,6 +375,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         artist: find(current, "Artist").map(str::to_string),
         album: find(current, "Album").map(str::to_string),
         album_uri: find(current, "X-AlbumUri").map(str::to_string),
+        artist_uri: find(current, "X-ArtistUri").map(str::to_string),
         file: find(current, "file").map(str::to_string),
         starred: find(current, "X-Starred").is_some(),
         cover: find(current, "X-CoverArt").map(str::to_string),
@@ -476,6 +481,9 @@ pub struct QueueItem {
     /// the daemon emits per library song, so the TUI can group the queue by album
     /// for the browse queue markers. `None` for a raw stream (no album).
     pub album_uri: Option<String>,
+    /// The artist browse uri (`artist/<id>`) from the non-standard `X-ArtistUri`
+    /// pair, so "go to artist" can navigate rather than search by name.
+    pub artist_uri: Option<String>,
     /// EVERY OTHER PAIR the daemon sent for this row, in wire order, minus the ones
     /// already structured above.
     ///
@@ -502,6 +510,7 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
             artist: find(b, "Artist").map(str::to_string),
             uri: find(b, "file").map(str::to_string),
             album_uri: find(b, "X-AlbumUri").map(str::to_string),
+            artist_uri: find(b, "X-ArtistUri").map(str::to_string),
             // Everything not already promoted to a field above. Filtered rather than
             // cloned wholesale, so the card cannot show the same fact twice.
             details: b
@@ -509,7 +518,7 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
                 .filter(|(k, _)| {
                     !matches!(
                         k.as_str(),
-                        "file" | "Pos" | "Id" | "Title" | "Artist" | "X-AlbumUri"
+                        "file" | "Pos" | "Id" | "Title" | "Artist" | "X-AlbumUri" | "X-ArtistUri"
                     )
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -971,6 +980,7 @@ mod tests {
                 artist: Some("A".into()),
                 uri: Some("song/1".into()),
                 album_uri: None,
+                artist_uri: None,
                 details: Vec::new(),
             }
         );
@@ -983,6 +993,7 @@ mod tests {
                 artist: None,
                 uri: Some("song/2".into()),
                 album_uri: None,
+                artist_uri: None,
                 details: Vec::new(),
             }
         );
@@ -995,6 +1006,7 @@ mod tests {
             ("file", "song/1"),
             ("Title", "One"),
             ("X-AlbumUri", "album/al-9"),
+            ("X-ArtistUri", "artist/ar-3"),
             ("Pos", "0"),
             ("Id", "1"),
             // A stream row carries no X-AlbumUri -> None.
@@ -1006,6 +1018,10 @@ mod tests {
         let q = parse_queue(&pairs);
         assert_eq!(q[0].album_uri.as_deref(), Some("album/al-9"));
         assert_eq!(q[1].album_uri, None);
+        assert_eq!(q[0].artist_uri.as_deref(), Some("artist/ar-3"));
+        assert_eq!(q[1].artist_uri, None);
+        // Promoted to a field, so it is not repeated in the detail pairs.
+        assert!(!q[0].details.iter().any(|(k, _)| k == "X-ArtistUri"));
     }
 
     #[test]
@@ -1018,13 +1034,16 @@ mod tests {
             ("Title", "Sweden"),
             ("Album", "Volume Alpha"),
             ("X-AlbumUri", "album/al-9"),
+            ("X-ArtistUri", "artist/ar-3"),
         ]);
         let np = now_playing(&[], &current);
+        assert_eq!(np.artist_uri.as_deref(), Some("artist/ar-3"));
         assert_eq!(np.album.as_deref(), Some("Volume Alpha"), "still the name");
         assert_eq!(np.album_uri.as_deref(), Some("album/al-9"), "and now the uri");
         // A raw stream carries no album at all -> None, never a guessed one.
         let stream = p(&[("file", "http://stream.example/live"), ("Title", "Live")]);
         assert_eq!(now_playing(&[], &stream).album_uri, None);
+        assert_eq!(now_playing(&[], &stream).artist_uri, None);
     }
 
     #[test]
