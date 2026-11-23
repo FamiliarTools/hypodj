@@ -995,35 +995,54 @@ mod tests {
     use state::Pending;
 
     #[test]
-    fn live_and_refused_render_through_apply_resp() {
-        use hypodj_client::spoken::{from_arm_pairs, refusal_ack};
-        use ratatui::backend::TestBackend;
-        use ratatui::style::Modifier;
-        use ratatui::Terminal;
+    fn every_handler_shape_renders_through_apply_resp() {
+        use hypodj_client::spoken::{speak_shape, reply_shapes};
+        use hypodj_style::State;
+        use ratatui::style::{Color, Modifier};
 
         let (tx, _rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         state.screen = Screen::Queue;
         state.truecolor = true;
-
-        let live = from_arm_pairs(&[], Some("clear"), &[]);
-        apply_resp(&tx, &mut state, RespKind::Banner(live.clone()));
-        let (text, style) = frame_style(&state, &live.text());
-        assert!(text.contains("Cleared the queue."));
-        let ink = hypodj_style::ratatui::style_for_state(
-            hypodj_style::State::Live,
-            state.term_bg,
-            true,
+        assert_eq!(
+            state.term_bg.source,
+            hypodj_style::BgSource::DarkDefault,
+            "the fallback room is not a reported background"
         );
-        assert_eq!(style.fg, ink.fg, "live is primary ink");
-        assert!(style.add_modifier.contains(Modifier::BOLD));
 
-        let refused = refusal_ack("no such nl token");
-        apply_resp(&tx, &mut state, RespKind::Banner(refused.clone()));
-        let (text, style) = frame_style(&state, &refused.text());
-        assert!(text.contains(&refused.text()), "missing refusal:\n{text}");
-        assert_eq!(style.fg, Some(ratatui::style::Color::Reset));
-        assert!(!style.add_modifier.contains(Modifier::BOLD));
+        for shape in reply_shapes() {
+            let spoken = speak_shape(&shape);
+            apply_resp(&tx, &mut state, RespKind::Banner(spoken.clone()));
+            assert_eq!(state.status_state, Some(shape.state), "{}", shape.name);
+            assert_eq!(
+                state.status_msg.as_deref(),
+                Some(spoken.text()).as_deref(),
+                "{}",
+                shape.name
+            );
+            if spoken.text().is_empty() {
+                continue;
+            }
+            let first = spoken.lines.first().map(String::as_str).unwrap_or("");
+            let needle: String = first.chars().take(40).collect();
+            let (text, style) = frame_style(&state, needle.trim());
+            assert!(text.contains(needle.trim()), "{}\n{text}", shape.name);
+            match shape.state {
+                State::Live => {
+                    assert_eq!(style.fg, Some(Color::Reset), "live under the fallback is Reset");
+                    assert!(style.add_modifier.contains(Modifier::BOLD), "{}", shape.name);
+                }
+                State::Refused => {
+                    assert_eq!(style.fg, Some(Color::Reset), "{}", shape.name);
+                    assert!(!style.add_modifier.contains(Modifier::BOLD), "{}", shape.name);
+                }
+                State::Armed => {
+                    let ember = hypodj_style::ratatui::ember_color(state.term_bg, true);
+                    assert_eq!(style.fg, Some(ember), "{}", shape.name);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn frame_style(state: &TuiState, needle: &str) -> (String, ratatui::style::Style) {

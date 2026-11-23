@@ -2050,6 +2050,29 @@ pub enum PlanOutcome {
     Failed(String),
 }
 
+/// Effect verbs [`HypodjHandler::run_action_outcome`] writes into
+/// [`PlanOutcome::Effect`]. One place, so a client catalog can match the daemon
+/// instead of guessing the sentence.
+pub const EFFECT_FADING: &str = "fading";
+pub const EFFECT_STOPPED: &str = "stopped";
+pub const EFFECT_PAUSED: &str = "paused";
+pub const EFFECT_WAKING: &str = "waking";
+pub const EFFECT_NOTHING: &str = "nothing to do";
+
+/// `set volume to N`. The number is the volume the action set.
+pub fn effect_set_volume(v: u8) -> String {
+    format!("set volume to {v}")
+}
+
+/// ACK message bodies the handler emits verbatim (the part after `}`).
+pub const ACK_WAKE_DURATION: &str = "duration out of range";
+pub const ACK_WAKE_TIME: &str = "bad time";
+pub const ACK_NL_NO_TOKEN: &str = "no such nl token";
+pub const ACK_NL_STALE: &str = "plan no longer valid";
+pub const ACK_NL_INVALID: &str = "plan invalid";
+pub const ACK_TRANSLATOR_TASK: &str = "translator task failed";
+pub const ACK_NO_PLAN: &str = "no such plan";
+
 impl PlanOutcome {
     /// The single human line the client shows after `y`/confirm. Speaks the REAL
     /// count/effect (0 when the selector resolved to nothing), NEVER the asked count.
@@ -3577,20 +3600,20 @@ impl HypodjHandler {
             // Fade precedence: start_fade_spec IS the single FadeSlot (validates
             // before aborting; logs an autonomous takeover).
             Action::Fade(ir) => match self.start_fade_spec(crate::executor::map_fade(ir)).await {
-                Ok(_) => PlanOutcome::Effect("fading".into()),
+                Ok(_) => PlanOutcome::Effect(EFFECT_FADING.into()),
                 Err(e) => PlanOutcome::Failed(e.to_string()),
             },
             Action::Stop => {
                 self.handle(MpdCommand::Stop).await;
-                PlanOutcome::Effect("stopped".into())
+                PlanOutcome::Effect(EFFECT_STOPPED.into())
             }
             Action::Pause => {
                 self.handle(MpdCommand::Pause(Some(true))).await;
-                PlanOutcome::Effect("paused".into())
+                PlanOutcome::Effect(EFFECT_PAUSED.into())
             }
             Action::SetVolume(v) => {
                 self.handle(MpdCommand::SetVol(*v)).await;
-                PlanOutcome::Effect(format!("set volume to {v}"))
+                PlanOutcome::Effect(effect_set_volume(*v))
             }
             // Strictly append-only (adds to the END, never starts/jumps).
             Action::Enqueue { selector, count } => {
@@ -3631,7 +3654,7 @@ impl HypodjHandler {
                 }
             }
             Action::Wake { selector, count } => match self.wake_now(selector.clone(), *count).await {
-                Ok(_) => PlanOutcome::Effect("waking".into()),
+                Ok(_) => PlanOutcome::Effect(EFFECT_WAKING.into()),
                 Err(e) => PlanOutcome::Failed(e),
             },
             // DETERMINISTIC queue edits: the selector resolves against the LIVE queue;
@@ -3652,7 +3675,7 @@ impl HypodjHandler {
                 Ok(n) => PlanOutcome::Jumped(n),
                 Err(e) => PlanOutcome::Failed(e),
             },
-            Action::Noop => PlanOutcome::Effect("nothing to do".into()),
+            Action::Noop => PlanOutcome::Effect(EFFECT_NOTHING.into()),
         }
         })
     }
@@ -4832,7 +4855,7 @@ impl HypodjHandler {
                 if self.plan_cancel(id) {
                     MpdResponse::ok()
                 } else {
-                    ack(ACK_ERROR_NO_EXIST, "plan", "no such plan")
+                    ack(ACK_ERROR_NO_EXIST, "plan", ACK_NO_PLAN)
                 }
             }
             PlanCmd::Replace(id, raw) => match self.plan_replace(id, raw) {
@@ -4884,11 +4907,11 @@ impl HypodjHandler {
                 let at = match when {
                     WakeWhen::In(d) => match chrono::Duration::from_std(d) {
                         Ok(delta) => chrono::Utc::now() + delta,
-                        Err(_) => return ack(ACK_ERROR_UNKNOWN, "wake", "duration out of range"),
+                        Err(_) => return ack(ACK_ERROR_UNKNOWN, "wake", ACK_WAKE_DURATION),
                     },
                     WakeWhen::At { h, m } => match self.resolve_next_civil(h, m) {
                         Some(at) => at,
-                        None => return ack(ACK_ERROR_UNKNOWN, "wake", "bad time"),
+                        None => return ack(ACK_ERROR_UNKNOWN, "wake", ACK_WAKE_TIME),
                     },
                 };
                 let sel = selector.map(Selector::Query);
@@ -4979,7 +5002,7 @@ impl HypodjHandler {
         // instant; a local model can take hundreds of ms. hypodj-nl needs no tokio.
         let hit = match tokio::task::spawn_blocking(move || translator.translate(&req, &ctx)).await {
             Ok(r) => r,
-            Err(_) => return ack(ACK_ERROR_UNKNOWN, "nl", "translator task failed"),
+            Err(_) => return ack(ACK_ERROR_UNKNOWN, "nl", ACK_TRANSLATOR_TASK),
         };
         let hit = match hit {
             // Loud ACK with the SPECIFIC reason (NotUnderstood / Ambiguous /
@@ -5007,7 +5030,7 @@ impl HypodjHandler {
             let mut clamped = clamp_raw(&raw, &bounds);
             clamped.origin = source_tag.to_string();
             if let Err(e) = validate(&clamped, &snap, now, now_civil, &bounds) {
-                return ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan invalid: {e}"));
+                return ack(ACK_ERROR_UNKNOWN, "nl", &format!("{ACK_NL_INVALID}: {e}"));
             }
             plans.push(clamped);
         }
@@ -5044,7 +5067,7 @@ impl HypodjHandler {
         };
         let pending = match pending {
             Some(p) => p,
-            None => return ack(ACK_ERROR_NO_EXIST, "nl", "no such nl token"),
+            None => return ack(ACK_ERROR_NO_EXIST, "nl", ACK_NL_NO_TOKEN),
         };
         let _ = pending.source;
         // SAFETY (atomic batch): arm ALL plans or NONE. `plan_add_batch`
@@ -5058,7 +5081,7 @@ impl HypodjHandler {
                 }
                 b.build()
             }
-            Err(e) => ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan no longer valid: {e}")),
+            Err(e) => ack(ACK_ERROR_UNKNOWN, "nl", &format!("{ACK_NL_STALE}: {e}")),
         }
     }
 

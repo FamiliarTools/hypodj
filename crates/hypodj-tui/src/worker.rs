@@ -589,19 +589,19 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 // count. Fall back to the plan-time armed line only for a deferred plan
                 // (no `result`), where nothing has executed yet.
                 (Some(cmd), _) => conn.command(cmd).map(|pairs| {
-                    Some(hypodj_client::spoken::from_arm_pairs(
+                    Some(hypodj_client::spoken::from_reply(
                         &pairs,
-                        pending.command.as_deref(),
-                        &pending.steps,
+                        pending
+                            .command
+                            .as_deref()
+                            .and_then(hypodj_client::spoken::act_from_command),
                     ))
                 }),
-                (None, Some(token)) => conn.command(&format!("nl confirm {token}")).map(|pairs| {
-                    Some(hypodj_client::spoken::from_arm_pairs(
-                        &pairs,
-                        pending.command.as_deref(),
-                        &pending.steps,
-                    ))
-                }),
+                (None, Some(token)) => {
+                    conn.command(&format!("nl confirm {token}")).map(|pairs| {
+                        Some(hypodj_client::spoken::from_reply(&pairs, None))
+                    })
+                }
                 (None, None) => Ok(None),
             };
             match result {

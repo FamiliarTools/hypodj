@@ -16,11 +16,10 @@ pub fn render_card(np: &NowPlaying) -> String {
 /// The line the binary prints after a confirm. Same words on the CLI and the TUI.
 pub fn render_outcome(
     pairs: &[(String, String)],
-    command: Option<&str>,
-    steps: &[String],
+    act: Option<hypodj_client::spoken::Act>,
     ansi: Ansi,
 ) -> String {
-    ansi.render(&hypodj_client::spoken::from_arm_pairs(pairs, command, steps))
+    ansi.render(&hypodj_client::spoken::from_reply(pairs, act))
 }
 
 /// The line the binary prints for a daemon ACK.
@@ -209,7 +208,10 @@ mod tests {
     use hypodj_client::model::now_playing;
 
     fn p(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -249,10 +251,10 @@ mod tests {
         let card = render_card(&now_playing(&status, &current));
         assert!(card.contains("\u{2665}\u{FE0E} Blue in Green"));
         // Without the pair the heart is absent (plain title).
-        let plain = render_card(&now_playing(&status, &p(&[
-            ("file", "song/42"),
-            ("Title", "Blue in Green"),
-        ])));
+        let plain = render_card(&now_playing(
+            &status,
+            &p(&[("file", "song/42"), ("Title", "Blue in Green")]),
+        ));
         assert!(!plain.contains('\u{2665}'));
         assert!(plain.contains("Blue in Green"));
     }
@@ -308,19 +310,35 @@ mod tests {
     }
 
     #[test]
-    fn clear_is_live_and_a_refusal_has_no_colour() {
-        let cleared = render_outcome(&[], Some("clear"), &[], Ansi::off());
-        let cleared_on = render_outcome(&[], Some("clear"), &[], Ansi::on_truecolor());
-        assert_eq!(cleared, "Cleared the queue.");
-        assert!(!cleared.contains("armed"));
-        assert_eq!(hypodj_style::ansi::strip(&cleared_on), cleared);
-        assert!(cleared_on.contains('\u{1b}'), "live is primary ink");
-
-        let refused = render_refusal("not understood", Ansi::off());
-        let refused_on = render_refusal("not understood", Ansi::on_truecolor());
-        assert_eq!(refused_on, refused, "a refusal has no colour");
-        assert!(!refused_on.contains('\u{1b}'));
-        assert!(!refused.is_empty());
+    fn every_handler_shape_renders_through_the_cli_path() {
+        use hypodj_client::spoken::{reply_shapes, speak_shape};
+        use hypodj_style::State;
+        for shape in reply_shapes() {
+            let spoken = speak_shape(&shape);
+            let off = Ansi::off().render(&spoken);
+            let on = Ansi::on_truecolor().render(&spoken);
+            let indexed = Ansi::on_indexed().render(&spoken);
+            assert_eq!(off, spoken.text(), "{}", shape.name);
+            assert_eq!(hypodj_style::ansi::strip(&on), off, "{}", shape.name);
+            assert_eq!(hypodj_style::ansi::strip(&indexed), off, "{}", shape.name);
+            assert_eq!(spoken.state, shape.state, "{}", shape.name);
+            assert_eq!(spoken.lines, shape.lines, "{}", shape.name);
+            match shape.state {
+                State::Live => {
+                    assert!(!on.contains("38;2;"), "live paints no ink: {}", shape.name);
+                    assert!(!on.contains("38;5;"), "live paints no ink: {}", shape.name);
+                    if !spoken.text().is_empty() {
+                        assert!(on.contains("\u{1b}[1m"), "live is bold: {}", shape.name);
+                    }
+                }
+                State::Refused => {
+                    assert_eq!(on, off, "a refusal has no colour: {}", shape.name);
+                    assert!(!on.contains('\u{1b}'), "{}", shape.name);
+                }
+                State::Armed => assert!(on.contains("38;2;"), "armed is ember: {}", shape.name),
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -384,7 +402,10 @@ mod tests {
             ("X-hypodj-continuation-station", "NTS 1"),
         ]);
         let out = render_card(&now_playing(&status, &[]));
-        assert!(out.contains("then: NTS 1"), "continuation hint line present:\n{out}");
+        assert!(
+            out.contains("then: NTS 1"),
+            "continuation hint line present:\n{out}"
+        );
         // Disarmed -> no line.
         let np = now_playing(&p(&[("state", "stop")]), &[]);
         assert!(!render_card(&np).contains("then:"));
@@ -500,7 +521,12 @@ mod tests {
 
     #[test]
     fn card_hides_unknown_volume() {
-        let status = p(&[("volume", "-1"), ("playlistlength", "1"), ("state", "play"), ("song", "0")]);
+        let status = p(&[
+            ("volume", "-1"),
+            ("playlistlength", "1"),
+            ("state", "play"),
+            ("song", "0"),
+        ]);
         let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
         let card = render_card(&now_playing(&status, &current));
         assert!(!card.contains("vol"));
@@ -538,7 +564,10 @@ mod tests {
             ("playlistlength", "12"),
             ("state", "play"),
             ("song", "2"),
-            ("X-Store", "318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming"),
+            (
+                "X-Store",
+                "318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming",
+            ),
         ]);
         let current = p(&[("file", "song/42"), ("Title", "Blue in Green")]);
         let card = render_card(&now_playing(&status, &current));
@@ -550,7 +579,10 @@ mod tests {
         let stopped = p(&[("state", "stop"), ("X-Store", "all 347 tracks, 9.8 GiB")]);
         let card = render_card(&now_playing(&stopped, &[]));
         assert!(card.contains("nothing playing"));
-        assert!(card.contains("store: all 347 tracks, 9.8 GiB"), "card: {card}");
+        assert!(
+            card.contains("store: all 347 tracks, 9.8 GiB"),
+            "card: {card}"
+        );
 
         // No store (or no full pass yet): no line at all, exactly like the armed HUD.
         let lean = p(&[("state", "stop")]);
@@ -569,7 +601,10 @@ mod tests {
                 ("X-LastPlayed", "3"),
             ]),
         ));
-        assert!(card.contains("23 plays, last heard 3 days ago"), "card: {card}");
+        assert!(
+            card.contains("23 plays, last heard 3 days ago"),
+            "card: {card}"
+        );
 
         // A track the server has never seen played renders NOTHING - not "0 plays",
         // which would be a claim the daemon deliberately declined to make.
@@ -591,6 +626,9 @@ mod tests {
             &p(&[("Title", "T"), ("X-LastPlayed", "1")]),
         ));
         assert!(yday.contains("last heard yesterday"), "card: {yday}");
-        assert!(!yday.contains("plays"), "a stamp with no count invents no count: {yday}");
+        assert!(
+            !yday.contains("plays"),
+            "a stamp with no count invents no count: {yday}"
+        );
     }
 }

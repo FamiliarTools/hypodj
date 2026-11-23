@@ -251,8 +251,6 @@ pub enum Mode {
     Confirm,
 }
 
-/// A plan awaiting confirmation. Either an owner-scoped NL `token` (confirm via
-/// `nl confirm <token>`) OR a direct `command` (e.g. destructive `clear`).
 /// One DJ scrollback entry. Chat text has no state. A plan or a daemon reply
 /// is a [`hypodj_style::Spoken`], and the surface only renders it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +276,8 @@ impl DjEntry {
     }
 }
 
+/// A plan awaiting confirmation. Either an owner-scoped NL `token` (confirm via
+/// `nl confirm <token>`) or a direct `command` (for example `clear`).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pending {
     pub token: Option<String>,

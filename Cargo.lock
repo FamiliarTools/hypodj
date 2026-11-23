@@ -1050,6 +1050,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hypodj-client",
  "libc",
  "libmpv2",
  "mpris-server",

@@ -77,7 +77,8 @@ pub fn visuals(bg: TermBg) -> Visuals {
         widget.weak_bg_fill = room;
     }
     v.widgets.inactive.fg_stroke.color = quiet;
-    v.widgets.noninteractive.fg_stroke.color = quiet;
+    // Labels are noninteractive. Their text is primary ink. Leave
+    // override_text_color unset so that ink is not forced onto a selection.
     // Selected rows copy `selection.stroke` onto the text and `bg_fill` onto
     // the background (`Style::interact_selectable`). Text is the room, fill
     // is primary ink: the same inversion as the TUI's reverse.
@@ -141,6 +142,11 @@ mod tests {
             assert!(
                 v.override_text_color.is_none(),
                 "must not force ink on selected text"
+            );
+            assert_eq!(
+                v.widgets.noninteractive.fg_stroke.color,
+                color32(fit_ink_primary(bg)),
+                "labels are primary ink"
             );
             let err = rgb_of(v.error_fg_color);
             assert!(contrast_ratio(err, bg.rgb) >= tokens().room.ink_primary_min_contrast);

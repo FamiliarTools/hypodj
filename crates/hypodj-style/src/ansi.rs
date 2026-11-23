@@ -90,12 +90,9 @@ fn fg(ansi: Ansi, rgb: [u8; 3], index: u8) -> String {
 
 fn open_code(ansi: Ansi, role: Role, bg: TermBg) -> Option<String> {
     match role {
-        // The terminal's own foreground. Live adds bold; primary does not.
-        Role::Live => {
-            let ink = crate::fit_ink_primary(TermBg::dark_default());
-            let (idx, _) = crate::quantize_256(ink);
-            Some(format!("{}\u{1b}[1m", fg(ansi, ink, idx)))
-        }
+        // The terminal's own foreground. Live adds bold. No explicit ink:
+        // the CLI cannot see the room.
+        Role::Live => Some("\u{1b}[1m".to_string()),
         Role::InkPrimary => None,
         Role::InkQuiet | Role::MusicNone => Some("\u{1b}[2m".to_string()),
         Role::Echo => Some("\u{1b}[2;4m".to_string()),

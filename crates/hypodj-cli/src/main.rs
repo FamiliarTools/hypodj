@@ -247,7 +247,11 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
                 let pairs = conn.command("clear")?;
                 println!(
                     "{}",
-                    render::render_outcome(&pairs, Some("clear"), &[], stdout_ansi())
+                    render::render_outcome(
+                        &pairs,
+                        hypodj_client::spoken::act_from_command("clear"),
+                        stdout_ansi(),
+                    )
                 );
                 print_card(&mut conn)?;
             } else {
@@ -380,7 +384,7 @@ fn nl_handshake(
     if read_answer() {
         match conn.command(&format!("nl confirm {token}")) {
             Ok(plan_pairs) => {
-                println!("{}", render::render_outcome(&plan_pairs, None, &[], stdout_ansi()));
+                println!("{}", render::render_outcome(&plan_pairs, None, stdout_ansi()));
                 print_card(conn)?;
             }
             Err(MpdError::Ack(msg)) => println!("{}", render::render_refusal(&msg, stdout_ansi())),
@@ -470,7 +474,7 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
             Ok(plan_pairs) => {
                 println!(
                     "{}",
-                    render::render_outcome(&plan_pairs, Some(&cmd), &[], stdout_ansi())
+                    render::render_outcome(&plan_pairs, None, stdout_ansi())
                 );
                 print_card(conn)?;
             }

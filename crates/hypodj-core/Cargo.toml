@@ -62,6 +62,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 libc = "0.2"
 
 [dev-dependencies]
+hypodj-client = { path = "../hypodj-client" }
 # Deserialize the exact camelCase wire JSON in the wire->model mapping tests,
 # through the real `opensubsonic::data` structs. Not a runtime dep.
 serde_json = "1"

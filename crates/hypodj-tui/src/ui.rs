@@ -2911,11 +2911,7 @@ mod tests {
             }
         }
         // Off the DJ screen the same arm result is the status-bar banner, in ember.
-        let armed = hypodj_client::spoken::from_arm_pairs(
-            &[("plan_id".into(), "4".into())],
-            None,
-            &[],
-        );
+        let armed = hypodj_client::spoken::from_reply(&[("plan_id".into(), "4".into())], None);
         s.screen = crate::state::Screen::Queue;
         s.mode = crate::state::Mode::Normal;
         s.set_reply(armed.clone());

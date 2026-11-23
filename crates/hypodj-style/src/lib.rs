@@ -58,7 +58,8 @@ pub enum Role {
     Echo,
     /// Confirmed and scheduled.
     Armed,
-    /// Happening now. Primary, bold.
+    /// Happening now. Bold, in the terminal's own foreground, unless the room
+    /// was actually reported.
     Live,
     /// Did not happen. Primary ink, no alarm colour.
     Refused,

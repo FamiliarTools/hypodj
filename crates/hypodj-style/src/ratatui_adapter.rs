@@ -112,21 +112,31 @@ pub fn render(spoken: &crate::Spoken, bg: TermBg, truecolor: bool) -> Vec<Line<'
 }
 
 /// Style for a role that does not need a cover swatch.
-/// Ink roles do not set a foreground: the terminal's own ink is the room's pair.
-/// Ember and armed do set a foreground.
+/// Ink is the terminal's own foreground unless OSC 11 reported the room.
+/// Ember and armed always set a foreground. A rule does too: it is not ink.
 pub fn style_for(role: Role, bg: TermBg, truecolor: bool) -> Style {
     match role {
-        Role::InkPrimary | Role::Refused | Role::Room => Style::default(),
-        Role::InkQuiet | Role::MusicNone => Style::default().quiet(),
-        Role::Echo => Style::default().quiet().underline(),
-        Role::Live => {
-            let ink = crate::fit_ink_primary(bg);
-            Style::default().fg(to_color(ink, truecolor)).bold()
-        }
+        Role::InkPrimary | Role::Refused | Role::Room => ink_style(bg, truecolor, false),
+        Role::InkQuiet | Role::MusicNone => ink_style(bg, truecolor, true).quiet(),
+        Role::Echo => ink_style(bg, truecolor, true).quiet().underline(),
+        Role::Live => ink_style(bg, truecolor, false).bold(),
         Role::Ember | Role::Armed => Style::default().fg(ember_color(bg, truecolor)),
         Role::Rule => Style::default().fg(to_color(crate::fit_rule(bg), truecolor)),
         Role::MusicInfo | Role::MusicDecoration => Style::default(),
     }
+}
+
+/// Primary or quiet ink. An explicit colour only when OSC 11 reported the room.
+fn ink_style(bg: TermBg, truecolor: bool, quiet: bool) -> Style {
+    if bg.source != crate::BgSource::Osc11 {
+        return Style::default();
+    }
+    let rgb = if quiet {
+        crate::fit_ink_quiet(bg)
+    } else {
+        crate::fit_ink_primary(bg)
+    };
+    Style::default().fg(to_color(rgb, truecolor))
 }
 
 #[cfg(test)]
@@ -225,6 +235,24 @@ mod tests {
             styled[0].spans[0].style.fg,
             Some(Color::Rgb(_, _, _))
         ));
+    }
+
+    #[test]
+    fn live_ink_is_reset_unless_osc11_reported_the_room() {
+        let fallback = TermBg::dark_default();
+        let live = style_for_state(State::Live, fallback, true);
+        assert!(live.fg.is_none(), "fallback live has no explicit ink");
+        assert!(live.add_modifier.contains(Modifier::BOLD));
+        let quiet = style_for(Role::InkQuiet, fallback, true);
+        assert!(quiet.fg.is_none());
+        let osc = TermBg::from_rgb([0x12, 0x12, 0x12], BgSource::Osc11);
+        let reported = style_for_state(State::Live, osc, true);
+        assert!(
+            reported.fg.is_some(),
+            "a reported room may carry fitted ink"
+        );
+        let fgbg = TermBg::from_rgb([0x12, 0x12, 0x12], BgSource::ColorFgBg);
+        assert!(style_for_state(State::Live, fgbg, true).fg.is_none());
     }
 
     #[test]
