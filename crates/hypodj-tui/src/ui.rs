@@ -2589,7 +2589,7 @@ mod tests {
             label: "Minecraft - Volume Alpha".into(), uri: "album/9".into(),
             is_dir: true, song_count: Some(24),
             artist: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
         }];
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("find> c418"), "the query that produced this branch stays visible:\n{out}");
@@ -2673,9 +2673,9 @@ mod tests {
             (FindKind::Song, 1, None),
         ];
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Artist, label: "C418".into(), uri: "artist/1".into(), trailer: "12 albums".into(), song_count: None, album_uri: None, artist: None, },
-            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None, artist: None, },
-            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: Some("album/2".into()), artist: None, },
+            FindRow { kind: FindKind::Artist, label: "C418".into(), uri: "artist/1".into(), trailer: "12 albums".into(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
+            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None, artist_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: Some("album/2".into()), artist_uri: None, artist: None, },
         ];
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("@  C418"), "artist row with its @ sigil:\n{out}");
@@ -2700,10 +2700,10 @@ mod tests {
             (FindKind::Song, 1, None),
         ];
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Album, label: "NTS Sessions".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None, artist: None, },
-            FindRow { kind: FindKind::Station, label: "NTS 4 To The Floor".into(), uri: "station/NTS 4 To The Floor".into(), trailer: "stream-mixtape-geo.ntslive.net".into(), song_count: None, album_uri: None, artist: None, },
-            FindRow { kind: FindKind::Station, label: "KFJC 89.7 FM".into(), uri: "station/KFJC 89.7 FM".into(), trailer: "netcast.kfjc.org".into(), song_count: None, album_uri: None, artist: None, },
-            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Album, label: "NTS Sessions".into(), uri: "album/2".into(), trailer: "24 tracks".into(), song_count: Some(24), album_uri: None, artist_uri: None, artist: None, },
+            FindRow { kind: FindKind::Station, label: "NTS 4 To The Floor".into(), uri: "station/NTS 4 To The Floor".into(), trailer: "stream-mixtape-geo.ntslive.net".into(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
+            FindRow { kind: FindKind::Station, label: "KFJC 89.7 FM".into(), uri: "station/KFJC 89.7 FM".into(), trailer: "netcast.kfjc.org".into(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(), trailer: "3:03".into(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
         ];
         let lines = render_to_lines(&s);
         let out = lines.join("\n");
@@ -2742,7 +2742,7 @@ mod tests {
         s.find.phase = crate::find::Phase::Loading("boards".into());
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Song, label: "Sweden".into(), uri: "song/3".into(),
-            trailer: "3:03".into(), song_count: None, album_uri: None,
+            trailer: "3:03".into(), song_count: None, album_uri: None, artist_uri: None,
             artist: None,
         }];
         let out = render_to_lines(&s).join("\n");

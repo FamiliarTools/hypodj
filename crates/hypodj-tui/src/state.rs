@@ -120,7 +120,7 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 is_dir: true,
                 song_count: None,
                 artist: None,
-                album_uri: None,
+                album_uri: None, artist_uri: None,
             }),
             "file" => rows.push(BrowseRow {
                 label: path_tail(v).to_string(),
@@ -128,7 +128,7 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 is_dir: false,
                 song_count: None,
                 artist: None,
-                album_uri: None,
+                album_uri: None, artist_uri: None,
             }),
             "playlist" => rows.push(BrowseRow {
                 label: v.clone(),
@@ -136,7 +136,7 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 is_dir: false,
                 song_count: None,
                 artist: None,
-                album_uri: None,
+                album_uri: None, artist_uri: None,
             }),
             "Album" | "Genre" => {
                 if let Some(last) = rows.last_mut() {
@@ -177,6 +177,13 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 if let Some(last) = rows.last_mut() {
                     if !last.is_dir {
                         last.album_uri = Some(v.clone());
+                    }
+                }
+            }
+            "X-ArtistUri" => {
+                if let Some(last) = rows.last_mut() {
+                    if !last.is_dir {
+                        last.artist_uri = Some(v.clone());
                     }
                 }
             }
@@ -295,6 +302,9 @@ pub struct BrowseRow {
     /// The owning album on a song row (`X-AlbumUri`), so "go to album" works from a
     /// drilled listing exactly as it does from the queue.
     pub album_uri: Option<String>,
+    /// The artist browse uri on a song row (`X-ArtistUri`), so "go to artist" from a
+    /// drilled listing is a real jump instead of a name search.
+    pub artist_uri: Option<String>,
 }
 
 /// A self-contained browse list with its own cursor, scroll offset, nav stack, and
@@ -1996,7 +2006,7 @@ impl TuiState {
                 uri: Some(row.uri.clone()),
                 album_uri: row.album_uri.clone(),
                 artist: named(row.artist.clone()),
-                artist_uri: None,
+                artist_uri: row.artist_uri.clone(),
                 match_uri: None,
             });
         }
@@ -2041,7 +2051,7 @@ impl TuiState {
                     uri: Some(row.uri.clone()),
                     album_uri: row.album_uri.clone(),
                     artist: named(row.artist.clone()),
-                    artist_uri: None,
+                    artist_uri: row.artist_uri.clone(),
                     match_uri: None,
                 })
             }
@@ -2188,7 +2198,13 @@ impl TuiState {
                 self.reveal(u, &label)
             }
             MenuAction::GoToArtist(ArtistRef::Uri(u)) => {
-                let label = self.menu_label();
+                // Name the place being shown (the artist), not the row it was reached
+                // from: "showing Everest - Klangstof" read as if the song were opened.
+                let label = self
+                    .menu
+                    .as_ref()
+                    .and_then(|m| m.target.artist.clone())
+                    .unwrap_or_else(|| self.menu_label());
                 self.reveal(u, &label)
             }
             // The row carried no artist uri, so this is a real library QUERY -
@@ -3091,7 +3107,7 @@ mod tests {
             uri: uri.into(),
             trailer: String::new(),
             song_count: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
             artist: None,
         };
         // The Find HIT list: all three kinds seed. The ARTIST row's first working
@@ -3175,7 +3191,7 @@ mod tests {
             uri: "song/s1".into(),
             trailer: String::new(),
             song_count: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
             artist: None,
         }];
         assert_eq!(s.handle_key(ch('r')), Some(cmd("radio song/s1")), "the HIT row, not song/0");
@@ -3222,7 +3238,7 @@ mod tests {
         s.find.phase = crate::find::Phase::Loading("c418".into());
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(),
-            trailer: String::new(), song_count: None, album_uri: None,
+            trailer: String::new(), song_count: None, album_uri: None, artist_uri: None,
             artist: None,
         }];
         s.mark_disconnected();
@@ -3259,8 +3275,8 @@ mod tests {
         s.screen = Screen::Find;
         s.find.focus = Focus::Results;
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
-            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(), trailer: String::new(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
         ];
         assert_eq!(s.handle_key(ch('l')), Some(Intent::BrowseInto("album/9".into())));
         s.find.selected = 1;
@@ -3281,7 +3297,7 @@ mod tests {
             uri: URI.into(),
             trailer: "uk5.internet-radio.com".into(),
             song_count: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
             artist: None,
         };
         let fresh = || {
@@ -3354,14 +3370,14 @@ mod tests {
         s.find.submitted = "c418".into();
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(),
-            trailer: String::new(), song_count: None, album_uri: None,
+            trailer: String::new(), song_count: None, album_uri: None, artist_uri: None,
             artist: None,
         }];
         s.find.drilling = true;
         s.find.drill.rows = vec![crate::state::BrowseRow {
             label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None,
             artist: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
         }];
         // `h` must NOT emit a BrowseBack: the drill sits at depth 0 with an empty
         // stack, so that would re-fetch `lsinfo ""` - the whole artist root.
@@ -3391,12 +3407,12 @@ mod tests {
         s.screen = Screen::Find;
         s.find.focus = Focus::Results;
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
-            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
         ];
         s.find.drill.rows = vec![
-            crate::state::BrowseRow { label: "x".into(), uri: "song/8".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
-            crate::state::BrowseRow { label: "y".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
+            crate::state::BrowseRow { label: "x".into(), uri: "song/8".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
+            crate::state::BrowseRow { label: "y".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
         ];
         s.find.drilling = true;
         s.handle_key(ch('j'));
@@ -3414,7 +3430,7 @@ mod tests {
         s.screen = Screen::Find;
         s.find.hits.rows = vec![];
         s.find.drill.rows = vec![
-            crate::state::BrowseRow { label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
+            crate::state::BrowseRow { label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
         ];
         s.find.drilling = true;
         assert_eq!(s.active_labels(), vec!["Sweden".to_string()]);
@@ -3445,8 +3461,8 @@ mod tests {
         s.find.query.clear();
         s.find.focus = Focus::Results;
         s.find.hits.rows = vec![
-            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
-            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "a".into(), uri: "song/1".into(), trailer: String::new(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
+            FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
         ];
         s.handle_key(ch('j'));
         assert_eq!(s.find.selected, 1, "the hit cursor moved");
@@ -3482,8 +3498,8 @@ mod tests {
         let mut s = TuiState::new();
         s.screen = Screen::Albums;
         s.albums.rows = vec![
-            BrowseRow { label: "one".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
-            BrowseRow { label: "two".into(), uri: "song/2".into(), is_dir: false, song_count: None, artist: None, album_uri: None, },
+            BrowseRow { label: "one".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
+            BrowseRow { label: "two".into(), uri: "song/2".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
         ];
         let t0 = Instant::now();
         assert_eq!(
@@ -3519,7 +3535,7 @@ mod tests {
         s.find.focus = Focus::Results;
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Album, label: "Volume Alpha".into(), uri: "album/9".into(),
-            trailer: String::new(), song_count: None, album_uri: None,
+            trailer: String::new(), song_count: None, album_uri: None, artist_uri: None,
             artist: None,
         }];
         assert_eq!(
@@ -3541,7 +3557,7 @@ mod tests {
         s.find.focus = Focus::Results;
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Song, label: "Sweden".into(), uri: "song/1".into(),
-            trailer: String::new(), song_count: None, album_uri: None,
+            trailer: String::new(), song_count: None, album_uri: None, artist_uri: None,
             artist: None,
         }];
         assert_eq!(
@@ -3579,7 +3595,7 @@ mod tests {
         assert_eq!(s.find.focus, Focus::Query, "no results yet: focus stays put");
         s.find.hits.rows = vec![FindRow {
             kind: FindKind::Song, label: "a".into(), uri: "song/1".into(),
-            trailer: String::new(), song_count: None, album_uri: None,
+            trailer: String::new(), song_count: None, album_uri: None, artist_uri: None,
             artist: None,
         }];
         s.handle_key(key(KeyCode::Tab));
@@ -4054,8 +4070,8 @@ mod tests {
         s.selected = 2; // the queue cursor sits on song/33 and must not be touched
         s.screen = Screen::Albums;
         s.albums.rows = vec![
-            BrowseRow { label: "Sun Ra".into(), uri: "album/a1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, },
-            BrowseRow { label: "Takuya Nakamura".into(), uri: "album/a2".into(), is_dir: true, song_count: None, artist: None, album_uri: None, },
+            BrowseRow { label: "Sun Ra".into(), uri: "album/a1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, },
+            BrowseRow { label: "Takuya Nakamura".into(), uri: "album/a2".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, },
         ];
         s.albums.selected = 1;
         assert_eq!(
@@ -4073,7 +4089,7 @@ mod tests {
             is_dir: true,
             song_count: None,
             artist: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
         });
         s.albums.selected = 2;
         assert_eq!(s.handle_key(ch('s')), None);
@@ -4093,7 +4109,7 @@ mod tests {
             is_dir: false,
             song_count: None,
             artist: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
         }];
         assert_eq!(s.handle_key(ch('s')), None);
         assert_eq!(
@@ -4339,7 +4355,7 @@ mod tests {
     }
 
     fn brow(label: &str, uri: &str, is_dir: bool) -> BrowseRow {
-        BrowseRow { label: label.into(), uri: uri.into(), is_dir, song_count: None, artist: None, album_uri: None, }
+        BrowseRow { label: label.into(), uri: uri.into(), is_dir, song_count: None, artist: None, album_uri: None, artist_uri: None, }
     }
 
     #[test]
@@ -4456,13 +4472,13 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[0],
-            BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, }
+            BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, }
         );
         assert_eq!(
             rows[1],
             // The credit is folded into the label the eye reads AND kept raw: the
             // composed "T - A" is a display string, so "go to artist" needs "A" alone.
-            BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: Some("A".into()), album_uri: None, }
+            BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: Some("A".into()), album_uri: None, artist_uri: None, }
         );
         assert_eq!(
             rows[2],
@@ -4472,7 +4488,7 @@ mod tests {
                 is_dir: false,
                 song_count: None,
                 artist: None,
-                album_uri: None,
+                album_uri: None, artist_uri: None,
             }
         );
     }
@@ -4672,7 +4688,7 @@ mod tests {
             uri: uri.into(),
             trailer: String::new(),
             song_count: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
             artist: artist.map(str::to_string),
         }
     }
@@ -4701,7 +4717,7 @@ mod tests {
                 is_dir: false,
                 song_count: None,
                 artist: Some("C418".into()),
-                album_uri: Some("album/drill".into()),
+                album_uri: Some("album/drill".into()), artist_uri: None,
             }];
             s
         };

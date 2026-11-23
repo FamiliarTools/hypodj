@@ -102,6 +102,9 @@ pub struct FindRow {
     /// the library query "go to artist" runs. Empty on an artist row (the artist IS the
     /// row, and its name is the label) and on a station (a stream has no credit).
     pub artist: Option<String>,
+    /// The artist browse uri (`X-ArtistUri`) on an album or song hit, so "go to
+    /// artist" jumps instead of searching by name.
+    pub artist_uri: Option<String>,
 }
 
 /// A parsed result set, plus what the server said about its own caps.
@@ -409,6 +412,7 @@ struct Block {
     count: Option<u32>,
     secs: Option<u32>,
     album_uri: Option<String>,
+    artist_uri: Option<String>,
     host: String,
 }
 
@@ -440,6 +444,7 @@ impl Block {
             count: None,
             secs: None,
             album_uri: None,
+            artist_uri: None,
             host: String::new(),
         })
     }
@@ -455,6 +460,7 @@ impl Block {
             "Title" => self.name = v.to_string(),
             "X-AlbumCount" | "X-SongCount" => self.count = v.parse().ok(),
             "X-AlbumUri" => self.album_uri = Some(v.to_string()),
+            "X-ArtistUri" => self.artist_uri = Some(v.to_string()),
             // The stream's host, extracted daemon-side so this stays a dumb column
             // fitter. It is what distinguishes "NTS Infinite Mixtapes 1" from
             // "NTS Radio Live 1" at a glance.
@@ -522,6 +528,7 @@ fn flush_block(
         song_count: if b.kind == FindKind::Album { b.count } else { None },
         album_uri: b.album_uri,
         artist,
+        artist_uri: b.artist_uri,
     });
 }
 
@@ -537,7 +544,7 @@ mod tests {
             uri: format!("song/{label}"),
             trailer: String::new(),
             song_count: None,
-            album_uri: None,
+            album_uri: None, artist_uri: None,
             artist: None,
         }
     }
