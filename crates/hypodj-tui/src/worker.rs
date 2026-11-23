@@ -32,7 +32,7 @@ use hypodj_client::model::{
     journal_lines, now_playing, parse_journal, parse_queue, undo_badge, NowPlaying, QueueItem,
 };
 use hypodj_client::nl::{
-    answer_from_pairs, armed_line, echo_from_pairs, map_ack_reason, nl_request, quote_arg, result_line_from_pairs,
+    answer_from_pairs, confirm_lines, echo_from_pairs, map_ack_reason, nl_request, quote_arg, result_line_from_pairs,
     split_echo, token_from_pairs,
 };
 
@@ -642,8 +642,11 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                     )
                 }),
                 (None, Some(token)) => {
+                    // Same real-outcome rule as the direct-command arm above: an
+                    // immediate plan reports what happened, a deferred one "armed".
                     conn.command(&format!("nl confirm {token}")).map(|pairs| {
-                        pairs.iter().find(|(k, _)| k == "plan_id").map(|(_, v)| armed_line(v))
+                        let lines = confirm_lines(&pairs);
+                        (!lines.is_empty()).then(|| lines.join("; "))
                     })
                 }
                 (None, None) => Ok(None),

@@ -283,6 +283,11 @@ struct State {
     /// client's VIEW: every delete re-validates it against a fresh fetch and shifts
     /// it like MPD shifts a playlist (see `resolve_starred_delete`).
     last_starred_order: Vec<SongId>,
+    /// The order each real playlist had in its last `listplaylistinfo`, keyed by
+    /// playlist id: the client's VIEW a positional `playlistdelete` indexes, mapped
+    /// onto a fresh fetch by [`resolve_playlist_delete`] so a concurrent edit
+    /// cannot shift the delete onto a different song.
+    last_playlist_order: HashMap<crate::model::PlaylistId, Vec<SongId>>,
     /// MPD `random` flag: pick the next entry at random instead of sequentially.
     random: bool,
     /// MPD `repeat` flag: at the end of the queue, loop back to the first entry
@@ -1298,6 +1303,7 @@ impl Default for State {
             binary_limit: 8192,
             cover_id_memo: None,
             last_starred_order: Vec::new(),
+            last_playlist_order: HashMap::new(),
             random: false,
             repeat: false,
             single: false,
@@ -2173,6 +2179,44 @@ fn fade_lands_at(action: &Action) -> Option<u8> {
 /// can never unstar a different song than the one the user pointed at. With no
 /// snapshot (a scripted client that deletes without listing first) the fresh order
 /// is the only view there is.
+/// Map a positional `playlistdelete <name> <pos>` on a real playlist to the index
+/// to remove in the FRESH order. `pos` indexes the client's last listing (the
+/// snapshot) when there is one: the song at `pos` there, counted by occurrence
+/// (a playlist may hold the same song twice), must still be in the fresh order,
+/// and that occurrence's fresh index is what gets removed. Without a snapshot the
+/// fresh order is the view. A row that is gone refuses rather than deleting a
+/// neighbour.
+fn resolve_playlist_delete(
+    snapshot: Option<&[SongId]>,
+    fresh: &[SongId],
+    pos: usize,
+) -> Result<usize, &'static str> {
+    let Some(view) = snapshot else {
+        return if pos < fresh.len() { Ok(pos) } else { Err("Bad song index") };
+    };
+    let id = view.get(pos).ok_or("Bad song index")?;
+    let nth = view[..pos].iter().filter(|s| *s == id).count();
+    fresh
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| *s == id)
+        .nth(nth)
+        .map(|(i, _)| i)
+        .ok_or("the playlist changed - list it again")
+}
+
+/// The ONE playlist carrying `name`, or `None`. Two playlists sharing a name is
+/// refused rather than resolved to the first: a delete or clear on the wrong one
+/// is unrecoverable, and MPD names are unique so a client cannot disambiguate.
+fn unique_playlist(list: Vec<Playlist>, name: &str) -> Result<Option<Playlist>, String> {
+    let mut hits = list.into_iter().filter(|p| p.name == name);
+    let first = hits.next();
+    if hits.next().is_some() {
+        return Err(format!("more than one playlist is named \"{name}\" - rename one in Navidrome"));
+    }
+    Ok(first)
+}
+
 fn resolve_starred_delete(
     snapshot: &[SongId],
     fresh: &[SongId],
@@ -3664,19 +3708,36 @@ impl HypodjHandler {
         &self,
         raw: RawPlan,
     ) -> Result<(PlanId, Option<PlanOutcome>), PlanError> {
-        let (mut pendings, mut ids, immediates) = self.prepare_batch(vec![raw])?;
-        // Single-plan batch: exactly one id + one pending.
-        let id = ids.remove(0);
-        if immediates.contains(&id) {
-            // Immediate: run inline for the true outcome. An Immediate plan holds no
-            // timer guard, so dropping the (un-enrolled) pending disarms nothing.
-            let raw = pendings.remove(0).armed.raw;
-            let outcome = self.run_action_outcome(&raw.action, &raw.origin).await;
-            Ok((id, Some(outcome)))
-        } else {
-            self.plan_pending.lock().unwrap().extend(pendings);
-            Ok((id, None))
+        let mut armed = self.plan_add_batch_reporting(vec![raw]).await?;
+        // Single-plan batch: exactly one entry.
+        Ok(armed.remove(0))
+    }
+
+    /// The batch form of [`Self::plan_add_reporting`], backing `nl confirm`: every
+    /// plan is validated against ONE snapshot first (all or none, as
+    /// [`Self::plan_add_batch`]), the deferred ones are enrolled, and then each
+    /// Immediate runs inline IN ORDER for its real outcome. An Immediate plan holds
+    /// no timer guard, so dropping its (never enrolled) pending disarms nothing.
+    pub async fn plan_add_batch_reporting(
+        &self,
+        raws: Vec<RawPlan>,
+    ) -> Result<Vec<(PlanId, Option<PlanOutcome>)>, PlanError> {
+        let (pendings, ids, immediates) = self.prepare_batch(raws)?;
+        let mut run = Vec::new();
+        let mut deferred = Vec::new();
+        for p in pendings {
+            if immediates.contains(&p.armed.id) {
+                run.push(p.armed.raw);
+            } else {
+                deferred.push(p);
+            }
         }
+        self.plan_pending.lock().unwrap().extend(deferred);
+        let mut outcomes = std::collections::HashMap::new();
+        for (id, raw) in immediates.iter().zip(run) {
+            outcomes.insert(*id, self.run_action_outcome(&raw.action, &raw.origin).await);
+        }
+        Ok(ids.into_iter().map(|id| (id, outcomes.remove(&id))).collect())
     }
 
     /// Execute one immediate plan [`Action`] against the existing primitives,
@@ -5419,7 +5480,7 @@ impl HypodjHandler {
     async fn handle_nl(&self, cmd: NlCmd) -> MpdResponse {
         match cmd {
             NlCmd::Translate { req, owner } => self.nl_translate(req, owner).await,
-            NlCmd::Confirm { token, owner } => self.nl_confirm(&token, owner),
+            NlCmd::Confirm { token, owner } => self.nl_confirm(&token, owner).await,
             NlCmd::Cancel { token, owner } => self.nl_cancel(&token, owner),
         }
     }
@@ -5554,7 +5615,11 @@ impl HypodjHandler {
     /// Confirm: pop the (single-use) token and RE-VALIDATE + arm each plan against
     /// the CURRENT snapshot via `plan_add`. A queue mutation since the echo that
     /// invalidates a target -> loud ACK (per-plan), nothing stale armed.
-    fn nl_confirm(&self, token: &str, owner: u64) -> MpdResponse {
+    ///
+    /// Like `plan add`, an Immediate plan runs INLINE and its real execute-time
+    /// outcome comes back as a `result` pair right after its `plan_id`, so a plain-NL
+    /// ask that resolves to nothing reads "added 0 - no matches for X", not "armed".
+    async fn nl_confirm(&self, token: &str, owner: u64) -> MpdResponse {
         // Pop ONLY when the token exists AND belongs to this connection. A confirm
         // from a different owner is treated as "no such token" (indistinguishable,
         // so it leaks nothing about another connection's pending plans).
@@ -5580,11 +5645,14 @@ impl HypodjHandler {
         // SAFETY (atomic batch): arm ALL plans or NONE. `plan_add_batch`
         // pre-validates every plan against ONE current snapshot and only then arms
         // them; a single invalid plan arms nothing (no partial, inconsistent arm).
-        match self.plan_add_batch(pending.plans) {
-            Ok(ids) => {
+        match self.plan_add_batch_reporting(pending.plans).await {
+            Ok(armed) => {
                 let mut b = MpdResponse::pairs();
-                for id in ids {
+                for (id, outcome) in armed {
                     b = b.pair("plan_id", id.0.to_string());
+                    if let Some(o) = outcome {
+                        b = b.pair("result", o.render());
+                    }
                 }
                 b.build()
             }
@@ -7941,15 +8009,11 @@ impl HypodjHandler {
     /// Resolve a real Navidrome playlist by NAME to its full song list, or `None`
     /// when no playlist carries that name. Backs `listplaylistinfo <name>` and
     /// `load <name>` so a `save`d set is inspectable and loadable by name.
-    async fn playlist_by_name(&self, name: &str) -> Result<Option<Playlist>, SubsonicError> {
-        let existing = self
-            .client
-            .get_playlists()
-            .await?
-            .into_iter()
-            .find(|p| p.name == name);
-        match existing {
-            Some(p) => Ok(Some(self.client.get_playlist(&p.id).await?)),
+    /// An ambiguous name (two playlists share it) is an `Err`, never the first match.
+    async fn playlist_by_name(&self, name: &str) -> Result<Option<Playlist>, String> {
+        let list = self.client.get_playlists().await.map_err(|e| e.to_string())?;
+        match unique_playlist(list, name)? {
+            Some(p) => Ok(Some(self.client.get_playlist(&p.id).await.map_err(|e| e.to_string())?)),
             None => Ok(None),
         }
     }
@@ -14484,6 +14548,11 @@ impl MpdHandler for HypodjHandler {
                 // be inspected. Unknown name is a loud ACK, not a silent empty ok.
                 match self.playlist_by_name(&name).await {
                     Ok(Some(pl)) => {
+                        // The view a later positional `playlistdelete` indexes.
+                        self.state.lock().unwrap().last_playlist_order.insert(
+                            pl.id.clone(),
+                            pl.songs.iter().map(|s| s.id.clone()).collect(),
+                        );
                         let mut pairs = Vec::new();
                         for s in &pl.songs {
                             pairs.extend(browse_song_pairs(s));
@@ -14640,23 +14709,40 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::PlaylistDelete(name, pos) => {
-                // A real Navidrome playlist: remove the song at `pos` via
-                // updatePlaylist(songIndexToRemove). Per MPD semantics an unknown
-                // name / out-of-range index is a LOUD ack, never a silent no-op.
-                // Removing the last remaining song deletes the whole playlist
-                // (deletePlaylist) so an empty stored playlist is not left behind.
+                // A real Navidrome playlist: remove ONE song via
+                // updatePlaylist(songIndexToRemove). `pos` indexes the client's last
+                // listing, re-validated against this fresh fetch (see
+                // [`resolve_playlist_delete`]); removing the last song leaves the
+                // playlist empty but existing, as MPD does. An unknown name / bad
+                // index is a LOUD ack, never a silent no-op. The server has no
+                // compare-and-swap, so an edit landing between this fetch and the
+                // update can still race - the window is one round trip, not a
+                // listing's lifetime.
                 match self.playlist_by_name(&name).await {
                     Ok(Some(pl)) => {
-                        if pos >= pl.songs.len() {
-                            return ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index");
-                        }
-                        let result = if pl.songs.len() == 1 {
-                            self.client.delete_playlist(&pl.id).await
-                        } else {
-                            self.client.remove_from_playlist(&pl.id, pos as u32).await
+                        let fresh: Vec<SongId> = pl.songs.iter().map(|s| s.id.clone()).collect();
+                        let idx = {
+                            let st = self.state.lock().unwrap();
+                            let snap = st.last_playlist_order.get(&pl.id).map(Vec::as_slice);
+                            resolve_playlist_delete(snap, &fresh, pos)
                         };
-                        match result {
+                        let idx = match idx {
+                            Ok(i) => i,
+                            Err(msg) => return ack(ACK_ERROR_NO_EXIST, "playlistdelete", msg),
+                        };
+                        match self.client.remove_from_playlist(&pl.id, idx as u32).await {
                             Ok(()) => {
+                                {
+                                    // Shift the view exactly as MPD shifts a stored
+                                    // playlist, so a command list deleting several
+                                    // rows maps each later position correctly.
+                                    let mut st = self.state.lock().unwrap();
+                                    if let Some(v) = st.last_playlist_order.get_mut(&pl.id) {
+                                        if pos < v.len() {
+                                            v.remove(pos);
+                                        }
+                                    }
+                                }
                                 self.notify_change();
                                 MpdResponse::ok()
                             }
@@ -14664,7 +14750,7 @@ impl MpdHandler for HypodjHandler {
                         }
                     }
                     Ok(None) => ack(ACK_ERROR_NO_EXIST, "playlistdelete", "No such playlist"),
-                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e),
                 }
             }
             MpdCommand::PlaylistClear(name) if name == "Starred" => {
@@ -14674,19 +14760,36 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::PlaylistClear(name) => {
-                // Clear a real Navidrome playlist by removing it (deletePlaylist).
-                // Unknown name is a LOUD ack; a failed delete surfaces a proper ACK
-                // error rather than a silent success.
-                match self.playlist_by_name(&name).await {
-                    Ok(Some(pl)) => match self.client.delete_playlist(&pl.id).await {
-                        Ok(()) => {
-                            self.notify_change();
-                            MpdResponse::ok()
+                // MPD semantics: truncate to empty, keeping the playlist (same id,
+                // so Navidrome-side metadata survives), and a name that does not
+                // exist yet is CREATED empty - so a clear-then-add command list
+                // works against a fresh name instead of aborting on the clear.
+                let result = match self.playlist_by_name(&name).await {
+                    Ok(Some(pl)) => {
+                        self.state.lock().unwrap().last_playlist_order.remove(&pl.id);
+                        if pl.songs.is_empty() {
+                            Ok(())
+                        } else {
+                            self.client
+                                .clear_playlist(&pl.id, pl.songs.len())
+                                .await
+                                .map_err(|e| e.to_string())
                         }
-                        Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistclear", &e.to_string()),
-                    },
-                    Ok(None) => ack(ACK_ERROR_NO_EXIST, "playlistclear", "No such playlist"),
-                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistclear", &e.to_string()),
+                    }
+                    Ok(None) => self
+                        .client
+                        .create_playlist(&name, &[])
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(()) => {
+                        self.notify_change();
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistclear", &e),
                 }
             }
 
@@ -21278,10 +21381,12 @@ mod tests {
         assert!(pair(&resp, "nl_echo").is_some(), "an echo is rendered");
         assert!(handler.plan_list().is_empty(), "translate must NOT arm");
 
-        // Confirm arms via the P2 registry and returns a plan id.
+        // Confirm validates + mints a plan id; an Immediate plan runs inline and
+        // reports its real outcome (6ze6srz), so it is never left enrolled.
         let resp = handler.handle(nl_confirm(&token, 1)).await;
         assert!(pair(&resp, "plan_id").is_some(), "confirm arms + returns id");
-        assert_eq!(handler.plan_list().len(), 1, "exactly one plan armed");
+        assert_eq!(pair(&resp, "result"), Some("stopped"));
+        assert!(handler.plan_list().is_empty(), "an inline immediate is never enrolled");
 
         // The token is single-use: a second confirm fails loud.
         let resp = handler.handle(nl_confirm(&token, 1)).await;
@@ -21317,7 +21422,9 @@ mod tests {
         // 9999s fade out is well over the 1800s (max_dur) ceiling -> clamps.
         let plan = RawPlan {
             version: 1,
-            trigger: crate::plan::RawTrigger::Immediate,
+            // Deferred (not Immediate), so the armed plan stays in the registry to read
+            // back: an Immediate one runs inline at confirm and is never enrolled.
+            trigger: crate::plan::RawTrigger::SpanElapsed { secs: 600.0 },
             action: crate::plan::Action::Fade(crate::plan::FadeIntentIr::Out { secs: 9999.0 }),
             once: true,
             origin: String::new(),
@@ -21411,7 +21518,10 @@ mod tests {
         // The rightful owner still confirms + arms.
         let resp = handler.handle(nl_confirm(&token_a, 100)).await;
         assert!(pair(&resp, "plan_id").is_some(), "the owner can confirm");
-        assert_eq!(handler.plan_list().len(), 1);
+        // 6ze6srz: an Immediate plan ran INLINE and reports its real outcome, the
+        // same contract as `plan add` - nothing is left enrolled to run again.
+        assert_eq!(pair(&resp, "result"), Some("stopped"));
+        assert!(handler.plan_list().is_empty(), "an inline immediate is never enrolled");
 
         // Tokens are non-sequential + distinct across several mints.
         let mut toks = Vec::new();
