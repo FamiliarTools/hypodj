@@ -13944,7 +13944,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Ping => MpdResponse::ok(),
 
             MpdCommand::Status => {
-                let (vol, qlen, cur, ver, random, repeat, single, consume) = {
+                let (vol, qlen, cur, ver, random, repeat, single, consume, skipping) = {
                     let st = self.state.lock().unwrap();
                     (
                         // Derived from the live gain so status tracks an in-flight
@@ -13961,6 +13961,7 @@ impl MpdHandler for HypodjHandler {
                         st.repeat,
                         st.single,
                         st.consume,
+                        st.pending_skip.is_some(),
                     )
                 };
                 let flag = |b: bool| if b { "1" } else { "0" };
@@ -13989,9 +13990,23 @@ impl MpdHandler for HypodjHandler {
                             .pair("songid", item.id.to_string());
                         // Duration is only known for a library song; a live
                         // stream reports none (unknown length is valid MPD).
-                        if let QueueEntry::Song(s) = &item.entry {
-                            if let Some(d) = s.duration_secs {
-                                b = b.pair("duration", format!("{d}.000"));
+                        let duration = match &item.entry {
+                            QueueEntry::Song(s) => s.duration_secs,
+                            _ => None,
+                        };
+                        if let Some(d) = duration {
+                            b = b.pair("duration", format!("{d}.000"));
+                        }
+                        // The live playhead, so a client can show where a scrub
+                        // landed. Only while a track is loaded (MPD omits it on
+                        // stop), and 0 during an in-flight skip: `song` already
+                        // names the TARGET, and the lockless position still holds
+                        // the track being left.
+                        if state != PlayState::Stopped {
+                            let e = if skipping { 0.0 } else { self.last_elapsed_secs() };
+                            b = b.pair("elapsed", format!("{e:.3}"));
+                            if let Some(d) = duration {
+                                b = b.pair("time", format!("{}:{d}", e as u64));
                             }
                         }
                     }
@@ -26277,6 +26292,27 @@ mod tests {
     }
 
     // ── SMOOTH-RESTART: resume composition (signal-free, no real process) ─────
+
+    // `status` carries the live playhead (`elapsed`, plus MPD's legacy `time`
+    // "e:d") while a track is loaded, so a client can show where a scrub landed.
+    // Stopped emits neither, as MPD does.
+    #[tokio::test]
+    async fn status_reports_elapsed_while_a_track_is_loaded() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "elapsed"), None, "stopped => no elapsed");
+
+        h.enqueue_song_for_test(mk_song("e1")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.pending_pause = true;
+        }
+        h.note_elapsed_ms(83_500);
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "elapsed"), Some("83.500"));
+        assert_eq!(pair(&status, "time"), Some("83:240"));
+    }
 
     fn mk_song(id: &str) -> Song {
         Song {

@@ -913,7 +913,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     }
     // Playback status: state | volume fader | N of M | M:SS.
     lines.push(Line::from(Span::styled(
-        status_line(np, text_area.width as usize),
+        status_line(np, state.live_elapsed(std::time::Instant::now()), text_area.width as usize),
         Style::default().add_modifier(Modifier::DIM),
     )));
     if let Some(a) = armed_line {
@@ -1084,7 +1084,7 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// "[playing|paused|stopped] · vol [==#--] V% · track N of M · M:SS total".
+/// "[playing|paused|stopped] · vol [==#--] V% · track N of M · M:SS / M:SS".
 ///
 /// Every number is LABELLED, because the unlabelled version lied. A bare
 /// `[======#-----] 56% | 1 of 5 | 7:14` sits exactly where a seek bar sits in every
@@ -1096,8 +1096,9 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
 /// The separator is a middle dot, not ` | `: three pipes in a forty-cell line read as
 /// table rules on a surface whose whole register is quiet.
 ///
-/// Volume is hidden when unknown, and elapsed is NEVER rendered (the server does not
-/// emit it) - which is precisely why the duration must say what it is.
+/// Volume is hidden when unknown. When the daemon reports a playhead the time reads
+/// `1:23 / 7:14` (a scrub's only feedback); without one (an older daemon) it stays
+/// `7:14 total`, because a bare duration is exactly what reads as elapsed.
 ///
 /// `width` is the pane's inner width, and the line SHEDS PARTS to fit it rather than
 /// being clipped. That is the whole reason width is a parameter: the paragraph does not
@@ -1110,7 +1111,7 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
 /// see change), then the queue position. Transport state and duration are never
 /// dropped - they are what the line is FOR. Each surviving part keeps its label; a
 /// half-labelled line is worse than a shorter one.
-fn status_line(np: &NowPlaying, width: usize) -> String {
+fn status_line(np: &NowPlaying, elapsed: Option<f64>, width: usize) -> String {
     let volume = np.volume.filter(|v| *v >= 0).map(|v| v.min(100) as u8);
     let modes = np.modes.label();
     let compose = |fader: bool, show_volume: bool, show_position: bool| {
@@ -1132,9 +1133,15 @@ fn status_line(np: &NowPlaying, width: usize) -> String {
         if let (Some(song), Some(m), true) = (np.song, np.playlistlength, show_position) {
             bits.push(format!("track {} of {}", song.saturating_add(1), m));
         }
-        if let Some(d) = np.duration {
-            let total = d as u64;
-            bits.push(format!("{}:{:02} total", total / 60, total % 60));
+        let mmss = |secs: f64| {
+            let t = secs as u64;
+            format!("{}:{:02}", t / 60, t % 60)
+        };
+        match (elapsed, np.duration) {
+            (Some(e), Some(d)) => bits.push(format!("{} / {}", mmss(e), mmss(d))),
+            (None, Some(d)) => bits.push(format!("{} total", mmss(d))),
+            (Some(e), None) => bits.push(format!("{} in", mmss(e))),
+            (None, None) => {}
         }
         // The ON playback modes. Never shed (they decide what happens when this track
         // ends), but LAST, so a pane too narrow for anything clips them before it
@@ -1510,13 +1517,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            status_line(&np, 80),
+            status_line(&np, None, 80),
             "playing \u{b7} vol [======#-----] 56% \u{b7} track 1 of 5 \u{b7} 7:14 total"
         );
 
         // And it stays honest as fields drop out: no volume, no queue, no duration.
         let lean = NowPlaying { state: Some("pause".into()), ..Default::default() };
-        assert_eq!(status_line(&lean, 80), "paused");
+        assert_eq!(status_line(&lean, None, 80), "paused");
 
         // An unknown volume (-1) is hidden rather than rendered as a fader at zero,
         // which would claim silence the daemon never reported.
@@ -1525,27 +1532,27 @@ mod tests {
             volume: Some(-1),
             ..Default::default()
         };
-        assert_eq!(status_line(&unknown, 80), "playing");
+        assert_eq!(status_line(&unknown, None, 80), "playing");
 
         // NARROW: the fader is the first thing to go, because it is the only part that
         // says nothing the number does not. Every label survives, which is the point -
         // clipping would have taken `total` off the end and restored the old lie.
-        let narrow = status_line(&np, 50);
+        let narrow = status_line(&np, None, 50);
         assert_eq!(narrow, "playing \u{b7} vol 56% \u{b7} track 1 of 5 \u{b7} 7:14 total");
         assert!(narrow.chars().count() <= 50, "and it now fits: {narrow}");
 
         // NARROWER STILL: the volume goes (he just set it, and can see it change), then
         // the queue position. Transport state and duration never go, and nothing that
         // survives loses its label.
-        let tight = status_line(&np, 38);
+        let tight = status_line(&np, None, 38);
         assert_eq!(tight, "playing \u{b7} track 1 of 5 \u{b7} 7:14 total");
         assert!(tight.chars().count() <= 38, "fits: {tight}");
-        let tighter = status_line(&np, 25);
+        let tighter = status_line(&np, None, 25);
         assert_eq!(tighter, "playing \u{b7} 7:14 total");
 
         // Below even that there is nothing left to drop, so the shortest honest line is
         // handed over and the terminal clips it - never a longer one.
-        assert_eq!(status_line(&np, 4), "playing \u{b7} 7:14 total");
+        assert_eq!(status_line(&np, None, 4), "playing \u{b7} 7:14 total");
     }
 
     #[test]
@@ -1557,10 +1564,22 @@ mod tests {
             modes: PlaybackModes { random: true, consume: true, ..Default::default() },
             ..Default::default()
         };
-        assert_eq!(status_line(&np, 80), "playing \u{b7} 7:14 total \u{b7} random consume");
+        assert_eq!(status_line(&np, None, 80), "playing \u{b7} 7:14 total \u{b7} random consume");
         // All off adds nothing, so the default deck reads exactly as before.
         let plain = NowPlaying { modes: PlaybackModes::default(), ..np };
-        assert_eq!(status_line(&plain, 80), "playing \u{b7} 7:14 total");
+        assert_eq!(status_line(&plain, None, 80), "playing \u{b7} 7:14 total");
+    }
+
+    #[test]
+    fn status_line_shows_the_playhead_when_reported() {
+        let np = NowPlaying {
+            state: Some("play".into()),
+            duration: Some(434.0),
+            ..Default::default()
+        };
+        assert_eq!(status_line(&np, Some(83.9), 80), "playing \u{b7} 1:23 / 7:14");
+        let stream = NowPlaying { state: Some("play".into()), ..Default::default() };
+        assert_eq!(status_line(&stream, Some(65.0), 80), "playing \u{b7} 1:05 in");
     }
 
     #[test]

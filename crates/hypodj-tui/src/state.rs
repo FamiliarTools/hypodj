@@ -723,6 +723,9 @@ pub struct SixelHeld {
 
 pub struct TuiState {
     pub now: NowPlaying,
+    /// When `now` was applied: the base `now.elapsed` is extrapolated from, so the
+    /// playhead moves between status reads without polling for it.
+    pub now_at: Option<Instant>,
     pub queue: Vec<QueueItem>,
     pub selected: usize,
     /// The active main view.
@@ -982,6 +985,7 @@ impl Default for TuiState {
     fn default() -> Self {
         TuiState {
             now: NowPlaying::default(),
+            now_at: None,
             queue: Vec::new(),
             selected: 0,
             screen: Screen::Queue,
@@ -1047,7 +1051,7 @@ impl TuiState {
     /// Apply a fresh (now-playing, queue) snapshot. Clamps `selected` down when the
     /// queue shrinks so it never dangles past the end.
     pub fn apply_snapshot(&mut self, now: NowPlaying, queue: Vec<QueueItem>) {
-        self.now = now;
+        self.apply_now(now);
         self.queue = queue;
         if self.queue.is_empty() {
             self.selected = 0;
@@ -1060,6 +1064,23 @@ impl TuiState {
     /// Used by the fast refresh path when the queue version is unchanged.
     pub fn apply_now(&mut self, now: NowPlaying) {
         self.now = now;
+        self.now_at = Some(Instant::now());
+    }
+
+    /// The playhead as of `at`: the reported `elapsed` plus the time since it was
+    /// read, advancing only while playing and never past the track's duration. A
+    /// scrub or pause refreshes the snapshot, which rebases it.
+    pub fn live_elapsed(&self, at: Instant) -> Option<f64> {
+        let base = self.now.elapsed?;
+        let moved = match (self.now.state.as_deref(), self.now_at) {
+            (Some("play"), Some(t)) => at.saturating_duration_since(t).as_secs_f64(),
+            _ => 0.0,
+        };
+        let e = base + moved;
+        Some(match self.now.duration {
+            Some(d) => e.min(d),
+            None => e,
+        })
     }
 
     /// Enter the confirm for a pending plan. On the DJ (chat) screen the echo +
@@ -2774,6 +2795,27 @@ impl TuiState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn live_elapsed_advances_only_while_playing_and_stops_at_the_end() {
+        let mut st = TuiState::new();
+        st.now = NowPlaying {
+            state: Some("play".into()),
+            elapsed: Some(10.0),
+            duration: Some(12.0),
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        st.now_at = Some(t0);
+        assert_eq!(st.live_elapsed(t0), Some(10.0));
+        assert_eq!(st.live_elapsed(t0 + Duration::from_secs(1)), Some(11.0));
+        assert_eq!(st.live_elapsed(t0 + Duration::from_secs(9)), Some(12.0), "capped");
+        st.now.state = Some("pause".into());
+        assert_eq!(st.live_elapsed(t0 + Duration::from_secs(5)), Some(10.0), "paused holds");
+        st.now.elapsed = None;
+        assert_eq!(st.live_elapsed(t0), None);
+    }
+
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
