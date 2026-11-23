@@ -132,6 +132,17 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
         }
         printed += 1;
     }
+    // The songs the SERVER'S INDEX mis-sizes (task 01m2300p), by name - before this
+    // only journalctl knew which ones. Their own section because the fix is on the
+    // server, not in hypodj: no limit or retry here can change them.
+    let mis: Vec<&String> =
+        pairs.iter().filter(|(k, _)| k == "SizeMismatch").map(|(_, v)| v).collect();
+    if !mis.is_empty() {
+        println!("mis-sized by the server ({}) - a server rescan fixes these:", mis.len());
+        for v in mis {
+            println!("  {v}");
+        }
+    }
     // A frontier view with no groups is a real answer (an empty pin set), and so is a
     // store with nothing deferred. Say so rather than ending on a bare summary line,
     // which reads as truncated output.

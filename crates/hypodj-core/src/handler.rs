@@ -6557,7 +6557,10 @@ impl HypodjHandler {
             // clause must stay at index 1 for `store_badge`'s positional drop (see
             // `hypodj_client::model::store_badge`), so the head has to remain ONE
             // clause however much it says.
-            let moving = st.pending_tracks.saturating_sub(st.given_up);
+            let moving = st
+                .pending_tracks
+                .saturating_sub(st.given_up)
+                .saturating_sub(st.size_disagreements.len());
             let mut head = format!("{} of {} songs", st.cached_tracks, st.resident_tracks);
             if moving > 0 {
                 head.push_str(&format!(" - {moving} still coming"));
@@ -6655,7 +6658,31 @@ impl HypodjHandler {
                 if st.given_up == 1 { "" } else { "s" }
             ));
         }
+        // A SEPARATE clause from "will not download", because the remedy is different
+        // and lives elsewhere: these are songs the SERVER'S INDEX mis-sizes (task
+        // 01m2300p), which only a server rescan fixes. `dj store` names each one.
+        let mis = st.size_disagreements.len();
+        if mis > 0 {
+            line.push_str(&format!(
+                ", {mis} song{} mis-sized by the server",
+                if mis == 1 { "" } else { "s" }
+            ));
+        }
         vec![("X-Store", line)]
+    }
+
+    /// One mis-sized song as a person reads it: name first, then the two numbers that
+    /// disagree, then the id a server-side search can use.
+    fn size_mismatch_line(d: &crate::store::SizeDisagreement) -> String {
+        let who = match d.artist.as_deref().filter(|a| !a.is_empty()) {
+            Some(a) => format!("\"{}\" - {a}", d.title),
+            None => format!("\"{}\"", d.title),
+        };
+        let served = match d.served {
+            Some(n) => format!("serves {n}"),
+            None => "serves more".to_string(),
+        };
+        format!("{who} (index says {} bytes, {served}) song/{}", d.indexed, d.id.0)
     }
 
     /// The neglect evidence for one ranked group, in one line: the integers the
@@ -7047,7 +7074,14 @@ impl HypodjHandler {
             .pair("X-StoreWaiting", st.waiting.label())
             // LOAD-BEARING: without it a pending count that will NEVER reach zero is
             // indistinguishable from one that is merely slow.
-            .pair("X-StoreGivenUp", st.given_up.to_string());
+            .pair("X-StoreGivenUp", st.given_up.to_string())
+            .pair("X-StoreSizeMismatch", st.size_disagreements.len().to_string());
+        // NAMED, one pair per song, in BOTH views: the fix is an action on the server
+        // (a rescan, or a look at the file), so the user needs WHICH songs - before
+        // this they were only in journalctl.
+        for d in &st.size_disagreements {
+            b = b.pair("SizeMismatch", Self::size_mismatch_line(d));
+        }
         // THE ACTIVE RULE, and ONLY for `frontier`. Rule and result readable together
         // is still the point - it is what lets a good decision be told from a bug -
         // but the rule is 240 characters of ranking policy with no knob for any clause
@@ -28527,6 +28561,65 @@ mod tests {
         );
         // The arithmetic the line now promises: held + coming + given-up == resident.
         assert_eq!(0 + 7 + 3, 10, "the three clauses account for every resident song");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_server_mis_sized_song_is_its_own_clause_and_is_named_by_the_verb() {
+        // Task 01m2300p: a size disagreement is not a transient give-up. The badge says
+        // so in its own words and `store` NAMES each song, which only journalctl did.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-mis-sized");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+
+        let mut input = crate::store::PassInput::new(crate::store::PassMode::Full, 1_000_000);
+        input.configured_max = 1_000_000;
+        input.budget_source = crate::store::BudgetSource::FreeSpace;
+        input.pins = Some(crate::store::PinSet {
+            groups: vec![crate::store::PinGroup {
+                kind: crate::store::PinKind::Album,
+                id: "al".into(),
+                name: "An Album".into(),
+                tier: crate::store::PinTier::Album,
+                songs: (0..4).map(|i| store_song(&format!("s{i}"), 100)).collect(),
+            }],
+        });
+        let (_plan, status) = crate::store::plan_pass_with_status(&input);
+        let mut status = status.expect("a full pass with pins publishes");
+        status.given_up = 1;
+        status.size_disagreements = vec![crate::store::SizeDisagreement {
+            id: SongId("s0".into()),
+            title: "Everest".into(),
+            artist: Some("Klangstof".into()),
+            indexed: 3_145_728,
+            served: Some(30_617_112),
+        }];
+        store.publish_status_for_test(status);
+
+        let pairs = pairs_of(h.handle(MpdCommand::Status).await);
+        let badge = pairs
+            .iter()
+            .find(|(k, _)| k == "X-Store")
+            .map(|(_, v)| v.clone())
+            .expect("the badge is present once a pass published");
+        assert!(
+            badge.starts_with("0 of 4 songs - 2 still coming ["),
+            "both stalled kinds leave the in-flight count: {badge}"
+        );
+        assert!(
+            badge.ends_with("1 song will not download, 1 song mis-sized by the server"),
+            "{badge}"
+        );
+
+        let pairs = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Show)).await);
+        let get = |k: &str| pairs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+        assert_eq!(get("X-StoreGivenUp").as_deref(), Some("1"));
+        assert_eq!(get("X-StoreSizeMismatch").as_deref(), Some("1"));
+        assert_eq!(
+            get("SizeMismatch").as_deref(),
+            Some("\"Everest\" - Klangstof (index says 3145728 bytes, serves 30617112) song/s0")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
