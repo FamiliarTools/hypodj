@@ -2131,27 +2131,74 @@ pub enum PlanOutcome {
     Failed(String),
 }
 
+/// Effect verbs [`HypodjHandler::run_action_outcome`] writes into
+/// [`PlanOutcome::Effect`]. One place, so a client catalog can match the daemon
+/// instead of guessing the sentence.
+pub const EFFECT_FADING: &str = "fading";
+pub const EFFECT_STOPPED: &str = "stopped";
+pub const EFFECT_PAUSED: &str = "paused";
+pub const EFFECT_WAKING: &str = "waking";
+pub const EFFECT_NOTHING: &str = "nothing to do";
+
+/// `set volume to N`. The number is the volume the action set.
+pub fn effect_set_volume(v: u8) -> String {
+    format!("set volume to {v}")
+}
+
+/// `random on`, `consume off`. The word is [`crate::plan::PlayMode::word`].
+pub fn effect_mode(word: &str, on: bool) -> String {
+    format!("{word} {}", if on { "on" } else { "off" })
+}
+
+/// ACK message bodies the handler emits verbatim (the part after `}`).
+pub const ACK_WAKE_DURATION: &str = "duration out of range";
+pub const ACK_WAKE_TIME: &str = "bad time";
+pub const ACK_NL_NO_TOKEN: &str = "no such nl token";
+pub const ACK_NL_STALE: &str = "plan no longer valid";
+pub const ACK_NL_INVALID: &str = "plan invalid";
+pub const ACK_TRANSLATOR_TASK: &str = "translator task failed";
+pub const ACK_NO_PLAN: &str = "no such plan";
+
+/// Pair keys these commands put on the wire. The reply catalog locks to them.
+pub const PAIR_PLAN_ID: &str = "plan_id";
+pub const PAIR_RESULT: &str = "result";
+pub const PAIR_SLEEP_REMAINING: &str = "sleep_remaining";
+pub const PAIR_SLEEP: &str = "sleep";
+pub const PAIR_WAKE_REMAINING: &str = "wake_remaining";
+pub const PAIR_WAKE: &str = "wake";
+pub const PAIR_ORIGIN: &str = "origin";
+pub const PAIR_WHEN: &str = "when";
+pub const PAIR_NEXT_FIRE: &str = "next_fire";
+pub const PAIR_NL_ANSWER: &str = "nl_answer";
+pub const PAIR_JDID: &str = "jdid";
+
+/// Fixed result sentences. The client refuses these by the constant, not by
+/// guessing at prose. `added 0` is structural and is not one of these.
+pub const RESULT_NO_JUMP: &str = "no matching track to play";
+pub const RESULT_FAILED: &str = "could not do that: ";
+pub const RESULT_ADDED_NONE: &str = "added 0 - no matches for ";
+
 impl PlanOutcome {
     /// The single human line the client shows after `y`/confirm. Speaks the REAL
     /// count/effect (0 when the selector resolved to nothing), NEVER the asked count.
     pub fn render(&self) -> String {
         match self {
             PlanOutcome::Added { n: 0, selector } => {
-                format!("added 0 - no matches for {selector}")
+                format!("{RESULT_ADDED_NONE}{selector}")
             }
             PlanOutcome::Added { n, .. } => format!("added {n} {}", tracks_word(*n)),
             PlanOutcome::Played { n: 0, selector, .. } => {
-                format!("added 0 - no matches for {selector}")
+                format!("{RESULT_ADDED_NONE}{selector}")
             }
             PlanOutcome::Played { title: Some(t), .. } => format!("played {t}"),
             PlanOutcome::Played { n, .. } => format!("played {n} {}", tracks_word(*n)),
             PlanOutcome::Removed(n) => format!("removed {n} {}", tracks_word(*n)),
             PlanOutcome::Moved(n) => format!("moved {n} {}", tracks_word(*n)),
             PlanOutcome::Cleared(n) => format!("cleared {n} {}", tracks_word(*n)),
-            PlanOutcome::Jumped(0) => "no matching track to play".to_string(),
+            PlanOutcome::Jumped(0) => RESULT_NO_JUMP.to_string(),
             PlanOutcome::Jumped(_) => "jumped to the matching track".to_string(),
             PlanOutcome::Effect(s) => s.clone(),
-            PlanOutcome::Failed(e) => format!("could not do that: {e}"),
+            PlanOutcome::Failed(e) => format!("{RESULT_FAILED}{e}"),
         }
     }
 }
@@ -3796,20 +3843,20 @@ impl HypodjHandler {
             // Fade precedence: start_fade_spec IS the single FadeSlot (validates
             // before aborting; logs an autonomous takeover).
             Action::Fade(ir) => match self.start_fade_spec(crate::executor::map_fade(ir)).await {
-                Ok(_) => PlanOutcome::Effect("fading".into()),
+                Ok(_) => PlanOutcome::Effect(EFFECT_FADING.into()),
                 Err(e) => PlanOutcome::Failed(e.to_string()),
             },
             Action::Stop => {
                 self.handle(MpdCommand::Stop).await;
-                PlanOutcome::Effect("stopped".into())
+                PlanOutcome::Effect(EFFECT_STOPPED.into())
             }
             Action::Pause => {
                 self.handle(MpdCommand::Pause(Some(true))).await;
-                PlanOutcome::Effect("paused".into())
+                PlanOutcome::Effect(EFFECT_PAUSED.into())
             }
             Action::SetVolume(v) => {
                 self.handle(MpdCommand::SetVol(*v)).await;
-                PlanOutcome::Effect(format!("set volume to {v}"))
+                PlanOutcome::Effect(effect_set_volume(*v))
             }
             // Strictly append-only (adds to the END, never starts/jumps).
             Action::Enqueue { selector, count } => {
@@ -3850,7 +3897,7 @@ impl HypodjHandler {
                 }
             }
             Action::Wake { selector, count } => match self.wake_now(selector.clone(), *count).await {
-                Ok(_) => PlanOutcome::Effect("waking".into()),
+                Ok(_) => PlanOutcome::Effect(EFFECT_WAKING.into()),
                 Err(e) => PlanOutcome::Failed(e),
             },
             // DETERMINISTIC queue edits: the selector resolves against the LIVE queue;
@@ -3871,7 +3918,7 @@ impl HypodjHandler {
                 Ok(n) => PlanOutcome::Jumped(n),
                 Err(e) => PlanOutcome::Failed(e),
             },
-            Action::Noop => PlanOutcome::Effect("nothing to do".into()),
+            Action::Noop => PlanOutcome::Effect(EFFECT_NOTHING.into()),
             // Same handler path as the direct MPD mode verbs (one implementation).
             Action::SetMode { mode, on } => {
                 let cmd = match mode {
@@ -3881,7 +3928,7 @@ impl HypodjHandler {
                     crate::plan::PlayMode::Consume => MpdCommand::Consume(*on),
                 };
                 self.handle(cmd).await;
-                PlanOutcome::Effect(format!("{} {}", mode.word(), if *on { "on" } else { "off" }))
+                PlanOutcome::Effect(effect_mode(mode.word(), *on))
             }
         };
         if let Some((snap, pre_key)) = pre {
@@ -5512,9 +5559,9 @@ impl HypodjHandler {
             // X" otherwise). A deferred (armed) plan carries no outcome yet.
             PlanCmd::Add(raw) => match self.plan_add_reporting(raw).await {
                 Ok((id, outcome)) => {
-                    let mut b = MpdResponse::pairs().pair("plan_id", id.0.to_string());
+                    let mut b = MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string());
                     if let Some(o) = outcome {
-                        b = b.pair("result", o.render());
+                        b = b.pair(PAIR_RESULT, o.render());
                     }
                     b.build()
                 }
@@ -5526,9 +5573,9 @@ impl HypodjHandler {
                 let civil = crate::clock::civil_now();
                 for (id, raw, deadline) in self.plan_list_with_deadlines() {
                     b = b
-                        .pair("plan_id", id.0.to_string())
-                        .pair("origin", raw.origin.clone())
-                        .pair("when", crate::echo::describe_when(&raw.trigger));
+                        .pair(PAIR_PLAN_ID, id.0.to_string())
+                        .pair(PAIR_ORIGIN, raw.origin.clone())
+                        .pair(PAIR_WHEN, crate::echo::describe_when(&raw.trigger));
                     // The armed deadline as a unix epoch second (deadline plans
                     // only): what a recurring plan will fire at NEXT, so its
                     // re-arm and restore are observable from the wire.
@@ -5538,7 +5585,7 @@ impl HypodjHandler {
                         let rem = chrono::Duration::from_std(d.saturating_duration_since(now))
                             .unwrap_or_default();
                         let next = ((civil + rem).timestamp_millis() + 500).div_euclid(1000);
-                        b = b.pair("next_fire", next.to_string());
+                        b = b.pair(PAIR_NEXT_FIRE, next.to_string());
                     }
                 }
                 b.build()
@@ -5547,11 +5594,11 @@ impl HypodjHandler {
                 if self.plan_cancel(id) {
                     MpdResponse::ok()
                 } else {
-                    ack(ACK_ERROR_NO_EXIST, "plan", "no such plan")
+                    ack(ACK_ERROR_NO_EXIST, "plan", ACK_NO_PLAN)
                 }
             }
             PlanCmd::Replace(id, raw) => match self.plan_replace(id, raw) {
-                Ok(new_id) => MpdResponse::pairs().pair("plan_id", new_id.0.to_string()).build(),
+                Ok(new_id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, new_id.0.to_string()).build(),
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "plan", &e.to_string()),
             },
         }
@@ -5570,7 +5617,7 @@ impl HypodjHandler {
                 .pair("jage", v.age_secs.to_string())
                 .pair("jorigin", v.origin)
                 .pair("jact", v.act.to_string())
-                .pair("jdid", v.did)
+                .pair(PAIR_JDID, v.did)
                 .pair("jundoable", if v.undoable { "1" } else { "0" }.to_string());
         }
         b.build()
@@ -5619,7 +5666,7 @@ impl HypodjHandler {
         );
         MpdResponse::pairs()
             .pair("jid", taken.id.to_string())
-            .pair("jdid", taken.did)
+            .pair(PAIR_JDID, taken.did)
             .build()
     }
 
@@ -5628,14 +5675,14 @@ impl HypodjHandler {
     fn handle_sleep(&self, cmd: SleepCmd) -> MpdResponse {
         match cmd {
             SleepCmd::Set(dur) => match self.sleep_set(dur) {
-                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                Ok(id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string()).build(),
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "sleep", &e.to_string()),
             },
             SleepCmd::Status => match self.sleep_remaining() {
                 Some(d) => MpdResponse::pairs()
-                    .pair("sleep_remaining", d.as_secs().to_string())
+                    .pair(PAIR_SLEEP_REMAINING, d.as_secs().to_string())
                     .build(),
-                None => MpdResponse::pairs().pair("sleep", "none").build(),
+                None => MpdResponse::pairs().pair(PAIR_SLEEP, "none").build(),
             },
             SleepCmd::Cancel => {
                 self.sleep_cancel();
@@ -5648,7 +5695,7 @@ impl HypodjHandler {
     fn handle_winddown(&self, cmd: WinddownCmd) -> MpdResponse {
         match cmd {
             WinddownCmd::Set(dur) => match self.winddown_set(dur) {
-                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                Ok(id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string()).build(),
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "winddown", &e.to_string()),
             },
             WinddownCmd::Cancel => {
@@ -5664,7 +5711,7 @@ impl HypodjHandler {
             WakeCmd::Set { when: WakeWhen::Daily { h, m, days }, selector, count } => {
                 let trigger = RawTrigger::Daily { hour: h as u8, minute: m as u8, days };
                 match self.wake_set_trigger(trigger, selector.map(Selector::Query), count) {
-                    Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                    Ok(id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string()).build(),
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "wake", &e.to_string()),
                 }
             }
@@ -5672,25 +5719,25 @@ impl HypodjHandler {
                 let at = match when {
                     WakeWhen::In(d) => match chrono::Duration::from_std(d) {
                         Ok(delta) => crate::clock::civil_now() + delta,
-                        Err(_) => return ack(ACK_ERROR_UNKNOWN, "wake", "duration out of range"),
+                        Err(_) => return ack(ACK_ERROR_UNKNOWN, "wake", ACK_WAKE_DURATION),
                     },
                     WakeWhen::At { h, m } => match self.resolve_next_civil(h, m) {
                         Some(at) => at,
-                        None => return ack(ACK_ERROR_UNKNOWN, "wake", "bad time"),
+                        None => return ack(ACK_ERROR_UNKNOWN, "wake", ACK_WAKE_TIME),
                     },
                     WakeWhen::Daily { .. } => unreachable!("matched above"),
                 };
                 let sel = selector.map(Selector::Query);
                 match self.wake_set(at, sel, count) {
-                    Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                    Ok(id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string()).build(),
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "wake", &e.to_string()),
                 }
             }
             WakeCmd::Status => match self.wake_remaining() {
                 Some(d) => MpdResponse::pairs()
-                    .pair("wake_remaining", d.as_secs().to_string())
+                    .pair(PAIR_WAKE_REMAINING, d.as_secs().to_string())
                     .build(),
-                None => MpdResponse::pairs().pair("wake", "none").build(),
+                None => MpdResponse::pairs().pair(PAIR_WAKE, "none").build(),
             },
             WakeCmd::Cancel => {
                 self.wake_cancel();
@@ -5772,7 +5819,7 @@ impl HypodjHandler {
         // instant; a local model can take hundreds of ms. hypodj-nl needs no tokio.
         let hit = match tokio::task::spawn_blocking(move || translator.translate(&req, &ctx)).await {
             Ok(r) => r,
-            Err(_) => return ack(ACK_ERROR_UNKNOWN, "nl", "translator task failed"),
+            Err(_) => return ack(ACK_ERROR_UNKNOWN, "nl", ACK_TRANSLATOR_TASK),
         };
         let hit = match hit {
             // Loud ACK with the SPECIFIC reason (NotUnderstood / Ambiguous /
@@ -5826,7 +5873,7 @@ impl HypodjHandler {
             let mut clamped = clamp_raw(&raw, &bounds);
             clamped.origin = source_tag.to_string();
             if let Err(e) = validate(&clamped, &snap, now, now_civil, &bounds) {
-                return ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan invalid: {e}"));
+                return ack(ACK_ERROR_UNKNOWN, "nl", &format!("{ACK_NL_INVALID}: {e}"));
             }
             plans.push(clamped);
         }
@@ -5889,7 +5936,7 @@ impl HypodjHandler {
                 Some(cur) => format!("no, \"{}\" is not a favorite", cur.title),
             },
         };
-        MpdResponse::pairs().pair("nl_answer", answer).build()
+        MpdResponse::pairs().pair(PAIR_NL_ANSWER, answer).build()
     }
 
     /// Confirm: pop the (single-use) token and RE-VALIDATE + arm each plan against
@@ -5913,13 +5960,13 @@ impl HypodjHandler {
         };
         let pending = match pending {
             Some(p) => p,
-            None => return ack(ACK_ERROR_NO_EXIST, "nl", "no such nl token"),
+            None => return ack(ACK_ERROR_NO_EXIST, "nl", ACK_NL_NO_TOKEN),
         };
         let _ = pending.source;
         if let (Some(session), Some(plan)) = (pending.session, pending.plans.first()) {
             return match self.nl_arm_feature(session, plan.trigger.clone()) {
-                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
-                Err(e) => ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan no longer valid: {e}")),
+                Ok(id) => MpdResponse::pairs().pair(PAIR_PLAN_ID, id.0.to_string()).build(),
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "nl", &format!("{ACK_NL_STALE}: {e}")),
             };
         }
         // SAFETY (atomic batch): arm ALL plans or NONE. `plan_add_batch`
@@ -5929,14 +5976,14 @@ impl HypodjHandler {
             Ok(armed) => {
                 let mut b = MpdResponse::pairs();
                 for (id, outcome) in armed {
-                    b = b.pair("plan_id", id.0.to_string());
+                    b = b.pair(PAIR_PLAN_ID, id.0.to_string());
                     if let Some(o) = outcome {
-                        b = b.pair("result", o.render());
+                        b = b.pair(PAIR_RESULT, o.render());
                     }
                 }
                 b.build()
             }
-            Err(e) => ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan no longer valid: {e}")),
+            Err(e) => ack(ACK_ERROR_UNKNOWN, "nl", &format!("{ACK_NL_STALE}: {e}")),
         }
     }
 

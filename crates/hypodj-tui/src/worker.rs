@@ -32,8 +32,8 @@ use hypodj_client::model::{
     journal_lines, now_playing, parse_journal, parse_queue, undo_badge, NowPlaying, QueueItem,
 };
 use hypodj_client::nl::{
-    answer_from_pairs, confirm_lines, echo_from_pairs, map_ack_reason, nl_request, quote_arg, result_line_from_pairs,
-    split_echo, token_from_pairs,
+    answer_from_pairs, echo_from_pairs, map_ack_reason, nl_request, quote_arg, split_echo,
+    token_from_pairs,
 };
 
 use crate::art::AlbumArt;
@@ -149,7 +149,9 @@ pub enum RespKind {
         undo: Option<String>,
     },
     Confirm(Pending),
-    Banner(String),
+    /// One reply. A confirm carries every plan; a later part does not replace
+    /// an earlier one.
+    Banner(hypodj_client::spoken::Reply),
     /// The daemon's `heard` render, one entry per line, for the scrollable overlay.
     /// Multi-line by construction (a one-line reply is a Banner), so it always has
     /// something the bottom bar could not have carried.
@@ -457,7 +459,7 @@ fn command_worker(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     /// One line for the bottom bar - transient, dismissed by the next keypress.
-    Banner(String),
+    Banner(hypodj_style::Spoken),
     /// The daemon's whole `heard` render, one entry per line, for the scrollable
     /// overlay. A ledger takes longer to read than the next keypress.
     Heard(Vec<String>),
@@ -487,21 +489,10 @@ pub enum Reply {
 ///
 /// Pure over the request and the pairs, so the whole rule is testable without a socket.
 pub fn command_reply(line: &str, pairs: &[(String, String)]) -> Option<Reply> {
-    if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "mark_result") {
-        return Some(Reply::Banner(v.clone()));
-    }
-    // `sleep` / `wake` status: the armed timer, worded once in the client lib.
-    if let Some(sentence) = hypodj_client::model::schedule_reply(pairs) {
-        return Some(Reply::Banner(sentence));
-    }
-    // A SUCCESSFUL `undo` answers with the `jdid` of what it put back, and saying it
-    // is the whole point: the queue may look identical to a human who was not
-    // watching, so a silent success is indistinguishable from a key that did nothing.
-    // The words are the daemon's own.
-    if line.split_whitespace().next() == Some("undo") {
-        if let Some((_, did)) = pairs.iter().find(|(k, _)| k == "jdid") {
-            return Some(Reply::Banner(format!("undone: {did}")));
-        }
+    // Mark, sleep, wake, an answer, undo, and a mode flip. The same
+    // `command_spoken` the CLI calls.
+    if let Some(spoken) = hypodj_client::spoken::command_spoken(line, pairs) {
+        return Some(Reply::Banner(spoken));
     }
     // `journal` answers with `jid`-keyed records, and an EMPTY ring is a real answer
     // rather than nothing to say - a panel that never opened would read as "the key
@@ -509,9 +500,9 @@ pub fn command_reply(line: &str, pairs: &[(String, String)]) -> Option<Reply> {
     if line.split_whitespace().next() == Some("journal") {
         let entries = parse_journal(pairs);
         if entries.is_empty() {
-            return Some(Reply::Banner(
-                "nothing to retract - the journal records plan actions, and none have run".into(),
-            ));
+            return Some(Reply::Banner(hypodj_client::spoken::live_text(
+                "nothing to retract - the journal records plan actions, and none have run",
+            )));
         }
         return Some(Reply::Journal(journal_lines(&entries, "  <- u")));
     }
@@ -522,10 +513,14 @@ pub fn command_reply(line: &str, pairs: &[(String, String)]) -> Option<Reply> {
         .collect();
     match heard.len() {
         0 if line.split_whitespace().next() == Some("heard") => Some(Reply::Banner(
-            "nothing to read back (is the daemon new enough to keep a heard ledger?)".into(),
+            hypodj_client::spoken::live_text(
+                "nothing to read back (is the daemon new enough to keep a heard ledger?)",
+            ),
         )),
         0 => None,
-        1 => Some(Reply::Banner(heard.into_iter().next().unwrap_or_default())),
+        1 => Some(Reply::Banner(hypodj_client::spoken::live_text(
+            heard.into_iter().next().unwrap_or_default(),
+        ))),
         _ => Some(Reply::Heard(heard)),
     }
 }
@@ -548,7 +543,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 false
             }
             Err(Fail::Ack(m)) => {
-                send(RespKind::Banner(m));
+                send(RespKind::Banner(hypodj_client::spoken::refused_text(m).into()));
                 false
             }
             Err(Fail::Down) => true,
@@ -561,8 +556,8 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 // floor is the silent-success hole a radio star shipped with: it worked,
                 // and nothing on screen changed at all.
                 match command_reply(&line, &pairs) {
-                    Some(Reply::Banner(b)) => {
-                        send(RespKind::Banner(b));
+                    Some(Reply::Banner(spoken)) => {
+                        send(RespKind::Banner(spoken.into()));
                     }
                     Some(Reply::Heard(lines)) => {
                         send(RespKind::Heard(lines));
@@ -580,7 +575,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 if (line == "knob up" || line == "knob down") && m.contains("unknown command") {
                     send(RespKind::KnobUnknown(line));
                 } else {
-                    send(RespKind::Banner(map_ack_reason(&m)));
+                    send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m).into()));
                 }
                 false
             }
@@ -594,7 +589,11 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             Ok(pairs) => {
                 // A READ-side question: show the answer, nothing to confirm.
                 if let Some(answer) = answer_from_pairs(&pairs) {
-                    send(RespKind::Banner(answer));
+                    send(RespKind::Banner(
+                        hypodj_client::spoken::command_spoken("nl", &pairs)
+                            .unwrap_or_else(|| hypodj_client::spoken::live_text(answer))
+                            .into(),
+                    ));
                     return false;
                 }
                 match token_from_pairs(&pairs) {
@@ -615,13 +614,18 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                         }));
                     }
                     None => {
-                        send(RespKind::Banner("the server returned no plan to confirm".into()));
+                        send(RespKind::Banner(
+                            hypodj_client::spoken::refused_text(
+                                "the server returned no plan to confirm",
+                            )
+                            .into(),
+                        ));
                     }
                 }
                 false
             }
             Err(MpdError::Ack(m)) => {
-                send(RespKind::Banner(map_ack_reason(&m)));
+                send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m).into()));
                 false
             }
             Err(_) => true,
@@ -636,30 +640,28 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 // count. Fall back to the plan-time armed line only for a deferred plan
                 // (no `result`), where nothing has executed yet.
                 (Some(cmd), _) => conn.command(cmd).map(|pairs| {
-                    Some(
-                        result_line_from_pairs(&pairs)
-                            .unwrap_or_else(|| command_armed_line(&pending.steps)),
-                    )
+                    hypodj_client::spoken::Reply::one(hypodj_client::spoken::from_reply(
+                        &pairs,
+                        pending
+                            .command
+                            .as_deref()
+                            .and_then(hypodj_client::spoken::act_from_command),
+                    ))
                 }),
-                (None, Some(token)) => {
-                    // Same real-outcome rule as the direct-command arm above: an
-                    // immediate plan reports what happened, a deferred one "armed".
-                    conn.command(&format!("nl confirm {token}")).map(|pairs| {
-                        let lines = confirm_lines(&pairs);
-                        (!lines.is_empty()).then(|| lines.join("; "))
-                    })
-                }
-                (None, None) => Ok(None),
+                (None, Some(token)) => conn
+                    .command(&format!("nl confirm {token}"))
+                    .map(|pairs| hypodj_client::spoken::from_confirm(&pairs)),
+                (None, None) => Ok(hypodj_client::spoken::Reply { parts: Vec::new() }),
             };
             match result {
-                Ok(banner) => {
-                    if let Some(b) = banner {
-                        send(RespKind::Banner(b));
+                Ok(reply) => {
+                    if !reply.parts.is_empty() {
+                        send(RespKind::Banner(reply));
                     }
                     refresh_after(conn, tx, epoch)
                 }
                 Err(MpdError::Ack(m)) => {
-                    send(RespKind::Banner(map_ack_reason(&m)));
+                    send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m).into()));
                     false
                 }
                 Err(_) => true,
@@ -683,7 +685,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                             .unwrap_or(0),
                     ),
                     Err(Fail::Ack(m)) => {
-                        send(RespKind::Banner(m));
+                        send(RespKind::Banner(hypodj_client::spoken::refused_text(m).into()));
                         return false;
                     }
                     Err(Fail::Down) => return true,
@@ -694,7 +696,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             match cmd(conn, &format!("add {}", quote_arg(&uri))) {
                 Ok(_) => {}
                 Err(Fail::Ack(m)) => {
-                    send(RespKind::Banner(m));
+                    send(RespKind::Banner(hypodj_client::spoken::refused_text(m).into()));
                     return false;
                 }
                 Err(Fail::Down) => return true,
@@ -712,7 +714,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
         Req::Load(name) => match conn.command(&format!("load {}", quote_arg(&name))) {
             Ok(_) => refresh_after(conn, tx, epoch),
             Err(MpdError::Ack(m)) => {
-                send(RespKind::Banner(map_ack_reason(&m)));
+                send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m).into()));
                 false
             }
             Err(_) => true,
@@ -724,23 +726,11 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 false
             }
             Err(MpdError::Ack(m)) => {
-                send(RespKind::Banner(map_ack_reason(&m)));
+                send(RespKind::Banner(hypodj_client::spoken::refusal_ack(&m).into()));
                 false
             }
             Err(_) => true,
         },
-    }
-}
-
-/// The human armed line for the DIRECT-COMMAND arm (the cc/DJ `plan add <dsl>`
-/// path). The command socket returns a bare OK with no plan_id to echo, so we
-/// synthesize the acknowledgment from the plan summary - without a banner here the
-/// DJ chat gets no feedback after `y` (the token path echoes `armed_line` instead).
-/// Pure - unit-tested.
-fn command_armed_line(steps: &[String]) -> String {
-    match steps.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
-        Some(s) => format!("armed: {s}"),
-        None => "armed".to_string(),
     }
 }
 
@@ -768,7 +758,7 @@ fn refresh_after(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64) -> bool {
             false
         }
         Err(Fail::Ack(m)) => {
-            let _ = tx.send(Inbound::Resp { epoch, kind: RespKind::Banner(m) });
+            let _ = tx.send(Inbound::Resp { epoch, kind: RespKind::Banner(hypodj_client::spoken::refused_text(m).into()) });
             false
         }
         Err(Fail::Down) => true,
@@ -1043,26 +1033,6 @@ fn art_worker(rx: Receiver<(String, Option<String>)>, tx: Sender<Inbound>, host:
 
 #[cfg(test)]
 mod tests {
-    use super::command_armed_line;
-
-    #[test]
-    fn command_armed_line_echoes_plan_summary() {
-        // The cc/DJ direct-command arm path produces a human "armed:" banner from the
-        // plan summary (RespKind::Banner then routes it to the DJ chat) - the fix for
-        // the swallowed feedback bug.
-        assert_eq!(
-            command_armed_line(&["add 5 calmer tracks".to_string()]),
-            "armed: add 5 calmer tracks"
-        );
-        // Leading blank steps are skipped; the first real one wins.
-        assert_eq!(
-            command_armed_line(&["".to_string(), "fade out".to_string()]),
-            "armed: fade out"
-        );
-        // No steps at all still yields a generic acknowledgment (never silence).
-        assert_eq!(command_armed_line(&[]), "armed");
-    }
-
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
         items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
@@ -1082,7 +1052,9 @@ mod tests {
                     ("mark_starred", "1"),
                 ])
             ),
-            Some(Reply::Banner("starred your copy: Takuya Nakamura - Cosmos".to_string()))
+            Some(Reply::Banner(hypodj_client::spoken::live_text(
+                "starred your copy: Takuya Nakamura - Cosmos",
+            )))
         );
         // The ambiguous reply - the one that stars NOTHING - must be just as visible,
         // because it is the one asking the human for the two explicit words.
@@ -1090,7 +1062,7 @@ mod tests {
                          which just ended - say `mark this` or `mark previous`";
         assert_eq!(
             command_reply("mark", &pairs(&[("mark_result", ambiguous), ("mark_ambiguous", "1")])),
-            Some(Reply::Banner(ambiguous.to_string()))
+            Some(Reply::Banner(hypodj_client::spoken::live_text(ambiguous.to_string())))
         );
     }
 
@@ -1113,14 +1085,14 @@ mod tests {
                     ("mark_cut", "window"),
                 ])
             ),
-            Some(Reply::Banner(kept.to_string()))
+            Some(Reply::Banner(hypodj_client::spoken::live_text(kept.to_string())))
         );
         // And the refusal, which is the case this whole gesture must never swallow: the
         // press could not keep audio and SAYS why.
         let refused = "noted: NTS 2 at 23:17 - no audio kept (only 3s is buffered so far)";
         assert_eq!(
             command_reply("mark", &pairs(&[("mark_result", refused)])),
-            Some(Reply::Banner(refused.to_string()))
+            Some(Reply::Banner(hypodj_client::spoken::live_text(refused.to_string())))
         );
     }
 
@@ -1153,11 +1125,13 @@ mod tests {
         // make the human dismiss a box to get back to a sentence.
         assert_eq!(
             command_reply("heard keep 2", &pairs(&[("heard", "kept: 20260805-2317-nts-2-w312s will not be evicted")])),
-            Some(Reply::Banner("kept: 20260805-2317-nts-2-w312s will not be evicted".to_string()))
+            Some(Reply::Banner(hypodj_client::spoken::live_text(
+                "kept: 20260805-2317-nts-2-w312s will not be evicted",
+            )))
         );
         assert_eq!(
             command_reply("heard marks", &pairs(&[("heard", "no marks recorded yet")])),
-            Some(Reply::Banner("no marks recorded yet".to_string()))
+            Some(Reply::Banner(hypodj_client::spoken::live_text("no marks recorded yet")))
         );
     }
 
@@ -1170,9 +1144,9 @@ mod tests {
         // ordinary silent verb.
         assert_eq!(
             command_reply("heard marks", &[]),
-            Some(Reply::Banner(
-                "nothing to read back (is the daemon new enough to keep a heard ledger?)".into()
-            ))
+            Some(Reply::Banner(hypodj_client::spoken::live_text(
+                "nothing to read back (is the daemon new enough to keep a heard ledger?)",
+            )))
         );
         assert!(matches!(command_reply("heard keep 2", &[]), Some(Reply::Banner(_))));
     }
@@ -1201,7 +1175,7 @@ mod tests {
         // An EMPTY ring is a real answer. A key that opened nothing would read as
         // broken - the same silent-success hole `mark` shipped with.
         match command_reply("journal", &[]) {
-            Some(Reply::Banner(b)) => assert!(b.contains("nothing to retract"), "{b}"),
+            Some(Reply::Banner(b)) => assert!(b.text().contains("nothing to retract"), "{b:?}"),
             other => panic!("an empty ring must still say something, got {other:?}"),
         }
     }
@@ -1215,7 +1189,7 @@ mod tests {
         let done = pairs(&[("jid", "12"), ("jdid", "cleared 7")]);
         assert_eq!(
             command_reply("undo", &done),
-            Some(Reply::Banner("undone: cleared 7".into()))
+            Some(Reply::Banner(hypodj_client::spoken::command_spoken("undo", &done).unwrap()))
         );
         // A REFUSAL is an ACK and never reaches here - it is mapped to a banner on
         // the error path - so this rule cannot dress a refusal up as a success.
@@ -1240,15 +1214,23 @@ mod tests {
     #[test]
     fn sleep_and_wake_status_answer_on_the_banner() {
         use super::{command_reply, Reply};
+        let sleep = pairs(&[("sleep_remaining", "720")]);
         assert_eq!(
-            command_reply("sleep", &pairs(&[("sleep_remaining", "720")])),
-            Some(Reply::Banner("sleep in 12m".into()))
+            command_reply("sleep", &sleep),
+            Some(Reply::Banner(hypodj_client::spoken::command_spoken("sleep", &sleep).unwrap()))
         );
+        let wake = pairs(&[("wake", "none")]);
         assert_eq!(
-            command_reply("wake", &pairs(&[("wake", "none")])),
-            Some(Reply::Banner("no wake alarm armed".into()))
+            command_reply("wake", &wake),
+            Some(Reply::Banner(hypodj_client::spoken::command_spoken("wake", &wake).unwrap()))
         );
-        // A mode flip answers a bare OK and stays silent.
-        assert_eq!(command_reply("random 1", &[]), None);
+        // The words appear only once the daemon has accepted the flip.
+        assert_eq!(
+            command_reply("random 1", &[]).map(|r| match r {
+                Reply::Banner(s) => s.text(),
+                other => panic!("{other:?}"),
+            }),
+            Some("random on".into())
+        );
     }
 }

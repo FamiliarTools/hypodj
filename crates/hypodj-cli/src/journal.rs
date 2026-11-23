@@ -48,16 +48,20 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
 pub fn undo(conn: &mut MpdConn) -> Result<bool, MpdError> {
     match conn.command("undo") {
         Ok(pairs) => {
-            let did = pairs
-                .iter()
-                .find(|(k, _)| k == "jdid")
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("done");
-            println!("undone: {did}");
+            if let Some(line) = crate::render::render_command("undo", &pairs, crate::stdout_ansi())
+            {
+                println!("{line}");
+            }
             Ok(true)
         }
         Err(MpdError::Ack(msg)) => {
-            println!("nothing undone: {msg}");
+            println!(
+                "{}",
+                crate::render::render_refusal(
+                    &format!("nothing undone: {msg}"),
+                    crate::stdout_ansi(),
+                )
+            );
             Ok(false)
         }
         Err(e) => Err(e),
@@ -73,7 +77,11 @@ pub fn render(entries: &[JournalEntry]) -> String {
             .to_string();
     }
     let mut out = vec!["what the daemon did, newest first".to_string()];
-    out.extend(journal_lines(entries, "  <- dj undo").into_iter().map(|l| format!("  {l}")));
+    out.extend(
+        journal_lines(entries, "  <- dj undo")
+            .into_iter()
+            .map(|l| format!("  {l}")),
+    );
     out.join("\n")
 }
 
@@ -96,7 +104,10 @@ mod tests {
     fn an_empty_ring_says_what_it_records_rather_than_printing_nothing() {
         let out = render(&[]);
         assert!(out.contains("nothing to retract"), "{out}");
-        assert!(out.contains("plan actions"), "and what a journal entry even is: {out}");
+        assert!(
+            out.contains("plan actions"),
+            "and what a journal entry even is: {out}"
+        );
     }
 
     #[test]
@@ -109,8 +120,14 @@ mod tests {
         let out = render(&rows);
         assert_eq!(out.matches("<- dj undo").count(), 1, "{out}");
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[1].contains("<- dj undo"), "the NEWEST undoable one: {out}");
-        assert!(!lines[2].contains("<- dj undo"), "not the one under it: {out}");
+        assert!(
+            lines[1].contains("<- dj undo"),
+            "the NEWEST undoable one: {out}"
+        );
+        assert!(
+            !lines[2].contains("<- dj undo"),
+            "not the one under it: {out}"
+        );
     }
 
     #[test]
@@ -130,7 +147,13 @@ mod tests {
 
     #[test]
     fn the_daemons_own_sentence_and_the_origin_are_shown_verbatim() {
-        let out = render(&[entry(12, 4, "mcp:sess-3f2a19bc", "removed The Man Machine", true)]);
+        let out = render(&[entry(
+            12,
+            4,
+            "mcp:sess-3f2a19bc",
+            "removed The Man Machine",
+            true,
+        )]);
         assert!(out.contains("removed The Man Machine"), "{out}");
         assert!(out.contains("agent sess-3f2a19bc"), "{out}");
         // A non-agent origin is NOT relabelled - `sleep` is not "you".
@@ -143,7 +166,10 @@ mod tests {
 
     #[test]
     fn the_age_reads_human() {
-        let out = render(&[entry(1, 4, "mpd", "added 1", false), entry(2, 130, "mpd", "added 1", false)]);
+        let out = render(&[
+            entry(1, 4, "mpd", "added 1", false),
+            entry(2, 130, "mpd", "added 1", false),
+        ]);
         assert!(out.contains("4s"), "{out}");
         assert!(out.contains("2m"), "{out}");
     }

@@ -33,6 +33,7 @@ hypodj-build-info = { path = "../hypodj-build-info" }
 # compose() at print time for `dj-gui --version`.
 hypodj-build-info = { path = "../hypodj-build-info" }
 hypodj-client = { path = "../hypodj-client" }
+hypodj-style = { path = "../hypodj-style", features = ["ratatui"] }
 hypodj-nl = { path = "../hypodj-nl", optional = true, default-features = false, features = ["cc"] }
 ratatui.workspace = true
 crossterm.workspace = true

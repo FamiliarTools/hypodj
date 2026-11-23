@@ -188,27 +188,6 @@ impl PlaybackModes {
     }
 }
 
-/// The sentence a `sleep` / `wake` STATUS reply deserves. The daemon answers
-/// `sleep_remaining: <secs>` or `sleep: none` (likewise `wake`); both clients print
-/// it through here so the words cannot drift. `None` for any other reply (a set
-/// answers `plan_id`, a cancel a bare OK - the card is the feedback there).
-pub fn schedule_reply(pairs: &[(String, String)]) -> Option<String> {
-    let num = |k: &str| find(pairs, k).and_then(|v| v.parse::<u64>().ok());
-    if let Some(s) = num("sleep_remaining") {
-        return Some(format!("sleep in {}", fmt_remaining(s)));
-    }
-    if find(pairs, "sleep") == Some("none") {
-        return Some("no sleep timer armed".into());
-    }
-    if let Some(s) = num("wake_remaining") {
-        return Some(format!("wake in {}", fmt_remaining(s)));
-    }
-    if find(pairs, "wake") == Some("none") {
-        return Some("no wake alarm armed".into());
-    }
-    None
-}
-
 /// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
 /// `strength` is a basis-of-100 integer (the wire value); render as `strength/100`.
 #[derive(Debug, Default, PartialEq, Clone)]
@@ -259,7 +238,11 @@ impl FieldState {
                 Some(a) => a,
                 None => continue,
             };
-            pulls.push(FieldPull { label, strength, age_mins });
+            pulls.push(FieldPull {
+                label,
+                strength,
+                age_mins,
+            });
         }
         FieldState { pulls }
     }
@@ -295,7 +278,10 @@ impl AmbientHint {
             _ => return None,
         };
         // Both keys required: a snapshot with a kind but no title is torn -> None.
-        Some(AmbientHint { kind, title: find(status, "X-hypodj-hint-title")?.to_string() })
+        Some(AmbientHint {
+            kind,
+            title: find(status, "X-hypodj-hint-title")?.to_string(),
+        })
     }
 
     /// The bare phrase for the terse card HUD (no "btw" prefix), matching the
@@ -329,9 +315,7 @@ pub struct ArmedFeatures {
 impl ArmedFeatures {
     /// `true` if any feature is armed - the render gate.
     pub fn any(&self) -> bool {
-        self.sleep_remaining.is_some()
-            || self.winddown_active
-            || self.wake_remaining.is_some()
+        self.sleep_remaining.is_some() || self.winddown_active || self.wake_remaining.is_some()
     }
 
     fn parse(status: &[(String, String)]) -> Self {
@@ -364,7 +348,10 @@ fn parse_continuation(status: &[(String, String)]) -> Option<String> {
 /// reads an MPD frame needs exactly this and nothing more - a second copy in another
 /// crate is a second place a key name can drift.
 pub fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) -> NowPlaying {
@@ -512,7 +499,9 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
         .iter()
         .enumerate()
         .map(|(i, b)| QueueItem {
-            pos: find(b, "Pos").and_then(|v| v.parse::<usize>().ok()).unwrap_or(i),
+            pos: find(b, "Pos")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(i),
             title: find(b, "Title").unwrap_or("(unknown)").to_string(),
             artist: find(b, "Artist").map(str::to_string),
             uri: find(b, "file").map(str::to_string),
@@ -643,10 +632,22 @@ pub fn journal_lines(entries: &[JournalEntry], mark: &str) -> Vec<String> {
 /// reaches a character of it.
 pub fn undo_badge(entries: &[JournalEntry], key: char) -> Option<String> {
     let e = entries.iter().find(|e| e.undoable)?;
-    let who = if e.from_agent() { "agent" } else { e.origin.as_str() };
+    let who = if e.from_agent() {
+        "agent"
+    } else {
+        e.origin.as_str()
+    };
     let who = if who.trim().is_empty() { "" } else { who };
-    let lead = if who.is_empty() { String::new() } else { format!("{who} ") };
-    Some(format!("{lead}{} - {key} to undo ({})", e.did, fmt_remaining(e.age_s)))
+    let lead = if who.is_empty() {
+        String::new()
+    } else {
+        format!("{who} ")
+    };
+    Some(format!(
+        "{lead}{} - {key} to undo ({})",
+        e.did,
+        fmt_remaining(e.age_s)
+    ))
 }
 
 #[cfg(test)]
@@ -654,7 +655,10 @@ mod tests {
     use super::*;
 
     fn p(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -712,12 +716,19 @@ mod tests {
             ("file", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
             ("Title", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
             ("Name", "4 To The Floor"),
-            ("X-CoverArt", "https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
+            (
+                "X-CoverArt",
+                "https://media.ntslive.co.uk/resize/400x400/ftf.jpeg",
+            ),
             ("Pos", "0"),
             ("Id", "1"),
         ]);
         let np = now_playing(&status, &current);
-        assert_eq!(np.name.as_deref(), Some("4 To The Floor"), "the station Name is parsed");
+        assert_eq!(
+            np.name.as_deref(),
+            Some("4 To The Floor"),
+            "the station Name is parsed"
+        );
         assert_eq!(
             np.cover.as_deref(),
             Some("https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
@@ -742,7 +753,11 @@ mod tests {
         ]);
         let np = now_playing(&[], &current);
         assert_eq!(np.plays, Some(23));
-        assert_eq!(np.last_played_days, Some(3), "whole days, rendered daemon-side");
+        assert_eq!(
+            np.last_played_days,
+            Some(3),
+            "whole days, rendered daemon-side"
+        );
 
         let bare = now_playing(&[], &p(&[("file", "song/42"), ("Title", "T")]));
         assert_eq!(bare.plays, None, "an absent pair is NOT zero plays");
@@ -760,10 +775,7 @@ mod tests {
     fn nowplaying_parses_x_starred_coexisting_with_armed() {
         // A starred current track WHILE a sleep timer is armed: the two X- sources
         // (currentsong X-Starred + status X-hypodj-*) must parse independently.
-        let status = p(&[
-            ("state", "play"),
-            ("X-hypodj-sleep-remaining", "600"),
-        ]);
+        let status = p(&[("state", "play"), ("X-hypodj-sleep-remaining", "600")]);
         let current = p(&[
             ("file", "song/42"),
             ("Title", "Blue in Green"),
@@ -875,8 +887,22 @@ mod tests {
         let np = now_playing(&status, &[]);
         assert!(np.field.active());
         assert_eq!(np.field.pulls.len(), 2);
-        assert_eq!(np.field.pulls[0], FieldPull { label: "calmer".into(), strength: 58, age_mins: 3 });
-        assert_eq!(np.field.pulls[1], FieldPull { label: "warmer".into(), strength: 41, age_mins: 1 });
+        assert_eq!(
+            np.field.pulls[0],
+            FieldPull {
+                label: "calmer".into(),
+                strength: 58,
+                age_mins: 3
+            }
+        );
+        assert_eq!(
+            np.field.pulls[1],
+            FieldPull {
+                label: "warmer".into(),
+                strength: 41,
+                age_mins: 1
+            }
+        );
     }
 
     #[test]
@@ -970,7 +996,12 @@ mod tests {
 
     #[test]
     fn nowplaying_unknown_volume() {
-        let status = p(&[("volume", "-1"), ("playlistlength", "1"), ("state", "play"), ("song", "0")]);
+        let status = p(&[
+            ("volume", "-1"),
+            ("playlistlength", "1"),
+            ("state", "play"),
+            ("song", "0"),
+        ]);
         let np = now_playing(&status, &[]);
         assert_eq!(np.volume, Some(-1));
     }
@@ -1057,7 +1088,11 @@ mod tests {
         let np = now_playing(&[], &current);
         assert_eq!(np.artist_uri.as_deref(), Some("artist/ar-3"));
         assert_eq!(np.album.as_deref(), Some("Volume Alpha"), "still the name");
-        assert_eq!(np.album_uri.as_deref(), Some("album/al-9"), "and now the uri");
+        assert_eq!(
+            np.album_uri.as_deref(),
+            Some("album/al-9"),
+            "and now the uri"
+        );
         // A raw stream carries no album at all -> None, never a guessed one.
         let stream = p(&[("file", "http://stream.example/live"), ("Title", "Live")]);
         assert_eq!(now_playing(&[], &stream).album_uri, None);
@@ -1077,8 +1112,14 @@ mod tests {
         // not in the `commands` advertisement. This is that wire, and a status without
         // the pair (no store, or no full pass yet) must stay None rather than invent a
         // row of zeros.
-        let np = now_playing(&p(&[("X-Store", "318 of 347 tracks, 12.1 of 16.0 GiB")]), &[]);
-        assert_eq!(np.store.as_deref(), Some("318 of 347 tracks, 12.1 of 16.0 GiB"));
+        let np = now_playing(
+            &p(&[("X-Store", "318 of 347 tracks, 12.1 of 16.0 GiB")]),
+            &[],
+        );
+        assert_eq!(
+            np.store.as_deref(),
+            Some("318 of 347 tracks, 12.1 of 16.0 GiB")
+        );
         assert_eq!(now_playing(&[], &[]).store, None);
     }
 
@@ -1151,26 +1192,42 @@ mod tests {
 
     #[test]
     fn playback_modes_parse_toggle_and_label() {
-        let np = now_playing(&p(&[("state", "play"), ("random", "1"), ("repeat", "0"), ("consume", "1")]), &[]);
+        let np = now_playing(
+            &p(&[
+                ("state", "play"),
+                ("random", "1"),
+                ("repeat", "0"),
+                ("consume", "1"),
+            ]),
+            &[],
+        );
         assert!(np.modes.random && np.modes.consume);
         assert!(!np.modes.repeat && !np.modes.single);
         assert_eq!(np.modes.label().as_deref(), Some("random consume"));
         assert_eq!(np.modes.toggle_command(Mode::Random), "random 0");
         assert_eq!(np.modes.toggle_command(Mode::Single), "single 1");
         // A lean status (no flags) is all off and renders nothing.
-        assert_eq!(now_playing(&p(&[("state", "stop")]), &[]).modes.label(), None);
+        assert_eq!(
+            now_playing(&p(&[("state", "stop")]), &[]).modes.label(),
+            None
+        );
         assert_eq!(Mode::from_word("repeat"), Some(Mode::Repeat));
         assert_eq!(Mode::from_word("shuffle"), None);
     }
 
     #[test]
-    fn schedule_reply_words_both_answers_and_ignores_others() {
-        assert_eq!(schedule_reply(&p(&[("sleep_remaining", "720")])).as_deref(), Some("sleep in 12m"));
-        assert_eq!(schedule_reply(&p(&[("sleep", "none")])).as_deref(), Some("no sleep timer armed"));
-        assert_eq!(schedule_reply(&p(&[("wake_remaining", "25200")])).as_deref(), Some("wake in 7h 00m"));
-        assert_eq!(schedule_reply(&p(&[("wake", "none")])).as_deref(), Some("no wake alarm armed"));
-        assert_eq!(schedule_reply(&p(&[("plan_id", "3")])), None);
-        assert_eq!(schedule_reply(&[]), None);
+    fn a_countdown_is_armed_in_the_same_words_as_the_hold() {
+        use crate::spoken::{armed_hold, command_spoken, State};
+        let sleep = p(&[("sleep_remaining", "720")]);
+        let spoken = command_spoken("sleep", &sleep).unwrap();
+        let hold = armed_hold(&ArmedFeatures { sleep_remaining: Some(720), ..ArmedFeatures::default() }).unwrap();
+        assert_eq!(spoken.state, State::Armed);
+        assert_eq!(hold.state, spoken.state);
+        assert_eq!(spoken.text(), "sleep in 12m");
+        assert!(hold.text().contains("sleep in 12m"));
+        let none = command_spoken("wake", &p(&[("wake", "none")])).unwrap();
+        assert_eq!(none.state, State::Note);
+        assert!(armed_hold(&ArmedFeatures::default()).is_none());
     }
 
     #[test]
@@ -1204,7 +1261,12 @@ mod tests {
     #[test]
     fn a_journal_record_without_a_usable_id_is_dropped_not_defaulted() {
         // A defaulted 0 would make `undo 0` a plausible-looking aim at nothing.
-        let pairs = p(&[("jid", "x"), ("jdid", "who knows"), ("jid", "3"), ("jdid", "removed 1")]);
+        let pairs = p(&[
+            ("jid", "x"),
+            ("jdid", "who knows"),
+            ("jid", "3"),
+            ("jdid", "removed 1"),
+        ]);
         let js = parse_journal(&pairs);
         assert_eq!(js.len(), 1);
         assert_eq!(js[0].id, 3);
@@ -1240,7 +1302,10 @@ mod tests {
         let lines = journal_lines(&rows, " <- undo");
         assert_eq!(lines.len(), 3);
         assert_eq!(lines.iter().filter(|l| l.contains("<- undo")).count(), 1);
-        assert!(lines[0].contains("<- undo"), "the NEWEST undoable one: {lines:?}");
+        assert!(
+            lines[0].contains("<- undo"),
+            "the NEWEST undoable one: {lines:?}"
+        );
         // A stale top hands the mark to the newest one that is not stale.
         let rows = [
             jentry(12, 4, "mcp:sess-1", "cleared 7", false),
@@ -1250,14 +1315,19 @@ mod tests {
         assert!(!lines[0].contains("<- undo"));
         assert!(lines[1].contains("<- undo"), "{lines:?}");
         // Nothing undoable offers nothing.
-        assert!(journal_lines(&[jentry(1, 1, "mpd", "x", false)], " <- undo")
-            .iter()
-            .all(|l| !l.contains("<- undo")));
+        assert!(
+            journal_lines(&[jentry(1, 1, "mpd", "x", false)], " <- undo")
+                .iter()
+                .all(|l| !l.contains("<- undo"))
+        );
     }
 
     #[test]
     fn the_origin_is_never_relabelled_into_a_guess_about_who() {
-        assert_eq!(journal_who(&jentry(1, 0, "mcp:sess-ab", "x", false)), "agent sess-ab");
+        assert_eq!(
+            journal_who(&jentry(1, 0, "mcp:sess-ab", "x", false)),
+            "agent sess-ab"
+        );
         // `sleep` is a daemon feature, not "you" - and an absent origin says so.
         assert_eq!(journal_who(&jentry(1, 0, "sleep", "x", false)), "sleep");
         assert_eq!(journal_who(&jentry(1, 0, "", "x", false)), "(no origin)");
@@ -1267,7 +1337,10 @@ mod tests {
     fn the_badge_offers_only_what_the_daemon_says_is_still_live() {
         // Nothing undoable -> no badge at all, rather than a dead offer.
         assert_eq!(undo_badge(&[], 'u'), None);
-        assert_eq!(undo_badge(&[jentry(1, 3, "mcp:sess-1", "cleared 7", false)], 'u'), None);
+        assert_eq!(
+            undo_badge(&[jentry(1, 3, "mcp:sess-1", "cleared 7", false)], 'u'),
+            None
+        );
         // The badge carries the daemon's OWN sentence and its age, and names the key.
         let b = undo_badge(&[jentry(9, 12, "mcp:sess-1", "removed 3", true)], 'u').unwrap();
         assert_eq!(b, "agent removed 3 - u to undo (12s)");
@@ -1277,6 +1350,9 @@ mod tests {
             jentry(9, 3, "mcp:sess-1", "cleared 7", false),
             jentry(8, 130, "winddown", "faded out", true),
         ];
-        assert_eq!(undo_badge(&rows, 'u').unwrap(), "winddown faded out - u to undo (2m)");
+        assert_eq!(
+            undo_badge(&rows, 'u').unwrap(),
+            "winddown faded out - u to undo (2m)"
+        );
     }
 }

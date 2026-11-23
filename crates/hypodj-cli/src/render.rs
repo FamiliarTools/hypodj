@@ -3,14 +3,51 @@
 //! NowPlaying + queue parsing lives in the client. A stopped/empty deck renders a
 //! friendly "nothing playing".
 
-use hypodj_client::model::{fmt_remaining, parse_queue, ArmedFeatures, FieldState, NowPlaying};
+use hypodj_client::model::{parse_queue, FieldState, NowPlaying};
+use hypodj_style::ansi::Ansi;
+use hypodj_style::{Role, TermBg};
 
 /// Render the now-playing card as plain text (a couple of lines). A stopped or
 /// empty deck is "nothing playing" - never a leftover title/artist.
 pub fn render_card(np: &NowPlaying) -> String {
+    render_card_with(np, Ansi::off())
+}
+
+/// The line the binary prints after a confirm. Same words on the CLI and the TUI.
+/// A confirm, one line, every plan, each in its own state.
+pub fn render_confirm(pairs: &[(String, String)], ansi: Ansi) -> String {
+    hypodj_client::spoken::from_confirm(pairs)
+        .parts
+        .iter()
+        .map(|part| ansi.render(part))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Sleep, wake, an answer, or undo. The same `command_spoken` the TUI calls.
+pub fn render_command(line: &str, pairs: &[(String, String)], ansi: Ansi) -> Option<String> {
+    hypodj_client::spoken::command_spoken(line, pairs).map(|spoken| ansi.render(&spoken))
+}
+
+pub fn render_outcome(
+    pairs: &[(String, String)],
+    act: Option<hypodj_client::spoken::Act>,
+    ansi: Ansi,
+) -> String {
+    ansi.render(&hypodj_client::spoken::from_reply(pairs, act))
+}
+
+/// The line the binary prints for a daemon ACK.
+pub fn render_refusal(msg: &str, ansi: Ansi) -> String {
+    ansi.render(&hypodj_client::spoken::refusal_ack(msg))
+}
+
+/// Same card as [`render_card`], with colour from the ANSI adapter when `ansi` is on.
+/// Off (not a TTY, or `NO_COLOR`) is the plain card. The words do not change.
+pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
-    let armed = render_armed(&np.armed);
+    let armed = hypodj_client::spoken::armed_hold(&np.armed).map(|s| ansi.render(&s));
     let field = render_field(&np.field);
     if stopped || empty {
         // A stopped deck can still hold an armed wake alarm or a held pull - surface
@@ -40,7 +77,11 @@ pub fn render_card(np: &NowPlaying) -> String {
         // so it is followed by U+FE0E (text-presentation selector) to force a single
         // cell on emoji-presentation terminals. Prepended only when starred.
         if np.starred {
-            lines.push(format!("\u{2665}\u{FE0E} {t}"));
+            // The heart is the kept mark. Ember when colour is on; the glyph stays
+            // either way, so the line still says favourite with the colour stripped.
+            let mark = ansi.paint(Role::Ember, "\u{2665}\u{FE0E}", TermBg::dark_default());
+            // Ember here is the CLI colour that clears both black and white.
+            lines.push(format!("{mark} {t}"));
         } else {
             lines.push(t.clone());
         }
@@ -157,25 +198,6 @@ fn render_field(field: &FieldState) -> Option<String> {
 /// `sleep in 12m \u{b7} winding down \u{b7} wake in 7h 00m`. `None` when nothing is
 /// armed. Worded exactly as the dj-gui's `armed_hud`: `in` marks every countdown, so
 /// `sleep 12m` cannot be read as a twelve-minute-long timer.
-fn render_armed(a: &ArmedFeatures) -> Option<String> {
-    if !a.any() {
-        return None;
-    }
-    let mut bits = Vec::new();
-    if let Some(s) = a.sleep_remaining {
-        bits.push(format!("sleep in {}", fmt_remaining(s)));
-    }
-    if a.winddown_active {
-        match a.winddown_remaining {
-            Some(s) => bits.push(format!("wind-down in {}", fmt_remaining(s))),
-            None => bits.push("winding down".to_string()),
-        }
-    }
-    if let Some(s) = a.wake_remaining {
-        bits.push(format!("wake in {}", fmt_remaining(s)));
-    }
-    Some(bits.join(" \u{00b7} "))
-}
 
 fn fmt_dur(secs: f64) -> String {
     let total = secs as u64;
@@ -206,7 +228,10 @@ mod tests {
     use hypodj_client::model::now_playing;
 
     fn p(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -246,12 +271,165 @@ mod tests {
         let card = render_card(&now_playing(&status, &current));
         assert!(card.contains("\u{2665}\u{FE0E} Blue in Green"));
         // Without the pair the heart is absent (plain title).
-        let plain = render_card(&now_playing(&status, &p(&[
-            ("file", "song/42"),
-            ("Title", "Blue in Green"),
-        ])));
+        let plain = render_card(&now_playing(
+            &status,
+            &p(&[("file", "song/42"), ("Title", "Blue in Green")]),
+        ));
         assert!(!plain.contains('\u{2665}'));
         assert!(plain.contains("Blue in Green"));
+    }
+
+    #[test]
+    fn card_colour_on_and_off_match_once_stripped() {
+        let status = p(&[("state", "play"), ("volume", "40")]);
+        let current = p(&[
+            ("file", "song/42"),
+            ("Title", "Blue in Green"),
+            ("Artist", "Miles Davis"),
+            ("X-Starred", "1"),
+        ]);
+        let np = now_playing(&status, &current);
+        let off = render_card_with(&np, Ansi::off());
+        let on = render_card_with(&np, Ansi::on_truecolor());
+        assert!(on.contains('\u{1b}'), "colour on actually emits an escape");
+        assert_eq!(hypodj_style::ansi::strip(&on), off);
+        assert_eq!(hypodj_style::ansi::strip(&off), off);
+        assert!(off.contains("\u{2665}\u{FE0E} Blue in Green"));
+        assert!(!Ansi::from_env(false, None, None).enabled());
+        assert!(!Ansi::from_env(true, Some("1"), None).enabled());
+    }
+
+    #[test]
+    fn a_canned_plan_echo_strips_to_the_same_words() {
+        use hypodj_client::nl::split_echo;
+        use hypodj_client::spoken::plan_echo;
+        use hypodj_style::State;
+        let parts = split_echo("via rules | [1] fade out | NOTE: a wake also needs a play");
+        for spoken in plan_echo(&parts) {
+            let off = Ansi::off().render(&spoken);
+            let on = Ansi::on_truecolor().render(&spoken);
+            let indexed = Ansi::on_indexed().render(&spoken);
+            assert_eq!(off, spoken.text());
+            assert_eq!(hypodj_style::ansi::strip(&on), off);
+            assert_eq!(hypodj_style::ansi::strip(&indexed), off);
+            if spoken.state == State::Echo {
+                assert!(on.contains("\u{1b}[2;4m"), "echo is quiet and underlined");
+            }
+            if spoken.state == State::Note {
+                assert_eq!(off, "NOTE: a wake also needs a play");
+                assert!(!on.contains("\u{1b}[4m"), "a note is not underlined");
+            }
+        }
+        let joined = plan_echo(&parts)
+            .into_iter()
+            .map(|s| s.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("[1] fade out"));
+        assert!(joined.trim_end().ends_with("confirm? [y/N]"));
+    }
+
+    #[test]
+    fn every_handler_shape_renders_through_the_cli_path() {
+        use hypodj_client::spoken::{reply_shapes, speak_shape};
+        use hypodj_style::State;
+        for shape in reply_shapes() {
+            let spoken = speak_shape(&shape);
+            let off = Ansi::off().render(&spoken);
+            let on = Ansi::on_truecolor().render(&spoken);
+            let indexed = Ansi::on_indexed().render(&spoken);
+            assert_eq!(off, spoken.text(), "{}", shape.name);
+            assert_eq!(hypodj_style::ansi::strip(&on), off, "{}", shape.name);
+            assert_eq!(hypodj_style::ansi::strip(&indexed), off, "{}", shape.name);
+            assert_eq!(spoken.state, shape.state, "{}", shape.name);
+            assert_eq!(spoken.lines, shape.lines, "{}", shape.name);
+            match shape.state {
+                State::Live => {
+                    assert!(!on.contains("38;2;"), "live paints no ink: {}", shape.name);
+                    assert!(!on.contains("38;5;"), "live paints no ink: {}", shape.name);
+                    if !spoken.text().is_empty() {
+                        assert!(on.contains("\u{1b}[1m"), "live is bold: {}", shape.name);
+                    }
+                }
+                State::Refused => {
+                    assert_eq!(on, off, "a refusal has no colour: {}", shape.name);
+                    assert!(!on.contains('\u{1b}'), "{}", shape.name);
+                }
+                State::Armed => assert!(on.contains("38;2;"), "armed is ember: {}", shape.name),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_confirm_and_a_status_use_the_same_words_on_the_cli() {
+        use hypodj_client::spoken::{command_spoken, from_confirm};
+        let mixed = [
+            ("plan_id".into(), "1".into()),
+            ("result".into(), "added 5 tracks".into()),
+            ("plan_id".into(), "2".into()),
+        ];
+        let off = render_confirm(&mixed, Ansi::off());
+        let on = render_confirm(&mixed, Ansi::on_truecolor());
+        assert_eq!(off, "added 5 tracks; armed (plan 2)");
+        assert_eq!(hypodj_style::ansi::strip(&on), off);
+        assert!(on.contains("\u{1b}[1m"), "the live plan is bold");
+        assert!(on.contains("38;2;"), "the armed plan is ember");
+
+        let batch = [
+            ("plan_id".into(), "7".into()),
+            ("plan_id".into(), "8".into()),
+        ];
+        let batch_off = render_confirm(&batch, Ansi::off());
+        assert_eq!(batch_off, from_confirm(&batch).text());
+        assert!(batch_off.contains("armed (plan 7)"));
+        assert!(batch_off.contains("armed (plan 8)"));
+
+        let sleep = vec![("sleep_remaining".into(), "720".into())];
+        let sleep_spoken = command_spoken("sleep", &sleep).unwrap();
+        let hold = hypodj_client::spoken::armed_hold(&hypodj_client::model::ArmedFeatures {
+            sleep_remaining: Some(720),
+            ..hypodj_client::model::ArmedFeatures::default()
+        })
+        .unwrap();
+        assert_eq!(sleep_spoken.state, hypodj_style::State::Armed);
+        assert_eq!(hold.state, sleep_spoken.state);
+        let sleep_on = render_command("sleep", &sleep, Ansi::on_truecolor()).unwrap();
+        assert!(sleep_on.contains("38;2;"), "a countdown is ember");
+        assert_eq!(hypodj_style::ansi::strip(&sleep_on), sleep_spoken.text());
+
+        let quiet = vec![("wake".into(), "none".into())];
+        let quiet_spoken = command_spoken("wake", &quiet).unwrap();
+        assert_eq!(quiet_spoken.state, hypodj_style::State::Note);
+        let quiet_on = render_command("wake", &quiet, Ansi::on_truecolor()).unwrap();
+        assert!(!quiet_on.contains("38;2;"), "nothing pending is not ember");
+
+        for (line, raw) in [
+            (
+                "nl",
+                vec![("nl_answer".into(), "yes, \"Blue\" is a favorite".into())],
+            ),
+            ("undo", vec![("jdid".into(), "cleared 7".into())]),
+        ] {
+            let spoken = command_spoken(line, &raw).unwrap();
+            assert_eq!(
+                render_command(line, &raw, Ansi::off()).as_deref(),
+                Some(spoken.text().as_str())
+            );
+            assert_eq!(spoken.state, hypodj_style::State::Live, "{line}");
+        }
+    }
+
+    #[test]
+    fn armed_hud_on_the_card_is_ember_and_strips_clean() {
+        let status = p(&[("state", "play"), ("X-hypodj-sleep-remaining", "720")]);
+        let current = p(&[("file", "song/1"), ("Title", "X")]);
+        let np = now_playing(&status, &current);
+        let off = render_card_with(&np, Ansi::off());
+        let on = render_card_with(&np, Ansi::on_truecolor());
+        assert!(off.contains("sleep in 12m"));
+        assert_eq!(hypodj_style::ansi::strip(&on), off);
+        assert_ne!(on, off, "the armed line is coloured");
     }
 
     #[test]
@@ -303,7 +481,10 @@ mod tests {
             ("X-hypodj-continuation-station", "NTS 1"),
         ]);
         let out = render_card(&now_playing(&status, &[]));
-        assert!(out.contains("then: NTS 1"), "continuation hint line present:\n{out}");
+        assert!(
+            out.contains("then: NTS 1"),
+            "continuation hint line present:\n{out}"
+        );
         // Disarmed -> no line.
         let np = now_playing(&p(&[("state", "stop")]), &[]);
         assert!(!render_card(&np).contains("then:"));
@@ -419,7 +600,12 @@ mod tests {
 
     #[test]
     fn card_hides_unknown_volume() {
-        let status = p(&[("volume", "-1"), ("playlistlength", "1"), ("state", "play"), ("song", "0")]);
+        let status = p(&[
+            ("volume", "-1"),
+            ("playlistlength", "1"),
+            ("state", "play"),
+            ("song", "0"),
+        ]);
         let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
         let card = render_card(&now_playing(&status, &current));
         assert!(!card.contains("vol"));
@@ -457,7 +643,10 @@ mod tests {
             ("playlistlength", "12"),
             ("state", "play"),
             ("song", "2"),
-            ("X-Store", "318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming"),
+            (
+                "X-Store",
+                "318 of 347 tracks, 12.1 of 16.0 GiB, paused while streaming",
+            ),
         ]);
         let current = p(&[("file", "song/42"), ("Title", "Blue in Green")]);
         let card = render_card(&now_playing(&status, &current));
@@ -469,7 +658,10 @@ mod tests {
         let stopped = p(&[("state", "stop"), ("X-Store", "all 347 tracks, 9.8 GiB")]);
         let card = render_card(&now_playing(&stopped, &[]));
         assert!(card.contains("nothing playing"));
-        assert!(card.contains("store: all 347 tracks, 9.8 GiB"), "card: {card}");
+        assert!(
+            card.contains("store: all 347 tracks, 9.8 GiB"),
+            "card: {card}"
+        );
 
         // No store (or no full pass yet): no line at all, exactly like the armed HUD.
         let lean = p(&[("state", "stop")]);
@@ -488,7 +680,10 @@ mod tests {
                 ("X-LastPlayed", "3"),
             ]),
         ));
-        assert!(card.contains("23 plays, last heard 3 days ago"), "card: {card}");
+        assert!(
+            card.contains("23 plays, last heard 3 days ago"),
+            "card: {card}"
+        );
 
         // A track the server has never seen played renders NOTHING - not "0 plays",
         // which would be a claim the daemon deliberately declined to make.
@@ -510,13 +705,19 @@ mod tests {
             &p(&[("Title", "T"), ("X-LastPlayed", "1")]),
         ));
         assert!(yday.contains("last heard yesterday"), "card: {yday}");
-        assert!(!yday.contains("plays"), "a stamp with no count invents no count: {yday}");
+        assert!(
+            !yday.contains("plays"),
+            "a stamp with no count invents no count: {yday}"
+        );
     }
 
     #[test]
     fn card_shows_playback_modes_only_when_on() {
         let cur = p(&[("Title", "T")]);
-        let on = now_playing(&p(&[("state", "play"), ("random", "1"), ("repeat", "1")]), &cur);
+        let on = now_playing(
+            &p(&[("state", "play"), ("random", "1"), ("repeat", "1")]),
+            &cur,
+        );
         let card = render_card(&on);
         assert!(card.contains("| random repeat"), "card: {card}");
         let off = now_playing(&p(&[("state", "play"), ("random", "0")]), &cur);
@@ -524,5 +725,4 @@ mod tests {
         let stopped = now_playing(&p(&[("state", "stop"), ("single", "1")]), &[]);
         assert!(render_card(&stopped).contains("modes: single"));
     }
-
 }

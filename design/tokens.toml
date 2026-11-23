@@ -1,0 +1,22 @@
+# HypoDJ design tokens: single source of truth. See docs/design/tokens.md.
+# Status: proposed (2026-11-23).
+
+[room]
+ink_primary_min_contrast = 7.0
+ink_quiet_min_contrast = 4.5
+rule_max_contrast = 2.0
+
+[music]
+info_min_contrast = 3.0        # INFO_TARGET
+decoration_max_contrast = 2.0  # DECO_CEILING
+
+[ember]
+oklch = [0.74, 0.15, 60.0]
+min_contrast = 3.0
+
+[motion]
+floor_ms = 250       # FadeConfig.min_slew_ms
+skip_ms = 350        # DEFAULT_SKIP_FADE_SECS
+pause_ms = 500       # DEFAULT_PAUSE_FADE_SECS
+max_chrome_hz = 4
+curve = "oklch_lightness"

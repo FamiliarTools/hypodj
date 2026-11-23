@@ -93,10 +93,7 @@ fn main() {
     if raw.iter().any(|a| a == "-V" || a == "--version") {
         println!(
             "dj {}",
-            hypodj_build_info::version(
-                env!("CARGO_PKG_VERSION"),
-                option_env!("HYPODJ_BUILD_INFO"),
-            )
+            hypodj_build_info::version(env!("CARGO_PKG_VERSION"), option_env!("HYPODJ_BUILD_INFO"),)
         );
         return;
     }
@@ -148,10 +145,7 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
             continue;
         }
         if let Some(v) = a.strip_prefix("--port=") {
-            port = Some(
-                v.parse::<u16>()
-                    .map_err(|_| format!("bad port: {v}"))?,
-            );
+            port = Some(v.parse::<u16>().map_err(|_| format!("bad port: {v}"))?);
             continue;
         }
         match a.as_str() {
@@ -185,7 +179,13 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
             }
         }
     }
-    Ok(Parsed { host, port, nl_translator, help, words })
+    Ok(Parsed {
+        host,
+        port,
+        nl_translator,
+        help,
+        words,
+    })
 }
 
 fn run(raw: Vec<String>) -> Result<(), MpdError> {
@@ -203,7 +203,9 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
     // belong in it - and left to the fallthrough, "stations import" would be sent to
     // the NL translator.
     if parsed.words.first().is_some_and(|w| w == "stations") {
-        let env = Env { get: &|k| std::env::var(k).ok() };
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         // A partial import is reported in full and THEN exits non-zero, so a script
@@ -220,7 +222,9 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
     // pins - and left to the fallthrough, `heard limit 5` and `heard --all` would be
     // handed to the NL translator, which has no heard action at all.
     if parsed.words.first().is_some_and(|w| w == "heard") {
-        let env = Env { get: &|k| std::env::var(k).ok() };
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         if !heard::run(&mut conn, &parsed.words[1..])? {
@@ -233,7 +237,9 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
     // reason: route knows no store verb at all, so every form of this - including the
     // bare one - would be handed to the NL translator, which has no store action.
     if parsed.words.first().is_some_and(|w| w == "store") {
-        let env = Env { get: &|k| std::env::var(k).ok() };
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         if !store::run(&mut conn, &parsed.words[1..])? {
@@ -246,8 +252,14 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
     // same stated reason: route knows neither verb, so both would be handed to the
     // NL translator, which has no journal action - and "undo" is the last phrase
     // that should reach a model.
-    if parsed.words.first().is_some_and(|w| w == "journal" || w == "undo") {
-        let env = Env { get: &|k| std::env::var(k).ok() };
+    if parsed
+        .words
+        .first()
+        .is_some_and(|w| w == "journal" || w == "undo")
+    {
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         let ok = if parsed.words[0] == "journal" {
@@ -273,7 +285,9 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         return Ok(());
     }
 
-    let env = Env { get: &|k| std::env::var(k).ok() };
+    let env = Env {
+        get: &|k| std::env::var(k).ok(),
+    };
     let (host, port) = config::resolve(parsed.host, parsed.port, &env);
     let pin = match nl::NlTranslatorPin::resolve(
         parsed.nl_translator.as_deref(),
@@ -293,7 +307,15 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         Action::Command(line) => run_verb(&mut conn, &line)?,
         Action::ClearConfirm => {
             if confirm("clear the whole queue?") {
-                conn.command("clear")?;
+                let pairs = conn.command("clear")?;
+                println!(
+                    "{}",
+                    render::render_outcome(
+                        &pairs,
+                        hypodj_client::spoken::act_from_command("clear"),
+                        stdout_ansi(),
+                    )
+                );
                 print_card(&mut conn)?;
             } else {
                 println!("cancelled");
@@ -340,7 +362,10 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
     match conn.command(&format!("playlistadd Starred {uri}")) {
         Ok(_) => {
             let label = np.title.as_deref().unwrap_or(uri);
-            println!("favorited: {label}");
+            println!(
+                "{}",
+                stdout_ansi().render(&hypodj_client::spoken::live_text(format!("favorited: {label}")))
+            );
             print_card(conn)?;
         }
         Err(MpdError::Ack(msg)) => println!("could not favorite: {msg}"),
@@ -355,11 +380,8 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
 /// `dj mark` succeed in silence, which is the precise bug the gesture exists to end.
 fn run_verb(conn: &mut MpdConn, line: &str) -> Result<(), MpdError> {
     let pairs = conn.command(line)?;
-    if let Some((_, sentence)) = pairs.iter().find(|(k, _)| k == "mark_result") {
-        println!("{sentence}");
-    }
-    if let Some(sentence) = model::schedule_reply(&pairs) {
-        println!("{sentence}");
+    if let Some(spoken) = render::render_command(line, &pairs, stdout_ansi()) {
+        println!("{spoken}");
     }
     print_card(conn)
 }
@@ -369,7 +391,8 @@ fn print_card(conn: &mut MpdConn) -> Result<(), MpdError> {
     let status = conn.command("status")?;
     let current = conn.command("currentsong")?;
     let np = model::now_playing(&status, &current);
-    println!("{}", render::render_card(&np));
+    let ansi = stdout_ansi();
+    println!("{}", render::render_card_with(&np, ansi));
     Ok(())
 }
 
@@ -407,48 +430,41 @@ fn nl_handshake(
         Ok(p) => p,
         // An ACK here is a translate failure: map to a friendly reason.
         Err(MpdError::Ack(msg)) => {
-            println!("{}", nl::map_ack_reason(&msg));
+            println!("{}", render::render_refusal(&msg, stdout_ansi()));
             return Ok(());
         }
         Err(e) => return Err(e),
     };
 
     // A READ-side question is answered immediately (no plan, nothing to confirm).
-    if let Some(answer) = nl::answer_from_pairs(&pairs) {
-        println!("{answer}");
+    if let Some(line) = render::render_command("nl", &pairs, stdout_ansi()) {
+        println!("{line}");
         return Ok(());
     }
     let token = match nl::token_from_pairs(&pairs) {
         Some(t) => t,
         None => {
-            println!("the server did not return a plan to confirm");
+            println!(
+                "{}",
+                stdout_ansi().render(&hypodj_client::spoken::refused_text(
+                    "the server did not return a plan to confirm",
+                ))
+            );
             return Ok(());
         }
     };
 
     if let Some(echo) = nl::echo_from_pairs(&pairs) {
-        let parts = nl::split_echo(&echo);
-        if let Some(trust) = &parts.trust {
-            println!("({trust})");
-        }
-        for step in &parts.steps {
-            println!("{step}");
-        }
-        // Wake caveat surfaced as a warning ABOVE the prompt.
-        if let Some(note) = &parts.note {
-            println!("\n! {note}");
-        }
+        print_utterances(&hypodj_client::spoken::plan_echo(&nl::split_echo(&echo)));
     }
 
-    if confirm("confirm?") {
+    if read_answer() {
         match conn.command(&format!("nl confirm {token}")) {
             Ok(plan_pairs) => {
-                for line in nl::confirm_lines(&plan_pairs) {
-                    println!("{line}");
-                }
+                println!("{}", render::render_confirm(&plan_pairs, stdout_ansi()));
                 print_card(conn)?;
             }
-            Err(MpdError::Ack(msg)) => println!("{}", nl::map_ack_reason(&msg)),
+            Err(MpdError::Ack(msg)) => println!("{}", render::render_refusal(&msg, stdout_ansi())),
             Err(e) => return Err(e),
         }
     } else {
@@ -505,7 +521,9 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
     let raw = match result {
         Ok(raw) => raw,
         Err(e) => {
-            eprintln!("Claude Code could not translate that ({e}); trying the built-in translator.");
+            eprintln!(
+                "Claude Code could not translate that ({e}); trying the built-in translator."
+            );
             return Ok(false);
         }
     };
@@ -519,28 +537,31 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
         }
     };
 
-    println!("(via Claude Code)");
-    println!("{}", hypodj_nl::describe_plan(&raw));
+    let mut lines = vec!["(via Claude Code)".to_string()];
+    lines.extend(
+        hypodj_nl::describe_plan(&raw)
+            .lines()
+            .map(|l| l.to_string()),
+    );
+    print_utterances(&[
+        hypodj_style::Spoken::new(hypodj_style::State::Echo, lines),
+        hypodj_style::Spoken::new(
+            hypodj_style::State::Echo,
+            vec![hypodj_client::spoken::CONFIRM_LINE.to_string()],
+        ),
+    ]);
 
-    if confirm("confirm?") {
-        match conn.command(&format!("plan add {dsl}")) {
+    if read_answer() {
+        let cmd = format!("plan add {dsl}");
+        match conn.command(&cmd) {
             Ok(plan_pairs) => {
-                // Prefer the REAL execute-time outcome ("added N", "added 0 - no
-                // matches for X", "played X") the daemon returns for an immediate
-                // plan; fall back to the plan-time armed line for a deferred plan.
-                match nl::result_line_from_pairs(&plan_pairs) {
-                    Some(line) => println!("{line}"),
-                    None => {
-                        for (k, v) in &plan_pairs {
-                            if k == "plan_id" {
-                                println!("{}", nl::armed_line(v));
-                            }
-                        }
-                    }
-                }
+                println!(
+                    "{}",
+                    render::render_outcome(&plan_pairs, None, stdout_ansi())
+                );
                 print_card(conn)?;
             }
-            Err(MpdError::Ack(msg)) => println!("{}", nl::map_ack_reason(&msg)),
+            Err(MpdError::Ack(msg)) => println!("{}", render::render_refusal(&msg, stdout_ansi())),
             Err(e) => return Err(e),
         }
     } else {
@@ -623,7 +644,10 @@ mod tests {
             route::route(&v(&["heard", "limit", "5"])),
             Action::Nl("heard limit 5".into())
         );
-        assert_eq!(route::route(&v(&["heard", "--all"])), Action::Nl("heard --all".into()));
+        assert_eq!(
+            route::route(&v(&["heard", "--all"])),
+            Action::Nl("heard --all".into())
+        );
         // And the tokens survive parse_args intact, so the interception sees them.
         let p = parse_args(v(&["heard", "--all"])).unwrap();
         assert_eq!(p.words, v(&["heard", "--all"]));
@@ -632,8 +656,14 @@ mod tests {
         assert_eq!(p.port, Some(6699));
         assert_eq!(p.words, v(&["heard", "limit", "5"]));
         // The bare views DO route, which is what makes `:heard` work in the TUI.
-        assert_eq!(route::route(&v(&["heard"])), Action::Command("heard".into()));
-        assert_eq!(route::route(&v(&["heard", "all"])), Action::Command("heard all".into()));
+        assert_eq!(
+            route::route(&v(&["heard"])),
+            Action::Command("heard".into())
+        );
+        assert_eq!(
+            route::route(&v(&["heard", "all"])),
+            Action::Command("heard all".into())
+        );
     }
 
     #[test]
@@ -713,7 +743,14 @@ mod tests {
             nl::NlTranslatorPin::Rules
         );
         // Unquoted phrase words plus trailing pin behave the same.
-        let p = parse_args(v(&["play", "something", "calmer", "--nl-translator", "rules"])).unwrap();
+        let p = parse_args(v(&[
+            "play",
+            "something",
+            "calmer",
+            "--nl-translator",
+            "rules",
+        ]))
+        .unwrap();
         assert_eq!(p.nl_translator.as_deref(), Some("rules"));
         assert_eq!(p.words, v(&["play", "something", "calmer"]));
         // `--flag=value` spelling after the phrase also pins.
@@ -727,8 +764,41 @@ mod tests {
 
 /// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm; bare
 /// Enter, "n", EOF (Ctrl-D), all mean No.
+fn stdout_ansi() -> hypodj_style::Ansi {
+    let no = std::env::var("NO_COLOR").ok();
+    let ct = std::env::var("COLORTERM").ok();
+    hypodj_style::Ansi::from_env(
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        no.as_deref(),
+        ct.as_deref(),
+    )
+}
+
+/// Print utterances. The last line stays on the same row as the answer.
+fn print_utterances(items: &[hypodj_style::Spoken]) {
+    let ansi = stdout_ansi();
+    let last = items.len().saturating_sub(1);
+    for (i, spoken) in items.iter().enumerate() {
+        let text = ansi.render(spoken);
+        if i == last {
+            print!("{text} ");
+            let _ = std::io::stdout().flush();
+        } else {
+            println!("{text}");
+        }
+    }
+}
+
+/// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm.
+/// The question and the typed answer share one line.
 pub(crate) fn confirm(question: &str) -> bool {
-    print!("{question} [y/N] ");
+    let spoken = hypodj_client::spoken::confirm_question(question);
+    print!("{} ", stdout_ansi().render(&spoken));
+    read_answer()
+}
+
+/// Read a default-No answer. The prompt itself was already printed.
+fn read_answer() -> bool {
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     match std::io::stdin().lock().read_line(&mut line) {

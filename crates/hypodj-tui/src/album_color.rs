@@ -1,12 +1,13 @@
-//! The SHARED visual-system primitives: terminal-background detection (OSC 11) and
-//! cover-palette extraction, plus the WCAG contrast math and OKLCH nudges that turn a
-//! raw album swatch into a legible waveform color (INFO policy, SC 1.4.11 >= 3:1) or a
-//! muted sigil decoration (DECORATION policy, capped below a distraction ceiling).
+//! Terminal-background detection (OSC 11) and cover-palette extraction.
 //!
-//! The album sigil and the waveform both read from exactly these two primitives -
-//! cover -> [`Palette`] and OSC 11 -> [`TermBg`] - so the two features are one system.
-//! Everything here is a PURE function except [`probe_bg`], which does the one-shot
-//! stdin read (bounded so a non-answering terminal never hangs the TUI).
+//! Contrast math and the OKLCH nudges live in `hypodj-style`. This module keeps the
+//! terminal IO: the OSC 11 probe, the DA1 sixel probe, and `COLORFGBG` parsing.
+//! [`info_color`] and [`to_color`] are thin wrappers over the ratatui adapter so
+//! existing call sites keep compiling. The sigil and the waveform still share
+//! [`Palette`] and [`TermBg`].
+//!
+//! Everything here is a PURE function except [`probe_bg`] and [`probe_sixel`], which
+//! do the one-shot stdin reads (bounded so a non-answering terminal never hangs).
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -14,49 +15,14 @@ use std::time::Duration;
 use ratatui::style::Color;
 
 use hypodj_client::config::Env;
-
-/// The lingua franca to and from `ratatui::style::Color::Rgb`.
-pub type Rgb = [u8; 3];
+pub use hypodj_style::{
+    contrast_ratio, fit_decoration, fit_info, oklch_to_srgb, quantize_256, relative_luminance,
+    srgb_to_oklch, BgSource, Rgb, TermBg, NEUTRAL_MUTED, NEUTRAL_VIBRANT, XTERM_CUBE as CUBE,
+};
 
 // --------------------------------------------------------------------------
 // (a) OSC 11 terminal-background query.
 // --------------------------------------------------------------------------
-
-/// Where a resolved terminal background came from, in fallback order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BgSource {
-    Osc11,
-    ColorFgBg,
-    // Reserved fallback tier (a TERM/COLORTERM luminance heuristic) between COLORFGBG
-    // and the dark default; kept in the documented order even though the current chain
-    // jumps straight to the dark default when no signal exists.
-    #[allow(dead_code)]
-    LuminanceGuess,
-    DarkDefault,
-}
-
-/// The detected terminal background, with its relative luminance pre-computed and a
-/// dark/light classification for the contrast policies.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TermBg {
-    pub rgb: Rgb,
-    pub luminance: f32,
-    pub is_dark: bool,
-    pub source: BgSource,
-}
-
-impl TermBg {
-    pub(crate) fn from_rgb(rgb: Rgb, source: BgSource) -> TermBg {
-        let luminance = relative_luminance(rgb);
-        TermBg { rgb, luminance, is_dark: luminance < 0.5, source }
-    }
-
-    /// The guaranteed near-black fallback: used whenever no reliable signal exists so
-    /// the rest of the visual system always has a background to contrast against.
-    pub fn dark_default() -> TermBg {
-        TermBg::from_rgb([0x12, 0x12, 0x12], BgSource::DarkDefault)
-    }
-}
 
 /// Probe the terminal background. Writes `ESC ]11;? BEL` to `out`, then reads the
 /// reply from stdin with a bounded deadline (`timeout`, <= ~100ms in practice) so a
@@ -416,195 +382,14 @@ const XTERM16: [Rgb; 16] = [
     [0xff, 0xff, 0xff],
 ];
 
-// --------------------------------------------------------------------------
-// (c) WCAG relative luminance + contrast, and the OKLCH nudge policies.
-// --------------------------------------------------------------------------
-
-fn srgb_to_linear(c: u8) -> f32 {
-    let c = c as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn linear_to_srgb(c: f32) -> u8 {
-    let c = c.clamp(0.0, 1.0);
-    let v = if c <= 0.0031308 {
-        c * 12.92
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    };
-    (v * 255.0).round().clamp(0.0, 255.0) as u8
-}
-
-/// WCAG relative luminance in `[0, 1]` (black = 0, white = 1). Pure and unit-tested.
-pub fn relative_luminance(c: Rgb) -> f32 {
-    let r = srgb_to_linear(c[0]);
-    let g = srgb_to_linear(c[1]);
-    let b = srgb_to_linear(c[2]);
-    0.2126 * r + 0.7152 * g + 0.0722 * b
-}
-
-/// WCAG contrast ratio in `1.0..=21.0`, order-free. Pure and unit-tested.
-pub fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
-    let la = relative_luminance(a);
-    let lb = relative_luminance(b);
-    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
-}
-
-/// A color in the OKLCH perceptual space (lightness, chroma, hue-radians).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Oklch {
-    pub l: f32,
-    pub c: f32,
-    pub h: f32,
-}
-
-/// sRGB -> OKLCH (Ottosson's Oklab, expressed as lightness/chroma/hue).
-pub fn srgb_to_oklch(c: Rgb) -> Oklch {
-    let r = srgb_to_linear(c[0]);
-    let g = srgb_to_linear(c[1]);
-    let b = srgb_to_linear(c[2]);
-    let l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;
-    let m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;
-    let s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;
-    let l_ = l.cbrt();
-    let m_ = m.cbrt();
-    let s_ = s.cbrt();
-    let ll = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
-    let aa = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
-    let bb = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
-    Oklch { l: ll, c: (aa * aa + bb * bb).sqrt(), h: bb.atan2(aa) }
-}
-
-/// OKLCH -> sRGB, gamut-clamped by clamping the linear channels.
-pub fn oklch_to_srgb(o: Oklch) -> Rgb {
-    let a = o.c * o.h.cos();
-    let b = o.c * o.h.sin();
-    let l_ = o.l + 0.3963377774 * a + 0.2158037573 * b;
-    let m_ = o.l - 0.1055613458 * a - 0.0638541728 * b;
-    let s_ = o.l - 0.0894841775 * a - 1.2914855480 * b;
-    let l = l_ * l_ * l_;
-    let m = m_ * m_ * m_;
-    let s = s_ * s_ * s_;
-    let r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
-    let g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
-    let bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
-    [linear_to_srgb(r), linear_to_srgb(g), linear_to_srgb(bl)]
-}
-
-/// The INFO contrast target for the waveform: a graphic (SC 1.4.11 non-text) needs
-/// >= 3:1 against the background.
-const INFO_TARGET: f32 = 3.0;
-
-/// The luminance where contrast to black equals contrast to white:
-/// `(L+0.05)^2 = 0.05 * 1.05` => `L ~= 0.179`. BELOW it, pushing lightness UP (toward
-/// white) has more contrast headroom; ABOVE it, pushing DOWN (toward black) does. This
-/// is the correct nudge pivot - NOT `is_dark`'s 0.5 midpoint, which drives medium-gray
-/// backgrounds the low-headroom way and can never reach 3:1.
-const INFO_PIVOT: f32 = 0.179;
-
-/// The lightness-nudge direction (+1 up / -1 down) that maximizes contrast headroom
-/// against `bg`, pivoting on [`INFO_PIVOT`].
-fn info_dir(bg: TermBg) -> f32 {
-    if bg.luminance < INFO_PIVOT {
-        1.0
-    } else {
-        -1.0
-    }
-}
-
-/// The legible neutral for a degenerate fit (swatch ~= bg, or hue pinned in a corner):
-/// near-white on darker-than-pivot backgrounds, near-black otherwise.
-fn info_neutral(bg: TermBg) -> Rgb {
-    if bg.luminance < INFO_PIVOT {
-        [0xe0, 0xe0, 0xe0]
-    } else {
-        [0x20, 0x20, 0x20]
-    }
-}
-
-/// INFO policy (the waveform): push the swatch's OKLCH lightness AWAY from the
-/// background in small steps (re-clamping chroma to gamut each step, preserving hue)
-/// until it clears >= 3:1. A swatch already indistinguishable from the bg degenerates
-/// to a near-fg neutral. NOTE: this guarantees >= 3:1 in TRUECOLOR; on a 256-color
-/// terminal use [`info_color`], which re-checks contrast after quantization. Pure and
-/// unit-tested.
-pub fn fit_info(swatch: Rgb, bg: TermBg) -> Rgb {
-    if contrast_ratio(swatch, bg.rgb) >= INFO_TARGET {
-        return swatch;
-    }
-    let mut o = srgb_to_oklch(swatch);
-    let dir = info_dir(bg);
-    for _ in 0..50 {
-        o.l = (o.l + dir * 0.02).clamp(0.0, 1.0);
-        let c = oklch_to_srgb(o);
-        if contrast_ratio(c, bg.rgb) >= INFO_TARGET {
-            return c;
-        }
-    }
-    // Degenerate (swatch ~= bg, or hue pinned in a corner): a legible neutral.
-    info_neutral(bg)
-}
-
-/// The INFO policy as an actual ratatui [`Color`], honoring the terminal's color depth.
-/// In truecolor this is just `fit_info` -> `Color::Rgb`. On a 256-color terminal the
-/// >= 3:1 guarantee that `fit_info` makes in RGB space can be LOST when the color is
-/// snapped to the xterm-256 palette, so here we re-check contrast on the REALIZED
-/// quantized color and keep nudging (in the same headroom direction) until the on-screen
-/// cell itself clears 3:1, falling back to a quantized legible neutral. Pure and
-/// unit-tested.
+/// The INFO policy as a ratatui colour. Implemented in the ratatui adapter.
 pub fn info_color(swatch: Rgb, bg: TermBg, truecolor: bool) -> Color {
-    let fitted = fit_info(swatch, bg);
-    if truecolor {
-        return Color::Rgb(fitted[0], fitted[1], fitted[2]);
-    }
-    let (idx, realized) = quantize_256(fitted);
-    if contrast_ratio(realized, bg.rgb) >= INFO_TARGET {
-        return Color::Indexed(idx);
-    }
-    // Quantization dropped it below the floor: nudge lightness further away from bg and
-    // test the realized cell each step.
-    let mut o = srgb_to_oklch(fitted);
-    let dir = info_dir(bg);
-    for _ in 0..50 {
-        o.l = (o.l + dir * 0.02).clamp(0.0, 1.0);
-        let (idx, realized) = quantize_256(oklch_to_srgb(o));
-        if contrast_ratio(realized, bg.rgb) >= INFO_TARGET {
-            return Color::Indexed(idx);
-        }
-    }
-    Color::Indexed(quantize_256(info_neutral(bg)).0)
+    hypodj_style::ratatui::info_color(swatch, bg, truecolor)
 }
 
-/// The DECORATION distraction ceiling: a sigil may never reach the >= 3:1 INFO floor
-/// (that would read as information, not decoration). Kept comfortably below it so even
-/// a light-dominant cover on a dark terminal stays a quiet texture.
-const DECO_CEILING: f32 = 2.0;
-
-/// DECORATION policy (the album sigil): pull chroma down ~50% and nudge lightness
-/// TOWARD the background so the sigil sits BELOW a distraction ceiling - present, but
-/// never a 3:1 attention-grabber. A light-dominant cover on a dark bg (or vice versa)
-/// can still clear the ceiling after the fixed blend, so we then pull lightness the rest
-/// of the way toward the bg in small steps until contrast drops under [`DECO_CEILING`].
-/// Pure and unit-tested.
-pub fn fit_decoration(swatch: Rgb, bg: TermBg) -> Rgb {
-    let mut o = srgb_to_oklch(swatch);
-    let bgo = srgb_to_oklch(bg.rgb);
-    o.c *= 0.5;
-    o.l = o.l * 0.55 + bgo.l * 0.45;
-    // Enforce the distraction ceiling: step lightness toward the bg's lightness until
-    // the realized contrast sits under the cap (or we have collapsed onto the bg).
-    for _ in 0..50 {
-        if contrast_ratio(oklch_to_srgb(o), bg.rgb) <= DECO_CEILING {
-            break;
-        }
-        o.l += (bgo.l - o.l) * 0.2;
-    }
-    oklch_to_srgb(o)
+/// Turn an `Rgb` into a ratatui `Color`. Implemented in the ratatui adapter.
+pub fn to_color(c: Rgb, truecolor: bool) -> Color {
+    hypodj_style::ratatui::to_color(c, truecolor)
 }
 
 // --------------------------------------------------------------------------
@@ -623,7 +408,7 @@ pub struct Palette {
 impl Palette {
     /// A neutral grey palette, the image-less / decode-failure fallback.
     pub fn neutral() -> Palette {
-        Palette { vibrant: [0x88, 0x88, 0x88], muted: [0x55, 0x55, 0x55], swatches: vec![[0x88, 0x88, 0x88]] }
+        Palette { vibrant: NEUTRAL_VIBRANT, muted: NEUTRAL_MUTED, swatches: vec![NEUTRAL_VIBRANT] }
     }
 }
 
@@ -775,58 +560,6 @@ pub fn truecolor(env: &Env) -> bool {
     )
 }
 
-/// The xterm 6-level cube axis values.
-const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
-
-/// Nearest xterm-256 color: returns the index AND the color it actually realizes, so
-/// the caller can re-run [`contrast_ratio`] POST-quantization. Considers the 6x6x6
-/// cube (16..231) and the 24-step gray ramp (232..255). Pure and unit-tested.
-pub fn quantize_256(c: Rgb) -> (u8, Rgb) {
-    let dist = |a: Rgb, b: Rgb| -> i32 {
-        (0..3).map(|i| {
-            let d = a[i] as i32 - b[i] as i32;
-            d * d
-        }).sum()
-    };
-    let mut best_idx = 16u8;
-    let mut best_rgb = [0u8; 3];
-    let mut best_d = i32::MAX;
-    for r in 0..6 {
-        for g in 0..6 {
-            for b in 0..6 {
-                let rgb = [CUBE[r], CUBE[g], CUBE[b]];
-                let d = dist(rgb, c);
-                if d < best_d {
-                    best_d = d;
-                    best_rgb = rgb;
-                    best_idx = 16 + (36 * r + 6 * g + b) as u8;
-                }
-            }
-        }
-    }
-    for j in 0..24u8 {
-        let v = 8 + j * 10;
-        let rgb = [v, v, v];
-        let d = dist(rgb, c);
-        if d < best_d {
-            best_d = d;
-            best_rgb = rgb;
-            best_idx = 232 + j;
-        }
-    }
-    (best_idx, best_rgb)
-}
-
-/// Turn an `Rgb` into a ratatui `Color`: truecolor `Color::Rgb`, else the nearest
-/// xterm-256 `Color::Indexed`.
-pub fn to_color(c: Rgb, truecolor: bool) -> Color {
-    if truecolor {
-        Color::Rgb(c[0], c[1], c[2])
-    } else {
-        Color::Indexed(quantize_256(c).0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,8 +644,8 @@ mod tests {
         let light = TermBg::from_rgb([0xf0, 0xf0, 0xf0], BgSource::DarkDefault);
         let on_dark = fit_info(swatch, dark);
         let on_light = fit_info(swatch, light);
-        assert!(contrast_ratio(on_dark, dark.rgb) >= INFO_TARGET, "clears on dark");
-        assert!(contrast_ratio(on_light, light.rgb) >= INFO_TARGET, "clears on light");
+        assert!(contrast_ratio(on_dark, dark.rgb) >= hypodj_style::tokens().music.info_min_contrast, "clears on dark");
+        assert!(contrast_ratio(on_light, light.rgb) >= hypodj_style::tokens().music.info_min_contrast, "clears on light");
         // Hue is roughly preserved (only lightness was nudged).
         let h0 = srgb_to_oklch(swatch).h;
         let h1 = srgb_to_oklch(on_dark).h;
@@ -928,7 +661,7 @@ mod tests {
             let bg = TermBg::from_rgb([g, g, g], BgSource::DarkDefault);
             let fitted = fit_info(swatch, bg);
             assert!(
-                contrast_ratio(fitted, bg.rgb) >= INFO_TARGET,
+                contrast_ratio(fitted, bg.rgb) >= hypodj_style::tokens().music.info_min_contrast,
                 "clears 3:1 on gray {g}: got {:.2} for {fitted:?}",
                 contrast_ratio(fitted, bg.rgb)
             );
@@ -951,14 +684,14 @@ mod tests {
             }
         };
         // Regression anchor from the finding.
-        assert!(contrast_ratio(realized([0, 14, 7]), bg.rgb) >= INFO_TARGET);
+        assert!(contrast_ratio(realized([0, 14, 7]), bg.rgb) >= hypodj_style::tokens().music.info_min_contrast);
         // Sweep a spread of swatches; every one must clear post-quantization.
         for r in (0..=255).step_by(51) {
             for g in (0..=255).step_by(51) {
                 for b in (0..=255).step_by(51) {
                     let got = realized([r as u8, g as u8, b as u8]);
                     assert!(
-                        contrast_ratio(got, bg.rgb) >= INFO_TARGET,
+                        contrast_ratio(got, bg.rgb) >= hypodj_style::tokens().music.info_min_contrast,
                         "swatch {:?} realized {got:?} only {:.2}:1",
                         [r, g, b],
                         contrast_ratio(got, bg.rgb)
@@ -1006,7 +739,7 @@ mod tests {
             for swatch in [[0xf0, 0xf0, 0xf0], [0xff, 0xd0, 0x40], [0x10, 0x10, 0x10]] {
                 let deco = fit_decoration(swatch, bg);
                 assert!(
-                    contrast_ratio(deco, bg.rgb) <= DECO_CEILING + 0.01,
+                    contrast_ratio(deco, bg.rgb) <= hypodj_style::tokens().music.decoration_max_contrast + 0.01,
                     "sigil {swatch:?} on bg {:?} exceeds ceiling: {:.2}",
                     bg.rgb,
                     contrast_ratio(deco, bg.rgb)
