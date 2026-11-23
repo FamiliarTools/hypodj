@@ -5285,6 +5285,38 @@ impl HypodjHandler {
         (texts, qids, st.current)
     }
 
+    /// [`Self::queue_texts`] with the structured fields a
+    /// [`crate::plan::QueueSelector::Upcoming`] filter reads, from ONE snapshot.
+    fn queue_rows(&self) -> (Vec<crate::plan::RowMeta>, Vec<u64>, Option<usize>) {
+        let st = self.state.lock().unwrap();
+        let rows = st
+            .queue
+            .iter()
+            .map(|it| {
+                let text = Self::item_search_text(&it.entry);
+                match &it.entry {
+                    QueueEntry::Song(s) => crate::plan::RowMeta {
+                        text,
+                        title: s.title.clone(),
+                        artist: s.artist.clone(),
+                        album_id: s.album_id.as_ref().map(|a| a.0.clone()),
+                    },
+                    QueueEntry::Stream { title, .. } => {
+                        crate::plan::RowMeta { text, title: title.clone(), ..Default::default() }
+                    }
+                }
+            })
+            .collect();
+        let qids = st.queue.iter().map(|it| it.id).collect();
+        (rows, qids, st.current)
+    }
+
+    /// How many rows a queue selector names RIGHT NOW (the echo's dry-run count).
+    pub fn preview_selector_count(&self, sel: &crate::plan::QueueSelector) -> usize {
+        let (rows, qids, current) = self.queue_rows();
+        crate::plan::resolve_selector_rows(sel, &rows, &qids, current).len()
+    }
+
     /// DETERMINISTIC queue-edit executor for the confirmed [`Action::Remove`] /
     /// [`Action::Move`] / [`Action::Clear`] / [`Action::Play`] plan actions. The
     /// selector resolves against the LIVE queue here (never pre-baked to indices),
@@ -5294,8 +5326,8 @@ impl HypodjHandler {
     pub async fn plan_queue_edit(&self, action: &Action) -> Result<usize, String> {
         match action {
             Action::Remove { sel } => {
-                let (texts, qids, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
+                let (rows, qids, current) = self.queue_rows();
+                let idxs = crate::plan::resolve_selector_rows(sel, &rows, &qids, current);
                 Ok(self.remove_indices(&idxs).await)
             }
             Action::Clear { scope } => match scope {
@@ -5328,13 +5360,13 @@ impl HypodjHandler {
                 }
             },
             Action::Move { sel, dest } => {
-                let (texts, qids, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
+                let (rows, qids, current) = self.queue_rows();
+                let idxs = crate::plan::resolve_selector_rows(sel, &rows, &qids, current);
                 Ok(self.move_indices(&idxs, *dest).await)
             }
             Action::Play { sel } => {
-                let (texts, qids, current) = self.queue_texts();
-                let idxs = crate::plan::resolve_selector(sel, &texts, &qids, current);
+                let (rows, qids, current) = self.queue_rows();
+                let idxs = crate::plan::resolve_selector_rows(sel, &rows, &qids, current);
                 match idxs.first() {
                     // ALREADY ON IT. "play the track that matches X" names the track
                     // he wants under the needle, and it already is - so loading it
@@ -5798,7 +5830,17 @@ impl HypodjHandler {
             }
             plans.push(clamped);
         }
-        let echo = describe_batch(&plans, hit.source);
+        let mut echo = describe_batch(&plans, hit.source);
+        // A removal names its blast radius BEFORE arming: the live count it would
+        // take now (it re-resolves at execute time, so this is a preview, not a
+        // promise - a no-match then is still a clean no-op).
+        for p in &plans {
+            if let Action::Remove { sel } = &p.action {
+                let n = self.preview_selector_count(sel);
+                let rows = if n == 1 { "row" } else { "rows" };
+                echo.push_str(&format!(" | {n} {rows} would go right now"));
+            }
+        }
         let token = self.mint_nl_token();
         {
             let mut g = self.nl_pending.lock().unwrap();
@@ -30886,6 +30928,44 @@ mod tests {
         let evs = drain_events(&h, &mut events).await;
         assert!(evs.is_empty(), "the undo reloaded the deck: {evs:?}");
         assert_eq!(h.last_elapsed_ms.load(Ordering::Relaxed), 30_000, "the playhead never moved");
+    }
+
+    // A curation filter ("no remixes", "no <artist>") removes only matching
+    // UPCOMING rows - never the playing one, even when it matches - is journaled
+    // through run_action_outcome, and `undo` puts every row back in place by id.
+    #[tokio::test(start_paused = true)]
+    async fn curate_filter_spares_the_playing_row_and_undo_restores() {
+        use crate::plan::{CurateFilter, QueueSelector};
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        let mk = |id: &str, title: &str, artist: &str| {
+            let mut s = playlist_test_song(id);
+            s.title = title.into();
+            s.artist = Some(artist.into());
+            s
+        };
+        h.enqueue_song_for_test(mk("a", "Around (Remix)", "Daft Punk")).await;
+        h.enqueue_song_for_test(mk("b", "One More Time", "Daft Punk")).await;
+        h.enqueue_song_for_test(mk("c", "Get Lucky (Club Remix)", "Daft Punk feat. Pharrell")).await;
+        h.enqueue_song_for_test(mk("d", "Happy", "Pharrell")).await;
+        h.enqueue_song_for_test(mk("e", "Lose Yourself (RMX)", "Eminem")).await;
+        h.play_for_test(0).await;
+        let before = rows(&h);
+        drain_events(&h, &mut events).await;
+
+        let sel = QueueSelector::Upcoming(CurateFilter::Remixes);
+        assert_eq!(h.preview_selector_count(&sel), 2, "the playing remix is not counted");
+        let out = h.run_action_outcome(&Action::Remove { sel }, "mcp:s").await;
+        assert_eq!(out, PlanOutcome::Removed(2));
+        assert_eq!(ids(&h), vec!["a", "b", "d"], "row a plays on, untouched");
+        assert!(drain_events(&h, &mut events).await.is_empty(), "the deck was never touched");
+
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(rows(&h), before, "every removed row is back, in place, with its id");
+
+        // Lead vs featured: "no Pharrell as lead" keeps the feature on row c.
+        let lead = QueueSelector::Upcoming(CurateFilter::LeadArtist("pharrell".into()));
+        assert_eq!(h.run_action_outcome(&Action::Remove { sel: lead }, "mcp:s").await, PlanOutcome::Removed(1));
+        assert_eq!(ids(&h), vec!["a", "b", "c", "e"]);
     }
 
     // A jump moved the playhead to another row; the undo has to bring it back to
