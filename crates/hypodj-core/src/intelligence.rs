@@ -654,6 +654,182 @@ pub fn lexicon_pull(words: &str, strength: f32, now: Instant) -> Option<Pull> {
 /// Direction - well below the arm threshold, which this slice never touches anyway).
 pub const LEXICON_PULL_STRENGTH: f32 = 0.6;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Behavioral signal (task u3zgfmt): what he actually DID with a track
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The behavioral facts about one candidate, gathered from what hypodj already
+/// has: the server's own star / rating / play count / last-played stamp (the
+/// read-back of what the scrobbler writes) and this session's skip ledger.
+/// Every field defaults to "no evidence", which scores exactly 0.0.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Behavior {
+    pub starred: bool,
+    /// 1..=5; `None` or 0 is unrated (neutral).
+    pub rating: Option<u8>,
+    /// Server play count (scrobbles that landed).
+    pub play_count: u32,
+    /// Seconds since the server last saw it played; `None` = never / unknown.
+    pub since_played_secs: Option<u64>,
+    /// Times he skipped it early THIS session.
+    pub session_skips: u32,
+}
+
+/// The behavioral term's ceiling in the blended sort key, in units of the whole
+/// incoming-rank span (0..=1). 0.25 means the strongest possible evidence moves a
+/// candidate by at most a quarter of the list, and a full opposite pair (a
+/// starred favourite against a just-skipped track) by at most half: a NUDGE on
+/// the similarity order the server produced, never a replacement for it.
+pub const BEHAVIOR_WEIGHT: f32 = 0.25;
+
+/// Star boost: he said so explicitly.
+const STAR_BOOST: f32 = 0.30;
+/// Rating swing at 1 or 5 stars (3 is neutral).
+const RATING_SWING: f32 = 0.20;
+/// Affinity at (and beyond) [`PLAYS_SATURATE`] plays.
+const PLAYS_BOOST: f32 = 0.15;
+const PLAYS_SATURATE: f32 = 20.0;
+/// Recency penalty right after a play, decaying with [`RECENT_DECAY_SECS`].
+const RECENT_PENALTY: f32 = 0.35;
+const RECENT_DECAY_SECS: f32 = 6.0 * 3600.0;
+/// Per early skip this session, counted up to [`SKIPS_CAP`].
+const SKIP_PENALTY: f32 = 0.30;
+const SKIPS_CAP: u32 = 2;
+
+/// PURE. One explainable score in `-1.0..=1.0`, the sum of five named terms:
+///
+/// - `+0.30` if starred;
+/// - `(rating - 3) / 2 * 0.20` (so 5 stars +0.20, 1 star -0.20);
+/// - `+0.15 * ln(1 + plays) / ln(1 + 20)`, saturating at 20 plays - listened and
+///   KEPT, logarithmic so a heavy rotation track cannot run away;
+/// - `-0.35 * exp(-age / 6h)` since the last play - so a favourite heard an hour
+///   ago waits its turn instead of coming straight back;
+/// - `-0.30` per early skip this session, at most two.
+///
+/// Missing evidence is 0, never a guess.
+pub fn behavior_score(b: &Behavior) -> f32 {
+    let mut s = 0.0;
+    if b.starred {
+        s += STAR_BOOST;
+    }
+    if let Some(r) = b.rating.filter(|r| (1..=5).contains(r)) {
+        s += (r as f32 - 3.0) / 2.0 * RATING_SWING;
+    }
+    if b.play_count > 0 {
+        let p = (1.0 + b.play_count as f32).ln() / (1.0 + PLAYS_SATURATE).ln();
+        s += PLAYS_BOOST * p.min(1.0);
+    }
+    if let Some(age) = b.since_played_secs {
+        s -= RECENT_PENALTY * (-(age as f32) / RECENT_DECAY_SECS).exp();
+    }
+    s -= SKIP_PENALTY * b.session_skips.min(SKIPS_CAP) as f32;
+    s.clamp(-1.0, 1.0)
+}
+
+/// PURE. Re-rank candidates by `incoming_rank + BEHAVIOR_WEIGHT * behavior_score`,
+/// where `incoming_rank` runs 1.0 (first) down to 0.0 (last). Ties keep the
+/// incoming order, so all-neutral evidence is the identity, byte for byte.
+/// `behavior` is parallel to `candidates`.
+pub fn behavior_rerank<T>(candidates: Vec<T>, behavior: &[Behavior]) -> Vec<T> {
+    let n = candidates.len();
+    if n <= 1 || behavior.len() != n {
+        return candidates;
+    }
+    let last = (n - 1) as f32;
+    let mut keyed: Vec<(usize, f32)> = (0..n)
+        .map(|i| (i, (last - i as f32) / last + BEHAVIOR_WEIGHT * behavior_score(&behavior[i])))
+        .collect();
+    keyed.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+    });
+    let mut src: Vec<Option<T>> = candidates.into_iter().map(Some).collect();
+    keyed.into_iter().filter_map(|(i, _)| src[i].take()).collect()
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+
+    #[test]
+    fn no_evidence_scores_zero_and_keeps_the_order() {
+        assert_eq!(behavior_score(&Behavior::default()), 0.0);
+        let v = behavior_rerank(vec!["a", "b", "c", "d"], &[Behavior::default(); 4]);
+        assert_eq!(v, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn each_term_points_the_right_way() {
+        let star = Behavior { starred: true, ..Default::default() };
+        assert!((behavior_score(&star) - 0.30).abs() < 1e-6);
+        let five = Behavior { rating: Some(5), ..Default::default() };
+        let one = Behavior { rating: Some(1), ..Default::default() };
+        assert!((behavior_score(&five) - 0.20).abs() < 1e-6);
+        assert!((behavior_score(&one) + 0.20).abs() < 1e-6);
+        let zero_rating = Behavior { rating: Some(0), ..Default::default() };
+        assert_eq!(behavior_score(&zero_rating), 0.0, "0 is unrated, not one star");
+        let skip = Behavior { session_skips: 1, ..Default::default() };
+        assert!(behavior_score(&skip) < 0.0);
+    }
+
+    #[test]
+    fn plays_saturate_and_never_run_away() {
+        let p = |n| behavior_score(&Behavior { play_count: n, ..Default::default() });
+        assert!(p(1) > 0.0 && p(5) > p(1) && p(20) > p(5));
+        assert!((p(20) - 0.15).abs() < 1e-6);
+        assert_eq!(p(20), p(10_000), "saturates at 20 plays");
+    }
+
+    #[test]
+    fn recency_penalty_decays_back_to_nothing() {
+        let r = |secs| behavior_score(&Behavior { since_played_secs: Some(secs), ..Default::default() });
+        assert!((r(0) + 0.35).abs() < 1e-6);
+        assert!(r(0) < r(3600) && r(3600) < r(6 * 3600));
+        assert!(r(7 * 24 * 3600).abs() < 1e-3, "a week ago is no penalty");
+    }
+
+    #[test]
+    fn skips_cap_and_the_whole_score_is_bounded() {
+        let s = |k| behavior_score(&Behavior { session_skips: k, ..Default::default() });
+        assert_eq!(s(2), s(50));
+        let best = Behavior { starred: true, rating: Some(5), play_count: 999, ..Default::default() };
+        let worst = Behavior { rating: Some(1), since_played_secs: Some(0), session_skips: 9, ..Default::default() };
+        assert!(behavior_score(&best) <= 1.0 && behavior_score(&worst) >= -1.0);
+        assert!((behavior_score(&best) - 0.65).abs() < 1e-6);
+        assert!((behavior_score(&worst) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_favourite_moves_up_a_bounded_distance() {
+        // 9 candidates: the rank step is 1/8 = 0.125. A star (0.30 * 0.25 = 0.075)
+        // jumps fewer than one slot; star + 5 + saturated plays (0.65 * 0.25 =
+        // 0.1625) jumps exactly one. Never to the top from the bottom.
+        let mut b = [Behavior::default(); 9];
+        b[8] = Behavior { starred: true, rating: Some(5), play_count: 50, ..Default::default() };
+        let v = behavior_rerank((0..9).collect::<Vec<_>>(), &b);
+        assert_eq!(v, vec![0, 1, 2, 3, 4, 5, 6, 8, 7]);
+    }
+
+    #[test]
+    fn a_skipped_track_sinks_but_does_not_vanish() {
+        let mut b = [Behavior::default(); 9];
+        b[0] = Behavior { session_skips: 2, ..Default::default() };
+        let v = behavior_rerank((0..9).collect::<Vec<_>>(), &b);
+        // -0.6 * 0.25 = -0.15 against a step of 0.125: drops one slot, no further.
+        assert_eq!(v, vec![1, 0, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn a_just_played_favourite_waits_its_turn() {
+        let fav_now = Behavior { starred: true, since_played_secs: Some(60), ..Default::default() };
+        assert!(behavior_score(&fav_now) < 0.0, "the recency penalty outweighs the star right after a play");
+    }
+
+    #[test]
+    fn mismatched_evidence_is_the_identity() {
+        assert_eq!(behavior_rerank(vec![1, 2, 3], &[Behavior::default()]), vec![1, 2, 3]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

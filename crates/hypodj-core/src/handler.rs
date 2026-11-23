@@ -499,6 +499,12 @@ struct State {
     excludes: Vec<crate::plan::CurateFilter>,
     /// Bumped on every change to `excludes` (the journal's drift key).
     excludes_gen: u64,
+    /// EARLY manual skips this session, per song id: a `next` while a library song
+    /// was playing and less than half of it (or 30 s when the length is unknown)
+    /// had been heard - the same "not really listened" line the scrobbler draws.
+    /// A behavioral pick signal ([`crate::intelligence::Behavior`]). EPHEMERAL,
+    /// and capped at [`SESSION_SKIPS_CAP`] ids (cleared wholesale past it).
+    session_skips: std::collections::HashMap<SongId, u32>,
     /// The clock instant of the most recent autofill FETCH attempt (stamped BEFORE the
     /// fetch), or `None` until the first. The DEGENERATE-INPUT FUSE: a true-drain within
     /// [`AUTOFILL_MIN_INTERVAL`] of this stamp is a pathological instant-EOF spiral (a
@@ -1399,6 +1405,7 @@ impl Default for State {
             last_autofill_at: None,
             excludes: Vec::new(),
             excludes_gen: 0,
+            session_skips: std::collections::HashMap::new(),
         }
     }
 }
@@ -3289,6 +3296,9 @@ const AUTOFILL_ALBUM_CANDIDATES: usize = 4;
 /// normal use; the hard ceiling is <= 1 fetch per this interval in ANY execution.
 const AUTOFILL_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Bound on [`State::session_skips`]: a long session cannot grow it without limit.
+const SESSION_SKIPS_CAP: usize = 512;
+
 /// The EOF auto-advance FUSE: a run of this many CONSECUTIVE errored EOFs WITH NO AUDIO
 /// IN BETWEEN stops the walk instead of grinding the queue down to no current entry
 /// (see [`HypodjHandler::advance_on_eof`]).
@@ -4953,10 +4963,10 @@ impl HypodjHandler {
                 .into_iter()
                 .take(want)
                 .collect(),
-            Selector::Radio => drop_excluded(
+            Selector::Radio => self.behavior_rerank(drop_excluded(
                 &self.held_excludes(),
                 self.client.random_songs(Some(want as i32)).await.map_err(|e| e.to_string())?,
-            ),
+            )),
             Selector::Starred => self
                 .client
                 .starred_songs()
@@ -4994,7 +5004,7 @@ impl HypodjHandler {
                 // "More like this" must not re-enqueue the seed itself, nor a track
                 // a held curation filter keeps out.
                 songs.retain(|s| &s.id != id);
-                let mut songs = drop_excluded(&self.held_excludes(), songs);
+                let mut songs = self.behavior_rerank(drop_excluded(&self.held_excludes(), songs));
                 songs.truncate(want);
                 songs
             }
@@ -5025,7 +5035,8 @@ impl HypodjHandler {
                         }
                         // Never re-enqueue the seed (the track already playing/queued).
                         songs.retain(|s| s.id != id);
-                        let mut songs = drop_excluded(&self.held_excludes(), songs);
+                        let mut songs =
+                            self.behavior_rerank(drop_excluded(&self.held_excludes(), songs));
                         songs.truncate(want);
                         songs
                     }
@@ -5276,6 +5287,58 @@ impl HypodjHandler {
         if n > 0 {
             self.arm_fresh_enqueue_anchor(first_qid);
         }
+    }
+
+    /// Record an EARLY manual skip of the playing library song (see
+    /// [`State::session_skips`]). Reads the play state and playhead first (their
+    /// own locks), then one short `State` lock; never across an await.
+    fn note_early_skip(&self) {
+        if self.reported_play_state() != PlayState::Playing {
+            return;
+        }
+        let heard = self.last_elapsed_secs();
+        let mut st = self.state.lock().unwrap();
+        let Some(song) = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
+            QueueEntry::Song(s) => Some((s.id.clone(), s.duration_secs)),
+            QueueEntry::Stream { .. } => None,
+        }) else {
+            return;
+        };
+        let line = song.1.map_or(30.0, |d| d as f64 / 2.0);
+        if heard >= line {
+            return;
+        }
+        if st.session_skips.len() >= SESSION_SKIPS_CAP {
+            st.session_skips.clear();
+        }
+        *st.session_skips.entry(song.0).or_insert(0) += 1;
+    }
+
+    /// THE BEHAVIORAL NUDGE (task u3zgfmt): re-rank an autonomous candidate pool by
+    /// what he actually did with each track - star, rating, server play count and
+    /// last-played (the read-back of the scrobbles), and this session's early
+    /// skips - via [`crate::intelligence::behavior_rerank`], bounded by
+    /// [`crate::intelligence::BEHAVIOR_WEIGHT`] so the similarity order still
+    /// leads. Never applied to an explicit, ordered list.
+    fn behavior_rerank(&self, songs: Vec<Song>) -> Vec<Song> {
+        if songs.len() <= 1 {
+            return songs;
+        }
+        let now = crate::store::now_unix();
+        let ev: Vec<crate::intelligence::Behavior> = {
+            let st = self.state.lock().unwrap();
+            songs
+                .iter()
+                .map(|s| crate::intelligence::Behavior {
+                    starred: s.starred,
+                    rating: s.user_rating,
+                    play_count: s.play_count.unwrap_or(0),
+                    since_played_secs: s.played_secs_ago(now),
+                    session_skips: st.session_skips.get(&s.id).copied().unwrap_or(0),
+                })
+                .collect()
+        };
+        crate::intelligence::behavior_rerank(songs, &ev)
     }
 
     /// A snapshot of the held curation exclusions (one short lock).
@@ -12216,7 +12279,7 @@ impl HypodjHandler {
             return self.autofill_append(picked, chosen_album, start).await;
         }
         let mut batch_seen: std::collections::HashSet<SongId> = std::collections::HashSet::new();
-        for song in fetched {
+        for song in self.behavior_rerank(fetched) {
             if song.id == seed || seen.contains(&song.id) || !batch_seen.insert(song.id.clone()) {
                 continue;
             }
@@ -14666,6 +14729,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Info(uri) => self.handle_info(&uri).await,
             MpdCommand::InfoMore(uri) => self.handle_info_more(&uri).await,
             MpdCommand::Next => {
+                self.note_early_skip();
                 // A manual `next` always advances (single governs only auto-advance);
                 // random/repeat/consume are honored via plan_next. The transition
                 // itself is startle-safe: user_skip dips through silence when
@@ -31173,6 +31237,42 @@ mod tests {
         tokio::time::advance(AUTOFILL_MIN_INTERVAL).await;
         h.push_autofill_batch(Ok(vec![mk("r3", "Other (Remix)")]));
         assert_eq!(h.autofill_once(None, AutofillStart::Behind).await, 1);
+    }
+
+    // An EARLY `next` (under half the track heard) is a session skip; a late one
+    // is not. The skip then sinks that song in an autonomous pool, by a bounded
+    // nudge, while a starred, well-played candidate rises.
+    #[tokio::test(start_paused = true)]
+    async fn early_skips_and_stars_nudge_autonomous_picks() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let mut a = playlist_test_song("a");
+        a.duration_secs = Some(200);
+        h.enqueue_song_for_test(a).await;
+        h.enqueue_song_for_test(playlist_test_song("b")).await;
+        h.enqueue_song_for_test(playlist_test_song("c")).await;
+        h.play_for_test(0).await;
+        h.note_elapsed_ms(20_000);
+        h.handle(MpdCommand::Next).await;
+        assert_eq!(h.state.lock().unwrap().session_skips.get(&SongId("a".into())), Some(&1));
+        h.note_elapsed_ms(150_000);
+        h.state.lock().unwrap().queue.iter_mut().for_each(|it| {
+            if let QueueEntry::Song(s) = &mut it.entry {
+                s.duration_secs = Some(200);
+            }
+        });
+        h.handle(MpdCommand::Next).await;
+        assert!(
+            !h.state.lock().unwrap().session_skips.contains_key(&SongId("b".into())),
+            "three quarters heard is a listen, not a skip"
+        );
+
+        let mut pool: Vec<Song> = (0..9).map(|i| playlist_test_song(&format!("p{i}"))).collect();
+        h.state.lock().unwrap().session_skips.insert(SongId("p0".into()), 2);
+        pool[8].starred = true;
+        pool[8].user_rating = Some(5);
+        pool[8].play_count = Some(40);
+        let got: Vec<String> = h.behavior_rerank(pool).into_iter().map(|s| s.id.0).collect();
+        assert_eq!(got, ["p1", "p0", "p2", "p3", "p4", "p5", "p6", "p8", "p7"]);
     }
 
     // RestOfAlbum is relative to the playing record, so it is never held; Artist

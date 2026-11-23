@@ -253,15 +253,22 @@ impl Song {
     /// play. A FUTURE stamp (server timezone ahead, host clock behind, an NTP
     /// step) saturates to 0 rather than wrapping into a huge age.
     pub fn played_days_ago(&self, now_unix: u64) -> Option<u32> {
+        // Whole days, truncating.
+        Some((self.played_secs_ago(now_unix)? / 86_400) as u32)
+    }
+
+    /// [`Self::played_days_ago`] at second resolution (the behavioral recency
+    /// term decays over hours, so days are too coarse for it). Same contract.
+    pub fn played_secs_ago(&self, now_unix: u64) -> Option<u64> {
         let raw = self.played.as_deref()?;
         // Accepts both shapes the server emits: whole seconds with an offset
         // (`2026-08-06T14:17:24+01:00`) and sub-second precision
         // (`2026-07-10T11:45:09.98345312+01:00`), offsets as well as `Z`.
         let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
         let elapsed = (now_unix as i64).saturating_sub(dt.timestamp());
-        // Clamp at 0 first, so a future stamp reads as "played today" instead of
-        // underflowing; then whole days, truncating.
-        Some((elapsed.max(0) / 86_400) as u32)
+        // Clamp at 0, so a future stamp reads as "played just now" instead of
+        // underflowing.
+        Some(elapsed.max(0) as u64)
     }
 }
 
