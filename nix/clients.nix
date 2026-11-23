@@ -3,6 +3,7 @@
 , pkg-config
 , mpv-unwrapped
 , makeWrapper
+, installShellFiles
 # DISPLAY-only enrichment (from flake.nix): the semver read from Cargo.toml and
 # the HYPODJ_BUILD_INFO grammar baked into the runtime env (the nix sandbox has
 # no .git, so this is what `dj --version` / `dj-gui --version` shows).
@@ -33,7 +34,7 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../Cargo.lock;
 
-  nativeBuildInputs = [ pkg-config makeWrapper ];
+  nativeBuildInputs = [ pkg-config makeWrapper installShellFiles ];
   # mpv.pc (for libmpv2-sys at build, pulled transitively via hypodj-core) +
   # libmpv.so (DT_NEEDED at link/runtime).
   buildInputs = [ mpv-unwrapped ];
@@ -70,6 +71,11 @@ rustPlatform.buildRustPackage {
         --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
         --set-default HYPODJ_BUILD_INFO ${lib.escapeShellArg buildInfo}
     done
+    # Generated from the verb tables (route::ROUTED_VERBS + the CLI's own), never
+    # hand-written, so a rebuild ships completions that match the router. Run via
+    # the wrapper so libmpv.so.2 resolves.
+    $out/bin/dj --completions fish > dj.fish
+    installShellCompletion --fish dj.fish
   '';
 
   meta = {

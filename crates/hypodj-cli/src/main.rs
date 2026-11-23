@@ -3,6 +3,7 @@
 //! runs directly; anything else is sent to the daemon as `nl "<phrase>"`, echoed,
 //! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
 
+mod completions;
 mod heard;
 mod journal;
 mod pls;
@@ -78,6 +79,8 @@ OPTIONS:
                 May appear before or after the phrase.
   -h, --help    this help
   -V, --version print version and exit
+  --completions fish
+                print the fish completion script
 
 CONFIG precedence: flags > HYPODJ_HOST/HYPODJ_PORT > MPD_HOST/MPD_PORT
                    > 127.0.0.1:6600
@@ -95,6 +98,17 @@ fn main() {
                 option_env!("HYPODJ_BUILD_INFO"),
             )
         );
+        return;
+    }
+    // `--completions fish` is generated from the verb tables, before any socket work.
+    if let Some(i) = raw.iter().position(|a| a == "--completions") {
+        match raw.get(i + 1).map(String::as_str) {
+            Some("fish") => print!("{}", completions::fish()),
+            _ => {
+                eprintln!("dj: --completions needs a shell (fish)");
+                std::process::exit(2);
+            }
+        }
         return;
     }
     match run(raw) {
