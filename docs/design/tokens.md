@@ -67,6 +67,14 @@ HypoDJ is holding it for you.
 
 There is no red and no error colour. A refusal is calm and says why.
 
+Confirmation stays proportional to consequence (design law 3, Memoria
+m:01kxjktj): an immediate, reversible act (pause, skip, volume) goes straight to
+`live` with an undo line and no `echo`. Only future triggers, stops, clears and
+wall-clock plans pass through `echo` and wait.
+
+These tokens extend the 13 client design laws (m:01kxjktj), in particular law 11
+(spend complexity on correctness, not chrome) and law 12 (calm by design).
+
 ### 5. Motion (derived from the fade constants)
 
 Visual transitions use the same constants as audio fades (`FadeConfig`), so the
