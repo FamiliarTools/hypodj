@@ -712,6 +712,15 @@ impl ScrollBox {
     }
 }
 
+/// The sixel payload last put on screen, with the geometry it was encoded for (the
+/// pane rect and the cell size in pixels). See [`TuiState::sixel_held`]: the pin is
+/// only reusable while the geometry still matches.
+#[derive(Debug, Clone)]
+pub struct SixelHeld {
+    pub geometry: (ratatui::layout::Rect, (u16, u16)),
+    pub payload: String,
+}
+
 pub struct TuiState {
     pub now: NowPlaying,
     pub queue: Vec<QueueItem>,
@@ -936,7 +945,7 @@ pub struct TuiState {
     /// [`sixel_gen`] anyway, which re-sends the now-current cover. The user never sees a
     /// stale cover: the only window it is stale in is the one where a popup is covering
     /// it.
-    pub sixel_held: RefCell<Option<String>>,
+    pub sixel_held: RefCell<Option<SixelHeld>>,
     /// Whether the terminal advertises truecolor (else colors quantize to xterm-256).
     pub truecolor: bool,
     /// The cached album sigil, rebuilt only when the album identity changes (static -
