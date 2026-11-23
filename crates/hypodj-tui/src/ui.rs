@@ -1312,6 +1312,18 @@ mod tests {
     }
 
     #[test]
+    fn now_playing_pane_draws_the_paused_playhead() {
+        let mut s = TuiState::new();
+        s.now.state = Some("pause".into());
+        s.now.title = Some("Blue in Green".into());
+        s.now.duration = Some(337.0);
+        s.now.elapsed = Some(83.0);
+        s.now_at = Some(std::time::Instant::now());
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("paused \u{b7} 1:23 / 5:37"), "playhead drawn:\n{out}");
+    }
+
+    #[test]
     fn stream_cover_renders_image_cells_in_art_pane() {
         // A playing STREAM with a recognized cover and a decoded AlbumArt lights the
         // now-playing art pane (task kmrhj8m): the pane renders IMAGE cells, not the
