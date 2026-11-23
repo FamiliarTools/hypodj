@@ -1673,8 +1673,8 @@ fn drain_is_next(st: &State) -> bool {
 
 /// The continuation-warm ARM PREDICATE, shared by arm time
 /// ([`HypodjHandler::reschedule_continuation_warm`]) and fire time
-/// ([`HypodjHandler::on_continuation_warm_fire`]). Returns the current FINITE Song's
-/// `duration_secs` when a warm is armable, else `None`. Read under the caller's `State`
+/// ([`HypodjHandler::on_continuation_warm_fire`]). `None` when no warm is armable.
+/// Read under the caller's `State`
 /// lock; `station_ok` (a non-empty station configured) is passed in because
 /// `continuation_station` is a SEPARATE Mutex the caller reads first (never nested).
 /// `playing` (the deck is genuinely PLAYING) is passed in for the SAME reason: the
@@ -1693,12 +1693,9 @@ fn drain_is_next(st: &State) -> bool {
 /// occur for a continuation warm because the actor's `WarmKind::Continuation` ATTRIBUTES
 /// the auto-advance instead of swallowing it - so this predicate omits that guard on
 /// purpose.
-fn continuation_warm_ready(st: &State, station_ok: bool, playing: bool) -> Option<f64> {
-    warm_ready(st, station_ok, playing).map(|(d, _)| d)
-}
-
-/// The warm predicate, now answering BOTH handoffs: returns the current finite Song's
-/// duration plus WHICH target should be parked behind it.
+///
+/// It answers BOTH handoffs: the current finite Song's duration plus WHICH target
+/// should be parked behind it.
 ///
 /// The shared guards are the ones the station warm already carried and they are not
 /// negotiable for either target: a GENUINELY PLAYING deck (never behind a stopped -

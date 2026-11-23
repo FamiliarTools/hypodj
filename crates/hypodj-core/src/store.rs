@@ -4123,7 +4123,9 @@ enum Attempt {
 }
 
 impl Backoff {
-    /// Whether `id` may be attempted now.
+    /// Whether `id` may be attempted now. Production asks [`Backoff::attempt`], which
+    /// also says why not; this is the yes/no its tests read.
+    #[cfg(test)]
     fn ready(&self, id: &SongId, now: tokio::time::Instant) -> bool {
         matches!(self.attempt(id, now), Attempt::Now)
     }
@@ -8654,10 +8656,6 @@ content_type = "audio/flac"
 
         fn set_pins(&self, pins: Option<Vec<Song>>) {
             *self.0.pins.lock().unwrap() = pins.map(PinSet::of_songs);
-        }
-
-        fn set_pin_set(&self, pins: Option<PinSet>) {
-            *self.0.pins.lock().unwrap() = pins;
         }
 
         fn invalidations(&self) -> usize {

@@ -528,7 +528,7 @@ pub fn more_rows_from_pairs(pairs: &[(String, String)]) -> Vec<(String, String)>
     // and no label. That distinction is what lets the renderer set headings flush and
     // bold while running text stays a plain block - without it both arrive as
     // indistinguishable empty-labelled rows and a heading reads as a stray value.
-    let mut section = |rows: &mut Vec<(String, String)>, title: &str| {
+    let section = |rows: &mut Vec<(String, String)>, title: &str| {
         if !rows.is_empty() {
             rows.push((String::new(), String::new()));
         }
