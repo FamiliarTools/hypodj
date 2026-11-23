@@ -283,6 +283,11 @@ struct State {
     /// client's VIEW: every delete re-validates it against a fresh fetch and shifts
     /// it like MPD shifts a playlist (see `resolve_starred_delete`).
     last_starred_order: Vec<SongId>,
+    /// The order each real playlist had in its last `listplaylistinfo`, keyed by
+    /// playlist id: the client's VIEW a positional `playlistdelete` indexes, mapped
+    /// onto a fresh fetch by [`resolve_playlist_delete`] so a concurrent edit
+    /// cannot shift the delete onto a different song.
+    last_playlist_order: HashMap<crate::model::PlaylistId, Vec<SongId>>,
     /// MPD `random` flag: pick the next entry at random instead of sequentially.
     random: bool,
     /// MPD `repeat` flag: at the end of the queue, loop back to the first entry
@@ -1298,6 +1303,7 @@ impl Default for State {
             binary_limit: 8192,
             cover_id_memo: None,
             last_starred_order: Vec::new(),
+            last_playlist_order: HashMap::new(),
             random: false,
             repeat: false,
             single: false,
@@ -2173,6 +2179,44 @@ fn fade_lands_at(action: &Action) -> Option<u8> {
 /// can never unstar a different song than the one the user pointed at. With no
 /// snapshot (a scripted client that deletes without listing first) the fresh order
 /// is the only view there is.
+/// Map a positional `playlistdelete <name> <pos>` on a real playlist to the index
+/// to remove in the FRESH order. `pos` indexes the client's last listing (the
+/// snapshot) when there is one: the song at `pos` there, counted by occurrence
+/// (a playlist may hold the same song twice), must still be in the fresh order,
+/// and that occurrence's fresh index is what gets removed. Without a snapshot the
+/// fresh order is the view. A row that is gone refuses rather than deleting a
+/// neighbour.
+fn resolve_playlist_delete(
+    snapshot: Option<&[SongId]>,
+    fresh: &[SongId],
+    pos: usize,
+) -> Result<usize, &'static str> {
+    let Some(view) = snapshot else {
+        return if pos < fresh.len() { Ok(pos) } else { Err("Bad song index") };
+    };
+    let id = view.get(pos).ok_or("Bad song index")?;
+    let nth = view[..pos].iter().filter(|s| *s == id).count();
+    fresh
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| *s == id)
+        .nth(nth)
+        .map(|(i, _)| i)
+        .ok_or("the playlist changed - list it again")
+}
+
+/// The ONE playlist carrying `name`, or `None`. Two playlists sharing a name is
+/// refused rather than resolved to the first: a delete or clear on the wrong one
+/// is unrecoverable, and MPD names are unique so a client cannot disambiguate.
+fn unique_playlist(list: Vec<Playlist>, name: &str) -> Result<Option<Playlist>, String> {
+    let mut hits = list.into_iter().filter(|p| p.name == name);
+    let first = hits.next();
+    if hits.next().is_some() {
+        return Err(format!("more than one playlist is named \"{name}\" - rename one in Navidrome"));
+    }
+    Ok(first)
+}
+
 fn resolve_starred_delete(
     snapshot: &[SongId],
     fresh: &[SongId],
@@ -7907,15 +7951,11 @@ impl HypodjHandler {
     /// Resolve a real Navidrome playlist by NAME to its full song list, or `None`
     /// when no playlist carries that name. Backs `listplaylistinfo <name>` and
     /// `load <name>` so a `save`d set is inspectable and loadable by name.
-    async fn playlist_by_name(&self, name: &str) -> Result<Option<Playlist>, SubsonicError> {
-        let existing = self
-            .client
-            .get_playlists()
-            .await?
-            .into_iter()
-            .find(|p| p.name == name);
-        match existing {
-            Some(p) => Ok(Some(self.client.get_playlist(&p.id).await?)),
+    /// An ambiguous name (two playlists share it) is an `Err`, never the first match.
+    async fn playlist_by_name(&self, name: &str) -> Result<Option<Playlist>, String> {
+        let list = self.client.get_playlists().await.map_err(|e| e.to_string())?;
+        match unique_playlist(list, name)? {
+            Some(p) => Ok(Some(self.client.get_playlist(&p.id).await.map_err(|e| e.to_string())?)),
             None => Ok(None),
         }
     }
@@ -14450,6 +14490,11 @@ impl MpdHandler for HypodjHandler {
                 // be inspected. Unknown name is a loud ACK, not a silent empty ok.
                 match self.playlist_by_name(&name).await {
                     Ok(Some(pl)) => {
+                        // The view a later positional `playlistdelete` indexes.
+                        self.state.lock().unwrap().last_playlist_order.insert(
+                            pl.id.clone(),
+                            pl.songs.iter().map(|s| s.id.clone()).collect(),
+                        );
                         let mut pairs = Vec::new();
                         for s in &pl.songs {
                             pairs.extend(browse_song_pairs(s));
@@ -14606,23 +14651,40 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::PlaylistDelete(name, pos) => {
-                // A real Navidrome playlist: remove the song at `pos` via
-                // updatePlaylist(songIndexToRemove). Per MPD semantics an unknown
-                // name / out-of-range index is a LOUD ack, never a silent no-op.
-                // Removing the last remaining song deletes the whole playlist
-                // (deletePlaylist) so an empty stored playlist is not left behind.
+                // A real Navidrome playlist: remove ONE song via
+                // updatePlaylist(songIndexToRemove). `pos` indexes the client's last
+                // listing, re-validated against this fresh fetch (see
+                // [`resolve_playlist_delete`]); removing the last song leaves the
+                // playlist empty but existing, as MPD does. An unknown name / bad
+                // index is a LOUD ack, never a silent no-op. The server has no
+                // compare-and-swap, so an edit landing between this fetch and the
+                // update can still race - the window is one round trip, not a
+                // listing's lifetime.
                 match self.playlist_by_name(&name).await {
                     Ok(Some(pl)) => {
-                        if pos >= pl.songs.len() {
-                            return ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index");
-                        }
-                        let result = if pl.songs.len() == 1 {
-                            self.client.delete_playlist(&pl.id).await
-                        } else {
-                            self.client.remove_from_playlist(&pl.id, pos as u32).await
+                        let fresh: Vec<SongId> = pl.songs.iter().map(|s| s.id.clone()).collect();
+                        let idx = {
+                            let st = self.state.lock().unwrap();
+                            let snap = st.last_playlist_order.get(&pl.id).map(Vec::as_slice);
+                            resolve_playlist_delete(snap, &fresh, pos)
                         };
-                        match result {
+                        let idx = match idx {
+                            Ok(i) => i,
+                            Err(msg) => return ack(ACK_ERROR_NO_EXIST, "playlistdelete", msg),
+                        };
+                        match self.client.remove_from_playlist(&pl.id, idx as u32).await {
                             Ok(()) => {
+                                {
+                                    // Shift the view exactly as MPD shifts a stored
+                                    // playlist, so a command list deleting several
+                                    // rows maps each later position correctly.
+                                    let mut st = self.state.lock().unwrap();
+                                    if let Some(v) = st.last_playlist_order.get_mut(&pl.id) {
+                                        if pos < v.len() {
+                                            v.remove(pos);
+                                        }
+                                    }
+                                }
                                 self.notify_change();
                                 MpdResponse::ok()
                             }
@@ -14630,7 +14692,7 @@ impl MpdHandler for HypodjHandler {
                         }
                     }
                     Ok(None) => ack(ACK_ERROR_NO_EXIST, "playlistdelete", "No such playlist"),
-                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e),
                 }
             }
             MpdCommand::PlaylistClear(name) if name == "Starred" => {
@@ -14640,19 +14702,36 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::PlaylistClear(name) => {
-                // Clear a real Navidrome playlist by removing it (deletePlaylist).
-                // Unknown name is a LOUD ack; a failed delete surfaces a proper ACK
-                // error rather than a silent success.
-                match self.playlist_by_name(&name).await {
-                    Ok(Some(pl)) => match self.client.delete_playlist(&pl.id).await {
-                        Ok(()) => {
-                            self.notify_change();
-                            MpdResponse::ok()
+                // MPD semantics: truncate to empty, keeping the playlist (same id,
+                // so Navidrome-side metadata survives), and a name that does not
+                // exist yet is CREATED empty - so a clear-then-add command list
+                // works against a fresh name instead of aborting on the clear.
+                let result = match self.playlist_by_name(&name).await {
+                    Ok(Some(pl)) => {
+                        self.state.lock().unwrap().last_playlist_order.remove(&pl.id);
+                        if pl.songs.is_empty() {
+                            Ok(())
+                        } else {
+                            self.client
+                                .clear_playlist(&pl.id, pl.songs.len())
+                                .await
+                                .map_err(|e| e.to_string())
                         }
-                        Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistclear", &e.to_string()),
-                    },
-                    Ok(None) => ack(ACK_ERROR_NO_EXIST, "playlistclear", "No such playlist"),
-                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistclear", &e.to_string()),
+                    }
+                    Ok(None) => self
+                        .client
+                        .create_playlist(&name, &[])
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(()) => {
+                        self.notify_change();
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistclear", &e),
                 }
             }
 
