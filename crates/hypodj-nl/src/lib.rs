@@ -577,6 +577,33 @@ mod tests {
         }
     }
 
+    /// The inverse of curation: lifting a HELD exclusion.
+    #[test]
+    fn corpus_allow_filters_again() {
+        use hypodj_core::plan::{CurateFilter as F, QueueSelector};
+        let c = ctx(Some("s1"), 10);
+        let al = |f: Option<F>| raw(RawTrigger::Immediate, Action::Allow { filter: f });
+        let cases: &[(&str, RawPlan)] = &[
+            ("clear filters", al(None)),
+            ("Clear the filters.", al(None)),
+            ("reset filters", al(None)),
+            ("allow everything again", al(None)),
+            ("allow remixes again", al(Some(F::Remixes))),
+            ("remixes are fine again", al(Some(F::Remixes))),
+            ("bring back the live versions", al(Some(F::Live))),
+            ("allow Daft Punk again", al(Some(F::Artist("Daft Punk".into())))),
+            ("bring Daft Punk back", al(Some(F::Artist("Daft Punk".into())))),
+        ];
+        for (u, want) in cases {
+            let got = tr(u, &c).unwrap_or_else(|e| panic!("{u}: {e:?}"));
+            assert_eq!(got.len(), 1, "{u}");
+            assert_eq!(j(&got[0]), j(want), "{u}");
+        }
+        // "no remixes" is still curation, not a lift.
+        let got = tr("no remixes", &c).unwrap();
+        assert!(matches!(&got[0].action, Action::Remove { sel: QueueSelector::Upcoming(F::Remixes) }));
+    }
+
     /// GOLDEN corpus (5znoe5i): one table of utterance -> exact plan batch (or the
     /// exact error), spanning every rules intent. A grammar change that shifts any
     /// row is a visible diff here.

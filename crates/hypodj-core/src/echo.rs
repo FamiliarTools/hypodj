@@ -89,6 +89,11 @@ fn action_dsl(a: &Action) -> Option<String> {
             _ => return None,
         },
         Action::Noop => "action noop".into(),
+        Action::Allow { filter: None } => "action allow all".into(),
+        Action::Allow { filter: Some(f) } => {
+            let q = qselector_dsl(&QueueSelector::Upcoming(f.clone()))?;
+            format!("action allow {}", q.strip_prefix("upcoming ")?)
+        }
         Action::SetMode { mode, on } => {
             format!("action mode {} {}", mode.word(), if *on { "on" } else { "off" })
         }
@@ -255,6 +260,12 @@ fn describe_action(raw: &RawPlan) -> String {
             }
         },
         Action::Noop => "do nothing (no valid action for this request)".to_string(),
+        Action::Allow { filter: None } => {
+            "LIFT every held curation filter (autofill and radio may pick anything again)".to_string()
+        }
+        Action::Allow { filter: Some(f) } => {
+            format!("LIFT the held \"{}\" filter (autofill and radio may pick it again)", f.label())
+        }
         Action::SetMode { mode, on } => {
             format!("turn {} mode {}", mode.word(), if *on { "ON" } else { "OFF" })
         }

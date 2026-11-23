@@ -62,6 +62,12 @@ pub struct ResumeState {
     /// upgrade, and the configured mode then stands unchanged.
     #[serde(default)]
     pub continuation_walk: bool,
+    /// The held curation exclusions (`no remixes`, `no <artist>`), so a filter the
+    /// human asked for survives a restart. `#[serde(default)]` so an older
+    /// resume.toml loads with none held. LAST on purpose: it serializes as a TOML
+    /// array of tables, which must follow every plain value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excludes: Vec<crate::plan::CurateFilter>,
 }
 
 /// One persisted queue entry. Internally tagged (`kind = "song" | "stream"`) so
@@ -263,6 +269,7 @@ mod tests {
             saved_at_unix: 1_700_000_000,
             continuation: true,
             continuation_walk: false,
+            excludes: Vec::new(),
         }
     }
 

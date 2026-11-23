@@ -1012,6 +1012,19 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
         "remove" => Some(Action::Remove { sel: parse_qselector(&toks[1..])? }),
         "play" => Some(Action::Play { sel: parse_qselector(&toks[1..])? }),
         "noop" => Some(Action::Noop),
+        // Lift a held curation exclusion: `allow all` | `allow <filter>` with the
+        // same filter words as `upcoming` (album is never held, so it is refused).
+        "allow" => {
+            if toks.get(1)?.eq_ignore_ascii_case("all") {
+                return Some(Action::Allow { filter: None });
+            }
+            let mut sel = vec!["upcoming".to_string()];
+            sel.extend(toks[1..].iter().cloned());
+            match parse_qselector(&sel)? {
+                QueueSelector::Upcoming(f) if f.is_sticky() => Some(Action::Allow { filter: Some(f) }),
+                _ => None,
+            }
+        }
         "mode" => {
             let mode = crate::plan::PlayMode::from_word(&toks.get(1)?.to_lowercase())?;
             let on = match toks.get(2)?.to_lowercase().as_str() {

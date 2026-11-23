@@ -144,6 +144,11 @@ fn rules_body(
     // 1c'. subtractive curation over the UPCOMING queue ("no remixes", "no Daft
     // Punk as lead", "drop the rest of this album"), and the honest not-yet for
     // refinements that need audio-content metadata ("no voices", "more motion").
+    // Its inverse first: "allow remixes again" / "clear filters" lifts a HELD
+    // exclusion, and must not be read as a curation by the "no X" rule.
+    if let Some(plans) = allow_again(text) {
+        return Ok(plans);
+    }
     if let Some(plans) = curate(text)? {
         return Ok(plans);
     }
@@ -296,6 +301,84 @@ const NOT_ARTISTS: &[&str] = &[
     "thanks", "thank you", "music", "songs", "tracks", "song", "track", "sound", "volume",
     "more", "way", "problem", "idea", "", "this", "that", "it",
 ];
+
+/// Lift a HELD curation exclusion. `None` when the utterance is not one.
+/// "clear filters" / "reset the filters" lifts every one; "allow remixes again" /
+/// "bring Daft Punk back" / "remixes are fine again" lifts one. An unprefixed
+/// phrase (or the loose "bring X") must carry an again/back/fine marker, so a
+/// bare "remixes" or "bring me something" never reads as a lift.
+fn allow_again(text: &str) -> Option<Vec<RawPlan>> {
+    let t = text.trim().trim_end_matches(['.', '!', '?']).trim();
+    let low = t.to_lowercase();
+    let allow = |filter: Option<CurateFilter>| {
+        Some(vec![plan(RawTrigger::Immediate, Action::Allow { filter }, true)])
+    };
+    const ALL: &[&str] = &[
+        "clear filters", "clear the filters", "clear all filters", "clear filter", "clear the filter",
+        "reset filters", "reset the filters", "remove filters", "remove the filters", "drop the filters",
+        "drop filters", "no filters", "allow everything again", "allow anything again", "unfilter",
+        "stop filtering", "lift the filters", "lift filters", "clear exclusions", "clear the exclusions",
+    ];
+    if ALL.contains(&low.as_str()) {
+        return allow(None);
+    }
+    let marked = |b: &str| {
+        let mut b = b;
+        let mut hit = false;
+        for s in [" again", " back in", " back", " are fine", " is fine", " are ok", " is ok"] {
+            if let Some(x) = strip_suffix_ci(b, s) {
+                b = x.trim_end();
+                hit = true;
+            }
+        }
+        (b.to_string(), hit)
+    };
+    let mut body = None;
+    for (p, need) in [
+        ("allow ", false),
+        ("bring back ", false),
+        ("unblock ", false),
+        ("unfilter ", false),
+        ("stop filtering ", false),
+        ("stop excluding ", false),
+        ("bring ", true),
+    ] {
+        if let Some(rest) = strip_prefix_ci(t, p) {
+            body = Some((rest.trim(), need));
+            break;
+        }
+    }
+    let (name, hit) = match body {
+        Some((b, need)) => {
+            let (b, hit) = marked(b);
+            (b, hit || !need)
+        }
+        None => marked(t),
+    };
+    if !hit {
+        return None;
+    }
+    let mut name = name.as_str();
+    for lead in ["the ", "some ", "any "] {
+        if let Some(b) = strip_prefix_ci(name, lead) {
+            name = b;
+        }
+    }
+    let nl = name.to_lowercase();
+    if matches!(nl.as_str(), "remixes" | "remix" | "rmx" | "remixed tracks") {
+        return allow(Some(CurateFilter::Remixes));
+    }
+    if matches!(nl.as_str(), "live" | "live versions" | "live tracks" | "live recordings" | "live songs") {
+        return allow(Some(CurateFilter::Live));
+    }
+    if matches!(nl.as_str(), "everything" | "anything" | "it all" | "all") {
+        return allow(None);
+    }
+    if NOT_ARTISTS.contains(&nl.as_str()) || nl.split_whitespace().count() > 5 {
+        return None;
+    }
+    allow(Some(CurateFilter::Artist(name.to_string())))
+}
 
 /// Subtractive curation over the UPCOMING queue. `Ok(None)` when the utterance is
 /// not a curation request (the caller falls through to the other rules). Every

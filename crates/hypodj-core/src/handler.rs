@@ -487,6 +487,18 @@ struct State {
     /// repeat invariant has to hold at album granularity instead. EPHEMERAL, like its
     /// track-level sibling.
     autofill_seen_albums: VecDeque<AlbumId>,
+    /// The HELD curation exclusions: every sticky [`crate::plan::CurateFilter`] an
+    /// `Action::Remove { sel: Upcoming(f) }` armed ("no remixes", "no <artist>"),
+    /// honored by every autonomous PICK (autofill walk + album refill, artist-top /
+    /// random radio starts, the similar / radio / calmer enqueue pools) so a filter
+    /// the human asked for cannot be undone by the next refill. Lifted by
+    /// `Action::Allow`, by undo of the curation that armed it, or by a restart -
+    /// it rides resume.toml, so it survives a rebuild too. Explicit picks (a named
+    /// song, an album he pointed at, an exact query) are NEVER filtered: the
+    /// exclusion bounds what the daemon chooses, not what he does.
+    excludes: Vec<crate::plan::CurateFilter>,
+    /// Bumped on every change to `excludes` (the journal's drift key).
+    excludes_gen: u64,
     /// The clock instant of the most recent autofill FETCH attempt (stamped BEFORE the
     /// fetch), or `None` until the first. The DEGENERATE-INPUT FUSE: a true-drain within
     /// [`AUTOFILL_MIN_INTERVAL`] of this stamp is a pathological instant-EOF spiral (a
@@ -1176,6 +1188,40 @@ impl State {
         Modes { random: self.random, repeat: self.repeat, single: self.single, consume: self.consume }
     }
 
+    /// Hold one sticky curation filter (dedup, case-insensitive). Returns whether
+    /// the held set changed.
+    pub(crate) fn hold_exclude(&mut self, f: &crate::plan::CurateFilter) -> bool {
+        if !f.is_sticky() || self.excludes.iter().any(|h| h.same_as(f)) {
+            return false;
+        }
+        self.excludes.push(f.clone());
+        self.excludes_gen += 1;
+        true
+    }
+
+    /// Lift one held filter (`Some`) or all (`None`). Returns how many were lifted.
+    pub(crate) fn lift_exclude(&mut self, f: Option<&crate::plan::CurateFilter>) -> usize {
+        let before = self.excludes.len();
+        match f {
+            Some(f) => self.excludes.retain(|h| !h.same_as(f)),
+            None => self.excludes.clear(),
+        }
+        let n = before - self.excludes.len();
+        if n > 0 {
+            self.excludes_gen += 1;
+        }
+        n
+    }
+
+    /// Install a held set wholesale (undo, resume), bumping the generation only
+    /// when it actually differs.
+    pub(crate) fn set_excludes(&mut self, v: Vec<crate::plan::CurateFilter>) {
+        if self.excludes != v {
+            self.excludes = v;
+            self.excludes_gen += 1;
+        }
+    }
+
     /// Put the four mode flags back (an undo).
     pub(crate) fn set_modes(&mut self, m: Modes) {
         self.random = m.random;
@@ -1351,6 +1397,8 @@ impl Default for State {
             autofill_seen: VecDeque::new(),
             autofill_seen_albums: VecDeque::new(),
             last_autofill_at: None,
+            excludes: Vec::new(),
+            excludes_gen: 0,
         }
     }
 }
@@ -2118,6 +2166,9 @@ pub enum PlanOutcome {
     Played { n: usize, title: Option<String>, selector: String },
     /// A queue REMOVE: `n` entries removed (0 = clean no-op, no match).
     Removed(usize),
+    /// A sticky curation: `removed` upcoming rows dropped AND the filter (named by
+    /// `holding`) now held against autofill / radio picks.
+    Curated { removed: usize, holding: String },
     /// A queue MOVE: `n` entries moved.
     Moved(usize),
     /// A queue CLEAR: `n` entries cleared.
@@ -2146,6 +2197,10 @@ impl PlanOutcome {
             PlanOutcome::Played { title: Some(t), .. } => format!("played {t}"),
             PlanOutcome::Played { n, .. } => format!("played {n} {}", tracks_word(*n)),
             PlanOutcome::Removed(n) => format!("removed {n} {}", tracks_word(*n)),
+            PlanOutcome::Curated { removed, holding } => format!(
+                "removed {removed} {}; holding out {holding} from autofill and radio",
+                tracks_word(*removed)
+            ),
             PlanOutcome::Moved(n) => format!("moved {n} {}", tracks_word(*n)),
             PlanOutcome::Cleared(n) => format!("cleared {n} {}", tracks_word(*n)),
             PlanOutcome::Jumped(0) => "no matching track to play".to_string(),
@@ -3855,10 +3910,35 @@ impl HypodjHandler {
             },
             // DETERMINISTIC queue edits: the selector resolves against the LIVE queue;
             // a no-match is a clean no-op (count 0), never a wrong-target edit.
+            // A STICKY curation also holds its filter, so the next autofill /
+            // radio pick cannot bring a match straight back. Held AFTER the rows go
+            // (one short lock, no await), and only when the removal itself did not
+            // fail, so a failed edit never leaves a standing exclusion behind.
+            Action::Remove { sel: crate::plan::QueueSelector::Upcoming(f) } if f.is_sticky() => {
+                match self.plan_queue_edit(action).await {
+                    Ok(n) => {
+                        self.state.lock().unwrap().hold_exclude(f);
+                        self.notify_change();
+                        PlanOutcome::Curated { removed: n, holding: f.label() }
+                    }
+                    Err(e) => PlanOutcome::Failed(e),
+                }
+            }
             Action::Remove { .. } => match self.plan_queue_edit(action).await {
                 Ok(n) => PlanOutcome::Removed(n),
                 Err(e) => PlanOutcome::Failed(e),
             },
+            Action::Allow { filter } => {
+                let lifted = self.state.lock().unwrap().lift_exclude(filter.as_ref());
+                if lifted > 0 {
+                    self.notify_change();
+                }
+                PlanOutcome::Effect(match (filter, lifted) {
+                    (_, 0) => "no filter was being held".to_string(),
+                    (Some(f), _) => format!("allowing {} again", f.label()),
+                    (None, n) => format!("cleared {n} held {}", if n == 1 { "filter" } else { "filters" }),
+                })
+            }
             Action::Move { .. } => match self.plan_queue_edit(action).await {
                 Ok(n) => PlanOutcome::Moved(n),
                 Err(e) => PlanOutcome::Failed(e),
@@ -3916,6 +3996,7 @@ impl HypodjHandler {
             // Assigned by `journal_record`, which is the one that knows the action.
             restores_volume: false,
             modes: st.modes(),
+            excludes: st.excludes.clone(),
         };
         let key = WorldKey {
             playlist_version: st.playlist_version,
@@ -3923,6 +4004,7 @@ impl HypodjHandler {
             state,
             target_volume,
             modes: st.modes(),
+            excludes_gen: st.excludes_gen,
         };
         (snap, key)
     }
@@ -3941,6 +4023,7 @@ impl HypodjHandler {
             state,
             target_volume: st.target_volume,
             modes: st.modes(),
+            excludes_gen: st.excludes_gen,
         };
         (ids, key)
     }
@@ -3956,6 +4039,7 @@ impl HypodjHandler {
             state,
             target_volume: st.target_volume,
             modes: st.modes(),
+            excludes_gen: st.excludes_gen,
         }
     }
 
@@ -4016,7 +4100,17 @@ impl HypodjHandler {
                     && raw_post_key.state == pre_key.state))
             // The flags must be exactly what this action alone writes: a human
             // `random` landing inside the window is not ours to put back.
-            && raw_post_key.modes == pre_key.modes.after(action);
+            && raw_post_key.modes == pre_key.modes.after(action)
+            // The held exclusions may move only under an action that writes them
+            // (a sticky curation arms one, `Allow` lifts), and then by exactly one
+            // generation: a human `clear filters` inside the window is not ours.
+            && match action {
+                Action::Remove { sel: crate::plan::QueueSelector::Upcoming(_) }
+                | Action::Allow { .. } => {
+                    raw_post_key.excludes_gen.wrapping_sub(pre_key.excludes_gen) <= 1
+                }
+                _ => raw_post_key.excludes_gen == pre_key.excludes_gen,
+            };
         snap.restores_volume = restores_volume(action);
         let mut post_key = raw_post_key;
         // A plan fade is NON-committing: `target_volume` stays at the pre level for
@@ -4859,11 +4953,10 @@ impl HypodjHandler {
                 .into_iter()
                 .take(want)
                 .collect(),
-            Selector::Radio => self
-                .client
-                .random_songs(Some(want as i32))
-                .await
-                .map_err(|e| e.to_string())?,
+            Selector::Radio => drop_excluded(
+                &self.held_excludes(),
+                self.client.random_songs(Some(want as i32)).await.map_err(|e| e.to_string())?,
+            ),
             Selector::Starred => self
                 .client
                 .starred_songs()
@@ -4898,8 +4991,10 @@ impl HypodjHandler {
                         .await
                         .map_err(|e| e.to_string())?;
                 }
-                // "More like this" must not re-enqueue the seed itself.
+                // "More like this" must not re-enqueue the seed itself, nor a track
+                // a held curation filter keeps out.
                 songs.retain(|s| &s.id != id);
+                let mut songs = drop_excluded(&self.held_excludes(), songs);
                 songs.truncate(want);
                 songs
             }
@@ -4930,6 +5025,7 @@ impl HypodjHandler {
                         }
                         // Never re-enqueue the seed (the track already playing/queued).
                         songs.retain(|s| s.id != id);
+                        let mut songs = drop_excluded(&self.held_excludes(), songs);
                         songs.truncate(want);
                         songs
                     }
@@ -4959,6 +5055,7 @@ impl HypodjHandler {
                 }
                 // "Something calmer" must not re-enqueue the seed itself.
                 pool.retain(|s| &s.id != id);
+                let pool = drop_excluded(&self.held_excludes(), pool);
                 calmer_rerank(self.store.as_ref(), &seed, pool, want)
             }
         };
@@ -5179,6 +5276,11 @@ impl HypodjHandler {
         if n > 0 {
             self.arm_fresh_enqueue_anchor(first_qid);
         }
+    }
+
+    /// A snapshot of the held curation exclusions (one short lock).
+    fn held_excludes(&self) -> Vec<crate::plan::CurateFilter> {
+        self.state.lock().unwrap().excludes.clone()
     }
 
     /// Apply the active latent-field pulls to a resolved candidate list, biasing the
@@ -10460,6 +10562,7 @@ impl HypodjHandler {
                 // ONE track, not fifty: the gesture is "surprise me and keep going", and
                 // the walk supplies the rest.
                 let songs = self.radio_fetch_songs(RadioWire::Random, "").await?;
+                let songs = drop_excluded(&self.held_excludes(), songs);
                 let Some(song) = songs.into_iter().next() else {
                     return Err(RadioResolveError::NotFound(
                         "the library returned no random song".to_string(),
@@ -10546,8 +10649,11 @@ impl HypodjHandler {
         let top = self
             .radio_fetch_songs(RadioWire::ArtistTop(want as i32), &name)
             .await?;
+        // Top songs are the daemon's PICK (he named the artist, not the tracks), so a
+        // held filter ("no remixes") applies; the album fallback is likewise filtered.
+        let top = drop_excluded(&self.held_excludes(), top);
         let songs = if top.is_empty() {
-            self.radio_fetch_songs(RadioWire::Album, &album_id.0).await?
+            drop_excluded(&self.held_excludes(), self.radio_fetch_songs(RadioWire::Album, &album_id.0).await?)
         } else {
             top
         };
@@ -10688,6 +10794,7 @@ impl HypodjHandler {
             playlist_version: st.playlist_version,
             continuation: st.continuation,
             continuation_walk: walk,
+            excludes: st.excludes.clone(),
             saved_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -10940,6 +11047,9 @@ impl HypodjHandler {
             // Rehydrate the persisted continuation arming (default false for a
             // pre-continuation resume.toml) so the toggle survives a restart.
             st.continuation = s.continuation;
+            // The held curation exclusions ride the restart too ("no remixes"
+            // should not quietly expire on a rebuild).
+            st.set_excludes(s.excludes.iter().filter(|f| f.is_sticky()).cloned().collect());
             if playing {
                 // Start SILENT so the first buffer is inaudible; the wake ramp then
                 // rises from the synth floor to the saved level.
@@ -11078,6 +11188,7 @@ impl HypodjHandler {
         let next_qid = snap.next_qid;
         let current = snap.current;
         let modes = snap.modes;
+        let excludes = snap.excludes.clone();
 
         if deck_ok && !dipping {
             // THE QUIET PATH, and the common one: the rows go back and nothing else
@@ -11092,6 +11203,7 @@ impl HypodjHandler {
                 st.next_id = next_qid.max(st.next_id);
                 st.current = current;
                 st.set_modes(modes);
+                st.set_excludes(excludes);
                 // FORWARD only, never back to the snapshot's own version: a client
                 // re-reads the queue when `playlist:` GROWS, so rolling it back would
                 // leave every client showing the world this call just replaced.
@@ -11124,6 +11236,7 @@ impl HypodjHandler {
                 st.next_id = next_qid.max(st.next_id);
                 st.current = current;
                 st.set_modes(modes);
+                st.set_excludes(excludes);
                 st.playlist_version = st.playlist_version.wrapping_add(1);
                 // Any in-flight skip target belongs to the world being replaced.
                 st.pending_skip = None;
@@ -11964,7 +12077,7 @@ impl HypodjHandler {
 
     async fn autofill_once(&self, seed_override: Option<SongId>, start: AutofillStart) -> usize {
         // 1. One short lock: armed? fuse? snapshot the dedup ring; stamp the fetch time.
-        let (n, seen, album_ctx, seen_albums) = {
+        let (n, seen, album_ctx, seen_albums, held) = {
             let mut st = self.state.lock().unwrap();
             // Armed? The runtime toggle must be ON (default OFF - never a surprise). Same
             // toggle as radio: ONE arm switch, `mode` selects the behavior.
@@ -11999,6 +12112,7 @@ impl HypodjHandler {
                 seen,
                 album_ctx,
                 seen_albums,
+                st.excludes.clone(),
             )
         };
         // The seed: the caller's EXPLICIT one (a `radio <thing>` gesture) if it supplied
@@ -12014,7 +12128,16 @@ impl HypodjHandler {
         //    degrade chain - autofill promises SIMILAR, not anything. Empty or error is an
         //    honest stop (one info log, no retry, no fallback ladder at the drain edge).
         let fetched = match self.autofill_fetch(&seed, (n * 2) as i32).await {
-            Ok(v) if !v.is_empty() => v,
+            // The HELD curation exclusions apply to the suggestion layer itself, so a
+            // held "no <artist>" also keeps that artist's albums out of album mode.
+            Ok(v) if !v.is_empty() => {
+                let v = drop_excluded(&held, v);
+                if v.is_empty() {
+                    tracing::info!(seed = %seed.0, "autofill: every similar song is held out by a curation filter; ending stopped");
+                    return 0;
+                }
+                v
+            }
             Ok(_) => {
                 tracing::info!(seed = %seed.0, "autofill: backend returned no similar songs; ending stopped");
                 return 0;
@@ -12053,7 +12176,10 @@ impl HypodjHandler {
                 }
                 tried += 1;
                 match self.autofill_album_songs(&aid).await {
-                    Ok(songs) if !songs.is_empty() => {
+                    Ok(songs) if !drop_excluded(&held, songs.clone()).is_empty() => {
+                        // A held filter drops its matches from the record (a remix
+                        // bonus track) rather than vetoing the whole album.
+                        let songs = drop_excluded(&held, songs);
                         // Play it as a record: disc then track, with absent numbers
                         // sorting first in the server's own order (a stable sort keeps
                         // that order intact).
@@ -14183,6 +14309,15 @@ fn continuation_mode_name(mode: ContinuationMode) -> &'static str {
 /// words: inside the `radio` verb "radio" would name the whole feature rather than the
 /// mechanism, so the two mechanisms are reported as what they DO - a library `walk` or a
 /// `station` handoff.
+/// Drop every candidate a HELD curation exclusion matches (see
+/// `State::excludes`). Order is preserved; an empty held set is the identity.
+fn drop_excluded(held: &[crate::plan::CurateFilter], mut songs: Vec<Song>) -> Vec<Song> {
+    if !held.is_empty() {
+        songs.retain(|s| !crate::plan::excluded_by(held, &s.title, s.artist.as_deref()));
+    }
+    songs
+}
+
 fn radio_mode_name(mode: ContinuationMode) -> &'static str {
     match mode {
         ContinuationMode::Radio => "station",
@@ -14333,6 +14468,14 @@ impl MpdHandler for HypodjHandler {
                 // <station>" queue-tail hint. Present ONLY when armed (lean at rest).
                 for (k, v) in self.continuation_status_pairs() {
                     b = b.pair(k, v);
+                }
+                // Surface the HELD curation exclusions as one compact pair, present
+                // only while one is held, so a client can show (and the human can
+                // see) why autofill keeps skipping remixes.
+                let held = self.held_excludes();
+                if !held.is_empty() {
+                    let labels: Vec<String> = held.iter().map(|f| f.label()).collect();
+                    b = b.pair("X-hypodj-exclude", labels.join("; "));
                 }
                 // Surface the OFFLINE STORE's progress as one compact pair, present
                 // only once a full pass has published. It rides `status` because a
@@ -26915,6 +27058,7 @@ mod tests {
             saved_at_unix: 1,
             continuation: false,
             continuation_walk: false,
+            excludes: Vec::new(),
         };
         h.restore(&s).await.unwrap();
         assert_eq!(h.player.state(), PlayState::Playing);
@@ -26942,6 +27086,7 @@ mod tests {
             saved_at_unix: 1,
             continuation: false,
             continuation_walk: false,
+            excludes: Vec::new(),
         };
         h.restore(&s).await.unwrap();
         assert_eq!(h.player.state(), PlayState::Stopped, "no autoplay on a paused resume");
@@ -27010,6 +27155,7 @@ mod tests {
             saved_at_unix: 1,
             continuation: false,
             continuation_walk: false,
+            excludes: Vec::new(),
         };
         // (a) restore aborts and leaves State untouched (no drain to empty, no
         // partial install).
@@ -27040,6 +27186,7 @@ mod tests {
             saved_at_unix: 1,
             continuation: false,
             continuation_walk: false,
+            excludes: Vec::new(),
         };
         crate::resume::store_atomic(&path, &good).expect("seed the good file");
         h.set_state_path(path.clone());
@@ -29590,6 +29737,7 @@ mod tests {
             saved_at_unix: 1,
             continuation: false,
             continuation_walk: false,
+            excludes: Vec::new(),
         }
     }
 
@@ -30955,17 +31103,92 @@ mod tests {
         let sel = QueueSelector::Upcoming(CurateFilter::Remixes);
         assert_eq!(h.preview_selector_count(&sel), 2, "the playing remix is not counted");
         let out = h.run_action_outcome(&Action::Remove { sel }, "mcp:s").await;
-        assert_eq!(out, PlanOutcome::Removed(2));
+        assert_eq!(out, PlanOutcome::Curated { removed: 2, holding: "remixes".into() });
         assert_eq!(ids(&h), vec!["a", "b", "d"], "row a plays on, untouched");
         assert!(drain_events(&h, &mut events).await.is_empty(), "the deck was never touched");
 
         assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
         assert_eq!(rows(&h), before, "every removed row is back, in place, with its id");
+        assert!(h.held_excludes().is_empty(), "and the undo lifted the held filter too");
 
         // Lead vs featured: "no Pharrell as lead" keeps the feature on row c.
         let lead = QueueSelector::Upcoming(CurateFilter::LeadArtist("pharrell".into()));
-        assert_eq!(h.run_action_outcome(&Action::Remove { sel: lead }, "mcp:s").await, PlanOutcome::Removed(1));
+        assert_eq!(
+            h.run_action_outcome(&Action::Remove { sel: lead }, "mcp:s").await,
+            PlanOutcome::Curated { removed: 1, holding: "lead \"pharrell\"".into() }
+        );
         assert_eq!(ids(&h), vec!["a", "b", "c", "e"]);
+    }
+
+    // A STICKY curation is held: the next autofill refill cannot bring a remix
+    // straight back, `status` names the held filter, `Allow` lifts it, and an
+    // undo of the Allow puts it back.
+    #[tokio::test(start_paused = true)]
+    async fn held_curation_keeps_remixes_out_of_autofill_until_allowed() {
+        use crate::plan::{CurateFilter, QueueSelector};
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let mk = |id: &str, title: &str| {
+            let mut s = playlist_test_song(id);
+            s.title = title.into();
+            s
+        };
+        h.enqueue_song_for_test(mk("seed", "Seed")).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_mode(ContinuationMode::Autofill, crate::config::DEFAULT_AUTOFILL_COUNT);
+        let journal_len = |h: &HypodjHandler| h.journal.views(Instant::now(), &h.world_key()).len();
+        let sel = QueueSelector::Upcoming(CurateFilter::Remixes);
+        let out = h.run_action_outcome(&Action::Remove { sel }, "mcp:s").await;
+        assert_eq!(out, PlanOutcome::Curated { removed: 0, holding: "remixes".into() });
+        assert!(out.render().contains("holding out remixes"));
+        assert_eq!(journal_len(&h), 1, "a pure hold is still journaled");
+
+        h.push_autofill_batch(Ok(vec![mk("r1", "Song (Club Remix)"), mk("k1", "Keeper"), mk("r2", "X RMX")]));
+        assert_eq!(h.autofill_once(None, AutofillStart::Behind).await, 1);
+        assert_eq!(ids(&h), vec!["seed", "k1"], "only the non-remix came in");
+
+        let held_pair = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p.into_iter().find(|(k, _)| k == "X-hypodj-exclude").map(|(_, v)| v),
+            _ => panic!("status ACKed"),
+        };
+        assert_eq!(held_pair(h.handle(MpdCommand::Status).await).as_deref(), Some("remixes"));
+
+        let out = h.run_action_outcome(&Action::Allow { filter: None }, "mcp:s").await;
+        assert_eq!(out, PlanOutcome::Effect("cleared 1 held filter".into()));
+        assert!(h.held_excludes().is_empty());
+        assert_eq!(held_pair(h.handle(MpdCommand::Status).await), None, "lean again at rest");
+
+        // Undo of the Allow re-holds it (the snapshot carries the held set).
+        assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
+        assert_eq!(h.held_excludes(), vec![CurateFilter::Remixes]);
+
+        // Allowing a filter that is not held changes nothing and journals nothing.
+        h.state.lock().unwrap().lift_exclude(None);
+        let n = journal_len(&h);
+        let out = h.run_action_outcome(&Action::Allow { filter: Some(CurateFilter::Live) }, "mcp:s").await;
+        assert_eq!(out.render(), "no filter was being held");
+        assert_eq!(journal_len(&h), n);
+
+        // Past the fuse interval, a lifted filter lets remixes back in.
+        tokio::time::advance(AUTOFILL_MIN_INTERVAL).await;
+        h.push_autofill_batch(Ok(vec![mk("r3", "Other (Remix)")]));
+        assert_eq!(h.autofill_once(None, AutofillStart::Behind).await, 1);
+    }
+
+    // RestOfAlbum is relative to the playing record, so it is never held; Artist
+    // holds are case-insensitive and deduplicated.
+    #[test]
+    fn hold_rules_skip_rest_of_album_and_dedup_artists() {
+        use crate::plan::CurateFilter;
+        let mut st = State::default();
+        assert!(!st.hold_exclude(&CurateFilter::RestOfAlbum));
+        assert!(st.hold_exclude(&CurateFilter::Artist("Daft Punk".into())));
+        assert!(!st.hold_exclude(&CurateFilter::Artist("daft punk ".into())));
+        assert_eq!(st.lift_exclude(Some(&CurateFilter::Artist("DAFT PUNK".into()))), 1);
+        assert!(st.excludes.is_empty());
+        let feat = Some("Daft Punk feat. Pharrell");
+        assert!(crate::plan::excluded_by(&[CurateFilter::Artist("pharrell".into())], "Get Lucky", feat));
+        assert!(!crate::plan::excluded_by(&[CurateFilter::LeadArtist("pharrell".into())], "Get Lucky", feat));
     }
 
     // A jump moved the playhead to another row; the undo has to bring it back to

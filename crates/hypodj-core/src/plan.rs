@@ -361,6 +361,13 @@ pub enum Action {
     /// `consume` commands, so NL and the direct verbs cannot diverge. Idempotent,
     /// bounded (a bool), non-destructive.
     SetMode { mode: PlayMode, on: bool },
+    /// Lift a held curation exclusion (see [`CurateFilter::is_sticky`]): `Some(f)`
+    /// lifts that one filter ("allow remixes again"), `None` lifts every one
+    /// ("clear filters"). Touches NO row, the deck or the level - it only widens
+    /// what autofill / radio may pick from here on. A filter that is not held is a
+    /// clean no-op. Retractable like a mode flag: the journal snapshot carries the
+    /// held set.
+    Allow { filter: Option<CurateFilter> },
 }
 
 /// A playback mode an [`Action::SetMode`] toggles. Mirrors the four MPD mode
@@ -455,6 +462,56 @@ pub enum CurateFilter {
     /// Only rows where this artist is a LEAD credit (before any feat/ft/with
     /// marker in the artist field); rows that merely feature them stay.
     LeadArtist(String),
+}
+
+impl CurateFilter {
+    /// Does arming this filter also HOLD it as a session exclusion, so autofill /
+    /// radio cannot bring a match straight back? True for every filter that names a
+    /// KIND of track. [`CurateFilter::RestOfAlbum`] is relative to whatever is
+    /// playing at that instant ("skip the rest of THIS album"), so holding it would
+    /// silently ban a record the human never named - it stays one-shot.
+    pub fn is_sticky(&self) -> bool {
+        !matches!(self, CurateFilter::RestOfAlbum)
+    }
+
+    /// The short human label of a held exclusion (status line, outcome text).
+    pub fn label(&self) -> String {
+        match self {
+            CurateFilter::Remixes => "remixes".into(),
+            CurateFilter::Live => "live".into(),
+            CurateFilter::RestOfAlbum => "this album".into(),
+            CurateFilter::Artist(a) => format!("artist \"{a}\""),
+            CurateFilter::LeadArtist(a) => format!("lead \"{a}\""),
+        }
+    }
+
+    /// Case-insensitive identity for the held set, so "no Daft Punk" twice holds
+    /// one entry and "allow daft punk" lifts it.
+    pub fn same_as(&self, other: &CurateFilter) -> bool {
+        let n = |s: &str| s.trim().to_lowercase();
+        match (self, other) {
+            (CurateFilter::Artist(a), CurateFilter::Artist(b))
+            | (CurateFilter::LeadArtist(a), CurateFilter::LeadArtist(b)) => n(a) == n(b),
+            (a, b) => a == b,
+        }
+    }
+}
+
+/// PURE. Is a library candidate excluded by ANY held filter? The candidate-side
+/// twin of [`curate_matches`]: same predicate, applied to a song autofill / radio
+/// is about to pick instead of a row already queued. `RestOfAlbum` is never held
+/// (see [`CurateFilter::is_sticky`]) and so never matches here.
+pub fn excluded_by(held: &[CurateFilter], title: &str, artist: Option<&str>) -> bool {
+    if held.is_empty() {
+        return false;
+    }
+    let row = RowMeta {
+        text: String::new(),
+        title: title.to_string(),
+        artist: artist.map(str::to_string),
+        album_id: None,
+    };
+    held.iter().any(|f| f.is_sticky() && curate_matches(f, &row, None))
 }
 
 /// The per-row metadata [`resolve_selector_rows`] reads: `text` is the same
@@ -827,7 +884,8 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
         | Action::Clear { .. }
         | Action::Play { .. }
         | Action::Noop
-        | Action::SetMode { .. } => action.clone(),
+        | Action::SetMode { .. }
+        | Action::Allow { .. } => action.clone(),
     }
 }
 

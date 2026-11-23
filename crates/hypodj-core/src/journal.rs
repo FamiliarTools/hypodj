@@ -106,6 +106,11 @@ pub(crate) struct Snapshot {
     /// live undo they equal the post-action flags, and only a `SetMode` makes the
     /// two differ.
     pub(crate) modes: Modes,
+    /// The held curation exclusions (see [`crate::plan::CurateFilter::is_sticky`]).
+    /// Always put back, for the same reason as `modes`: the [`WorldKey`] carries
+    /// their generation, so on any live undo they equal the post-action set, and
+    /// only an action that armed or lifted a filter makes the two differ.
+    pub(crate) excludes: Vec<crate::plan::CurateFilter>,
 }
 
 /// The DRIFT DETECTOR: the coarse shape of the world, compared before an undo is
@@ -143,6 +148,9 @@ pub(crate) struct WorldKey {
     pub(crate) state: PlayState,
     pub(crate) target_volume: u8,
     pub(crate) modes: Modes,
+    /// Bumped on every change to the held curation exclusions, with NO version
+    /// bump, so a human `clear filters` between act and undo is drift.
+    pub(crate) excludes_gen: u64,
 }
 
 /// What the action ITSELF is allowed to have done, so that a CONCURRENT writer's
@@ -252,6 +260,7 @@ pub(crate) fn action_shape(action: &Action, outcome: &PlanOutcome) -> ActionShap
         Action::Wake { .. } => ActionShape::deck(Opaque),
         Action::Remove { .. } => match outcome {
             PlanOutcome::Removed(n) => ActionShape::deck(Removed(*n)),
+            PlanOutcome::Curated { removed, .. } => ActionShape::deck(Removed(*removed)),
             _ => ActionShape::deck(Opaque),
         },
         Action::Clear { .. } => match outcome {
@@ -271,6 +280,8 @@ pub(crate) fn action_shape(action: &Action, outcome: &PlanOutcome) -> ActionShap
         // snapshot carries the flags and the window check holds the post flags to
         // exactly this one write (see `Modes::after`).
         Action::SetMode { .. } => ActionShape::queue_only(Untouched),
+        // The held exclusion set only, the same shape as a mode flag.
+        Action::Allow { .. } => ActionShape::queue_only(Untouched),
         // EXHAUSTIVE on purpose, like `action_verb`: a new variant must fail to
         // compile HERE rather than default to a shape that lets an undo clobber.
     }
@@ -367,6 +378,7 @@ impl JournalEntry {
             && live.current_qid == self.post_key.current_qid
             && live.state == self.post_key.state
             && live.modes == self.post_key.modes
+            && live.excludes_gen == self.post_key.excludes_gen
             && (live.target_volume == self.post_key.target_volume
                 || live.target_volume == snap.target_volume)
     }
@@ -538,6 +550,7 @@ pub(crate) fn action_verb(action: &Action) -> &'static str {
         Action::PlayNow { .. } => "playnow",
         Action::Noop => "noop",
         Action::SetMode { .. } => "setmode",
+        Action::Allow { .. } => "allow",
         // EXHAUSTIVE on purpose (`Action` is #[non_exhaustive] only outside this
         // crate): a new variant must fail to compile HERE, so nobody adds an action
         // the journal cannot name.
@@ -558,6 +571,8 @@ pub(crate) fn changed_anything(outcome: &PlanOutcome) -> bool {
         PlanOutcome::Added { n, .. } => *n > 0,
         PlanOutcome::Played { n, .. } => *n > 0,
         PlanOutcome::Removed(n) => *n > 0,
+        // A held exclusion was armed even when no queued row matched.
+        PlanOutcome::Curated { .. } => true,
         PlanOutcome::Moved(n) => *n > 0,
         PlanOutcome::Cleared(n) => *n > 0,
         PlanOutcome::Jumped(n) => *n > 0,
@@ -582,6 +597,7 @@ mod tests {
             state,
             target_volume: vol,
             modes: Modes::default(),
+            excludes_gen: 0,
         }
     }
 
@@ -598,6 +614,7 @@ mod tests {
             target_volume: vol,
             restores_volume: true,
             modes: Modes::default(),
+            excludes: Vec::new(),
         }
     }
 
