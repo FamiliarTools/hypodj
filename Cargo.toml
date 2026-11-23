@@ -8,6 +8,7 @@ members = [
     "crates/hypodj-client",
     "crates/hypodj-tui",
     "crates/hypodj-build-info",
+    "crates/hypodj-style",
 ]
 
 [workspace.package]

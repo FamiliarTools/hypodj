@@ -4,10 +4,18 @@
 //! friendly "nothing playing".
 
 use hypodj_client::model::{fmt_remaining, parse_queue, ArmedFeatures, FieldState, NowPlaying};
+use hypodj_style::ansi::Ansi;
+use hypodj_style::{Role, TermBg};
 
 /// Render the now-playing card as plain text (a couple of lines). A stopped or
 /// empty deck is "nothing playing" - never a leftover title/artist.
 pub fn render_card(np: &NowPlaying) -> String {
+    render_card_with(np, Ansi::off())
+}
+
+/// Same card as [`render_card`], with colour from the ANSI adapter when `ansi` is on.
+/// Off (not a TTY, or `NO_COLOR`) is the plain card. The words do not change.
+pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
     let armed = render_armed(&np.armed);
@@ -38,7 +46,10 @@ pub fn render_card(np: &NowPlaying) -> String {
         // so it is followed by U+FE0E (text-presentation selector) to force a single
         // cell on emoji-presentation terminals. Prepended only when starred.
         if np.starred {
-            lines.push(format!("\u{2665}\u{FE0E} {t}"));
+            // The heart is the kept mark. Ember when colour is on; the glyph stays
+            // either way, so the line still says favourite with the colour stripped.
+            let mark = ansi.paint(Role::Ember, "\u{2665}\u{FE0E}", TermBg::dark_default());
+            lines.push(format!("{mark} {t}"));
         } else {
             lines.push(t.clone());
         }
@@ -247,6 +258,26 @@ mod tests {
         ])));
         assert!(!plain.contains('\u{2665}'));
         assert!(plain.contains("Blue in Green"));
+    }
+
+    #[test]
+    fn card_colour_on_and_off_match_once_stripped() {
+        let status = p(&[("state", "play"), ("volume", "40")]);
+        let current = p(&[
+            ("file", "song/42"),
+            ("Title", "Blue in Green"),
+            ("Artist", "Miles Davis"),
+            ("X-Starred", "1"),
+        ]);
+        let np = now_playing(&status, &current);
+        let off = render_card_with(&np, Ansi::off());
+        let on = render_card_with(&np, Ansi::on());
+        assert!(on.contains('\u{1b}'), "colour on actually emits an escape");
+        assert_eq!(hypodj_style::ansi::strip(&on), off);
+        assert_eq!(hypodj_style::ansi::strip(&off), off);
+        assert!(off.contains("\u{2665}\u{FE0E} Blue in Green"));
+        assert!(!Ansi::from_env(false, false).enabled());
+        assert!(!Ansi::from_env(true, true).enabled());
     }
 
     #[test]

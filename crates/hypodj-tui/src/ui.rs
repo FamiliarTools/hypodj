@@ -2,7 +2,9 @@
 //! the queue highlight; all decisions come from TuiState.
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
+
+use hypodj_style::ratatui::Emphasis;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -177,20 +179,20 @@ fn render_menu(f: &mut Frame, region: Rect, menu: &crate::menu::Menu, state: &Tu
     use crate::menu::Avail;
     // A legible fg for the detected background, the same INFO policy the help overlay
     // uses, so the two modals read as one visual system on light and dark terminals.
-    let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
+    let fg = hypodj_style::ratatui::info_color(hypodj_style::NEUTRAL_VIBRANT, state.term_bg, state.truecolor);
     let base = Style::default().fg(fg);
     let mut lines: Vec<Line> = vec![Line::from(vec![
-        Span::styled(menu.target.label.clone(), base.add_modifier(Modifier::BOLD)),
+        Span::styled(menu.target.label.clone(), base.bold()),
         Span::styled(
             format!("  ({})", menu.target.origin.word()),
-            base.add_modifier(Modifier::DIM),
+            base.quiet(),
         ),
     ])];
     for (i, row) in menu.rows.iter().enumerate() {
         let blocked = matches!(row.avail, Avail::No(_));
-        let mut style = if blocked { base.add_modifier(Modifier::DIM) } else { base };
+        let mut style = if blocked { base.quiet() } else { base };
         if i == menu.selected {
-            style = style.add_modifier(Modifier::REVERSED);
+            style = style.reverse();
         }
         lines.push(Line::from(Span::styled(
             format!(" {}  {} ", row.item.hotkey(), row.label),
@@ -201,7 +203,7 @@ fn render_menu(f: &mut Frame, region: Rect, menu: &crate::menu::Menu, state: &Tu
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(base)
-        .title(Span::styled("Menu", base.add_modifier(Modifier::BOLD)));
+        .title(Span::styled("Menu", base.bold()));
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(lines).block(block).style(base), popup);
 }
@@ -274,9 +276,9 @@ fn status_lines(msg: &str, width: usize, max_rows: usize) -> Vec<String> {
 /// press kept. Every line is WRAPPED rather than clipped: a marked row ends in its
 /// `[tape <n>: ...]` annotation, which is precisely what a horizontal clip removes.
 fn render_heard_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
-    let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
+    let fg = hypodj_style::ratatui::info_color(hypodj_style::NEUTRAL_VIBRANT, state.term_bg, state.truecolor);
     let base = Style::default().fg(fg);
-    let head = base.add_modifier(Modifier::BOLD);
+    let head = base.bold();
 
     // The WHOLE frame, unlike the help overlay's content-sized box: a heard line carries
     // a time, a title, a url and its tape annotation, so every column is worth having -
@@ -349,9 +351,9 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
     let rows: Vec<(String, String)> =
         base.iter().chain(state.card_more.iter()).cloned().collect();
     let rows = &rows;
-    let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
+    let fg = hypodj_style::ratatui::info_color(hypodj_style::NEUTRAL_VIBRANT, state.term_bg, state.truecolor);
     let base = Style::default().fg(fg);
-    let head = base.add_modifier(Modifier::BOLD);
+    let head = base.bold();
 
     // The label column is measured from the content, so a long label never collides with
     // its own value and a card of short labels does not carry a wide empty gutter.
@@ -439,7 +441,7 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
                 let label =
                     if i == 0 { format!("{k:<label_w$}  ") } else { " ".repeat(label_w + 2) };
                 lines.push(Line::from(vec![
-                    Span::styled(label, base.add_modifier(Modifier::DIM)),
+                    Span::styled(label, base.quiet()),
                     Span::styled(part.clone(), base),
                 ]));
             }
@@ -484,11 +486,11 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
 fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     use crate::keymap::grouped;
     // A legible fg for the detected background (a neutral swatch pushed to >= 3:1).
-    let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
+    let fg = hypodj_style::ratatui::info_color(hypodj_style::NEUTRAL_VIBRANT, state.term_bg, state.truecolor);
     let base = Style::default().fg(fg);
-    let head = base.add_modifier(Modifier::BOLD);
-    let key_style = base.add_modifier(Modifier::BOLD);
-    let desc_style = base.add_modifier(Modifier::DIM);
+    let head = base.bold();
+    let key_style = base.bold();
+    let desc_style = base.quiet();
 
     // Widest keys column across all rows, so the description column aligns.
     let key_w = keymap::KEYMAP.iter().map(|b| b.keys.len()).max().unwrap_or(6).min(18);
@@ -650,7 +652,7 @@ fn find_ci(label: &str, needle_lower: &str) -> Option<(usize, usize)> {
 /// The substring-highlight style: underline + bold, composed over the selected
 /// row's REVERSED modifier (see [`match_spans`]).
 fn hit_style() -> Style {
-    Style::default().add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
+    Style::default().underline().bold()
 }
 
 /// A one-line tab strip: the active screen is REVERSED, the rest dim.
@@ -670,9 +672,9 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen) {
             spans.push(Span::raw("  "));
         }
         let style = if *s == screen {
-            Style::default().add_modifier(Modifier::REVERSED)
+            Style::default().reverse()
         } else {
-            Style::default().add_modifier(Modifier::DIM)
+            Style::default().quiet()
         };
         spans.push(Span::styled(*label, style));
     }
@@ -771,18 +773,18 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         // far corner of the bottom bar. Two verbs cost one dim line.
         lines.push(Line::from(Span::styled(
             "F5 to search, F4 to ask the DJ",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         )));
         if let Some(a) = &armed_line {
             lines.push(Line::from(Span::styled(
                 a.clone(),
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().quiet(),
             )));
         }
         if let Some(fl) = &field_line {
             lines.push(Line::from(Span::styled(
                 fl.clone(),
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().quiet(),
             )));
         }
         // The ambient context hint is the last, faintest line: a stopped deck still
@@ -795,7 +797,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
             if state.screen != Screen::Dj && hint_earns_line(&hint.kind) {
                 lines.push(Line::from(Span::styled(
                     hint.phrase(),
-                    Style::default().add_modifier(Modifier::DIM),
+                    Style::default().quiet(),
                 )));
             }
         }
@@ -859,14 +861,18 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         width: inner.width,
         height: text_h,
     };
-    let title_span = Span::styled(headline, Style::default().add_modifier(Modifier::BOLD));
+    let title_span = Span::styled(headline, Style::default().bold());
     // A heart marks a Subsonic favorite. U+2665 is East-Asian-Width ambiguous, so it
     // is followed by U+FE0E (text-presentation selector) to force a single cell on
     // emoji-presentation terminals (else the title shifts and the border corrupts).
-    // Prepended only when starred, so the layout is unchanged otherwise. Red, subtle.
+    // Prepended only when starred, so the layout is unchanged otherwise.
+    // Ember: a kept item, fitted to the room. There is no red.
     let title_line = if np.starred {
         Line::from(vec![
-            Span::styled("\u{2665}\u{FE0E} ", Style::default().fg(Color::Red)),
+            Span::styled(
+                "\u{2665}\u{FE0E} ",
+                Style::default().fg(hypodj_style::ratatui::ember_color(state.term_bg, state.truecolor)),
+            ),
             title_span,
         ])
     } else {
@@ -878,7 +884,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     if let Some(station) = station_line {
         lines.push(Line::from(Span::styled(
             station,
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         )));
     }
     if let Some(artist) = np.artist.as_deref() {
@@ -889,7 +895,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         // the music. Still shown - the tag is what the server says, and hiding it would
         // be a different claim.
         let style = if is_placeholder_artist(artist) {
-            Style::default().add_modifier(Modifier::DIM)
+            Style::default().quiet()
         } else {
             Style::default()
         };
@@ -898,25 +904,25 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     if let Some(album) = np.album.as_deref() {
         lines.push(Line::from(Span::styled(
             album.to_string(),
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         )));
     }
     // Playback status: state | volume fader | N of M | M:SS.
     lines.push(Line::from(Span::styled(
         status_line(np, text_area.width as usize),
-        Style::default().add_modifier(Modifier::DIM),
+        Style::default().quiet(),
     )));
     if let Some(a) = armed_line {
         lines.push(Line::from(Span::styled(
             a,
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         )));
     }
     // The field pull is the last, faintest line - the quietest voice in the pane.
     if let Some(fl) = field_line {
         lines.push(Line::from(Span::styled(
             fl,
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         )));
     }
     f.render_widget(Paragraph::new(lines), text_area);
@@ -1012,7 +1018,7 @@ fn art_placeholder(_np: &NowPlaying) -> Paragraph<'static> {
     Paragraph::new(vec![Line::from("\u{266B}")])
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL))
-        .style(Style::default().add_modifier(Modifier::DIM))
+        .style(Style::default().quiet())
 }
 
 /// Right of Now Playing: a compact preview of the next 3 queued tracks, each a
@@ -1043,14 +1049,14 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
         // words are the same ones the continuation hint already uses ("then: <station>").
         let lead = if count == 0 { "next" } else { "then" };
         lines.push(Line::from(vec![
-            Span::styled(format!("{lead}  "), Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(it.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{lead}  "), Style::default().quiet()),
+            Span::styled(it.title.clone(), Style::default().bold()),
         ]));
         match it.artist.as_deref() {
             Some(a) if previous_artist != Some(a) => {
                 lines.push(Line::from(Span::styled(
                     format!("      {a}"),
-                    Style::default().add_modifier(Modifier::DIM),
+                    Style::default().quiet(),
                 )));
             }
             _ => {}
@@ -1064,11 +1070,11 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
         // a list), plus the one gesture that fills it.
         lines.push(Line::from(Span::styled(
             "nothing queued",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         )));
         lines.push(Line::from(Span::styled(
             "F5 to search, F4 to ask the DJ",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -2169,6 +2175,25 @@ mod tests {
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(out.contains('\u{2665}'), "heart glyph rendered when starred:\n{out}");
         assert!(out.contains("Blue in Green"), "title still present:\n{out}");
+        // The heart is ember, fitted to the room. Red is not a colour we paint.
+        s.truecolor = true;
+        let ember = hypodj_style::ratatui::ember_color(s.term_bg, true);
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| super::render(f, &s)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut saw = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].symbol().contains('\u{2665}') {
+                    assert_eq!(buf[(x, y)].style().fg, Some(ember), "heart is ember");
+                    assert_ne!(buf[(x, y)].style().fg, Some(ratatui::style::Color::Red));
+                    saw = true;
+                }
+            }
+        }
+        assert!(saw, "heart cell is on screen");
         // Not starred -> no heart, title unchanged.
         s.now.starred = false;
         let plain = render_to_lines_sized(&s, 100, 40).join("\n");
@@ -2895,7 +2920,7 @@ mod tests {
         });
         assert!(s.dj_log.iter().any(|l| l == "confirm? [y/N]"), "prompt pushed to chat");
         let accent =
-            crate::album_color::info_color([0xff, 0xd0, 0x66], s.term_bg, s.truecolor);
+            hypodj_style::ratatui::info_color(hypodj_style::CONFIRM_INFO_SWATCH, s.term_bg, s.truecolor);
         let colors = render_fg_colors(&s, 80, 30);
         assert!(colors.contains(&accent), "confirm prompt uses the accent color:\n{colors:?}");
         // The caret stays alive during the confirm (the pane must not read as dead).
@@ -3049,11 +3074,11 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     if let Some(station) = &state.now.continuation {
         items.push(ListItem::new(Line::from(Span::styled(
             format!("   then: {station}"),
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         ))));
     }
     let list = List::new(items).block(block).highlight_style(
-        Style::default().add_modifier(Modifier::REVERSED),
+        Style::default().reverse(),
     );
     let mut ls = ListState::default();
     if !state.queue.is_empty() {
@@ -3113,7 +3138,7 @@ fn render_browse(
         .collect();
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .highlight_style(Style::default().reverse());
     let mut ls = ListState::default();
     if !browse.rows.is_empty() {
         let h = area.height.saturating_sub(2) as usize;
@@ -3164,7 +3189,7 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
     let log_lines: Vec<Line> = if state.dj_log.is_empty() {
         vec![Line::from(Span::styled(
             "ask me to DJ - e.g. \"fade out over 30s\"",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         ))]
     } else {
         // Style interactive-prompt lines DIFFERENTIATED so a confirm reads as a live
@@ -3172,14 +3197,14 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
         // get a bold, theme-aware accent (INFO policy off the terminal background);
         // everything else stays plain. Keeps dj_log a Vec<String> - the styling is
         // decided at render time by matching the line content.
-        let accent = crate::album_color::info_color([0xff, 0xd0, 0x66], state.term_bg, state.truecolor);
+        let accent = hypodj_style::ratatui::info_color(hypodj_style::CONFIRM_INFO_SWATCH, state.term_bg, state.truecolor);
         state.dj_log[start..]
             .iter()
             .map(|l| {
                 if dj_prompt_line(l) {
                     Line::from(Span::styled(
                         l.clone(),
-                        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                        Style::default().fg(accent).bold(),
                     ))
                 } else {
                     Line::from(l.clone())
@@ -3198,7 +3223,7 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
             let spin = frames[((state.spin_secs * 6.0) as usize) % 4];
             Line::from(Span::styled(
                 format!("{spin} {phase}"),
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().quiet(),
             ))
         }
         _ => Line::from(""),
@@ -3211,14 +3236,14 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
     if let (Some(row), Some(hint)) = (hint_row, state.now.hint.as_ref()) {
         let line = Line::from(Span::styled(
             format!("btw, DJ knows: {}", hint.phrase()),
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().quiet(),
         ));
         f.render_widget(Paragraph::new(line), row);
     }
 
     // The "ask>" input row; place the caret when the DJ View has focus.
     let input_line = Line::from(vec![
-        Span::styled("ask> ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("ask> ", Style::default().bold()),
         Span::raw(state.dj_input.clone()),
     ]);
     f.render_widget(Paragraph::new(input_line), input_row);
@@ -3439,26 +3464,26 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 // No cover -> stay DIM (no album hue to honor).
                 let wave_style = match &state.art {
                     Some(a) => {
-                        let c = crate::album_color::info_color(
+                        let c = hypodj_style::ratatui::info_color(
                             a.palette.vibrant,
                             state.term_bg,
                             state.truecolor,
                         );
                         Style::default().fg(c)
                     }
-                    None => Style::default().add_modifier(Modifier::DIM),
+                    None => Style::default().quiet(),
                 };
                 let mut spans = vec![Span::styled(wave, wave_style)];
                 if let Some(badge) = badge {
                     spans.push(Span::styled(
                         badge,
-                        Style::default().add_modifier(Modifier::DIM),
+                        Style::default().quiet(),
                     ));
                 }
                 if hint_len > 0 {
                     spans.push(Span::styled(
                         HINT,
-                        Style::default().add_modifier(Modifier::DIM),
+                        Style::default().quiet(),
                     ));
                 }
                 Line::from(spans)
@@ -3477,7 +3502,7 @@ fn render_confirm_popup(f: &mut Frame, region: Rect, state: &TuiState) {
         if let Some(trust) = &p.trust {
             lines.push(Line::from(Span::styled(
                 trust.clone(),
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().quiet(),
             )));
         }
         for step in &p.steps {
@@ -3486,13 +3511,13 @@ fn render_confirm_popup(f: &mut Frame, region: Rect, state: &TuiState) {
         if let Some(note) = &p.note {
             lines.push(Line::from(Span::styled(
                 format!("! {note}"),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default().bold(),
             )));
         }
     }
     lines.push(Line::from(Span::styled(
         "confirm? [y/N]",
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().bold(),
     )));
 
     // Size the popup to the content, clamped inside the region (with borders).
@@ -3529,10 +3554,10 @@ fn render_find(f: &mut Frame, area: Rect, state: &TuiState) {
     let pad = (query_row.width as usize)
         .saturating_sub(prompt.chars().count() + hint.chars().count() + 1);
     let query_line = Line::from(vec![
-        Span::styled("find> ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("find> ", Style::default().bold()),
         Span::raw(find.query.clone()),
         Span::raw(" ".repeat(pad)),
-        Span::styled(hint, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(hint, Style::default().quiet()),
     ]);
     f.render_widget(Paragraph::new(query_line), query_row);
 
@@ -3586,7 +3611,7 @@ fn render_find(f: &mut Frame, area: Rect, state: &TuiState) {
             Phase::Done => format!("no results for {:?}", find.submitted),
         };
         if !msg.is_empty() {
-            let line = Line::from(Span::styled(msg, Style::default().add_modifier(Modifier::DIM)));
+            let line = Line::from(Span::styled(msg, Style::default().quiet()));
             f.render_widget(Paragraph::new(line).centered(), inner);
         }
         return;
@@ -3631,14 +3656,14 @@ fn find_row_line(
     let pad = room.saturating_sub(label.chars().count()) + 1;
     let mut style = Style::default();
     if selected {
-        style = style.add_modifier(Modifier::REVERSED);
+        style = style.reverse();
     }
     if stale {
-        style = style.add_modifier(Modifier::DIM);
+        style = style.quiet();
     }
     // Underline the query inside the label, so the eye lands on WHY this row
     // matched - the same treatment the browse lists already give a `/` search.
-    let hit = style.add_modifier(Modifier::UNDERLINED);
+    let hit = style.underline();
     let mut spans = vec![Span::styled(gutter, style)];
     spans.extend(match_spans(&label, query, style, hit));
     spans.push(Span::styled(format!("{}{trailer}", " ".repeat(pad)), style));

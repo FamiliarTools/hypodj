@@ -43,7 +43,7 @@ rustPlatform.buildRustPackage {
   # Test only the client crates (offline, no network). The cc tests are pure - a
   # missing `claude` just means cc_available() is false, never a live call.
   doCheck = true;
-  cargoTestFlags = [ "-p" "hypodj-client" "-p" "hypodj-cli" "-p" "dj-gui" ];
+  cargoTestFlags = [ "-p" "hypodj-client" "-p" "hypodj-cli" "-p" "dj-gui" "-p" "hypodj-style" ];
 
   # libmpv2-sys uses pkg-config to find mpv at build time.
   PKG_CONFIG_PATH = "${mpv-unwrapped.dev}/lib/pkgconfig";

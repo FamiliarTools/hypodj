@@ -311,7 +311,11 @@ fn print_card(conn: &mut MpdConn) -> Result<(), MpdError> {
     let status = conn.command("status")?;
     let current = conn.command("currentsong")?;
     let np = model::now_playing(&status, &current);
-    println!("{}", render::render_card(&np));
+    let ansi = hypodj_style::Ansi::from_env(
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        std::env::var_os("NO_COLOR").is_some(),
+    );
+    println!("{}", render::render_card_with(&np, ansi));
     Ok(())
 }
 
