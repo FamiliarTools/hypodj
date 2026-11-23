@@ -279,7 +279,9 @@ struct State {
     cover_id_memo: Option<(String, String)>,
     /// The ordering of the last `listplaylistinfo Starred` response, so a
     /// position-based `playlistdelete Starred <pos>` can map back to a song id
-    /// for unstar (MPD playlist deletes are position-based, not uri-based).
+    /// for unstar (MPD playlist deletes are position-based, not uri-based). Only the
+    /// client's VIEW: every delete re-validates it against a fresh fetch and shifts
+    /// it like MPD shifts a playlist (see `resolve_starred_delete`).
     last_starred_order: Vec<SongId>,
     /// MPD `random` flag: pick the next entry at random instead of sequentially.
     random: bool,
@@ -2158,6 +2160,30 @@ fn fade_lands_at(action: &Action) -> Option<u8> {
     match action {
         Action::Fade(FadeIntentIr::To { vol, .. }) => Some(*vol),
         _ => None,
+    }
+}
+
+/// Map a `playlistdelete Starred <pos>` to the song to unstar.
+///
+/// `snapshot` is the order of the last `listplaylistinfo` / `load` / `lsinfo` of
+/// Starred - what the client was looking at when it chose `pos`. `fresh` is what the
+/// server holds right now. The position is read against the snapshot (the user's
+/// view, which the server may have reordered or shrunk since), and the pick is
+/// accepted only if that song is STILL starred, so a stale view can fail loud but
+/// can never unstar a different song than the one the user pointed at. With no
+/// snapshot (a scripted client that deletes without listing first) the fresh order
+/// is the only view there is.
+fn resolve_starred_delete(
+    snapshot: &[SongId],
+    fresh: &[SongId],
+    pos: usize,
+) -> Result<SongId, &'static str> {
+    let view = if snapshot.is_empty() { fresh } else { snapshot };
+    let id = view.get(pos).ok_or("Bad song index")?;
+    if fresh.contains(id) {
+        Ok(id.clone())
+    } else {
+        Err("that song is no longer starred - list Starred again")
     }
 }
 
@@ -14511,14 +14537,38 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::PlaylistDelete(name, pos) if name == "Starred" => {
-                // Position-based: map to the song id from the last listed order.
+                // Position-based, so the position must be read against the order
+                // the CLIENT saw (the last listing), then validated against a FRESH
+                // fetch - see [`resolve_starred_delete`]. Starred is never cached, so
+                // this fetch is the authority on what is still starred. An index past
+                // the listed view is refused before any round trip.
+                {
+                    let st = self.state.lock().unwrap();
+                    if !st.last_starred_order.is_empty() && pos >= st.last_starred_order.len() {
+                        return ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index");
+                    }
+                }
+                let fresh = match self.client.starred_songs().await {
+                    Ok(songs) => songs.into_iter().map(|s| s.id).collect::<Vec<_>>(),
+                    Err(e) => return ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
+                };
                 let target = {
                     let st = self.state.lock().unwrap();
-                    st.last_starred_order.get(pos).cloned()
+                    resolve_starred_delete(&st.last_starred_order, &fresh, pos)
                 };
                 match target {
-                    Some(id) => match self.client.unstar(&Favorite::Song(id.clone())).await {
+                    Ok(id) => match self.client.unstar(&Favorite::Song(id.clone())).await {
                         Ok(()) => {
+                            {
+                                // Shift the snapshot exactly as MPD shifts a stored
+                                // playlist on delete, so a command list deleting
+                                // several rows maps each later position correctly.
+                                let mut st = self.state.lock().unwrap();
+                                if st.last_starred_order.is_empty() {
+                                    st.last_starred_order = fresh.clone();
+                                }
+                                st.last_starred_order.retain(|s| *s != id);
+                            }
                             self.bust_star_caches();
                             // Symmetrically clear the heart on any matching queued
                             // entry so it disappears LIVE (before a re-fetch). Only
@@ -14529,7 +14579,7 @@ impl MpdHandler for HypodjHandler {
                         }
                         Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
                     },
-                    None => ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index"),
+                    Err(msg) => ack(ACK_ERROR_NO_EXIST, "playlistdelete", msg),
                 }
             }
             MpdCommand::PlaylistDelete(name, pos) => {
@@ -16391,6 +16441,32 @@ mod tests {
         );
     }
     use super::*;
+
+    fn sids(v: &[&str]) -> Vec<SongId> {
+        v.iter().map(|s| SongId((*s).to_string())).collect()
+    }
+
+    // kdelwgx: an unstar by position reads the position against the order the
+    // client LISTED, and only ever unstars a song that is still starred.
+    #[test]
+    fn starred_delete_reads_the_listed_order_and_validates_against_fresh() {
+        let listed = sids(&["a", "b", "c"]);
+        // Unchanged server: plain positional mapping.
+        assert_eq!(resolve_starred_delete(&listed, &listed, 1), Ok(SongId("b".into())));
+        // The server reordered since the listing: the user still gets the row they
+        // pointed at, not whatever sits at that index now.
+        let reordered = sids(&["c", "a", "b"]);
+        assert_eq!(resolve_starred_delete(&listed, &reordered, 1), Ok(SongId("b".into())));
+        // The pointed-at song was unstarred elsewhere: fail loud, never unstar a
+        // neighbour.
+        let shrunk = sids(&["a", "c"]);
+        assert!(resolve_starred_delete(&listed, &shrunk, 1).is_err());
+        // Out of range of the listed view.
+        assert_eq!(resolve_starred_delete(&listed, &listed, 3), Err("Bad song index"));
+        // No listing at all (scripted client): the fresh order is the view.
+        assert_eq!(resolve_starred_delete(&[], &reordered, 0), Ok(SongId("c".into())));
+        assert_eq!(resolve_starred_delete(&[], &[], 0), Err("Bad song index"));
+    }
     use std::collections::HashSet;
     use std::path::Path;
     use crate::config::ServerConfig;
@@ -20843,10 +20919,12 @@ mod tests {
     #[tokio::test]
     async fn playlistdelete_starred_bad_index_acks_and_stays_special() {
         // `playlistdelete Starred <pos>` routes through the star order, NOT the
-        // real-playlist path. With no recorded order, pos 0 is a bad index -> a
-        // LOUD ack, proving Starred is still handled specially (no network).
+        // real-playlist path. An index past the listed order is a bad index -> a
+        // LOUD NO_EXIST ack before any round trip (the real-playlist path would
+        // reach the unreachable server and ack UNKNOWN instead).
         let Some((h, _events)) = handler_with_null_player() else { return };
-        let resp = h.handle(MpdCommand::PlaylistDelete("Starred".into(), 0)).await;
+        h.state.lock().unwrap().last_starred_order = vec![SongId("only".into())];
+        let resp = h.handle(MpdCommand::PlaylistDelete("Starred".into(), 1)).await;
         match resp {
             MpdResponse::Ack { command, code, .. } => {
                 assert_eq!(command, "playlistdelete");
