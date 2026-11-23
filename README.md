@@ -158,8 +158,8 @@ The password is read at service start into a `0600` runtime config - never the
 Nix store (`passwordCommand` is the alternative to `passwordFile`). The service
 runs headless (`audio = "null"`) by default; set `audio = "device"` when hypodj
 should own the speakers. Then point any client at `mpd.bind`
-(e.g. `ncmpcpp -h 127.0.0.1 -p 6601`, the default; 6600 is reserved for mopidy,
-so use it only if you set `mpd.bind = "127.0.0.1:6600"`).
+(default `127.0.0.1:6600`, the standard MPD port, so a bare `ncmpcpp` or `mpc`
+finds it).
 
 ## Layout
 

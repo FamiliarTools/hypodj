@@ -69,8 +69,8 @@ USAGE:
 
 OPTIONS:
   --host <h>    daemon host (default 127.0.0.1)
-  --port <p>    daemon port (default 6600, matches the live deploy; a DEV daemon
-                defaults to 6601 - point at it with HYPODJ_PORT=6601)
+  --port <p>    daemon port (default 6600, the daemon's default bind; a dev
+                daemon on another port: HYPODJ_PORT)
   --nl-translator <auto|rules|daemon|claude|cc>
                 pin the NL path (default auto = Claude Code when available,
                 else daemon nl; rules/daemon force daemon nl, claude/cc prefer
