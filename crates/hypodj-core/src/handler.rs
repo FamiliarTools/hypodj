@@ -283,6 +283,12 @@ struct State {
     /// client's VIEW: every delete re-validates it against a fresh fetch and shifts
     /// it like MPD shifts a playlist (see `resolve_starred_delete`).
     last_starred_order: Vec<SongId>,
+    /// READ-YOUR-WRITES overlay for song stars: every CONFIRMED star/unstar this
+    /// daemon made, with when. Navidrome does not promise that a `getStarred2` right
+    /// after a star reflects it, so a verify read could disagree with the write it
+    /// follows (an unstar that "came back"). Every Starred read folds this in for
+    /// [`STAR_OVERLAY_TTL`]; past that the server is the authority again.
+    star_overlay: HashMap<SongId, (bool, Instant)>,
     /// The order each real playlist had in its last `listplaylistinfo`, keyed by
     /// playlist id: the client's VIEW a positional `playlistdelete` indexes, mapped
     /// onto a fresh fetch by [`resolve_playlist_delete`] so a concurrent edit
@@ -1303,6 +1309,7 @@ impl Default for State {
             binary_limit: 8192,
             cover_id_memo: None,
             last_starred_order: Vec::new(),
+            star_overlay: HashMap::new(),
             last_playlist_order: HashMap::new(),
             random: false,
             repeat: false,
@@ -8000,9 +8007,28 @@ impl HypodjHandler {
     /// Shared by `listplaylistinfo Starred` and `load Starred` (which must agree on
     /// the exact order they present). Starred is NEVER cached (freshness-critical).
     async fn starred_songs_recording_order(&self) -> Result<Vec<Song>, SubsonicError> {
-        let songs = self.client.starred_songs().await?;
+        let songs = self.starred_songs_read_your_writes().await?;
         let mut st = self.state.lock().unwrap();
         st.last_starred_order = songs.iter().map(|s| s.id.clone()).collect();
+        Ok(songs)
+    }
+
+    /// `getStarred2` with this daemon's own recent star writes folded over it (see
+    /// `State::star_overlay`). A just-starred song the server has not indexed yet is
+    /// fetched by id and appended; one that fails to fetch is left out rather than
+    /// failing the listing - the next read has it once the server catches up.
+    async fn starred_songs_read_your_writes(&self) -> Result<Vec<Song>, SubsonicError> {
+        let songs = self.client.starred_songs().await?;
+        let (mut songs, missing) = {
+            let mut st = self.state.lock().unwrap();
+            fold_star_overlay(songs, &mut st.star_overlay, Instant::now())
+        };
+        for id in missing {
+            if let Ok(mut s) = self.client.song(&id).await {
+                s.starred = true;
+                songs.push(s);
+            }
+        }
         Ok(songs)
     }
 
@@ -14689,7 +14715,7 @@ impl MpdHandler for HypodjHandler {
                         return ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index");
                     }
                 }
-                let fresh = match self.client.starred_songs().await {
+                let fresh = match self.starred_songs_read_your_writes().await {
                     Ok(songs) => songs.into_iter().map(|s| s.id).collect::<Vec<_>>(),
                     Err(e) => return ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
                 };
@@ -15382,7 +15408,7 @@ impl HypodjHandler {
             // directory rows) with the starred-song `file:` rows. Albums/artists
             // are DIRECTORY entities, so they surface as subdirs (ncmpcpp expands
             // them on add), never as fake song rows in a stored playlist.
-            Some("Starred") => match self.client.starred_songs().await {
+            Some("Starred") => match self.starred_songs_read_your_writes().await {
                 Ok(songs) => {
                     {
                         let mut st = self.state.lock().unwrap();
@@ -16032,6 +16058,8 @@ impl HypodjHandler {
     /// taken and released synchronously here - never held across an `.await`.
     fn set_queue_starred(&self, id: &SongId, starred: bool) {
         let mut st = self.state.lock().unwrap();
+        // The same confirmation is what a Starred read must not contradict.
+        st.star_overlay.insert(id.clone(), (starred, Instant::now()));
         for item in st.queue.iter_mut() {
             if let QueueEntry::Song(song) = &mut item.entry {
                 if &song.id == id {
@@ -16453,6 +16481,32 @@ fn browse_song_pairs(s: &Song) -> Vec<(String, String)> {
 /// `now_unix` is INJECTED rather than read here so the day arithmetic on the play
 /// stats below is a pure function the tests can pin to a fixed date - the same reason
 /// the store's frontier takes its epoch as an argument.
+/// How long a confirmed star/unstar overrides what `getStarred2` says. Long enough
+/// to cover Navidrome's observed read-after-write lag (sub-second) with margin; short
+/// enough that a change made in another client is not masked for long. Entries are
+/// evicted only by age, never on the first agreeing read, so a read that flaps back
+/// after agreeing once is still covered.
+const STAR_OVERLAY_TTL: Duration = Duration::from_secs(5);
+
+/// Fold the read-your-writes overlay over one `getStarred2` result: drop expired
+/// entries, remove songs this daemon just unstarred, and return the ids it just
+/// starred that the server did not list (for the caller to fetch). Order of the
+/// server's rows is kept, so position-based deletes stay stable.
+fn fold_star_overlay(
+    mut songs: Vec<Song>,
+    overlay: &mut HashMap<SongId, (bool, Instant)>,
+    now: Instant,
+) -> (Vec<Song>, Vec<SongId>) {
+    overlay.retain(|_, (_, at)| now.saturating_duration_since(*at) < STAR_OVERLAY_TTL);
+    songs.retain(|s| !matches!(overlay.get(&s.id), Some((false, _))));
+    let missing = overlay
+        .iter()
+        .filter(|(id, (starred, _))| *starred && !songs.iter().any(|s| &s.id == *id))
+        .map(|(id, _)| id.clone())
+        .collect();
+    (songs, missing)
+}
+
 fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
     // THE SERVER'S OWN LISTENING HISTORY, on every song row - browse, Find, the
     // queue, and `currentsong`. Both are emitted ONLY when the server actually has a
@@ -26312,6 +26366,26 @@ mod tests {
         let status = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&status, "elapsed"), Some("83.500"));
         assert_eq!(pair(&status, "time"), Some("83:240"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn star_overlay_masks_a_lagging_read_then_expires() {
+        let mut ov = HashMap::new();
+        let t0 = Instant::now();
+        ov.insert(SongId("gone".into()), (false, t0));
+        ov.insert(SongId("new".into()), (true, t0));
+        ov.insert(SongId("kept".into()), (true, t0));
+        // The lagging server still lists the unstarred song and lacks the new one.
+        let server = vec![mk_song("kept"), mk_song("gone"), mk_song("other")];
+        let (songs, missing) = fold_star_overlay(server.clone(), &mut ov, t0);
+        let ids: Vec<_> = songs.iter().map(|s| s.id.0.as_str()).collect();
+        assert_eq!(ids, ["kept", "other"], "the unstar sticks, order kept");
+        assert_eq!(missing, vec![SongId("new".into())], "the star is fetched in");
+        // Past the TTL the server is the authority again and the overlay empties.
+        tokio::time::advance(STAR_OVERLAY_TTL).await;
+        let (songs, missing) = fold_star_overlay(server, &mut ov, Instant::now());
+        assert_eq!(songs.len(), 3);
+        assert!(missing.is_empty() && ov.is_empty());
     }
 
     fn mk_song(id: &str) -> Song {
