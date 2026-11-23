@@ -2766,15 +2766,6 @@ fn crossfade_task(
     })
 }
 
-/// Build the bounded remote-cover HTTP client (task kmrhj8m + njvsh8w): a 2s connect /
-/// 2.5s total ceiling with a small redirect budget. HARD-FAILS at construction rather
-/// than degrading to an UNBOUNDED fallback: the bound is a load-bearing invariant (it is
-/// what stops a hung cover host from wedging the art worker), so a fallback that silently
-/// drops it would reintroduce the very hang the bound prevents. reqwest's own
-/// `Client::new()` panics in the identical TLS-backend-init failure this builder would
-/// hit (it is `builder().build().unwrap()` under the hood), so the old
-/// `unwrap_or_else(|_| Client::new())` was not even a graceful degrade - it was an
-/// unbounded client OR a panic. Expect is the honest choice: bounded, or nothing.
 /// The http-loopback exemption for [`HypodjHandler::fetch_remote_cover`] (task njvsh8w):
 /// plain `http://` is allowed ONLY for a genuine loopback host (local test servers / dev),
 /// everything else must be `https://`. PARSES the url and matches the exact host, so a
@@ -8816,7 +8807,9 @@ impl HypodjHandler {
     pub fn set_continuation_mode(&self, mode: ContinuationMode, autofill_count: u32) {
         *self.continuation_mode.lock().unwrap() = mode;
         *self.configured_continuation_mode.lock().unwrap() = mode;
-        self.autofill_count.store(autofill_count.max(1), Ordering::Relaxed);
+        // Ceiling too: the refill over-fetches `2n` as an i32 page size, so an
+        // absurd configured count must not wrap negative or ask for the library.
+        self.autofill_count.store(autofill_count.clamp(1, MAX_AUTOFILL_COUNT), Ordering::Relaxed);
     }
 
     /// Force the LIVE continuation mode without touching the configured value - the
@@ -16481,6 +16474,10 @@ fn browse_song_pairs(s: &Song) -> Vec<(String, String)> {
 /// `now_unix` is INJECTED rather than read here so the day arithmetic on the play
 /// stats below is a pure function the tests can pin to a fixed date - the same reason
 /// the store's frontier takes its epoch as an argument.
+/// The largest honoured `[continuation].autofill_count`: a refill is a queue's worth,
+/// and `2 * MAX` stays far inside the i32 page size the over-fetch sends.
+const MAX_AUTOFILL_COUNT: u32 = 500;
+
 /// How long a confirmed star/unstar overrides what `getStarred2` says. Long enough
 /// to cover Navidrome's observed read-after-write lag (sub-second) with margin; short
 /// enough that a change made in another client is not masked for long. Entries are
@@ -26366,6 +26363,15 @@ mod tests {
         let status = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&status, "elapsed"), Some("83.500"));
         assert_eq!(pair(&status, "time"), Some("83:240"));
+    }
+
+    #[tokio::test]
+    async fn autofill_count_is_clamped_on_both_ends() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_continuation_mode(ContinuationMode::Autofill, u32::MAX);
+        assert_eq!(h.autofill_count.load(Ordering::Relaxed), MAX_AUTOFILL_COUNT);
+        h.set_continuation_mode(ContinuationMode::Autofill, 0);
+        assert_eq!(h.autofill_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(start_paused = true)]
