@@ -74,14 +74,26 @@ pub struct PendingPlan {
     /// (registry-side) rather than in [`ArmedPlan`] so nothing serializable, and
     /// therefore nothing a producer can author, can ever set it.
     pub reserved: bool,
+    /// The CIVIL instant a [`Resolved::OnDeadline`] plan armed from a
+    /// [`crate::plan::RawTrigger::WallClock`] or `Daily` trigger is meant to fire
+    /// at. The timer itself runs on the monotonic clock, which STOPS during a
+    /// laptop suspend, so the deadline drifts late by the time asleep; this is
+    /// the truth [`HypodjHandler::resync_civil_deadlines`] re-derives it from.
+    /// `None` for every other shape (a span or a track edge is monotonic by
+    /// meaning, so a suspend correctly pauses it).
+    pub civil_at: Option<chrono::DateTime<chrono::Utc>>,
 }
+
+/// How often the executor re-derives civil deadlines from the wall clock (see
+/// [`HypodjHandler::resync_civil_deadlines`]). Bounds how late an alarm can ring
+/// after a resume; one cheap registry pass, so the cost is negligible.
+pub const CIVIL_RESYNC: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The executor task. Generic over the [`Clock`] so it runs identically under
 /// real time and paused fake time.
 pub struct Executor<C: Clock> {
     handler: Arc<HypodjHandler>,
     timers: TimerHandle,
-    #[allow(dead_code)]
     clock: C,
     triggers: mpsc::UnboundedReceiver<DjEvent>,
     ticks: Option<broadcast::Receiver<DjEvent>>,
@@ -120,8 +132,16 @@ impl<C: Clock> Executor<C> {
     }
 
     async fn run(mut self) {
+        let mut next_resync = self.clock.now() + CIVIL_RESYNC;
         loop {
             tokio::select! {
+                // Suspend safety: the monotonic clock every timer sleeps on stops
+                // while the machine is asleep, so periodically re-derive civil
+                // deadlines from the wall clock. Dependency-free (no logind).
+                _ = self.clock.sleep_until(next_resync) => {
+                    next_resync = self.clock.now() + CIVIL_RESYNC;
+                    self.handler.resync_civil_deadlines();
+                }
                 // The lossless edge/WallClock path is the lifeline: its close means
                 // the director spine is gone, so the executor winds down too.
                 ev = self.triggers.recv() => match ev {
@@ -1230,6 +1250,59 @@ mod tests {
             "wake ramp starts near silence"
         );
         assert!(rig.handler.plan_list().is_empty(), "once wake plan removed");
+    }
+
+    // SUSPEND: the monotonic clock stops while the laptop sleeps, the wall clock
+    // does not. `wake in 2h`, then civil time jumps 2h minus 10s with NO monotonic
+    // progress (a suspend): the alarm must ring within one resync period, not 2h
+    // late. Then a wake slept THROUGH by more than the grace is dropped, never
+    // rung hours late.
+    #[tokio::test(start_paused = true)]
+    async fn wake_survives_suspend_civil_jump() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let at = crate::clock::civil_now() + chrono::Duration::seconds(7200);
+        rig.handler.wake_set(at, None, 0).unwrap();
+        settle().await;
+        crate::clock::skew_civil_for_test(chrono::Duration::seconds(7190));
+        // 9s of monotonic time: no resync yet, still armed for the old deadline.
+        tokio::time::advance(Duration::from_secs(9)).await;
+        settle().await;
+        assert!(!rig.handler.fade_active_for_test().await, "not before the civil target");
+        // Cross the resync period (30s): re-derived, and past the civil target.
+        tokio::time::advance(CIVIL_RESYNC).await;
+        settle().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert!(rig.handler.fade_active_for_test().await, "wake rang after the suspend, not 2h late");
+        assert!(rig.handler.plan_list().is_empty(), "once wake plan removed");
+
+        // Slept through by an hour: dropped, not rung.
+        let at = crate::clock::civil_now() + chrono::Duration::seconds(600);
+        rig.handler.wake_set(at, None, 0).unwrap();
+        assert_eq!(rig.handler.plan_list().len(), 1);
+        crate::clock::skew_civil_for_test(chrono::Duration::seconds(600 + 3600));
+        tokio::time::advance(CIVIL_RESYNC + Duration::from_secs(1)).await;
+        settle().await;
+        assert!(rig.handler.plan_list().is_empty(), "missed-by-an-hour wake dropped");
+    }
+
+    // A steady run (no civil jump) re-derives nothing: the resync is a no-op and
+    // the deadline stays exactly where it was armed.
+    #[tokio::test(start_paused = true)]
+    async fn civil_resync_is_noop_without_jump() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let at = crate::clock::civil_now() + chrono::Duration::seconds(7200);
+        rig.handler.wake_set(at, None, 0).unwrap();
+        let before = rig.handler.plan_deadlines()[0].2;
+        tokio::time::advance(CIVIL_RESYNC * 4).await;
+        settle().await;
+        assert_eq!(rig.handler.plan_deadlines()[0].2, before, "no re-arm without drift");
     }
 
     // WAKE: an enqueue failure ABORTS the ramp - never ramp silence over an empty

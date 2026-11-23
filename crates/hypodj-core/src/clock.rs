@@ -85,11 +85,26 @@ pub fn civil_now() -> chrono::DateTime<chrono::Utc> {
                 v
             }
         });
-        match now.checked_duration_since(i0) {
+        let skew = CIVIL_SKEW.with(|s| s.get());
+        let base = match now.checked_duration_since(i0) {
             Some(d) => c0 + chrono::Duration::from_std(d).unwrap_or_default(),
             None => c0 - chrono::Duration::from_std(i0 - now).unwrap_or_default(),
-        }
+        };
+        base + skew
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CIVIL_SKEW: std::cell::Cell<chrono::TimeDelta> = const { std::cell::Cell::new(chrono::TimeDelta::zero()) };
+}
+
+/// TEST-ONLY: move civil time by `by` WITHOUT advancing the monotonic clock -
+/// what a laptop suspend looks like to the daemon (CLOCK_MONOTONIC stops while
+/// asleep, the wall clock does not). Per-thread, like the anchor above.
+#[cfg(test)]
+pub fn skew_civil_for_test(by: chrono::Duration) {
+    CIVIL_SKEW.with(|s| s.set(s.get() + by));
 }
 
 #[cfg(test)]

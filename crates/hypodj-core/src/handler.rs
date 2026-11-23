@@ -3523,6 +3523,26 @@ struct RadioTestHook {
     calls: Vec<String>,
 }
 
+/// How far a civil plan's monotonic deadline may drift from its wall-clock
+/// target before [`HypodjHandler::resync_civil_deadlines`] re-arms it.
+pub const CIVIL_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The civil instant a deadline plan is meant to fire at, for the two trigger
+/// shapes whose meaning IS civil time; `None` for everything else.
+fn civil_target(
+    trigger: &RawTrigger,
+    resolved: &Resolved,
+    now: Instant,
+    now_civil: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match (trigger, resolved) {
+        (RawTrigger::WallClock { .. } | RawTrigger::Daily { .. }, Resolved::OnDeadline(d)) => {
+            Some(now_civil + chrono::Duration::from_std(d.saturating_duration_since(now)).ok()?)
+        }
+        _ => None,
+    }
+}
+
 impl HypodjHandler {
     /// Construct with the default `[fade]` tunables (research-backed constants).
     pub fn new(client: Arc<SubsonicClient>, player: PlayerHandle) -> Self {
@@ -4073,7 +4093,8 @@ impl HypodjHandler {
             };
             // Never reserved: this is the path EVERY producer-supplied plan takes
             // (`plan add`, `nl confirm`, a batch). Only `set_singleton` promotes.
-            pendings.push(PendingPlan { armed, guard, remaining_deadline: None, reserved: false });
+            let civil_at = civil_target(&armed.raw.trigger, &armed.resolved, now, now_civil);
+            pendings.push(PendingPlan { armed, guard, remaining_deadline: None, reserved: false, civil_at });
             ids.push(id);
         }
         Ok((pendings, ids, immediates))
@@ -4122,9 +4143,8 @@ impl HypodjHandler {
     /// caller drops it) or when no next occurrence resolves. Sync and called under
     /// the executor's registry lock, so it never touches `plan_pending` itself.
     pub(crate) fn rearm_recurring(&self, pp: &mut PendingPlan) -> bool {
-        let Some(resolved) =
-            crate::plan::rearm(&pp.armed.raw.trigger, Instant::now(), crate::clock::civil_now())
-        else {
+        let (now, now_civil) = (Instant::now(), crate::clock::civil_now());
+        let Some(resolved) = crate::plan::rearm(&pp.armed.raw.trigger, now, now_civil) else {
             return false;
         };
         let Resolved::OnDeadline(deadline) = resolved else {
@@ -4134,10 +4154,69 @@ impl HypodjHandler {
             return false;
         };
         let (tid, guard) = timers.arm(deadline);
+        pp.civil_at = civil_target(&pp.armed.raw.trigger, &resolved, now, now_civil);
         pp.armed.resolved = resolved;
         pp.armed.timer_id = Some(tid);
         pp.guard = Some(guard);
         true
+    }
+
+    /// Suspend safety for civil-time plans. Every plan timer sleeps on the
+    /// MONOTONIC clock, which stops while the laptop is suspended, so a wake alarm
+    /// armed for 07:00 before a suspend would otherwise ring late by the whole
+    /// time asleep. Called periodically by the executor: each `WallClock`/`Daily`
+    /// plan's deadline is re-derived from its civil target against the wall clock
+    /// NOW and re-armed when it moved by more than [`CIVIL_SLACK`] (normal
+    /// monotonic-vs-wall drift stays inside it, so a steady run re-arms nothing).
+    ///
+    /// A target the suspend slept THROUGH follows the restart policy
+    /// ([`crate::plan_store::MISSED_GRACE`]): missed by at most the grace, it fires
+    /// now; missed by more, a one-shot is dropped (an alarm hours late is worse
+    /// than none) and a `Daily` moves to its next occurrence. Sync, one short
+    /// registry lock, no `.await`.
+    pub fn resync_civil_deadlines(&self) {
+        let Some(timers) = self.plan_timers.get() else {
+            return;
+        };
+        let (now, now_civil) = (Instant::now(), crate::clock::civil_now());
+        let mut dropped = false;
+        {
+            let mut g = self.plan_pending.lock().unwrap();
+            g.retain_mut(|pp| {
+                let (Some(mut at), Resolved::OnDeadline(old)) = (pp.civil_at, &pp.armed.resolved) else {
+                    return true;
+                };
+                if now_civil - at > crate::plan_store::MISSED_GRACE {
+                    let RawTrigger::Daily { hour, minute, days } = pp.armed.raw.trigger else {
+                        tracing::warn!(plan = pp.armed.id.0, "wall-clock plan slept through (suspend); dropped");
+                        dropped = true;
+                        return false;
+                    };
+                    match crate::plan::next_daily_fire(&chrono::Local, hour, minute, days, now_civil) {
+                        Some(next) => at = next,
+                        None => {
+                            dropped = true;
+                            return false;
+                        }
+                    }
+                }
+                let deadline = now + (at - now_civil).to_std().unwrap_or_default();
+                let drift = deadline.max(*old) - deadline.min(*old);
+                if drift <= CIVIL_SLACK && Some(at) == pp.civil_at {
+                    return true;
+                }
+                tracing::info!(plan = pp.armed.id.0, drift_secs = drift.as_secs(), "civil deadline re-derived (suspend or clock step)");
+                let (tid, guard) = timers.arm(deadline);
+                pp.armed.resolved = Resolved::OnDeadline(deadline);
+                pp.armed.timer_id = Some(tid);
+                pp.guard = Some(guard);
+                pp.civil_at = Some(at);
+                true
+            });
+        }
+        if dropped {
+            self.persist_plans();
+        }
     }
 
     /// Cancel one plan by id. Dropping its [`PendingPlan`] drops any held
