@@ -165,6 +165,9 @@ fn the_catalog_speaks_the_handlers_sentences() {
         PAIR_WAKE,
         PAIR_NL_ANSWER,
         PAIR_JDID,
+        hypodj_dsl::WINDDOWN_KEY,
+        hypodj_dsl::WINDDOWN_WHEN_KEY,
+        "X-hypodj-winddown-remaining",
     ];
     for shape in &shapes {
         for (k, _) in &shape.pairs {

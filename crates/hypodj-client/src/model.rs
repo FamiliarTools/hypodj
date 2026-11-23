@@ -301,10 +301,13 @@ impl AmbientHint {
 pub struct ArmedFeatures {
     /// Seconds until the sleep fade-to-stop fires (`X-hypodj-sleep-remaining`).
     pub sleep_remaining: Option<u64>,
-    /// A wind-down plan is armed (`X-hypodj-winddown-active`).
+    /// A wind-down plan is present (`X-hypodj-winddown-active`).
     pub winddown_active: bool,
-    /// Seconds until a scheduled wind-down fires (`X-hypodj-winddown-remaining`);
-    /// absent for an immediate wind-down.
+    /// `armed` or `running` (`X-hypodj-winddown`). Absent on an old daemon.
+    pub winddown_phase: Option<String>,
+    /// `album`, `track`, or `deadline` (`X-hypodj-winddown-when`).
+    pub winddown_when: Option<String>,
+    /// Seconds until a deadline wind-down fires (`X-hypodj-winddown-remaining`).
     pub winddown_remaining: Option<u64>,
     /// Seconds until the scheduled wake alarm (`X-hypodj-wake-remaining`).
     pub wake_remaining: Option<u64>,
@@ -315,14 +318,20 @@ pub struct ArmedFeatures {
 impl ArmedFeatures {
     /// `true` if any feature is armed - the render gate.
     pub fn any(&self) -> bool {
-        self.sleep_remaining.is_some() || self.winddown_active || self.wake_remaining.is_some()
+        self.sleep_remaining.is_some()
+            || self.winddown_active
+            || self.winddown_phase.is_some()
+            || self.wake_remaining.is_some()
     }
 
     fn parse(status: &[(String, String)]) -> Self {
         let num = |k: &str| find(status, k).and_then(|v| v.parse::<u64>().ok());
         ArmedFeatures {
             sleep_remaining: num("X-hypodj-sleep-remaining"),
-            winddown_active: find(status, "X-hypodj-winddown-active").is_some(),
+            winddown_active: find(status, "X-hypodj-winddown-active").is_some()
+                || find(status, hypodj_dsl::WINDDOWN_KEY).is_some(),
+            winddown_phase: find(status, hypodj_dsl::WINDDOWN_KEY).map(str::to_string),
+            winddown_when: find(status, hypodj_dsl::WINDDOWN_WHEN_KEY).map(str::to_string),
             winddown_remaining: num("X-hypodj-winddown-remaining"),
             wake_remaining: num("X-hypodj-wake-remaining"),
             wake_at: num("X-hypodj-wake-at"),

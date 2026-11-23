@@ -195,11 +195,7 @@ fn render_field(field: &FieldState) -> Option<String> {
     Some(line)
 }
 
-/// The armed human-features as one unobtrusive line, e.g.
-/// `sleep in 12m \u{b7} winding down \u{b7} wake in 7h 00m`. `None` when nothing is
-/// armed. Worded exactly as the dj-gui's `armed_hud`: `in` marks every countdown, so
-/// `sleep 12m` cannot be read as a twelve-minute-long timer.
-
+/// `M:SS` for a track duration on the card.
 fn fmt_dur(secs: f64) -> String {
     let total = secs as u64;
     format!("{}:{:02}", total / 60, total % 60)
@@ -417,6 +413,32 @@ mod tests {
                 Some(spoken.text().as_str())
             );
             assert_eq!(spoken.state, hypodj_style::State::Live, "{line}");
+        }
+    }
+
+    #[test]
+    fn winddown_phase_is_explicit_on_the_cli() {
+        use hypodj_client::spoken::{reply_shapes, speak_shape, State};
+        let shapes = reply_shapes();
+        for name in [
+            "wind down at album end",
+            "wind down after this track",
+            "wind down in 5m",
+            "winding down",
+        ] {
+            let shape = shapes.iter().find(|s| s.name == name).expect(name);
+            let spoken = speak_shape(shape);
+            let off = render_command("winddown", &shape.pairs, Ansi::off()).unwrap();
+            let on = render_command("winddown", &shape.pairs, Ansi::on_truecolor()).unwrap();
+            assert_eq!(off, spoken.text(), "{name}");
+            assert_eq!(hypodj_style::ansi::strip(&on), off);
+            if spoken.state == State::Armed {
+                assert!(on.contains("38;2;"), "{name} is ember");
+            }
+            if spoken.state == State::Live {
+                assert!(on.contains("\u{1b}[1m"), "{name} is live");
+                assert!(!on.contains("38;2;"), "{name} is not ember");
+            }
         }
     }
 

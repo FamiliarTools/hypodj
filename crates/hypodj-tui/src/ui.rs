@@ -1355,6 +1355,8 @@ mod tests {
         let a = ArmedFeatures {
             sleep_remaining: Some(720),
             winddown_active: true,
+            winddown_phase: Some("running".into()),
+            winddown_when: None,
             winddown_remaining: None,
             wake_remaining: Some(25200),
             wake_at: Some(1750000000),
