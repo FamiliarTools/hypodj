@@ -2172,11 +2172,23 @@ pub const PAIR_NEXT_FIRE: &str = "next_fire";
 pub const PAIR_NL_ANSWER: &str = "nl_answer";
 pub const PAIR_JDID: &str = "jdid";
 
-/// Fixed result sentences. The client refuses these by the constant, not by
-/// guessing at prose. `added 0` is structural and is not one of these.
-pub const RESULT_NO_JUMP: &str = "no matching track to play";
-pub const RESULT_FAILED: &str = "could not do that: ";
-pub const RESULT_ADDED_NONE: &str = "added 0 - no matches for ";
+pub use hypodj_dsl::{
+    RESULT_ADDED_NONE, RESULT_FAILED, RESULT_NO_JUMP, WINDDOWN_ARMED, WINDDOWN_KEY,
+    WINDDOWN_RUNNING, WINDDOWN_WHEN_ALBUM, WINDDOWN_WHEN_DEADLINE, WINDDOWN_WHEN_KEY,
+    WINDDOWN_WHEN_TRACK,
+};
+
+/// Phase and trigger of a wind-down plan. Immediate has no future edge, so the
+/// fade is running. A boundary or a deadline is still armed.
+pub(crate) fn winddown_phase(trigger: Option<&RawTrigger>) -> (&'static str, Option<&'static str>) {
+    match trigger {
+        Some(RawTrigger::AlbumBoundary { .. }) => (WINDDOWN_ARMED, Some(WINDDOWN_WHEN_ALBUM)),
+        Some(RawTrigger::TrackAfterCurrent) => (WINDDOWN_ARMED, Some(WINDDOWN_WHEN_TRACK)),
+        Some(RawTrigger::Immediate) => (WINDDOWN_RUNNING, None),
+        Some(_) => (WINDDOWN_ARMED, Some(WINDDOWN_WHEN_DEADLINE)),
+        None => (WINDDOWN_ARMED, None),
+    }
+}
 
 impl PlanOutcome {
     /// The single human line the client shows after `y`/confirm. Speaks the REAL
@@ -4411,6 +4423,16 @@ impl HypodjHandler {
     /// Backs single-instance control (replace/cancel) for the convenience
     /// features. Matches on the reserved flag AND the origin, so a client plan
     /// carrying the same origin string is never the one cancelled.
+    /// The reserved wind-down plan's trigger, if one is armed.
+    fn winddown_trigger(&self) -> Option<RawTrigger> {
+        self.plan_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pp| pp.reserved && pp.armed.raw.origin == ORIGIN_WINDDOWN)
+            .map(|pp| pp.armed.raw.trigger.clone())
+    }
+
     fn find_feature(&self, origin: &str) -> Option<PlanId> {
         self.plan_pending
             .lock()
@@ -4646,6 +4668,12 @@ impl HypodjHandler {
                     }
                 }
                 ORIGIN_WINDDOWN => {
+                    let trigger = self.winddown_trigger();
+                    let (phase, when) = winddown_phase(trigger.as_ref());
+                    out.push((hypodj_dsl::WINDDOWN_KEY, phase.to_string()));
+                    if let Some(w) = when {
+                        out.push((hypodj_dsl::WINDDOWN_WHEN_KEY, w.to_string()));
+                    }
                     out.push(("X-hypodj-winddown-active", "1".to_string()));
                     if let Some(r) = remaining {
                         out.push(("X-hypodj-winddown-remaining", r.as_secs().to_string()));
@@ -27369,6 +27397,9 @@ mod tests {
 
         let resp = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&resp, "X-hypodj-winddown-active"), Some("1"));
+        // Immediate has no future edge: the phase is running, said explicitly.
+        assert_eq!(pair(&resp, hypodj_dsl::WINDDOWN_KEY), Some(hypodj_dsl::WINDDOWN_RUNNING));
+        assert_eq!(pair(&resp, hypodj_dsl::WINDDOWN_WHEN_KEY), None);
         // Immediate wind-down has no deadline -> no remaining pair.
         assert_eq!(pair(&resp, "X-hypodj-winddown-remaining"), None);
         let wake_rem: u64 = pair(&resp, "X-hypodj-wake-remaining")
@@ -27377,6 +27408,32 @@ mod tests {
             .unwrap();
         assert!(wake_rem > 7100 && wake_rem <= 7200, "~2h remaining: {wake_rem}");
         assert!(pair(&resp, "X-hypodj-wake-at").is_some(), "wake-at epoch present");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_winddown_is_armed_and_names_the_deadline() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.winddown_set(Some(Duration::from_secs(300))).expect("arm winddown");
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&resp, hypodj_dsl::WINDDOWN_KEY), Some(hypodj_dsl::WINDDOWN_ARMED));
+        assert_eq!(
+            pair(&resp, hypodj_dsl::WINDDOWN_WHEN_KEY),
+            Some(hypodj_dsl::WINDDOWN_WHEN_DEADLINE)
+        );
+        let rem: u64 = pair(&resp, "X-hypodj-winddown-remaining").unwrap().parse().unwrap();
+        assert!(rem > 290 && rem <= 300, "{rem}");
+    }
+
+    #[test]
+    fn a_boundary_winddown_is_armed_until_it_fires() {
+        let (phase, when) = super::winddown_phase(Some(&crate::plan::RawTrigger::AlbumBoundary {
+            track: crate::plan::TrackSel::Current,
+        }));
+        assert_eq!(phase, hypodj_dsl::WINDDOWN_ARMED);
+        assert_eq!(when, Some(hypodj_dsl::WINDDOWN_WHEN_ALBUM));
+        let (phase, when) = super::winddown_phase(Some(&crate::plan::RawTrigger::TrackAfterCurrent));
+        assert_eq!(phase, hypodj_dsl::WINDDOWN_ARMED);
+        assert_eq!(when, Some(hypodj_dsl::WINDDOWN_WHEN_TRACK));
     }
 
 

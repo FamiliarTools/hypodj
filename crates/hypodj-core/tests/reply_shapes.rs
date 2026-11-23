@@ -10,7 +10,6 @@ use hypodj_core::handler::{
     effect_set_volume, PlanOutcome, ACK_NL_INVALID, ACK_NL_NO_TOKEN, ACK_NL_STALE, ACK_NO_PLAN,
     ACK_TRANSLATOR_TASK, ACK_WAKE_DURATION, ACK_WAKE_TIME, EFFECT_FADING, EFFECT_NOTHING,
     EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_JDID, PAIR_NL_ANSWER, PAIR_PLAN_ID,
-    RESULT_FAILED, RESULT_NO_JUMP,
     PAIR_RESULT, PAIR_SLEEP, PAIR_SLEEP_REMAINING, PAIR_WAKE, PAIR_WAKE_REMAINING,
 };
 use hypodj_core::nl::NlError;
@@ -117,8 +116,19 @@ fn the_catalog_speaks_the_handlers_sentences() {
                 .map(|(_, v)| v.as_str())
         })
         .collect();
-    assert_eq!(PlanOutcome::Jumped(0).render(), RESULT_NO_JUMP);
-    assert!(PlanOutcome::Failed("gone".into()).render().starts_with(RESULT_FAILED));
+    for sample in [
+        PlanOutcome::Jumped(0),
+        PlanOutcome::Failed("gone".into()),
+        PlanOutcome::Added { n: 0, selector: "\"jazz\"".into() },
+    ] {
+        let line = sample.render();
+        let spoken = hypodj_client::spoken::from_reply(
+            &[("result".into(), line.clone())],
+            None,
+        );
+        assert_eq!(spoken.state, State::Refused, "{line}");
+        assert_eq!(spoken.text(), line);
+    }
     for line in outcome_lines() {
         assert!(
             results.contains(&line.as_str()),
@@ -155,6 +165,9 @@ fn the_catalog_speaks_the_handlers_sentences() {
         PAIR_WAKE,
         PAIR_NL_ANSWER,
         PAIR_JDID,
+        hypodj_dsl::WINDDOWN_KEY,
+        hypodj_dsl::WINDDOWN_WHEN_KEY,
+        "X-hypodj-winddown-remaining",
     ];
     for shape in &shapes {
         for (k, _) in &shape.pairs {

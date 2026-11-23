@@ -175,19 +175,12 @@ pub fn from_reply(pairs: &[(String, String)], act: Option<Act>) -> Spoken {
     }
 }
 
-/// The handler's fixed failure sentences. `reply_shapes` locks these to the
-/// same constants in hypodj-core. A wording change there fails that test.
-const RESULT_NO_JUMP: &str = "no matching track to play";
-const RESULT_FAILED: &str = "could not do that: ";
-
-/// A result that did not happen.
-///
-/// `added 0` is the count the daemon reports, not a sentence we match.
-/// The other two are the handler's own constants, compared whole.
+/// A result that did not happen. The sentences are the daemon's constants.
 fn state_of_result(line: &str) -> State {
-    let mut words = line.split_whitespace();
-    let added_none = words.next() == Some("added") && words.next() == Some("0");
-    if added_none || line == RESULT_NO_JUMP || line.starts_with(RESULT_FAILED) {
+    if line.starts_with(hypodj_dsl::RESULT_ADDED_NONE)
+        || line == hypodj_dsl::RESULT_NO_JUMP
+        || line.starts_with(hypodj_dsl::RESULT_FAILED)
+    {
         State::Refused
     } else {
         State::Live
@@ -199,6 +192,9 @@ fn state_of_result(line: &str) -> State {
 /// A timer that is counting down is armed: it is set to fire and can be
 /// disarmed. Nothing pending is a note, not ember.
 fn noted(pairs: &[(String, String)], act: Option<Act>) -> Option<Spoken> {
+    if let Some(spoken) = winddown_from_pairs(pairs) {
+        return Some(spoken);
+    }
     if let Some((_, secs)) = pairs.iter().find(|(k, _)| k == "sleep_remaining") {
         return Some(Spoken::new(
             State::Armed,
@@ -263,6 +259,19 @@ fn mode_sentence(line: &str) -> Option<String> {
     Some(format!("{verb} {on}"))
 }
 
+fn winddown_from_pairs(pairs: &[(String, String)]) -> Option<Spoken> {
+    let phase = pairs.iter().find(|(k, _)| k == hypodj_dsl::WINDDOWN_KEY).map(|(_, v)| v.as_str());
+    let when = pairs
+        .iter()
+        .find(|(k, _)| k == hypodj_dsl::WINDDOWN_WHEN_KEY)
+        .map(|(_, v)| v.as_str());
+    let remaining = pairs
+        .iter()
+        .find(|(k, _)| k == "X-hypodj-winddown-remaining")
+        .and_then(|(_, v)| v.parse().ok());
+    winddown_spoken(phase, when, remaining)
+}
+
 fn span(secs: &str) -> String {
     match secs.parse::<u64>() {
         Ok(n) => fmt_remaining(n),
@@ -290,25 +299,63 @@ pub fn confirm_question(question: &str) -> Spoken {
     Spoken::new(State::Echo, vec![format!("{question} [y/N]")])
 }
 
-/// Sleep, wind-down, and wake, as one armed line. None when nothing is armed.
-pub fn armed_hold(a: &ArmedFeatures) -> Option<Spoken> {
-    if !a.any() {
-        return None;
-    }
-    let mut bits = Vec::new();
+/// Sleep, a future wind-down, and wake are armed: set to fire later.
+/// A wind-down that has already started is live, in the present tense.
+/// Empty when nothing is set and nothing is winding down.
+pub fn armed_hold(a: &ArmedFeatures) -> Vec<Spoken> {
+    let mut out = Vec::new();
+    let mut later = Vec::new();
     if let Some(s) = a.sleep_remaining {
-        bits.push(format!("sleep in {}", fmt_remaining(s)));
-    }
-    if a.winddown_active {
-        match a.winddown_remaining {
-            Some(s) => bits.push(format!("wind-down in {}", fmt_remaining(s))),
-            None => bits.push("winding down".to_string()),
-        }
+        later.push(format!("sleep in {}", fmt_remaining(s)));
     }
     if let Some(s) = a.wake_remaining {
-        bits.push(format!("wake in {}", fmt_remaining(s)));
+        later.push(format!("wake in {}", fmt_remaining(s)));
     }
-    Some(Spoken::new(State::Armed, vec![bits.join(" \u{00b7} ")]))
+    if let Some(spoken) = winddown_spoken(
+        a.winddown_phase.as_deref(),
+        a.winddown_when.as_deref(),
+        a.winddown_remaining,
+    ) {
+        if spoken.state == State::Armed {
+            later.extend(spoken.lines);
+        } else {
+            out.push(spoken);
+        }
+    }
+    if !later.is_empty() {
+        out.push(Spoken::new(State::Armed, vec![later.join(" \u{00b7} ")]));
+    }
+    out
+}
+
+/// Map the daemon's explicit wind-down pair. No inference from a missing remaining.
+pub fn winddown_spoken(
+    phase: Option<&str>,
+    when: Option<&str>,
+    remaining: Option<u64>,
+) -> Option<Spoken> {
+    match phase {
+        Some(p) if p == hypodj_dsl::WINDDOWN_RUNNING => {
+            Some(Spoken::new(State::Live, vec!["winding down".into()]))
+        }
+        Some(p) if p == hypodj_dsl::WINDDOWN_ARMED => {
+            let line = match when {
+                Some(w) if w == hypodj_dsl::WINDDOWN_WHEN_ALBUM => {
+                    "wind down at album end".to_string()
+                }
+                Some(w) if w == hypodj_dsl::WINDDOWN_WHEN_TRACK => {
+                    "wind down after this track".to_string()
+                }
+                Some(w) if w == hypodj_dsl::WINDDOWN_WHEN_DEADLINE => match remaining {
+                    Some(s) => format!("wind down in {}", fmt_remaining(s)),
+                    None => "wind down at the deadline".to_string(),
+                },
+                _ => return None,
+            };
+            Some(Spoken::new(State::Armed, vec![line]))
+        }
+        _ => None,
+    }
 }
 
 /// One reply shape the handler can emit, and the state and words it must
@@ -579,12 +626,58 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
             command: None,
         });
     }
+    out.push(shape(
+        "wind down at album end",
+        pairs(&[
+            (hypodj_dsl::WINDDOWN_KEY, hypodj_dsl::WINDDOWN_ARMED),
+            (hypodj_dsl::WINDDOWN_WHEN_KEY, hypodj_dsl::WINDDOWN_WHEN_ALBUM),
+        ]),
+        None,
+        None,
+        State::Armed,
+        &["wind down at album end"],
+    ));
+    out.push(shape(
+        "wind down after this track",
+        pairs(&[
+            (hypodj_dsl::WINDDOWN_KEY, hypodj_dsl::WINDDOWN_ARMED),
+            (hypodj_dsl::WINDDOWN_WHEN_KEY, hypodj_dsl::WINDDOWN_WHEN_TRACK),
+        ]),
+        None,
+        None,
+        State::Armed,
+        &["wind down after this track"],
+    ));
+    out.push(shape(
+        "wind down in 5m",
+        pairs(&[
+            (hypodj_dsl::WINDDOWN_KEY, hypodj_dsl::WINDDOWN_ARMED),
+            (hypodj_dsl::WINDDOWN_WHEN_KEY, hypodj_dsl::WINDDOWN_WHEN_DEADLINE),
+            ("X-hypodj-winddown-remaining", "300"),
+        ]),
+        None,
+        None,
+        State::Armed,
+        &["wind down in 5m"],
+    ));
+    out.push(shape(
+        "winding down",
+        pairs(&[(hypodj_dsl::WINDDOWN_KEY, hypodj_dsl::WINDDOWN_RUNNING)]),
+        None,
+        None,
+        State::Live,
+        &["winding down"],
+    ));
     for shape in &mut out {
         shape.command = match shape.name {
             "sleep remaining" | "sleep none" => Some("sleep"),
             "wake remaining" | "wake none" => Some("wake"),
             "nl answer" => Some("nl"),
             "undo" => Some("undo"),
+            "wind down at album end"
+            | "wind down after this track"
+            | "wind down in 5m"
+            | "winding down" => Some("winddown"),
             _ => shape.command,
         };
     }

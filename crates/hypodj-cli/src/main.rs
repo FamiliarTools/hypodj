@@ -368,7 +368,12 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
             );
             print_card(conn)?;
         }
-        Err(MpdError::Ack(msg)) => println!("could not favorite: {msg}"),
+        Err(MpdError::Ack(msg)) => {
+            println!(
+                "{}",
+                render::render_refusal(&format!("could not favorite: {msg}"), stdout_ansi())
+            );
+        }
         Err(e) => return Err(e),
     }
     Ok(())

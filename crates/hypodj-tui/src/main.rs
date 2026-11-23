@@ -1079,13 +1079,18 @@ mod tests {
 
     #[test]
     fn a_long_mark_reaches_the_bar_through_apply_resp() {
-        use hypodj_client::spoken::live_text;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let (tx, _rx) = mpsc::channel::<Req>();
         let mut state = TuiState::new();
         let sentence = "noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it";
-        apply_resp(&tx, &mut state, RespKind::Banner(live_text(sentence).into()));
+        let pairs = [("mark_result".into(), sentence.to_string())];
+        let super::worker::Reply::Banner(spoken) =
+            super::worker::command_reply("mark", &pairs).expect("mark speaks")
+        else {
+            panic!("mark is a banner");
+        };
+        apply_resp(&tx, &mut state, RespKind::Banner(spoken.into()));
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
         terminal.draw(|f| ui::render(f, &state)).unwrap();
         let buf = terminal.backend().buffer().clone();

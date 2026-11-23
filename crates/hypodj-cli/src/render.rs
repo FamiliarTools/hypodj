@@ -47,7 +47,10 @@ pub fn render_refusal(msg: &str, ansi: Ansi) -> String {
 pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
-    let armed = hypodj_client::spoken::armed_hold(&np.armed).map(|s| ansi.render(&s));
+    let armed: Vec<String> = hypodj_client::spoken::armed_hold(&np.armed)
+        .iter()
+        .map(|s| ansi.render(s))
+        .collect();
     let field = render_field(&np.field);
     if stopped || empty {
         // A stopped deck can still hold an armed wake alarm or a held pull - surface
@@ -56,7 +59,7 @@ pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
         let mut lines = vec!["nothing playing".to_string()];
         // The modes still decide what the next `play` does, so a stopped deck says them.
         lines.extend(np.modes.label().map(|m| format!("modes: {m}")));
-        lines.extend(armed);
+        lines.extend(armed.clone());
         lines.extend(field);
         if let Some(hint) = &np.hint {
             lines.push(hint.phrase());
@@ -127,9 +130,7 @@ pub fn render_card_with(np: &NowPlaying, ansi: Ansi) -> String {
     if let Some(l) = render_history(np.plays, np.last_played_days) {
         lines.push(l);
     }
-    if let Some(a) = armed {
-        lines.push(a);
-    }
+    lines.extend(armed);
     // The field is the last, faintest line of the card - the quietest voice.
     if let Some(fl) = field {
         lines.push(fl);
@@ -194,11 +195,7 @@ fn render_field(field: &FieldState) -> Option<String> {
     Some(line)
 }
 
-/// The armed human-features as one unobtrusive line, e.g.
-/// `sleep in 12m \u{b7} winding down \u{b7} wake in 7h 00m`. `None` when nothing is
-/// armed. Worded exactly as the dj-gui's `armed_hud`: `in` marks every countdown, so
-/// `sleep 12m` cannot be read as a twelve-minute-long timer.
-
+/// `M:SS` for a track duration on the card.
 fn fmt_dur(secs: f64) -> String {
     let total = secs as u64;
     format!("{}:{:02}", total / 60, total % 60)
@@ -390,10 +387,9 @@ mod tests {
         let hold = hypodj_client::spoken::armed_hold(&hypodj_client::model::ArmedFeatures {
             sleep_remaining: Some(720),
             ..hypodj_client::model::ArmedFeatures::default()
-        })
-        .unwrap();
+        });
         assert_eq!(sleep_spoken.state, hypodj_style::State::Armed);
-        assert_eq!(hold.state, sleep_spoken.state);
+        assert_eq!(hold[0].state, sleep_spoken.state);
         let sleep_on = render_command("sleep", &sleep, Ansi::on_truecolor()).unwrap();
         assert!(sleep_on.contains("38;2;"), "a countdown is ember");
         assert_eq!(hypodj_style::ansi::strip(&sleep_on), sleep_spoken.text());
@@ -417,6 +413,32 @@ mod tests {
                 Some(spoken.text().as_str())
             );
             assert_eq!(spoken.state, hypodj_style::State::Live, "{line}");
+        }
+    }
+
+    #[test]
+    fn winddown_phase_is_explicit_on_the_cli() {
+        use hypodj_client::spoken::{reply_shapes, speak_shape, State};
+        let shapes = reply_shapes();
+        for name in [
+            "wind down at album end",
+            "wind down after this track",
+            "wind down in 5m",
+            "winding down",
+        ] {
+            let shape = shapes.iter().find(|s| s.name == name).expect(name);
+            let spoken = speak_shape(shape);
+            let off = render_command("winddown", &shape.pairs, Ansi::off()).unwrap();
+            let on = render_command("winddown", &shape.pairs, Ansi::on_truecolor()).unwrap();
+            assert_eq!(off, spoken.text(), "{name}");
+            assert_eq!(hypodj_style::ansi::strip(&on), off);
+            if spoken.state == State::Armed {
+                assert!(on.contains("38;2;"), "{name} is ember");
+            }
+            if spoken.state == State::Live {
+                assert!(on.contains("\u{1b}[1m"), "{name} is live");
+                assert!(!on.contains("38;2;"), "{name} is not ember");
+            }
         }
     }
 

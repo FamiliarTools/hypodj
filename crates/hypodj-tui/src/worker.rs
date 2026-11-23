@@ -1224,6 +1224,19 @@ mod tests {
             command_reply("wake", &wake),
             Some(Reply::Banner(hypodj_client::spoken::command_spoken("wake", &wake).unwrap()))
         );
+        for name in ["wind down at album end", "wind down in 5m", "winding down"] {
+            let shape = hypodj_client::spoken::reply_shapes()
+                .into_iter()
+                .find(|s| s.name == name)
+                .expect(name);
+            match command_reply("winddown", &shape.pairs) {
+                Some(Reply::Banner(s)) => {
+                    assert_eq!(s.state, shape.state, "{name}");
+                    assert_eq!(s.text(), shape.lines.join("\n"), "{name}");
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
         // The words appear only once the daemon has accepted the flip.
         assert_eq!(
             command_reply("random 1", &[]).map(|r| match r {

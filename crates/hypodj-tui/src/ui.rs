@@ -852,7 +852,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         return;
     }
 
-    let armed_line = hypodj_client::spoken::armed_hold(&np.armed);
+    let holds = hypodj_client::spoken::armed_hold(&np.armed);
     // The active latent-field pull, as its own subtle line (the quietest voice),
     // mirroring the armed HUD: present ONLY when a pull is active, so a resting field
     // reserves no row and never jumps the layout.
@@ -887,7 +887,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
                 ),
             )));
         }
-        if let Some(a) = &armed_line {
+        for a in &holds {
             lines.extend(hypodj_style::ratatui::render(a, state.term_bg, state.truecolor));
         }
         if let Some(fl) = &field_line {
@@ -924,7 +924,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     // and HUD line (armed, then field); the rest is art. Reserving no row when a line is
     // absent is what keeps the layout from jumping when it vanishes at rest.
     let extra = station_line.is_some() as u16
-        + armed_line.is_some() as u16
+        + holds.len() as u16
         + field_line.is_some() as u16;
     let text_h = (4u16 + extra).min(inner.height);
     // The art takes what the text does not - but NEVER more rows than it can be square
@@ -1029,8 +1029,8 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
             state.truecolor,
         ),
     )));
-    if let Some(a) = armed_line {
-        lines.extend(hypodj_style::ratatui::render(&a, state.term_bg, state.truecolor));
+    for a in &holds {
+        lines.extend(hypodj_style::ratatui::render(a, state.term_bg, state.truecolor));
     }
     // The field pull is the last, faintest line - the quietest voice in the pane.
     if let Some(fl) = field_line {
@@ -1351,15 +1351,18 @@ mod tests {
 
     #[test]
     fn armed_hud_reads_human_and_absent_when_unarmed() {
-        assert!(hypodj_client::spoken::armed_hold(&ArmedFeatures::default()).is_none());
+        assert!(hypodj_client::spoken::armed_hold(&ArmedFeatures::default()).is_empty());
         let a = ArmedFeatures {
             sleep_remaining: Some(720),
             winddown_active: true,
+            winddown_phase: Some("running".into()),
+            winddown_when: None,
             winddown_remaining: None,
             wake_remaining: Some(25200),
             wake_at: Some(1750000000),
         };
-        let hud = hypodj_client::spoken::armed_hold(&a).expect("armed").text();
+        let lines = hypodj_client::spoken::armed_hold(&a);
+        let hud = lines.iter().map(|s| s.text()).collect::<Vec<_>>().join(" ");
         assert!(
             !hud.contains("[armed]"),
             "no category tag on a line that is nothing but armed state: {hud}"
@@ -1367,6 +1370,8 @@ mod tests {
         assert!(hud.contains("sleep in 12m"), "every countdown says `in`: {hud}");
         assert!(hud.contains("winding down"), "hud: {hud}");
         assert!(hud.contains("wake in 7h 00m"), "hud: {hud}");
+        let wind = lines.iter().find(|s| s.text() == "winding down").expect("live wind-down");
+        assert_eq!(wind.state, hypodj_style::State::Live);
     }
 
     #[test]
@@ -2582,10 +2587,15 @@ mod tests {
         // edge - so the capture would be announced to nobody, which is the same silent
         // success the gesture was built to end. The bar borrows the blank breathing row
         // below it (already reserved, so nothing moves) and the clause lands.
+        let sentence = "noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it";
+        let pairs = [("mark_result".to_string(), sentence.to_string())];
+        let crate::worker::Reply::Banner(spoken) =
+            crate::worker::command_reply("mark", &pairs).expect("mark speaks")
+        else {
+            panic!("mark is a banner");
+        };
         let mut s = TuiState::new();
-        s.set_reply(hypodj_client::spoken::Reply::one(hypodj_client::spoken::live_text(
-            "noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it",
-        )));
+        s.set_reply(spoken.into());
         let out = render_flat(&s);
         assert!(
             out.contains("noted: NTS 2 at 23:17 - kept 5m of audio (window); `dj heard` has it"),
@@ -3829,7 +3839,11 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 if hint_len > 0 {
                     spans.push(Span::styled(
                         HINT,
-                        Style::default().quiet(),
+                        hypodj_style::ratatui::style_for(
+                            hypodj_style::Role::InkQuiet,
+                            state.term_bg,
+                            state.truecolor,
+                        ),
                     ));
                 }
                 Line::from(spans)
