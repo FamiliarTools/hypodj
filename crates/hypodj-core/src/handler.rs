@@ -11148,11 +11148,15 @@ impl HypodjHandler {
         // was itself the active continuation stream - the ONE-SHOT re-entrancy guard
         // - and (b) whether the queue is GENUINELY exhausted (true drain) vs a
         // `single`-mode stop that left tracks queued.
-        let (finishing_is_continuation, true_drain) = {
+        let (finishing_is_continuation, true_drain, pausing) = {
             let mut st = self.state.lock().unwrap();
             if st.pending_skip.is_some() {
                 return;
             }
+            // A pause gesture whose PauseOut fade is still descending (or a halt's held
+            // pause): the user asked for quiet, so a drain must neither start a station
+            // nor leave that fade orphaned over the stopped deck.
+            let pausing = st.pending_pause;
             // Record the finishing track as the recency seed BEFORE the advance
             // repoints `current`. Only a real library Song counts: a live/continuous
             // stream has no id and must never become a similar seed, so a stream EOF
@@ -11179,7 +11183,7 @@ impl HypodjHandler {
             let finishing_is_continuation = st.continuation_active.is_some()
                 && st.current.and_then(|i| st.queue.get(i)).map(|it| it.id)
                     == st.continuation_active;
-            (finishing_is_continuation, st.is_true_drain())
+            (finishing_is_continuation, st.is_true_drain(), pausing)
         };
         // THE FUSE, checked BEFORE plan_next (which mutates the queue under `consume`):
         // count the unbroken run of errored ends WITH NO AUDIO IN BETWEEN (any live
@@ -11322,6 +11326,9 @@ impl HypodjHandler {
                     tracing::warn!(
                         "continuation stream ended (dropped / finite / unreachable); stopping honestly - one-shot, no re-fire"
                     );
+                } else if pausing {
+                    // The queue ran out under a pause: the user asked for quiet, so the
+                    // walk does not get to start music behind that gesture.
                 } else if true_drain
                     && mode == ContinuationMode::Autofill
                     && self.autofill_once(None, AutofillStart::Walk).await > 0
@@ -11350,6 +11357,22 @@ impl HypodjHandler {
                 // the deck reports Paused, exactly as [`Self::halt_failed_advance`] does;
                 // an ordinary end of queue is untouched, because the track that PLAYED to
                 // get here already ended the walk.
+                // A PauseOut fade still descending when the queue drained would
+                // otherwise outlive the stop: its Terminal::Pause lands on a stopped deck
+                // and, until then, the reported volume follows a dead envelope. Retire it
+                // the way `stop` does - abort+join and settle the baseline under one slot
+                // lock - then re-assert the real gain so any later play starts audible.
+                if pausing {
+                    self.fade
+                        .cancel_with(|| {
+                            let mut st = self.state.lock().unwrap();
+                            let v = st.target_volume;
+                            st.set_manual_volume(v, false);
+                        })
+                        .await;
+                    let v = self.state.lock().unwrap().target_volume;
+                    let _ = self.player.set_volume(v).await;
+                }
                 let origin = self.walk_origin();
                 let mut st = self.state.lock().unwrap();
                 let held = origin.is_some_and(|qid| st.point_current_at_qid(qid));
@@ -29762,6 +29785,29 @@ mod tests {
         h.wait_for_fade().await;
         assert_eq!(h.reported_play_state(), PlayState::Paused, "and lands on the new track");
         assert_eq!(h.player.state(), PlayState::Paused, "which the PLAYER really froze");
+    }
+
+    /// gogss78: the LAST track hitting EOF while its PauseOut fade is still descending
+    /// must not orphan that fade over the stopped deck (its Terminal::Pause landing on
+    /// nothing, the reported volume following a dead envelope in the meantime), and
+    /// the drain must not start a continuation behind the pause.
+    #[tokio::test(start_paused = true)]
+    async fn an_end_of_queue_eof_under_a_pause_fade_retires_the_fade() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("last")).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        let baseline = h.state.lock().unwrap().target_volume;
+        h.set_pause(Some(true)).await.expect("pause");
+        pump(20, 2).await;
+        assert!(h.fade_active().await, "the PauseOut fade is descending");
+
+        h.advance_on_eof(EofSignal::default()).await;
+        assert!(!h.fade_active().await, "the drain retired the pause fade");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "end of queue stops the deck");
+        assert!(!st.fading, "no dead envelope drives the reported volume");
+        assert_eq!(st.reported_volume(), baseline, "getvol reads the baseline");
+        assert_eq!(st.queue.len(), 1, "no continuation was appended behind the pause");
     }
 
     /// The skip-pin SLOT must be leak-proof under CONCURRENCY - two connections issuing
