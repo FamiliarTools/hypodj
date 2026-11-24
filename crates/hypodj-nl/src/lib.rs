@@ -821,6 +821,75 @@ mod tests {
         );
     }
 
+    /// One golden row's rendering: the plan-DSL echo of each plan (joined by
+    /// " ; "), or `ERR <variant>: <message>` for a refusal. The Debug form stands in
+    /// for a plan the DSL cannot express, so no row is ever silently blank.
+    fn golden_render(u: &str, c: &NlContext) -> String {
+        match tr(u, c) {
+            Ok(ps) => ps
+                .iter()
+                .map(|p| render_dsl(p).unwrap_or_else(|| format!("{p:?}")))
+                .collect::<Vec<_>>()
+                .join(" ; "),
+            Err(e) => format!("ERR {e:?}"),
+        }
+    }
+
+    /// GOLDEN corpus as DATA (5znoe5i): `tests/golden.tsv` holds one
+    /// `utterance<TAB>expected` row per line (`#` comments, blank lines ignored),
+    /// translated under the fixed test context. A grammar change that shifts any
+    /// row fails here with the actual rendering, ready to paste. Set
+    /// `HYPODJ_GOLDEN_BLESS=1` to rewrite the expected column from the current
+    /// grammar (then review the diff).
+    #[test]
+    fn golden_fixture_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden.tsv");
+        let c = ctx(Some("song-42"), 5);
+        let src = std::fs::read_to_string(path).expect("golden.tsv");
+        let bless = std::env::var_os("HYPODJ_GOLDEN_BLESS").is_some();
+        let mut out = String::new();
+        let mut bad = Vec::new();
+        let mut rows = 0;
+        for line in src.lines() {
+            if line.trim().is_empty() || line.starts_with('#') {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            let (u, want) = line.split_once('\t').unwrap_or((line, ""));
+            let got = golden_render(u, &c);
+            rows += 1;
+            if got != want {
+                bad.push(format!("{u}\t{got}"));
+            }
+            out.push_str(&format!("{u}\t{got}\n"));
+        }
+        if bless {
+            std::fs::write(path, out).unwrap();
+            return;
+        }
+        assert!(rows >= 50, "golden corpus shrank to {rows} rows");
+        assert!(bad.is_empty(), "{} golden row(s) drifted:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    /// REAL-INFERENCE smoke for the local model path (5znoe5i): a golden ask the
+    /// rules also answer, decoded by the actual llama backend against the GBNF.
+    /// Ignored (needs a GGUF on disk and the llama.cpp build); run with
+    /// `HYPODJ_NL_MODEL=/path/model.gguf cargo test -p hypodj-nl --features
+    /// llm-llama -- --ignored llm_real_inference_smoke`.
+    #[cfg(feature = "llm-llama")]
+    #[test]
+    #[ignore = "needs a local GGUF model (HYPODJ_NL_MODEL) and the llama.cpp build"]
+    fn llm_real_inference_smoke() {
+        let model = std::env::var_os("HYPODJ_NL_MODEL").expect("set HYPODJ_NL_MODEL to a GGUF path");
+        let t = LlmTranslator::new(llama::LlamaBackend::new(model.into()));
+        let c = ctx(Some("song-42"), 5);
+        let hit = t.translate("fade out over 20 minutes", &c).expect("the model must yield a plan");
+        assert_eq!(hit.source, NlSource::Llm);
+        assert_eq!(hit.plans.len(), 1);
+        assert!(matches!(hit.plans[0].action, Action::Fade(FadeIntentIr::Out { .. })), "{:?}", hit.plans[0]);
+    }
+
     // Sleep and wind-down name the daemon's single-instance FEATURES, so the hit
     // says so (the handler then arms them through its own singleton path). Nothing
     // else does - not even a fade that happens to share the sleep shape.

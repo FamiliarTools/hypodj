@@ -1,0 +1,69 @@
+# Golden NL corpus (task 5znoe5i): utterance<TAB>expected echo or ERR refusal.
+# Run under the fixed test context (current song-42, queue of 4 credited rows,
+# library artists Boards of Canada / The The, civil clock 2026-07-15 05:30 UTC).
+# Regenerate: HYPODJ_GOLDEN_BLESS=1 cargo test -p hypodj-nl golden_fixture_file
+fade out	trigger immediate action fade out 30 once
+fade in	trigger immediate action fade in 30 once
+fade out over 20 minutes	trigger immediate action fade out 1200 once
+fade out in 20 minutes	trigger in 1200 action fade out 30 once
+fade out at 23:30	trigger at 2026-07-15T23:30:00+00:00 action fade out 30 once
+fade the 3rd track	trigger track 3 base absolute action fade out 30 once
+fade the 3rd track counting current as 1st	trigger track 3 base current action fade out 30 once
+fade the last track	ERR NotUnderstood
+stop	trigger immediate action stop once
+pause	trigger immediate action pause once
+stop after this album	trigger album action stop once
+stop after this track	trigger after action stop once
+pause in 10 minutes	trigger in 600 action pause once
+stop in a bit	ERR NotUnderstood
+pause in 2 days	ERR NotUnderstood
+something calmer	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
+5 more like this	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Similar(SongId("song-42")), count: 5 }, once: true, origin: "" }
+more like this	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Similar(SongId("song-42")), count: 5 }, once: true, origin: "" }
+play something calmer	RawPlan { version: 1, trigger: Immediate, action: PlayNow { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
+something calmer, not too loud	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
+something calmer, but nothing too slow	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
+something calmer, not my favorites	ERR Ambiguous("\"not\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+shuffle on	trigger immediate action mode random on once
+don't shuffle	trigger immediate action mode random off once
+turn off random	trigger immediate action mode random off once
+repeat this	trigger immediate action mode repeat on once ; trigger immediate action mode single on once
+loop the queue	trigger immediate action mode repeat on once
+single mode	trigger immediate action mode single on once
+consume	trigger immediate action mode consume on once
+repeat and shuffle	ERR Ambiguous("more than one playback mode named")
+play my favorites	trigger immediate action playnow starred 20 once
+queue my favorites	trigger immediate action enqueue starred 20 once
+shuffle my favorites	trigger immediate action mode random on once ; trigger immediate action playnow starred 20 once
+play anything but my favorites	ERR Ambiguous("\"anything but\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+don't play my favorites	ERR Ambiguous("\"don't\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+wind down	RawPlan { version: 1, trigger: Immediate, action: Fade(ToFloor { secs: 300.0 }), once: true, origin: "" }
+start a wind-down in 10 minutes	RawPlan { version: 1, trigger: SpanElapsed { secs: 600.0 }, action: Fade(ToFloor { secs: 300.0 }), once: true, origin: "" }
+never wind down	ERR Ambiguous("\"never\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+sleep in 30 minutes	trigger in 1800 action fade out 480 once
+go to sleep in an hour	ERR Ambiguous("sleep for how long?")
+sleep timer	ERR Ambiguous("sleep for how long?")
+don't go to sleep in 30 minutes	ERR Ambiguous("\"don't\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+wake me at 7 with jazz	RawPlan { version: 1, trigger: WallClock { at: 2026-07-15T07:00:00Z }, action: Wake { selector: Some(Genre("jazz")), count: 5 }, once: true, origin: "" }
+wake me at 7pm	RawPlan { version: 1, trigger: WallClock { at: 2026-07-15T19:00:00Z }, action: Wake { selector: None, count: 5 }, once: true, origin: "" }
+don't wake me at 7	ERR Ambiguous("\"don't\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+no remixes	trigger immediate action remove upcoming remixes once
+no more remixes please	trigger immediate action remove upcoming remixes once
+no live versions	trigger immediate action remove upcoming live once
+drop the rest of this album	trigger immediate action remove upcoming album once
+no Daft Punk	trigger immediate action remove upcoming artist "Daft Punk" once
+no Pharrell as lead	trigger immediate action remove upcoming lead Pharrell once
+drop everything by Aphex Twin	trigger immediate action remove upcoming artist "Aphex Twin" once
+no Boards of Canada	trigger immediate action remove upcoming artist "Boards of Canada" once
+no Prince	ERR Ambiguous("no artist \"Prince\" in the queue or library")
+no the	ERR NotUnderstood
+no jazz	ERR Ambiguous("no artist \"jazz\" in the queue or library")
+no thanks	ERR NotUnderstood
+no vocals please	ERR Unresolvable("that refinement needs audio-content metadata (vocals, energy, motion) hypodj does not have yet - see task iwwy04x")
+allow remixes again	trigger immediate action allow remixes once
+clear filters	trigger immediate action allow all once
+bring Daft Punk back	trigger immediate action allow artist "Daft Punk" once
+never allow remixes again	ERR Ambiguous("\"never\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+don't fade out	ERR Ambiguous("\"don't\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+don't stop	ERR Ambiguous("\"don't\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
+do a barrel roll	ERR NotUnderstood
