@@ -77,7 +77,8 @@ impl Cause {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Intent {
     Play,
-    /// `stop`: hold the head, silence the decks at once.
+    /// `stop`: hold the head, take the decks to silence (a short slewed fade from a
+    /// playing deck, never a cut).
     Stop,
 }
 
@@ -146,6 +147,10 @@ pub(crate) struct Caps {
     pub crossfade_bound: Duration,
     /// The single-deck duck-swap-rise length.
     pub dip: Duration,
+    /// The fade-out of a `stop` over a playing deck (the pause fade length).
+    pub stop_fade: Duration,
+    /// The fade-out when the head goes away under a playing track (clear).
+    pub quiesce: Duration,
     /// The bound on fast-finishing an overlap a third declaration interrupts.
     pub settle: Duration,
     /// False once arming the second deck failed for this declaration: the ladder
@@ -198,7 +203,13 @@ pub(crate) fn plan(a: Audible, d: &Declared, c: Caps) -> Step {
         return match a {
             // Silent already, or a fade-out is carrying it to the stop.
             Audible::Silent | Audible::Single { leaving: true, .. } => Step::Settled,
-            _ => Step::Quiesce { fade: None },
+            // A playing deck is faded out, never cut: a stop is a deliberate
+            // transition like a pause, and a cut from full level is a click.
+            Audible::Single { playing: true, .. } => Step::Quiesce { fade: Some(c.stop_fade) },
+            // Paused: nothing audible to smooth.
+            Audible::Single { playing: false, .. } => Step::Quiesce { fade: None },
+            // Land the overlap first (bounded), then fade the one deck left.
+            Audible::Overlap { .. } => Step::FinishThenReplan,
         };
     }
     match a {
@@ -219,7 +230,7 @@ pub(crate) fn plan(a: Audible, d: &Declared, c: Caps) -> Step {
                 return match (playing, leaving) {
                     // The fade-out is already carrying it to silence.
                     (_, true) => Step::Settled,
-                    (true, false) => Step::Quiesce { fade: Some(quiesce_fade(c)) },
+                    (true, false) => Step::Quiesce { fade: Some(c.quiesce) },
                     // Paused: nothing audible to smooth.
                     (false, false) => Step::Quiesce { fade: None },
                 };
@@ -261,17 +272,6 @@ fn ladder(cause: Cause, c: Caps) -> Step {
         return begin(Shape::Cut, cause.attributes_finish());
     }
     begin(Shape::Dip(c.dip), false)
-}
-
-/// The fade-out length when the head goes away under a playing track: the gesture
-/// crossfade length, so a `clear; add; play` that lands inside it overlaps exactly as a
-/// skip would, or the dip length on a deck that cannot overlap.
-fn quiesce_fade(c: Caps) -> Duration {
-    if c.can_crossfade && !c.crossfade_skip.is_zero() {
-        c.crossfade_skip
-    } else {
-        c.dip
-    }
 }
 
 // ── the impure half: the one path that changes what the decks play ─────────
@@ -381,6 +381,10 @@ impl CrossfadeSink for PairSink {
             if self.reversed { (incoming_db, outgoing_db) } else { (outgoing_db, incoming_db) };
         let player = self.player.clone();
         async move { player.set_deck_pair_db(&KEY, active, spare).await }
+    }
+
+    fn settle(&self) -> Duration {
+        self.player.gain_settle()
     }
 }
 
@@ -545,6 +549,8 @@ impl HypodjHandler {
             crossfade_skip: self.crossfade_skip_dur().unwrap_or(Duration::ZERO),
             crossfade_bound: self.crossfade_bound_dur().unwrap_or(Duration::ZERO),
             dip: self.skip_fade_dur(),
+            stop_fade: self.pause_fade_dur(),
+            quiesce: self.clear_fade_dur(),
             settle: SETTLE,
             incoming_loads: st.xf_failed_rev != Some(d.rev),
             abandoned: st.abandoned_rev == Some(d.rev),
@@ -620,17 +626,17 @@ impl HypodjHandler {
                 self.load(&play, d.rev).await
             }
             Shape::FromSilence => {
-                // Something still audible (an undo while another track plays) is taken
-                // DOWN first, never cut from full: the dip's own duck to its shallow
-                // floor, and the silence below that is the same small step the dip's
-                // trough already takes. A duck the user supersedes just re-plans.
+                // Something still audible (an undo while another track plays, on a
+                // player that cannot overlap) is taken DOWN first, all the way to
+                // silence: never cut from an audible level. A duck the user supersedes
+                // just re-plans.
                 let audible = self.state.lock().unwrap().deck.is_some()
                     && self.player.state() == PlayState::Playing;
                 if audible {
                     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
                     let dur = self.skip_fade_dur();
                     if self
-                        .install_engine_fade(FadeTarget::Db(SKIP_DIP_DB), dur, Terminal::Trough(tx))
+                        .install_engine_fade(FadeTarget::Silence, dur, Terminal::Trough(tx))
                         .await
                         .is_ok()
                         && (rx.await.is_err() || self.state.lock().unwrap().declared.rev != d.rev)
@@ -680,9 +686,19 @@ impl HypodjHandler {
     /// inside a fade-out continues it rather than jumping back up. A refused arm leaves
     /// nothing audible changed and marks the ladder to continue below the crossfade.
     async fn begin_overlap(&self, play: &ResolvedPlay, d: &Declared, dur: Duration, attribute: bool) {
+        let start = {
+            let mut st = self.state.lock().unwrap();
+            match st.head_start {
+                Some((q, secs)) if q == play.qid => {
+                    st.head_start = None;
+                    Some(secs)
+                }
+                _ => None,
+            }
+        };
         let armed = self
             .player
-            .crossfade_arm(&KEY, play.song_id.clone(), Some(play.qid), &play.url, play.local)
+            .crossfade_arm(&KEY, play.song_id.clone(), Some(play.qid), &play.url, play.local, start)
             .await;
         if armed.is_err() || self.state.lock().unwrap().declared.rev != d.rev {
             // Refused, or superseded while loading: silence the spare, re-plan.
@@ -1039,7 +1055,7 @@ impl HypodjHandler {
 /// now plays. The head bookkeeping is the reconciler's ([`HypodjHandler::commit_head`]).
 async fn land_overlap(player: &PlayerHandle, state: &Mutex<State>, o: &Overlap) {
     if o.reversed {
-        let _ = player.crossfade_abort(&KEY).await;
+        let _ = player.crossfade_retire(&KEY).await;
     } else {
         let _ = player.crossfade_commit(&KEY, o.attribute).await;
     }
@@ -1103,6 +1119,8 @@ mod tests {
     const SKIP: Duration = Duration::from_millis(1500);
     const BOUND: Duration = Duration::from_secs(4);
     const DIP: Duration = Duration::from_millis(350);
+    const STOP: Duration = Duration::from_millis(500);
+    const CLEAR: Duration = Duration::from_secs(5);
 
     fn caps() -> Caps {
         Caps {
@@ -1110,6 +1128,8 @@ mod tests {
             crossfade_skip: SKIP,
             crossfade_bound: BOUND,
             dip: DIP,
+            stop_fade: STOP,
+            quiesce: CLEAR,
             settle: Duration::from_millis(200),
             incoming_loads: true,
             abandoned: false,
@@ -1153,7 +1173,7 @@ mod tests {
             ("committed head is settled", playing(2, 1), decl(Some(2), Cause::Natural, 1), caps(), Step::Settled),
             // 5. remove the playing row: the successor is declared, the outgoing abandoned
             ("delete playing row crossfades to the successor", playing(1, 0), decl(Some(2), Cause::Removed, 1), caps(), xf(SKIP, false)),
-            ("delete the last row fades out", playing(1, 0), decl(None, Cause::Removed, 1), caps(), Step::Quiesce { fade: Some(SKIP) }),
+            ("delete the last row fades out", playing(1, 0), decl(None, Cause::Removed, 1), caps(), Step::Quiesce { fade: Some(CLEAR) }),
             // 6. mid-flight with two decks
             ("redeclaring the incoming waits", Audible::Overlap { out: leg(1, 0), inn: leg(2, 1) }, decl(Some(2), Cause::Gesture, 1), caps(), Step::AwaitOverlap),
             ("declaring the outgoing reverses", Audible::Overlap { out: leg(1, 0), inn: leg(2, 1) }, Declared { fresh: 0, ..decl(Some(1), Cause::Removed, 2) }, caps(), Step::Reverse),
@@ -1162,14 +1182,14 @@ mod tests {
             ("clear mid-overlap finishes first", Audible::Overlap { out: leg(1, 0), inn: leg(2, 1) }, decl(None, Cause::Gesture, 2), caps(), Step::FinishThenReplan),
             // 7. single-deck floor
             ("one deck dips", playing(1, 0), decl(Some(2), Cause::Gesture, 1), no_xf, Step::Begin { shape: Shape::Dip(DIP), attribute_finish: false }),
-            ("one deck fades out over the dip length", playing(1, 0), decl(None, Cause::Gesture, 1), no_xf, Step::Quiesce { fade: Some(DIP) }),
+            ("one deck fades out over the clear length too", playing(1, 0), decl(None, Cause::Gesture, 1), no_xf, Step::Quiesce { fade: Some(CLEAR) }),
             // 8. EOF spine: the track already ended, nothing to overlap
             ("eof advance from silence is a cut", Audible::Silent, decl(Some(2), Cause::Natural, 1), caps(), Step::Begin { shape: Shape::Cut, attribute_finish: false }),
             // 9. load failure falls through, never a no-op
             ("failed arm drops to the dip", playing(1, 0), decl(Some(2), Cause::Gesture, 1), arm_failed, Step::Begin { shape: Shape::Dip(DIP), attribute_finish: false }),
             ("exhausted ladder stops retrying", playing(1, 0), decl(Some(2), Cause::Gesture, 1), Caps { abandoned: true, ..caps() }, Step::Settled),
             // the proof case: the queue swap lands inside clear's fade-out
-            ("clear while playing fades out", playing(1, 0), decl(None, Cause::Gesture, 1), caps(), Step::Quiesce { fade: Some(SKIP) }),
+            ("clear while playing fades out", playing(1, 0), decl(None, Cause::Gesture, 1), caps(), Step::Quiesce { fade: Some(CLEAR) }),
             ("play during the fade-out crossfades in", Audible::Single { leg: leg(1, 0), playing: true, leaving: true, committed: true }, decl(Some(9), Cause::Gesture, 2), caps(), xf(SKIP, false)),
             ("a fade-out with no head is left to finish", Audible::Single { leg: leg(1, 0), playing: true, leaving: true, committed: true }, decl(None, Cause::Gesture, 1), caps(), Step::Settled),
             // transport
@@ -1177,7 +1197,9 @@ mod tests {
             ("re-stating the head without a fresh floor is settled", playing(1, 0), Declared { fresh: 0, ..decl(Some(1), Cause::Gesture, 3) }, caps(), Step::Settled),
             ("paused deck: a new head is a plain load", Audible::Single { leg: leg(1, 0), playing: false, leaving: false, committed: true }, decl(Some(2), Cause::Gesture, 1), caps(), Step::Begin { shape: Shape::Cut, attribute_finish: false }),
             ("paused deck: clear halts", Audible::Single { leg: leg(1, 0), playing: false, leaving: false, committed: true }, decl(None, Cause::Gesture, 1), caps(), Step::Quiesce { fade: None }),
-            ("stop halts whatever plays", Audible::Overlap { out: leg(1, 0), inn: leg(2, 1) }, Declared { intent: Intent::Stop, ..decl(Some(2), Cause::Gesture, 2) }, caps(), Step::Quiesce { fade: None }),
+            ("stop lands an overlap first", Audible::Overlap { out: leg(1, 0), inn: leg(2, 1) }, Declared { intent: Intent::Stop, ..decl(Some(2), Cause::Gesture, 2) }, caps(), Step::FinishThenReplan),
+            ("stop fades a playing deck out", playing(1, 0), Declared { intent: Intent::Stop, ..decl(Some(1), Cause::Gesture, 2) }, caps(), Step::Quiesce { fade: Some(STOP) }),
+            ("stop halts a paused deck", Audible::Single { leg: leg(1, 0), playing: false, leaving: false, committed: true }, Declared { intent: Intent::Stop, ..decl(Some(1), Cause::Gesture, 2) }, caps(), Step::Quiesce { fade: None }),
             ("a fade-out to a stop is left to land", Audible::Single { leg: leg(1, 0), playing: true, leaving: true, committed: true }, Declared { intent: Intent::Stop, ..decl(Some(1), Cause::Gesture, 2) }, caps(), Step::Settled),
             ("stop when silent is settled", Audible::Silent, Declared { intent: Intent::Stop, ..decl(Some(2), Cause::Gesture, 2) }, caps(), Step::Settled),
         ];

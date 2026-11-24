@@ -127,7 +127,6 @@ mod tests {
     fn motion_matches_fade_config_defaults() {
         let t = tokens();
         let min_slew = fade_const("DEFAULT_MIN_SLEW_MS");
-        let tick = fade_const("DEFAULT_TICK_MS");
         let skip = fade_const("DEFAULT_SKIP_FADE_SECS");
         let pause = fade_const("DEFAULT_PAUSE_FADE_SECS");
         assert_eq!(t.motion.floor_ms as f64, min_slew, "floor is min slew");
@@ -141,14 +140,14 @@ mod tests {
             (pause * 1000.0).round(),
             "pause ms is the pause fade"
         );
+        // The chrome steps once per startle slew. It used to be pinned to the fade
+        // tick because the two were the same 250 ms; the audio tick is now a fine
+        // knot interval the player interpolates between, and says nothing about
+        // how fast anything VISIBLE may step.
         assert_eq!(
             t.motion.max_chrome_hz as f64,
-            (1000.0 / tick).round(),
-            "chrome rate is the fade tick"
-        );
-        assert_eq!(
-            t.motion.floor_ms as f64, tick,
-            "floor and the fade tick agree"
+            (1000.0 / min_slew).round(),
+            "chrome rate is one step per startle slew"
         );
     }
 }

@@ -232,13 +232,10 @@ pub fn build_shutdown_fade(
         bounds,
     )
     .ok()?;
-    // Real length: the driver places steps one STEP INTERVAL apart, which is the
-    // tick clamped UP to min_slew (t_eff = max(tick, min_slew)) - NOT min_slew
-    // alone. Using min_slew would UNDER-estimate when tick > min_slew, so a fade
-    // longer than `budget` could pass this check and get SIGKILLed mid-ramp (a
-    // click). saturating so a pathological count cannot overflow.
-    let step_interval = min_slew.max(Duration::from_millis(cfg.tick_ms));
-    let real_dur = step_interval.saturating_mul(spec.step_count() as u32);
+    // Real length: read off the schedule itself (its last step), never re-derived
+    // from config, so a fade longer than `budget` can never pass this check and get
+    // SIGKILLed mid-ramp (a click).
+    let real_dur = spec.duration();
     if real_dur > budget {
         return None;
     }
@@ -466,17 +463,17 @@ mod tests {
     #[test]
     fn build_shutdown_fade_is_deliberate_not_sub_jnd() {
         // A short shutdown fade from 0 dB spans the full 60 dB to silence. The
-        // DELIBERATE (3 dB/step) path needs at least ceil(60/3) = 20 ramp steps +
-        // 1 mute = 21 - NOT the ~80 steps the sub-JND Out path would extend to.
+        // DELIBERATE path keeps its configured length (plus the one inaudible mute
+        // step) - it is never stretched like a sub-JND sleep fade would be.
         let mut cfg = FadeConfig::default();
-        cfg.shutdown_fade_secs = 5; // 5s / 250ms = 20 nominal steps at exactly 3 dB.
+        cfg.shutdown_fade_secs = 5;
         cfg.normalize();
         let budget = Duration::from_secs(15);
         let sf = build_shutdown_fade(&cfg, 0.0, budget).expect("builds");
-        let steps = sf.spec.step_count();
         assert!(
-            steps <= (60.0f64 / 3.0).ceil() as usize + 1,
-            "steps {steps} must be the deliberate 3 dB/step count (<= 21), not the sub-JND ~80"
+            sf.real_dur <= Duration::from_millis(5_050),
+            "real_dur {:?} must be the configured 5 s, not extended",
+            sf.real_dur
         );
     }
 

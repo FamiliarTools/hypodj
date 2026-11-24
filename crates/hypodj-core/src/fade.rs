@@ -26,15 +26,17 @@
 //! ## Startle safety, enforced in CODE (not just documented)
 //!
 //! [`FadeSpec::new`] precomputes a validated [`Schedule`] that guarantees:
-//!   - every step interval is `>= min_slew` (>= 250 ms; startle vanishes by
-//!     ~140-220 ms, so a slewed step never triggers the brainstem);
-//!   - each per-step dB delta is `<= step_size_db` (sub-JND, ~0.75 dB) after
-//!     clamping - the sub-JND staircase IS the startle mitigation;
+//!   - every transition lasts `>= min_slew` (>= 250 ms; startle vanishes by
+//!     ~140-220 ms, so a slewed transition never triggers the brainstem);
+//!   - steps are FINE (20-50 ms apart, see [`FADE_MIN_TICK`]) and each per-step dB
+//!     delta is `<= step_size_db` (sub-JND, ~0.75 dB) wherever the duration
+//!     allows; the player interpolates between steps inside the audio path, so
+//!     what plays is a continuous ramp, never a stair;
 //!   - the schedule is MONOTONE toward the target: it never overshoots and never
 //!     re-brightens (fresh transients re-flag the autistic/anxious brain);
-//!   - it is NEVER a hard cut: even `dur < min_slew` yields one >= 250 ms slewed
-//!     step, and true silence is reached via one final slewed mute step from the
-//!     -60 dB floor (no click), not an instantaneous drop to zero.
+//!   - it is NEVER a hard cut: even `dur < min_slew` yields a >= 250 ms ramp,
+//!     and true silence is reached via one final mute step from the -60 dB
+//!     floor (inaudible, no click), not a drop to zero from an audible level.
 //!
 //! The envelope is content-agnostic and CONTINUOUS across track boundaries (mpv
 //! `volume` persists across `loadfile ... replace`); the handler does NOT cancel
@@ -71,22 +73,12 @@ const STARTLE_HARD_MIN_SLEW: Duration = Duration::from_millis(STARTLE_HARD_MIN_S
 pub const DELIBERATE_STEP_CAP_DB: f64 = 3.0;
 
 /// The shortest duration for which a DELIBERATE (`sub_jnd = false`) fade spanning
-/// `from_db -> target` at `min_slew` per step stays at or under the 3 dB/step
-/// startle cap - i.e. the smallest `dur` for which [`FadeSpec::new`] will NOT
-/// return [`FadeError::StepTooLarge`]. Used by the pause/resume path to clamp a
-/// too-short requested duration UP (never a hard cut). `step_interval` MUST be the
-/// SAME per-step interval [`FadeSpec::new`] will use - i.e. `tick.max(min_slew)`,
-/// NOT `min_slew` alone. Passing the bare `min_slew` when `tick > min_slew` yields
-/// a duration whose `ceil(dur / t_eff)` step count is too small, so the deliberate
-/// ramp exceeds the 3 dB/step cap and `FadeSpec::new` rejects it as `StepTooLarge`
-/// - the exact rejection this clamp exists to prevent. `synth_floor_db` resolves a
-/// `Silence` target to its ramp end.
-pub fn min_deliberate_dur(
-    from_db: f64,
-    target: FadeTarget,
-    step_interval: Duration,
-    synth_floor_db: f64,
-) -> Duration {
+/// `from_db -> target` stays at or under the 3 dB/step startle cap at the fastest
+/// step interval ([`FADE_MIN_TICK`]) - i.e. the smallest `dur` for which
+/// [`FadeSpec::new`] will NOT return [`FadeError::StepTooLarge`]. Used by the
+/// pause/resume path to clamp a too-short requested duration UP (never a hard cut).
+/// `synth_floor_db` resolves a `Silence` target to its ramp end.
+pub fn min_deliberate_dur(from_db: f64, target: FadeTarget, synth_floor_db: f64) -> Duration {
     let t_db = match target {
         FadeTarget::Db(x) => x,
         FadeTarget::Silence => synth_floor_db,
@@ -95,8 +87,18 @@ pub fn min_deliberate_dur(
     // ceil(range / cap) steps keeps every per-step delta <= cap; at least one.
     let steps = (range / DELIBERATE_STEP_CAP_DB).ceil().max(1.0);
     let steps = steps.min(MAX_SCHEDULE_STEPS as f64) as u32;
-    step_interval.saturating_mul(steps)
+    FADE_MIN_TICK.saturating_mul(steps)
 }
+
+/// Fastest single-gain step interval. The audio path interpolates linearly in dB
+/// between successive steps (see the player's gain line), so a step is a knot of a
+/// continuous ramp, not an instantaneous jump; this floor only bounds how many knots
+/// a fast fade sends.
+pub const FADE_MIN_TICK: Duration = Duration::from_millis(20);
+
+/// Slowest single-gain step interval, whatever `tick_ms` says: a knot this often
+/// keeps the shape of the ramp (its ease, a supersede) close to the schedule.
+pub const FADE_MAX_TICK: Duration = Duration::from_millis(50);
 
 /// Hard cap on the number of scheduled steps. Belt-and-suspenders against a
 /// pathological (`dur`, `tick`, `step_size`) combination producing an enormous
@@ -206,6 +208,12 @@ impl FadeSpec {
         self.schedule.steps.len()
     }
 
+    /// The real wall-clock length of the schedule: the offset of its last step
+    /// (including the final mute step). Zero for an empty (already-arrived) spec.
+    pub fn duration(&self) -> Duration {
+        self.schedule.steps.last().map(|s| s.at).unwrap_or_default()
+    }
+
     /// The wall-clock offset (`at`, relative to the fade's start instant) of the
     /// FIRST scheduled step whose gain reaches `threshold_db` (`gain_db >=
     /// threshold_db`); `None` if no step reaches it (or the schedule is empty).
@@ -261,10 +269,12 @@ impl FadeSpec {
         // Clamp the start to the finite floor (no -inf ever enters the math).
         let f = from_db.max(bounds.synth_floor_db);
 
-        // 2. tick is the step interval; never below min_slew. Duration never
-        //    yields fewer than one full slewed step.
-        let t_eff = tick.max(bounds.min_slew);
-        let mut d_eff = dur.max(bounds.min_slew);
+        // 2. min_slew bounds the WHOLE transition, not each step: no level change is
+        //    ever faster than one startle slew. The step interval is the configured
+        //    tick, held inside [FADE_MIN_TICK, FADE_MAX_TICK] - fine enough that each
+        //    step is a sub-JND nudge rather than an audible stair.
+        let t_max = tick.clamp(FADE_MIN_TICK, FADE_MAX_TICK);
+        let d_eff = dur.max(bounds.min_slew);
 
         // 3. Degenerate: already at the target. One report, immediate complete.
         //    A Silence target whose start is already at the floor also lands here
@@ -278,56 +288,57 @@ impl FadeSpec {
             });
         }
 
-        // 4. Nominal step count from the (clamped) duration.
-        let t_eff_s = t_eff.as_secs_f64();
-        let mut n = ((d_eff.as_secs_f64() / t_eff_s).ceil() as u64).max(1);
-
-        // 5. Sub-JND enforcement: if a step would exceed step_size_db, EXTEND the
-        //    duration (more steps) rather than silently violate the cap. Logged,
-        //    never silent. `fade to` (sub_jnd = false) skips this for a
-        //    deliberate cue but is still capped at 3 dB/step below.
-        // Guard the divide: `step_size_db > 0` is guaranteed by config
-        // normalization (MIN_STEP_SIZE_DB), but a hand-built StartleBounds could
-        // pass 0 / negative, which would yield +inf -> u64::MAX steps -> capacity
-        // / Duration overflow panic. Skip the extension in that degenerate case.
-        if bounds.sub_jnd
-            && bounds.step_size_db > 0.0
-            && range.abs() / (n as f64) > bounds.step_size_db
-        {
-            let needed = (range.abs() / bounds.step_size_db).ceil() as u64;
-            n = needed.clamp(1, MAX_SCHEDULE_STEPS);
-            d_eff = t_eff.saturating_mul(n as u32);
-            tracing::info!(
-                extended_secs = d_eff.as_secs_f64(),
-                steps = n,
-                "fade extended to honor the sub-JND per-step cap"
-            );
+        // 4. Step count: enough steps that no interval exceeds the tick AND (where
+        //    the duration allows it) no step exceeds the sub-JND size. Guard the
+        //    divide: `step_size_db > 0` is guaranteed by config normalization
+        //    (MIN_STEP_SIZE_DB), but a hand-built StartleBounds could pass 0.
+        let n_time = (d_eff.as_secs_f64() / t_max.as_secs_f64()).ceil() as u64;
+        let n_jnd = if bounds.step_size_db > 0.0 {
+            (range.abs() / bounds.step_size_db).ceil() as u64
+        } else {
+            1
+        };
+        let mut n = n_time.max(n_jnd).clamp(1, MAX_SCHEDULE_STEPS);
+        let mut total = d_eff;
+        // The sub-JND count may want steps closer than the fastest tick. A sub-JND
+        // fade then EXTENDS (never silently violates the cap; logged); a deliberate
+        // one keeps its duration and accepts larger steps, capped at 3 dB below.
+        let n_fit = ((d_eff.as_secs_f64() / FADE_MIN_TICK.as_secs_f64()).floor() as u64).max(1);
+        if n > n_fit {
+            if bounds.sub_jnd {
+                total = FADE_MIN_TICK.saturating_mul(n.min(u32::MAX as u64) as u32);
+                tracing::info!(
+                    extended_secs = total.as_secs_f64(),
+                    steps = n,
+                    "fade extended to honor the sub-JND per-step cap"
+                );
+            } else {
+                n = n_fit;
+            }
         }
-        // Belt-and-suspenders cap so a pathological nominal count (huge dur / tiny
-        // tick) can never overflow the capacity / Duration math below.
-        n = n.min(MAX_SCHEDULE_STEPS);
-        let _ = d_eff; // d_eff's only role after extension is the log above.
 
-        // 6. Equal-dB steps toward the target on absolute deadlines t0 + k*T_eff.
+        // 5. Equal-dB steps toward the target on absolute deadlines t0 + k*total/n.
         let step_db = range / (n as f64);
         // A deliberate cue must still not exceed the 3 dB/step startle ceiling.
         if !bounds.sub_jnd && step_db.abs() > DELIBERATE_STEP_CAP_DB {
             return Err(FadeError::StepTooLarge);
         }
+        let interval = total.div_f64(n as f64);
         let mut steps = Vec::with_capacity(n as usize + mute_last as usize);
         for k in 1..=n {
             let t01 = (k as f64) / (n as f64);
             steps.push(Step {
-                at: t_eff.saturating_mul(k as u32),
+                at: total.mul_f64(t01),
                 gain_db: f + curve.sample(t01) * range,
             });
         }
 
-        // 7. Final mute step: one more slewed interval AFTER the floor, dropping
-        //    to true silence (NEG_INFINITY -> mpv volume 0) without a click.
+        // 6. Final mute step: one more interval AFTER the floor, dropping from the
+        //    -60 dB floor to true silence (NEG_INFINITY -> mpv volume 0): a step
+        //    below audibility, so no click.
         if mute_last {
             steps.push(Step {
-                at: t_eff.saturating_mul((n + 1) as u32),
+                at: total.saturating_add(interval),
                 gain_db: f64::NEG_INFINITY,
             });
         }
@@ -346,6 +357,13 @@ impl FadeSpec {
 pub trait VolumeSink {
     /// Apply a perceptual gain in dB. `f64::NEG_INFINITY` means true silence.
     fn set_gain_db(&self, db: f64) -> impl std::future::Future<Output = Result<(), PlayerError>> + Send;
+
+    /// How long after the last applied step the level is what the room hears (the
+    /// audio path's lead). The driver waits it out before reporting completion, so a
+    /// terminal never acts on audio still sounding at an earlier gain.
+    fn settle(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 impl VolumeSink for PlayerHandle {
@@ -354,6 +372,10 @@ impl VolumeSink for PlayerHandle {
         // actor path (never the u8 external seam).
         let vol = db_to_mpv_volume(db);
         async move { self.set_volume_f64(vol).await }
+    }
+
+    fn settle(&self) -> Duration {
+        self.gain_settle()
     }
 }
 
@@ -508,6 +530,11 @@ pub trait CrossfadeSink {
         outgoing_db: f64,
         incoming_db: f64,
     ) -> impl std::future::Future<Output = Result<(), PlayerError>> + Send;
+
+    /// See [`VolumeSink::settle`].
+    fn settle(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The pure crossfade driver: replay `spec` against `sink` on `clock`'s timeline.
@@ -538,6 +565,10 @@ pub async fn run_crossfade<S: CrossfadeSink, C: Clock>(
             return FadeOutcome::SinkError(e);
         }
         report(FadeProgress { gain_db: spec.in_db, done: i + 1 == n });
+    }
+    let settle = sink.settle();
+    if !settle.is_zero() {
+        clock.sleep_until(clock.now() + settle).await;
     }
     FadeOutcome::Completed
 }
@@ -595,6 +626,10 @@ pub async fn run_fade<S: VolumeSink, C: Clock>(
             return FadeOutcome::SinkError(e);
         }
         report(FadeProgress { gain_db: step.gain_db, done: i + 1 == n });
+    }
+    let settle = sink.settle();
+    if !settle.is_zero() {
+        clock.sleep_until(clock.now() + settle).await;
     }
     FadeOutcome::Completed
 }
@@ -844,28 +879,36 @@ mod tests {
     }
 
     #[test]
-    fn every_interval_ge_min_slew() {
+    fn steps_are_fine_and_the_whole_ramp_is_slewed() {
+        // A coarse configured tick is held to FADE_MAX_TICK: a 250 ms stair of
+        // instantaneous gain jumps is audible, a 50 ms one of 0.15 dB is not.
         let spec = FadeSpec::new(
             0.0,
             FadeTarget::Db(-30.0),
             Duration::from_secs(10),
-            // A sub-min_slew tick must be clamped up to 250 ms.
-            Duration::from_millis(100),
+            Duration::from_millis(250),
             Curve::DbLinear,
             bounds(true),
         )
         .unwrap();
         let steps = &spec.schedule.steps;
-        assert_eq!(steps[0].at, Duration::from_millis(250));
-        for w in steps.windows(2) {
-            assert!(w[1].at - w[0].at >= Duration::from_millis(250));
+        let mut prev = Duration::ZERO;
+        for st in steps {
+            assert!(st.at - prev <= FADE_MAX_TICK + Duration::from_micros(1));
+            assert!(st.at - prev >= FADE_MIN_TICK - Duration::from_micros(1));
+            prev = st.at;
         }
+        // The whole ramp still takes its configured length.
+        assert_eq!(spec.duration(), Duration::from_secs(10));
+        // A sub-min_slew request is stretched to one whole slew, never faster.
+        let short = FadeSpec::new(0.0, FadeTarget::Db(-30.0), Duration::from_millis(50), Duration::from_millis(25), Curve::DbLinear, bounds(true)).unwrap();
+        assert!(short.duration() >= Duration::from_millis(250));
     }
 
     #[test]
     fn total_duration_extends_not_violates() {
-        // 'fade to 0 (from 0 dB) in 5s' spans ~45 dB; 5s / 250ms = 20 steps would
-        // be 2.25 dB/step, over the 0.75 cap. It must EXTEND n, not violate.
+        // 'fade to -45 in 5s' at a 250 ms configured tick: the tick is held to 50 ms
+        // (100 steps of 0.45 dB) - finer than the 0.75 dB cap needs, never coarser.
         let spec = FadeSpec::new(
             0.0,
             FadeTarget::Db(-45.0),
@@ -876,8 +919,7 @@ mod tests {
         )
         .unwrap();
         let steps = &spec.schedule.steps;
-        // ceil(45 / 0.75) = 60 steps, not the nominal 20.
-        assert_eq!(steps.len(), 60);
+        assert_eq!(steps.len(), 100);
         for w in steps.windows(2) {
             assert!((w[0].gain_db - w[1].gain_db).abs() <= 0.75 + 1e-9);
         }
@@ -923,10 +965,10 @@ mod tests {
         let steps = &spec.schedule.steps;
         let last = steps.last().unwrap();
         let penult = steps[steps.len() - 2];
-        // Exactly one NEG_INFINITY step, one min_slew interval after the floor.
+        // Exactly one NEG_INFINITY step, one step interval after the (inaudible) floor.
         assert!(last.gain_db.is_infinite() && last.gain_db < 0.0);
         assert!((penult.gain_db - SYNTH_FLOOR_DB).abs() < 1e-6);
-        assert!(last.at - penult.at >= Duration::from_millis(250));
+        assert!(last.at > penult.at);
         // Only the final step is the mute step.
         assert_eq!(steps.iter().filter(|s| s.gain_db.is_infinite()).count(), 1);
     }
@@ -954,8 +996,8 @@ mod tests {
     }
 
     #[test]
-    fn dur_below_min_slew_is_one_slewed_step() {
-        // A 50 ms fade must not hard-cut: exactly one >= 250 ms slewed step.
+    fn dur_below_min_slew_is_one_slewed_ramp() {
+        // A 50 ms fade must not hard-cut: it becomes a 250 ms ramp of fine steps.
         let spec = FadeSpec::new(
             0.0,
             FadeTarget::Db(-2.0),
@@ -966,9 +1008,9 @@ mod tests {
         )
         .unwrap();
         let steps = &spec.schedule.steps;
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].at, Duration::from_millis(250));
-        assert!((steps[0].gain_db - (-2.0)).abs() < 1e-9);
+        assert_eq!(spec.duration(), Duration::from_millis(250));
+        assert!(steps.len() > 1, "a ramp, not one jump");
+        assert!((steps.last().unwrap().gain_db - (-2.0)).abs() < 1e-9);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1013,10 +1055,11 @@ mod tests {
         let outcome = run_fade(&sink, &spec, &clock, &mut report).await;
         assert!(matches!(outcome, FadeOutcome::Completed));
         let elapsed = clock.now() - t0;
-        let nominal = Duration::from_millis(250) * n;
-        // Within one tick of nominal despite per-step latency.
+        let _ = n;
+        let nominal = spec.duration();
+        // Within one sink latency of nominal: lag does not accumulate per step.
         assert!(
-            elapsed >= nominal && elapsed <= nominal + Duration::from_millis(250),
+            elapsed >= nominal && elapsed <= nominal + Duration::from_millis(50),
             "elapsed {elapsed:?} drifted from nominal {nominal:?}"
         );
     }
@@ -1052,15 +1095,11 @@ mod tests {
     }
 
     #[test]
-    fn min_deliberate_dur_survives_tick_gt_min_slew() {
-        // Regression: when tick_ms > min_slew_ms, FadeSpec steps at t_eff = tick,
-        // so the clamp must size the duration off tick, not min_slew. A pause from
-        // vol 100 (0 dB) to Silence with tick 500ms / min_slew 250ms must NOT get
-        // rejected as StepTooLarge.
-        let min_slew = Duration::from_millis(250);
+    fn min_deliberate_dur_survives_a_coarse_tick() {
+        // A pause from vol 100 (0 dB) to Silence clamped up by min_deliberate_dur must
+        // build, not be rejected as StepTooLarge, whatever the configured tick.
         let tick = Duration::from_millis(500);
-        let step_interval = tick.max(min_slew);
-        let dur = min_deliberate_dur(0.0, FadeTarget::Silence, step_interval, SYNTH_FLOOR_DB);
+        let dur = min_deliberate_dur(0.0, FadeTarget::Silence, SYNTH_FLOOR_DB);
         let b = StartleBounds { sub_jnd: false, ..bounds(false) };
         let spec = FadeSpec::new(0.0, FadeTarget::Silence, dur, tick, Curve::DbLinear, b)
             .expect("deliberate pause fade must build, not reject as StepTooLarge");
@@ -1146,10 +1185,10 @@ mod tests {
                 Duration::from_millis(250), Curve::DbLinear, bad).unwrap_err(),
             FadeError::SlewTooShort
         );
-        // A deliberate (sub_jnd=false) fade over a big range in one short step
-        // exceeds the 3 dB/step cap.
+        // A deliberate (sub_jnd=false) fade over a range too big for the shortest
+        // ramp even at the fastest step (50 steps of 5 ms) exceeds the 3 dB/step cap.
         assert_eq!(
-            FadeSpec::new(0.0, FadeTarget::Db(-45.0), Duration::from_millis(250),
+            FadeSpec::new(0.0, FadeTarget::Db(-200.0), Duration::from_millis(250),
                 Duration::from_millis(250), Curve::DbLinear, bounds(false)).unwrap_err(),
             FadeError::StepTooLarge
         );

@@ -1,0 +1,141 @@
+#!/usr/bin/env nix-shell
+#! nix-shell -i bash -p bash coreutils pipewire wireplumber
+# TRANSITION LISTEN: run the transition witness with its two mpv decks summed by a
+# PRIVATE PipeWire graph into a null sink, captured to WAV and analysed (see
+# crates/hypodj-core/src/listen.rs). This is the AI-judgeable stand-in for a human
+# listening test: the audio is the real mixed output, it just never reaches a speaker.
+#
+# Isolation is an allowlist: everything runs under `env -i` with a throwaway HOME,
+# XDG_RUNTIME_DIR, PIPEWIRE_RUNTIME_DIR and config dirs; no DBUS address is passed;
+# the daemon loads no ALSA/udev/bluez module and wireplumber's hardware monitors are
+# disabled, so the only sink that exists is `hypodj-listen-sink` (a null sink driven
+# by a timer). The remote name `hypodj-listen` does not exist in the user's runtime
+# dir, so a leaked env fails closed instead of reaching the user's session.
+#
+# Usage: scripts/transition-listen [OUT_DIR]   (HYPODJ_WITNESS_ONLY=next,stop to narrow)
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+out="${1:-$repo/target/listen}"
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+priv="$(mktemp -d /tmp/hypodj-listen.XXXXXX)"
+mkdir -p "$priv/run" "$priv/home" "$priv/config/wireplumber/wireplumber.conf.d" "$priv/state"
+chmod 700 "$priv/run"
+
+pids=()
+cleanup() {
+  for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+  wait 2>/dev/null || true
+  rm -rf "$priv"
+}
+trap cleanup EXIT
+
+cat > "$priv/pipewire.conf" <<'EOF'
+context.properties = {
+    core.daemon = true
+    core.name = hypodj-listen
+    support.dbus = false
+    default.clock.rate = 48000
+    default.clock.allowed-rates = [ 48000 ]
+    # A large fixed quantum: the private graph runs on a timer driver without RT
+    # scheduling on a loaded laptop, and at the default 1024 it measurably dropped
+    # whole quanta even for a plain `mpv` (a rig artifact, not the decks). The
+    # pre-trigger control window of every capture re-checks this.
+    default.clock.quantum = 4096
+    default.clock.min-quantum = 4096
+    default.clock.max-quantum = 4096
+    settings.check-quantum = true
+}
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+context.modules = [
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-metadata }
+    { name = libpipewire-module-spa-node-factory }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-access }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-link-factory }
+]
+context.objects = [
+    { factory = metadata args = { metadata.name = default } }
+    { factory = spa-node-factory
+        args = {
+            factory.name    = support.node.driver
+            node.name       = Dummy-Driver
+            priority.driver = 20000
+        }
+    }
+    { factory = adapter
+        args = {
+            factory.name     = support.null-audio-sink
+            node.name        = hypodj-listen-sink
+            node.description = "hypodj listen null sink"
+            media.class      = Audio/Sink
+            audio.position   = [ FL FR ]
+            object.linger    = true
+            monitor.channel-volumes = true
+        }
+    }
+]
+EOF
+
+cat > "$priv/config/wireplumber/wireplumber.conf.d/90-listen.conf" <<'EOF'
+wireplumber.profiles = {
+  main = {
+    monitor.alsa = disabled
+    monitor.alsa-midi = disabled
+    monitor.bluez = disabled
+    monitor.bluez-midi = disabled
+    monitor.v4l2 = disabled
+    monitor.libcamera = disabled
+    support.dbus = disabled
+    support.reserve-device = disabled
+    support.logind = disabled
+    support.portal-permissionstore = disabled
+  }
+}
+EOF
+
+# The only variables the private graph and the test ever see.
+penv=(env -i
+  PATH="$PATH"
+  HOME="$priv/home"
+  XDG_RUNTIME_DIR="$priv/run"
+  PIPEWIRE_RUNTIME_DIR="$priv/run"
+  PIPEWIRE_REMOTE=hypodj-listen
+  XDG_CONFIG_HOME="$priv/config"
+  XDG_STATE_HOME="$priv/state"
+  PULSE_SERVER=unix:/nonexistent)
+
+"${penv[@]}" pipewire -c "$priv/pipewire.conf" >"$priv/pipewire.log" 2>&1 &
+pids+=($!)
+for _ in $(seq 50); do [ -S "$priv/run/hypodj-listen" ] && break; sleep 0.1; done
+[ -S "$priv/run/hypodj-listen" ] || { cat "$priv/pipewire.log"; echo "private pipewire did not start" >&2; exit 1; }
+"${penv[@]}" wireplumber >"$priv/wireplumber.log" 2>&1 &
+pids+=($!)
+for _ in $(seq 50); do
+  "${penv[@]}" pw-cli info 0 >/dev/null 2>&1 && "${penv[@]}" pw-metadata 0 default.audio.sink 2>/dev/null | grep -q hypodj-listen-sink && break
+  sleep 0.2
+done
+
+# Placement check from the private side: the only Audio/Sink is ours.
+sinks="$("${penv[@]}" pw-cli ls Node | grep -c 'media.class = "Audio/Sink"' || true)"
+"${penv[@]}" pw-cli ls Node | grep -E 'node.name|media.class' | sed 's/^/[private graph] /'
+if [ "$sinks" != 1 ]; then echo "expected exactly one private sink, saw $sinks" >&2; exit 1; fi
+
+echo "[listen] private graph up at $priv/run; output -> $out"
+cd "$repo"
+"${penv[@]}" \
+  NIX_PATH="${NIX_PATH:-}" \
+  CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+  XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}" \
+  ${RUSTC_WRAPPER:+RUSTC_WRAPPER="$RUSTC_WRAPPER"} \
+  HYPODJ_LISTEN_DIR="$out" \
+  HYPODJ_WITNESS_ONLY="${HYPODJ_WITNESS_ONLY:-}" \
+  HYPODJ_LISTEN_STRICT="${HYPODJ_LISTEN_STRICT:-}" \
+  CARGO_BUILD_JOBS=2 \
+  nix develop "$repo" --command cargo test -j2 -p hypodj-core -- --ignored transition_listen_record --nocapture --test-threads=1

@@ -714,8 +714,9 @@ impl Default for RestartConfig {
 /// config-knobs memories for the rationale behind each default.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FadeConfig {
-    /// Hard floor on any step interval, ms. Startle re-emerges below ~200 ms; the
-    /// design floor is 250 ms and it applies to EVERY transition incl user nudges.
+    /// Hard floor on the length of any single-gain transition, ms. Startle
+    /// re-emerges below ~200 ms; the design floor is 250 ms and it applies to EVERY
+    /// transition incl user nudges. It bounds the whole ramp, not each step.
     #[serde(default = "d_min_slew_ms")]
     pub min_slew_ms: u64,
     /// Max per-step dB delta for a sub-JND fade (sleep-safe, imperceptible).
@@ -735,7 +736,9 @@ pub struct FadeConfig {
     /// The comfort ceiling a wake ramp-in must never overshoot (0 dB == vol 100).
     #[serde(default = "d_ceiling_db")]
     pub wake_ceiling_db: f64,
-    /// Tick == step interval, ms (clamped up to `min_slew_ms`).
+    /// Longest step interval of a single-gain fade, ms. [`crate::fade::FadeSpec::new`]
+    /// holds it inside `[FADE_MIN_TICK, FADE_MAX_TICK]` (20-50 ms); the player
+    /// interpolates between steps, so the tick shapes the ramp, not its smoothness.
     #[serde(default = "d_tick_ms")]
     pub tick_ms: u64,
     /// Default duration of a sleep-stop fade to silence, seconds. RESERVED and
@@ -778,6 +781,11 @@ pub struct FadeConfig {
     /// Normalized into `[min_slew_s, max_dur_secs]`.
     #[serde(default = "d_pause_fade_s")]
     pub pause_fade_secs: f64,
+    /// Duration of the fade-out when the playing head goes away (`clear`, removing
+    /// the last row), SECONDS. Deliberately longer than a pause: nothing was asked
+    /// to stop NOW, the music is leaving. Normalized into `[min_slew_s, max_dur_secs]`.
+    #[serde(default = "d_clear_fade_s")]
+    pub clear_fade_secs: f64,
     /// Duration of the startle-safe USER-skip dip fade, SECONDS (a float, like
     /// `pause_fade_secs`). On a USER Next/Previous while playing, the transport
     /// runs a short DELIBERATE dip to silence, loads the target from silence, then
@@ -838,7 +846,7 @@ pub const DEFAULT_STEP_SIZE_DB: f64 = 0.75;
 pub const DEFAULT_FLOOR_LEVEL_DB: f64 = -45.0;
 pub const DEFAULT_SYNTH_FLOOR_DB: f64 = -60.0;
 pub const DEFAULT_WAKE_CEILING_DB: f64 = 0.0;
-pub const DEFAULT_TICK_MS: u64 = 250;
+pub const DEFAULT_TICK_MS: u64 = 25;
 pub const DEFAULT_SLEEP_FADE_SECS: u64 = 480;
 pub const DEFAULT_WINDDOWN_FADE_SECS: u64 = 300;
 pub const DEFAULT_WAKE_RAMP_SECS: u64 = 480;
@@ -846,6 +854,7 @@ pub const DEFAULT_MAX_DUR_SECS: u64 = 1800;
 pub const DEFAULT_SHUTDOWN_FADE_SECS: u64 = 6;
 pub const DEFAULT_RESTART_FADE_SECS: u64 = 5;
 pub const DEFAULT_PAUSE_FADE_SECS: f64 = 0.5;
+pub const DEFAULT_CLEAR_FADE_SECS: f64 = 5.0;
 pub const DEFAULT_SKIP_FADE_SECS: f64 = 0.35;
 pub const DEFAULT_GLIDE_FADE_SECS: f64 = 0.4;
 /// Long enough for two songs to genuinely overlap rather than butt-splice, short
@@ -882,6 +891,7 @@ fn d_max_dur_s() -> u64 { DEFAULT_MAX_DUR_SECS }
 fn d_shutdown_fade_s() -> u64 { DEFAULT_SHUTDOWN_FADE_SECS }
 fn d_restart_fade_s() -> u64 { DEFAULT_RESTART_FADE_SECS }
 fn d_pause_fade_s() -> f64 { DEFAULT_PAUSE_FADE_SECS }
+fn d_clear_fade_s() -> f64 { DEFAULT_CLEAR_FADE_SECS }
 fn d_skip_fade_s() -> f64 { DEFAULT_SKIP_FADE_SECS }
 fn d_glide_fade_s() -> f64 { DEFAULT_GLIDE_FADE_SECS }
 fn d_crossfade_skip_s() -> f64 { DEFAULT_CROSSFADE_SKIP_SECS }
@@ -940,12 +950,8 @@ impl FadeConfig {
             );
             self.min_slew_ms = STARTLE_HARD_MIN_SLEW_MS;
         }
-        // A tick is at least one startle-slew long. It is NOT upper-bounded here
-        // (a large min_slew implies a large tick); FadeSpec::new uses saturating
-        // Duration arithmetic so even a degenerate huge tick cannot overflow/panic.
-        if self.tick_ms < self.min_slew_ms {
-            self.tick_ms = self.min_slew_ms;
-        }
+        // The tick is NOT tied to min_slew any more (min_slew bounds the whole
+        // ramp); FadeSpec::new clamps it into its [20, 50] ms window.
         // Floor step_size_db to a positive minimum: a 0 (or negative) step would
         // divide by zero in FadeSpec::new's sub-JND path -> u64::MAX steps ->
         // capacity/Duration overflow panic. This is the config-side guarantee;
@@ -1026,6 +1032,10 @@ impl FadeConfig {
         }
         let pause_lo = self.min_slew_ms as f64 / 1000.0;
         self.pause_fade_secs = self.pause_fade_secs.clamp(pause_lo, self.max_dur_secs as f64);
+        if !self.clear_fade_secs.is_finite() {
+            self.clear_fade_secs = DEFAULT_CLEAR_FADE_SECS;
+        }
+        self.clear_fade_secs = self.clear_fade_secs.clamp(pause_lo, self.max_dur_secs as f64);
         // The skip-dip fade is the same FLOAT-second shape as the pause fade.
         if !self.skip_fade_secs.is_finite() {
             self.skip_fade_secs = DEFAULT_SKIP_FADE_SECS;
@@ -1072,6 +1082,7 @@ impl Default for FadeConfig {
             shutdown_fade_secs: DEFAULT_SHUTDOWN_FADE_SECS,
             restart_fade_secs: DEFAULT_RESTART_FADE_SECS,
             pause_fade_secs: DEFAULT_PAUSE_FADE_SECS,
+            clear_fade_secs: DEFAULT_CLEAR_FADE_SECS,
             skip_fade_secs: DEFAULT_SKIP_FADE_SECS,
             glide_fade_secs: DEFAULT_GLIDE_FADE_SECS,
             crossfade_skip_secs: DEFAULT_CROSSFADE_SKIP_SECS,
@@ -1310,7 +1321,6 @@ logo = "relative/d.png"
         )
         .unwrap();
         assert_eq!(cfg.fade.min_slew_ms, 200, "min_slew clamped to startle floor");
-        assert!(cfg.fade.tick_ms >= cfg.fade.min_slew_ms, "tick >= min_slew");
         assert_eq!(cfg.fade.synth_floor_db, -60.0, "synth floor pinned to the seam");
     }
 
@@ -1427,7 +1437,6 @@ logo = "relative/d.png"
             let f = &cfg.fade;
             // All invariants hold: no clamp could have had min > max.
             assert!(f.min_slew_ms >= 200);
-            assert!(f.tick_ms >= f.min_slew_ms);
             assert!(f.step_size_db >= MIN_STEP_SIZE_DB);
             assert!(f.step_size_db.is_finite());
             assert_eq!(f.synth_floor_db, -60.0);

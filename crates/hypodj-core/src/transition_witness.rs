@@ -35,6 +35,14 @@ use std::io::{BufRead, BufReader, Write};
 const SAMPLE_MS: u64 = 10;
 const PRE_MS: u64 = 400;
 const POST_MS: u64 = 3500;
+/// `clear` fades out over the configured clear fade (5 s by default, deliberately
+/// long), plus the audio path's lead: its window has to hold the whole fade.
+const CLEAR_POST_MS: u64 = 6500;
+
+/// How long after the trigger a cause is recorded and judged.
+fn post_ms(cause: &str) -> u64 {
+    if cause == "clear" { CLEAR_POST_MS } else { POST_MS }
+}
 /// A source counts as AUDIBLE above this mpv softvol (cubic: 2 is about -102 dB, i.e.
 /// anything the fade driver did not deliberately park at zero).
 const AUDIBLE_VOL: f64 = 0.5;
@@ -368,6 +376,79 @@ pub(crate) fn classify(cause: &str, samples: &[Sample]) -> Row {
 struct Rig {
     h: Arc<HypodjHandler>,
     _runtime: crate::director::DjRuntime,
+    /// Set when the decks play into the private PipeWire graph being recorded.
+    listen: Option<Arc<Listen>>,
+}
+
+// ── the audio capture (transition listen) ───────────────────────────────────
+
+/// The node every deck links to inside the private graph `scripts/transition-listen`
+/// builds; the only sink that graph has.
+const LISTEN_SINK: &str = "hypodj-listen-sink";
+
+/// One cause's capture: a `pw-record` of the private null sink's monitor, i.e. the two
+/// decks AFTER PipeWire summed them - the signal a speaker would have been fed.
+pub(crate) struct Listen {
+    remote: String,
+    wav: PathBuf,
+    /// The child and the instant its first captured frame corresponds to.
+    cap: std::sync::Mutex<Option<(std::process::Child, std::time::Instant)>>,
+    /// Wall-clock instant of every trigger, in record order (one per witness row).
+    triggers: std::sync::Mutex<Vec<std::time::Instant>>,
+}
+
+impl Listen {
+    fn new(remote: &str, wav: PathBuf) -> Listen {
+        Listen { remote: remote.to_string(), wav, cap: Default::default(), triggers: Default::default() }
+    }
+
+    /// Start recording and wait until frames are landing, so the first frame's instant
+    /// is MEASURED (file growth back-dated by its own byte count), not assumed.
+    fn start(&self) {
+        let _ = std::fs::remove_file(&self.wav);
+        let child = std::process::Command::new("pw-record")
+            .args(["--remote", &self.remote, "--target", LISTEN_SINK])
+            .args(["-P", "{ stream.capture.sink = true }"])
+            .args(["--rate", "48000", "--channels", "2", "--format", "f32"])
+            .arg(&self.wav)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn pw-record (run under scripts/transition-listen)");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            let len = std::fs::metadata(&self.wav).map(|m| m.len()).unwrap_or(0);
+            if len > 4096 {
+                // ~80 bytes of header; 8 bytes per stereo f32 frame at 48 kHz.
+                let secs = (len - 80) as f64 / (8.0 * crate::handler::listen::FS as f64);
+                break std::time::Instant::now() - Duration::from_secs_f64(secs);
+            }
+            assert!(std::time::Instant::now() < deadline, "pw-record produced no audio frames");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        *self.cap.lock().unwrap() = Some((child, first));
+    }
+
+    /// Stop (SIGINT lets pw-record finalise the header) and return the first frame's instant.
+    fn stop(&self) -> Option<std::time::Instant> {
+        let (mut child, first) = self.cap.lock().unwrap().take()?;
+        let _ = std::process::Command::new("kill").args(["-INT", &child.id().to_string()]).status();
+        let _ = child.wait();
+        Some(first)
+    }
+
+    fn mark(&self, at: std::time::Instant) {
+        self.triggers.lock().unwrap().push(at);
+    }
+}
+
+impl Drop for Listen {
+    fn drop(&mut self) {
+        if let Some((mut c, _)) = self.cap.lock().unwrap().take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
 }
 
 fn head_of(h: &HypodjHandler) -> Option<String> {
@@ -384,6 +465,10 @@ fn qid_at(h: &HypodjHandler, pos: usize) -> u64 {
 
 impl Rig {
     async fn new(port: u16, songs: &[&str]) -> Rig {
+        Rig::with(port, None, songs).await
+    }
+
+    async fn with(port: u16, listen: Option<Arc<Listen>>, songs: &[&str]) -> Rig {
         let cfg = crate::config::ServerConfig {
             url: format!("http://127.0.0.1:{port}"),
             username: "witness".to_string(),
@@ -391,7 +476,11 @@ impl Rig {
             client_name: "hypodj-witness".to_string(),
         };
         let client = Arc::new(SubsonicClient::connect(&cfg).expect("subsonic client"));
-        let (player, events) = MpvPlayer::spawn_pair(crate::player::AudioOut::Null);
+        let out = match &listen {
+            Some(l) => crate::player::AudioOut::Pipewire(l.remote.clone()),
+            None => crate::player::AudioOut::Null,
+        };
+        let (player, events) = MpvPlayer::spawn_pair(out);
         assert!(player.can_crossfade(), "the witness needs the real two-deck pair");
         let h = Arc::new(HypodjHandler::with_fade_config(
             client.clone(),
@@ -402,10 +491,17 @@ impl Rig {
         let scrobbler = Arc::new(crate::scrobble::Scrobbler::new(client.clone()));
         let runtime =
             crate::director::run(TokioClock, h.clone(), scrobbler, client, events);
+        // As the daemon does: the timers are what arm the gapless warm of the next row
+        // ahead of a natural EOF. Without them every EOF here was a cold load, a gap
+        // the daemon never plays.
+        h.set_plan_timers(runtime.timers.clone());
         for s in songs {
             h.enqueue_song_for_test(song(s)).await;
         }
-        Rig { h, _runtime: runtime }
+        if let Some(l) = &listen {
+            l.start();
+        }
+        Rig { h, _runtime: runtime, listen }
     }
 
     async fn sample(&self, t0: tokio::time::Instant) -> Sample {
@@ -424,13 +520,23 @@ impl Rig {
     where
         F: std::future::Future<Output = ()>,
     {
+        self.record_for(trigger, POST_MS).await
+    }
+
+    async fn record_for<F>(&self, trigger: F, post: u64) -> Vec<Sample>
+    where
+        F: std::future::Future<Output = ()>,
+    {
         let t0 = tokio::time::Instant::now();
         let mut out = Vec::new();
         while t0.elapsed() < Duration::from_millis(PRE_MS) {
             out.push(self.sample(t0).await);
             tokio::time::sleep(Duration::from_millis(SAMPLE_MS)).await;
         }
-        let end = t0 + Duration::from_millis(PRE_MS + POST_MS);
+        let end = t0 + Duration::from_millis(PRE_MS + post);
+        if let Some(l) = &self.listen {
+            l.mark(std::time::Instant::now());
+        }
         tokio::pin!(trigger);
         let mut done = false;
         while tokio::time::Instant::now() < end {
@@ -470,6 +576,10 @@ impl Rig {
             tokio::time::sleep(Duration::from_millis(SAMPLE_MS)).await;
         }
         let m = moved_at.unwrap_or(i64::MAX / 2);
+        if let (Some(l), Some(mv)) = (&self.listen, moved_at) {
+            let at = t0.into_std() + Duration::from_millis((mv + PRE_MS as i64).max(0) as u64);
+            l.mark(at);
+        }
         for s in &mut out {
             s.t -= m;
         }
@@ -487,6 +597,9 @@ pub(crate) const CAUSES: &[&str] = &[
     "previous",
     "eof-other-album",
     "eof-same-album",
+    // A natural EOF on the deck a crossfade just landed on: its gain arrived by the
+    // engine's ramp, and the gapless advance must carry it into the next file.
+    "eof-after-crossfade",
     "play-n-while-playing",
     "playid",
     "delete-playing-row",
@@ -496,47 +609,58 @@ pub(crate) const CAUSES: &[&str] = &[
     "radio-start-while-playing",
     // Also emits the `undo-head-change` row: the undo of this same edit.
     "plan-remove-current",
+    "pause",
+    "stop",
+    "clear",
 ];
 
-async fn run_cause(port: u16, cause: &str) -> Vec<Row> {
+async fn run_cause(port: u16, cause: &str, lx: Option<Arc<Listen>>) -> Vec<Row> {
     let row = |s: &[Sample]| {
         dump(cause, s);
         classify(cause, s)
     };
     match cause {
         "next" => {
-            let r = Rig::new(port, &["A", "B", "C"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(0).await;
             vec![row(&r.record(async { r.h.handle(MpdCommand::Next).await; }).await)]
         }
         "previous" => {
-            let r = Rig::new(port, &["A", "B", "C"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(1).await;
             vec![row(&r.record(async { r.h.handle(MpdCommand::Previous).await; }).await)]
         }
         "eof-other-album" => {
-            let r = Rig::new(port, &["X", "Y"]).await;
+            let r = Rig::with(port, lx.clone(), &["X", "Y"]).await;
             r.h.handle(MpdCommand::Play(Some(0))).await;
             vec![row(&r.record_until_head_moves(Duration::from_secs(8)).await)]
         }
         "eof-same-album" => {
-            let r = Rig::new(port, &["P", "Q"]).await;
+            let r = Rig::with(port, lx.clone(), &["P", "Q"]).await;
             r.h.handle(MpdCommand::Play(Some(0))).await;
             vec![row(&r.record_until_head_moves(Duration::from_secs(8)).await)]
         }
+        "eof-after-crossfade" => {
+            let r = Rig::with(port, lx.clone(), &["A", "X", "Y"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            // Let the overlap land on X (3 s) before its natural end.
+            tokio::time::sleep(Duration::from_millis(2100)).await;
+            vec![row(&r.record_until_head_moves(Duration::from_secs(8)).await)]
+        }
         "play-n-while-playing" => {
-            let r = Rig::new(port, &["A", "B", "C"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(0).await;
             vec![row(&r.record(async { r.h.handle(MpdCommand::Play(Some(2))).await; }).await)]
         }
         "playid" => {
-            let r = Rig::new(port, &["A", "B", "C"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(0).await;
             let id = qid_at(&r.h, 2);
             vec![row(&r.record(async { r.h.handle(MpdCommand::PlayId(Some(id))).await; }).await)]
         }
         "delete-playing-row" => {
-            let r = Rig::new(port, &["A", "B", "C"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(0).await;
             vec![row(
                 &r.record(async { r.h.handle(MpdCommand::Delete(Some("0".into()))).await; })
@@ -544,7 +668,7 @@ async fn run_cause(port: u16, cause: &str) -> Vec<Row> {
             )]
         }
         "clear-add-play" => {
-            let r = Rig::new(port, &["A", "B"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B"]).await;
             r.play(0).await;
             vec![row(
                 &r.record(async {
@@ -557,7 +681,7 @@ async fn run_cause(port: u16, cause: &str) -> Vec<Row> {
             )]
         }
         "move-playing-row" => {
-            let r = Rig::new(port, &["A", "B", "C"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(0).await;
             vec![row(
                 &r.record(async {
@@ -567,13 +691,13 @@ async fn run_cause(port: u16, cause: &str) -> Vec<Row> {
             )]
         }
         "plan-play" => {
-            let r = Rig::new(port, &["A", "B", "C"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(0).await;
             let act = Action::Play { sel: QueueSelector::Position(3) };
             vec![row(&r.record(async { r.h.run_action_outcome(&act, "mcp:witness").await; }).await)]
         }
         "radio-start-while-playing" => {
-            let r = Rig::new(port, &["A", "B"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B"]).await;
             r.play(0).await;
             r.h.push_radio_songs(Ok(vec![song("R")]));
             r.h.push_autofill_batch(Ok(vec![]));
@@ -589,7 +713,7 @@ async fn run_cause(port: u16, cause: &str) -> Vec<Row> {
         }
         // One rig, two transitions: the plan edit that moves the head, then its undo.
         "plan-remove-current" => {
-            let r = Rig::new(port, &["A", "B", "C"]).await;
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(0).await;
             let act = Action::Remove { sel: QueueSelector::Current };
             let first = row(
@@ -600,6 +724,22 @@ async fn run_cause(port: u16, cause: &str) -> Vec<Row> {
                 &r.record(async { r.h.handle(MpdCommand::Undo(None)).await; }).await,
             );
             vec![first, undo]
+        }
+        // Deliberate stops: the listen harness judges these as fade-outs.
+        "pause" => {
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
+            r.play(0).await;
+            vec![row(&r.record(async { r.h.handle(MpdCommand::Pause(Some(true))).await; }).await)]
+        }
+        "stop" => {
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
+            r.play(0).await;
+            vec![row(&r.record(async { r.h.handle(MpdCommand::Stop).await; }).await)]
+        }
+        "clear" => {
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
+            r.play(0).await;
+            vec![row(&r.record_for(async { r.h.handle(MpdCommand::Clear).await; }, CLEAR_POST_MS).await)]
         }
         other => panic!("unknown witness cause {other}"),
     }
@@ -649,7 +789,7 @@ fn transition_witness_record() {
             .enable_all()
             .build()
             .expect("tokio rt");
-        let got = rt.block_on(run_cause(port, cause));
+        let got = rt.block_on(run_cause(port, cause, None));
         rt.shutdown_timeout(Duration::from_secs(2));
         for r in got {
             eprintln!("witness {}", r.tsv());
@@ -686,6 +826,95 @@ fn transition_witness_diff() {
     let latest = std::fs::read_to_string(latest_path())
         .unwrap_or_else(|_| panic!("no recorded run at {}", latest_path().display()));
     print!("{}", diff_tables(&base, &latest));
+}
+
+/// What each cause is SUPPOSED to sound like (decided here, never read off the capture).
+fn expect_of(cause: &str) -> crate::handler::listen::Expect {
+    use crate::handler::listen::Expect;
+    match cause {
+        "move-playing-row" => Expect::Steady,
+        "pause" | "stop" | "clear" => Expect::FadeOut,
+        _ => Expect::Continue,
+    }
+}
+
+/// THE LISTENING TEST an agent can judge: every witness cause again, but with the two
+/// decks playing into a PRIVATE PipeWire graph whose only sink is a null sink, the
+/// summed output recorded, and each transition window analysed against grounded
+/// thresholds (see `listen.rs`). Writes `listen.tsv`, and per window `<cause>.wav`,
+/// `<cause>.curve.tsv` and `<cause>.png` under `$HYPODJ_LISTEN_DIR`.
+///
+/// Refuses to run outside the private graph: it needs `PIPEWIRE_REMOTE` naming a socket
+/// that exists in a `PIPEWIRE_RUNTIME_DIR` that is not the user's `/run/user/...`.
+/// A FAIL verdict is a finding, printed, not a test failure (`HYPODJ_LISTEN_STRICT=1`
+/// makes it one); an INVALID window (nothing audible to compare against) always is.
+// Run: scripts/transition-listen [OUT_DIR]
+#[test]
+#[ignore = "needs a real libmpv runtime and the private PipeWire graph of scripts/transition-listen"]
+fn transition_listen_record() {
+    use crate::handler::listen;
+    let remote = std::env::var("PIPEWIRE_REMOTE").expect("PIPEWIRE_REMOTE (run scripts/transition-listen)");
+    let rt_dir = std::env::var("PIPEWIRE_RUNTIME_DIR").expect("PIPEWIRE_RUNTIME_DIR (run scripts/transition-listen)");
+    for (k, v) in [("PIPEWIRE_RUNTIME_DIR", rt_dir.clone()), ("XDG_RUNTIME_DIR", std::env::var("XDG_RUNTIME_DIR").unwrap_or_default())] {
+        assert!(!v.starts_with("/run/user/"), "{k}={v} is the user's session: refusing to play there");
+    }
+    assert!(
+        std::path::Path::new(&rt_dir).join(&remote).exists(),
+        "no private PipeWire socket at {rt_dir}/{remote}"
+    );
+    let dir = std::env::var_os("HYPODJ_LISTEN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("hypodj-listen"));
+    std::fs::create_dir_all(&dir).expect("listen dir");
+    let only: Option<Vec<String>> = std::env::var("HYPODJ_WITNESS_ONLY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| v.split(',').map(str::to_string).collect());
+    let f_max = 220.0 + 110.0 * (library().len() - 1) as f64;
+    let port = serve_tones();
+    let mut text = format!("{}\tshape\toverlap_ms\n", listen::AUDIO_HEADER);
+    let mut invalid = Vec::new();
+    let mut failed = Vec::new();
+    for cause in CAUSES {
+        if only.as_ref().is_some_and(|o| !o.iter().any(|c| c == cause)) {
+            continue;
+        }
+        let lx = Arc::new(Listen::new(&remote, dir.join(format!("{cause}.wav"))));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio rt");
+        let rows = rt.block_on(run_cause(port, cause, Some(lx.clone())));
+        rt.shutdown_timeout(Duration::from_secs(2));
+        let first = lx.stop().expect("capture was started");
+        let wav = listen::read_wav(&std::fs::read(&lx.wav).expect("read capture")).expect("parse capture");
+        let triggers = lx.triggers.lock().unwrap().clone();
+        assert_eq!(triggers.len(), rows.len(), "{cause}: one trigger per witness row");
+        for (row, at) in rows.iter().zip(triggers) {
+            let trigger = (at.saturating_duration_since(first).as_secs_f64() * listen::FS as f64) as usize;
+            let win = listen::Window { trigger, pre_ms: PRE_MS as f64, post_ms: post_ms(&row.cause) as f64, f_max };
+            let (a, curve) = listen::analyse(&row.cause, expect_of(&row.cause), &wav, &win);
+            std::fs::write(dir.join(format!("{}.curve.tsv", row.cause)), listen::curve_tsv(&curve)).expect("curve");
+            std::fs::write(dir.join(format!("{}.png", row.cause)), listen::plot_png(&curve, PRE_MS as f64, post_ms(&row.cause) as f64)).expect("png");
+            let line = format!("{}\t{}\t{}", a.tsv(), row.shape, row.overlap_ms);
+            eprintln!("listen {line}");
+            text.push_str(&line);
+            text.push('\n');
+            match a.verdict {
+                "INVALID" => invalid.push(row.cause.clone()),
+                "FAIL" => failed.push(row.cause.clone()),
+                _ => {}
+            }
+        }
+    }
+    let out = dir.join("listen.tsv");
+    std::fs::write(&out, &text).expect("write listen table");
+    println!("\n{text}\nlisten table written to {}", out.display());
+    assert!(invalid.is_empty(), "INVALID windows (no reference signal): {invalid:?}");
+    if std::env::var("HYPODJ_LISTEN_STRICT").is_ok_and(|v| v == "1") {
+        assert!(failed.is_empty(), "FAIL verdicts: {failed:?}");
+    }
 }
 
 pub(crate) fn diff_tables(base: &str, latest: &str) -> String {
@@ -779,9 +1008,9 @@ async fn adv_settled(r: &Rig, label: &str) -> (Vec<Option<String>>, Option<Strin
 }
 
 /// Wait for an engine fade (a clear's fade-out, a pause's fade to silence) to land.
-/// Those are one-legged ramps to silence, held to the startle-safe slew (3 dB per
-/// 250 ms tick, so about five seconds from the baseline), longer than the fixed
-/// settle window `adv_settled` samples at. Bounded: a fade that never lands fails.
+/// Those are one-legged ramps to silence (a clear's runs its configured five seconds,
+/// plus the audio path's lead), longer than the fixed settle window `adv_settled`
+/// samples at. Bounded: a fade that never lands fails.
 async fn adv_fade_landed(r: &Rig, label: &str) {
     for _ in 0..60 {
         if !r.h.state.lock().unwrap().fading {
@@ -1206,12 +1435,14 @@ fn adv_scenarios() {
             r.h.handle(MpdCommand::Clear).await;
             tokio::time::sleep(Duration::from_millis(500)).await;
             r.h.handle(MpdCommand::Stop).await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // The stop takes over the clear's slow fade with its own short one (the
+            // pause length plus the audio path's lead), never a cut.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
             let (pr, _) = r.h.player.witness_probe().await;
             assert!(pr.iter().all(|p| src_of(p).is_none()), "explicit stop after clear left audio: {pr:?}");
         }
         if run("stop-fade-audible") {
-            // a plain stop while playing: MPD stops at once
+            // a plain stop while playing: reported stopped at once, the deck fades out
             let r = Rig::new(port, &["A", "B"]).await;
             r.play(0).await;
             r.h.handle(MpdCommand::Stop).await;
