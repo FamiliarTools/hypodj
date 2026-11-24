@@ -46,7 +46,7 @@
       in
       {
         packages.hypodj = pkgs.callPackage ./nix/package.nix { inherit buildInfo cargoVersion; };
-        # The client bins (dj + dj-gui) - libmpv-free, so a separate, lighter
+        # The client bins (djc + dj + dj-gui) - libmpv-free, so a separate, lighter
         # derivation that a workstation can install without pulling mpv.
         packages.hypodj-clients = pkgs.callPackage ./nix/clients.nix { inherit buildInfo cargoVersion; };
         packages.default = self.packages.${system}.hypodj;
@@ -54,6 +54,10 @@
         apps.hypodj = {
           type = "app";
           program = "${self.packages.${system}.hypodj}/bin/hypodj";
+        };
+        apps.djc = {
+          type = "app";
+          program = "${self.packages.${system}.hypodj-clients}/bin/djc";
         };
         apps.dj = {
           type = "app";

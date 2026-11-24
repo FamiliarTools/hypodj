@@ -5,9 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "hypodj_cli"
+path = "src/lib.rs"
+
+# `djc` is the jukebox CLI. `dj` is the listening shell: the TUI on an interactive
+# terminal with no arguments, otherwise exactly `djc` (same library code).
+[[bin]]
+name = "djc"
+path = "src/main.rs"
+
 [[bin]]
 name = "dj"
-path = "src/main.rs"
+path = "src/bin/dj.rs"
 
 # Depends on the shared hypodj-client for the one client implementation (MpdConn,
 # nl handshake seams, config, and the NowPlaying/queue parsing). This crate keeps
@@ -30,11 +40,11 @@ default = ["cc"]
 cc = ["dep:hypodj-nl"]
 
 [build-dependencies]
-# emit() from build.rs: bakes HYPODJ_BUILD_INFO for the enriched `dj --version`.
+# emit() from build.rs: bakes HYPODJ_BUILD_INFO for the enriched `djc --version`.
 hypodj-build-info = { path = "../hypodj-build-info" }
 
 [dependencies]
-# compose() at print time for `dj --version`.
+# compose() at print time for `djc --version`.
 hypodj-build-info = { path = "../hypodj-build-info" }
 hypodj-client = { path = "../hypodj-client" }
 hypodj-nl = { path = "../hypodj-nl", optional = true, default-features = false, features = ["cc"] }

@@ -7,7 +7,7 @@
 //! `hypodj_client::route::route`, the same router the `dj` CLI and the dj-gui `:`
 //! line use, so "next song" means one thing on every surface. Only the reversible
 //! transport verbs are run straight from the search box; an open-ended phrase is
-//! offered as "Ask the DJ", which opens `dj <phrase>` in a terminal where the plan is
+//! offered as "Ask the DJ", which opens `djc <phrase>` in a terminal where the plan is
 //! echoed and confirmed before anything is armed.
 
 use hypodj_client::route::{route, Action};

@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "dj-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "hypodj-build-info",
@@ -964,11 +964,11 @@ dependencies = [
 
 [[package]]
 name = "hypodj-build-info"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "hypodj-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hypodj-build-info",
  "hypodj-client",
@@ -977,14 +977,14 @@ dependencies = [
 
 [[package]]
 name = "hypodj-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "hypodj-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "hypodj-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "hypodj-build-info",
@@ -1022,11 +1022,11 @@ dependencies = [
 
 [[package]]
 name = "hypodj-dsl"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "hypodj-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hypodj-client",
  "hypodj-dsl",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "hypodj-nl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "hypodj-core",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "hypodj-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hypodj-client",
  "tokio",

@@ -11,7 +11,7 @@ does the real work below while your client lounges in the warm room.
 
 ```
 MPD client ──MPD text/TCP──▶ hypodj daemon ──OpenSubsonic REST──▶ Navidrome
-(ncmpcpp, dj, dj-gui)             │                               (or any
+(ncmpcpp, djc, dj-gui)            │                               (or any
                                   ▼                                OpenSubsonic
                              libmpv audio                          server)
 ```
@@ -63,22 +63,27 @@ daemon's idle-push socket with worker-thread IO so the UI never blocks on networ
 - Physical-potentiometer volume knob: perceptual dB detents, off-click pause
 - Queue markers on albums (fully / partially enqueued) and songs
 
-### `dj` - the CLI
+### `djc` - the CLI, and `dj` - the listening shell
 
-Pure MPD/TCP, no libmpv. Bare `dj` prints a now-playing card; `dj next`,
-`dj pause`, `dj vol 40` are quick verbs; anything else is natural language with
-the same echo-before-arm confirm: `dj "play something calmer"`. `dj radio` starts
-the endless radio from whatever is playing (`dj radio random` from cold, `dj radio
-off` to stop). `dj mark` is the press; `dj heard` reads the ledger back with each
-marked row's tape segment beside it, and `dj heard keep <n>` / `dj heard drop <n>`
+Pure MPD/TCP, no libmpv. Bare `djc` prints a now-playing card; `djc next`,
+`djc pause`, `djc vol 40` are quick verbs; anything else is natural language with
+the same echo-before-arm confirm: `djc "play something calmer"`. `djc radio` starts
+the endless radio from whatever is playing (`djc radio random` from cold, `djc radio
+off` to stop). `djc mark` is the press; `djc heard` reads the ledger back with each
+marked row's tape segment beside it, and `djc heard keep <n>` / `djc heard drop <n>`
 pin and release one.
+
+`dj` is the one name to type: on an interactive terminal with no arguments it
+opens HypoDJ (`dj-gui`); given arguments, or run from a script or pipe, it is
+exactly `djc`. (In 0.3.0 only, `dj <args>` also prints a one-line notice that the
+CLI moved to `djc`.)
 
 ### GNOME Activities search (`dj-search-provider`)
 
 An `org.gnome.Shell.SearchProvider2` D-Bus service. Type `next song`, `pause`,
 `louder`, `vol 30` or an artist/album name into Activities: transport rows run on
 the spot, a library hit is enqueued and played (an artist starts its radio), and
-`dj <anything>` offers "Ask the DJ", which opens `dj <phrase>` in a terminal so
+`dj <anything>` offers "Ask the DJ", which opens `djc <phrase>` in a terminal so
 the plan is still echoed and confirmed before it arms. Enable it with
 `services.hypodj.searchProvider.enable = true;` (it is started by D-Bus on the
 first search and exits when idle; `HYPODJ_TERMINAL` picks the terminal).
@@ -93,7 +98,7 @@ Any stock MPD client (ncmpcpp, mpc) also works unchanged against the daemon.
 | Library | OpenSubsonic browse/search3, smart album lists, genres, first-class favorites (songs / albums / artists), scrobbling, TTL+LRU listing cache |
 | Playback | libmpv actor; startle-safe fades on pause/resume/skip; graduated + humanized absolute volume; sleep / wind-down / wake; smooth restart |
 | Endless radio | `radio` starts a never-ending radio from a thing (`radio`, `radio random`, `radio song/<id>`, `radio album/<id>`, `radio artist/<id>`): it plays what you pointed at - bare `radio` picks the deck up where it stands (resumes a paused one, starts a stopped one, never restarts what is already playing) - prefetches one batch of similar library tracks behind it, and hands the end-of-queue edge to the continuation walk, which re-seeds from what just played and so keeps moving through your own library. `radio on` arms the walk without touching the queue; `radio off` disarms and restores the configured continuation mode |
-| Keeping what you heard | `mark` names the moment, stars it when you own it, writes one ledger row - and KEEPS THE SOUND. mpv is already holding the whole past of the stream in RAM, so a press dumps the last few minutes to `~/.local/state/hypodj/tape/` in about 6 ms with zero network. Read it back with `dj heard`; pin one with `heard keep <n>` |
+| Keeping what you heard | `mark` names the moment, stars it when you own it, writes one ledger row - and KEEPS THE SOUND. mpv is already holding the whole past of the stream in RAM, so a press dumps the last few minutes to `~/.local/state/hypodj/tape/` in about 6 ms with zero network. Read it back with `djc heard`; pin one with `heard keep <n>` |
 | Intent | Deterministic capability core + typed Plan IR; the NL front-end (rules-first, optional local model) only ever emits a validated plan |
 | Desktop | MPRIS, so GNOME media controls work |
 
@@ -141,12 +146,13 @@ max_secs = 1200       # hard span cap per dump
 ## Install and run (Nix)
 
 ```
-nix run github:FamiliarTools/hypodj#dj       # the CLI (default app)
+nix run github:FamiliarTools/hypodj#dj       # the listening shell (default app)
+nix run github:FamiliarTools/hypodj#djc      # the CLI
 nix run github:FamiliarTools/hypodj#dj-gui   # HypoDJ, the TUI
 ```
 
 The flake ships `packages.hypodj` (the daemon, libmpv wrapped),
-`packages.hypodj-clients` (`dj`, `dj-gui`, `dj-mcp`, `dj-search-provider`), and one shared `services.hypodj`
+`packages.hypodj-clients` (`djc`, `dj`, `dj-gui`, `dj-mcp`, `dj-search-provider`), and one shared `services.hypodj`
 module for both NixOS and Home-Manager:
 
 ```nix
@@ -179,7 +185,7 @@ finds it).
 | `crates/hypodj-daemon` | `hypodj` daemon binary + `probe`/`play_probe` live provers |
 | `crates/hypodj-nl` | Natural language to validated Plan IR (rules + optional local model) |
 | `crates/hypodj-client` | Shared client lib (MPD connection, `nl` handshake, routing) |
-| `crates/hypodj-cli` | `dj` |
+| `crates/hypodj-cli` | `djc` (the CLI) and `dj` (the listening shell) |
 | `crates/hypodj-tui` | `dj-gui` (product name HypoDJ) |
 | `crates/hypodj-search` | `dj-search-provider`, the GNOME Shell search provider |
 

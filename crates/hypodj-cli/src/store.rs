@@ -1,8 +1,8 @@
-//! `dj store` - the human surface over the offline mirror and the ranking that
+//! `djc store` - the human surface over the offline mirror and the ranking that
 //! decides what fits in it.
 //!
 //! WHY THIS EXISTS AT ALL: the daemon has answered `store` for a while, but nothing
-//! he runs could ask. `dj` and `dj-gui` had no store command, and the client library
+//! he runs could ask. `djc` and `dj-gui` had no store command, and the client library
 //! parses only the one-line `X-Store` badge - so the deferred list, and now the
 //! reason each group lost, were reachable only by hand-writing MPD over `nc`. A
 //! ranking he cannot interrogate is one he cannot tell a good decision from a bug in,
@@ -16,7 +16,7 @@
 //!
 //! It is a PRINTER. Every number and every sentence is rendered daemon-side - the
 //! badge line, the rule, the per-group reason - and this module puts them on stdout
-//! in order. One formatter, so `dj store` and a future dj-gui panel can never
+//! in order. One formatter, so `djc store` and a future dj-gui panel can never
 //! disagree about the same mirror.
 
 use hypodj_client::mpd::{MpdConn, MpdError};
@@ -25,16 +25,16 @@ use hypodj_client::route::parse_size;
 
 const USAGE: &str = "\
 usage:
-  dj store                 what is held, what is still coming, and every favourite
+  djc store                what is held, what is still coming, and every favourite
                             that did not fit
-  dj store limit <size>    set how much disk the mirror may use (e.g. 24G, 500M).
-                            \"dj store limit default\" goes back to the configured cap
-  dj store frontier        the whole ranked order, best to worst, with the evidence
+  djc store limit <size>   set how much disk the mirror may use (e.g. 24G, 500M).
+                            \"djc store limit default\" goes back to the configured cap
+  djc store frontier       the whole ranked order, best to worst, with the evidence
                             each group was ranked on - what a refused group lost to
                             is the line above it
-  dj store now             run a full reconcile pass now instead of waiting
-  dj store pause           suspend bulk mirroring for this daemon process
-  dj store resume          resume it (and kick a pass)
+  djc store now            run a full reconcile pass now instead of waiting
+  djc store pause          suspend bulk mirroring for this daemon process
+  djc store resume         resume it (and kick a pass)
 
 pause/resume/now/limit are ACTIONS and are words only; the two views are read-only.
 Sizes are binary (24G is 24 GiB) and are clamped up to 64 MiB, never rejected.";
@@ -97,8 +97,8 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
     // reading as immovable.
     if let Some(limit) = find("X-StoreLimit").and_then(|s| s.parse::<u64>().ok()) {
         let source = match find("X-StoreLimitSource") {
-            Some("user") => "set by you - \"dj store limit default\" to undo",
-            _ => "from the config - change it with \"dj store limit <size>\"",
+            Some("user") => "set by you - \"djc store limit default\" to undo",
+            _ => "from the config - change it with \"djc store limit <size>\"",
         };
         println!("limit: {} ({source})", human(limit));
     }
@@ -108,7 +108,7 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
         println!("rule: {rule}");
     }
     if find("X-StorePaused") == Some("1") {
-        println!("bulk mirroring is PAUSED (dj store resume)");
+        println!("bulk mirroring is PAUSED (djc store resume)");
     }
 
     // The daemon's lines, verbatim and in order. `Frontier` is the whole ranked walk

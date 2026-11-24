@@ -1,4 +1,4 @@
-//! `dj stations` - the gesture that makes a curated `.pls` collection first-class.
+//! `djc stations` - the gesture that makes a curated `.pls` collection first-class.
 //!
 //! The FILES are read here, on the human's side of the socket, and the IDEMPOTENCE
 //! lives in the daemon's `station add` verb. That split is deliberate: the daemon does
@@ -57,15 +57,15 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
 
 const USAGE: &str = "\
 usage:
-  dj stations import [PATH ...] [--dry-run]   save every .pls under PATH as a station
-  dj stations list                            list the saved stations
-  dj stations rm <name>                       remove one saved station
+  djc stations import [PATH ...] [--dry-run]  save every .pls under PATH as a station
+  djc stations list                           list the saved stations
+  djc stations rm <name>                      remove one saved station
 
 With no PATH, import reads $HYPODJ_STATIONS_DIR. A PATH may be a directory (its
 .pls files, not recursive) or individual .pls files. Importing is idempotent: a
 second run over the same files writes nothing.";
 
-/// `dj stations list` - the saved set, straight from the daemon's `Stations` browse dir.
+/// `djc stations list` - the saved set, straight from the daemon's `Stations` browse dir.
 fn list(conn: &mut MpdConn) -> Result<bool, MpdError> {
     let saved = saved_stations(conn)?;
     if saved.is_empty() {
@@ -80,11 +80,11 @@ fn list(conn: &mut MpdConn) -> Result<bool, MpdError> {
     Ok(true)
 }
 
-/// `dj stations rm <name>` - the undo half. A gesture that writes to the user's server
+/// `djc stations rm <name>` - the undo half. A gesture that writes to the user's server
 /// must be removable by the same tool.
 fn rm(conn: &mut MpdConn, name: &str) -> Result<bool, MpdError> {
     // Deleting from the user's own Navidrome is destructive and not undoable from
-    // here, so it asks first - the same bar `dj clear` already sets for the queue.
+    // here, so it asks first - the same bar `djc clear` already sets for the queue.
     // A station is harder to get back than a queue: the .pls it came from may be the
     // only record of the URL.
     if !crate::confirm(&format!("remove the saved station {name:?}?")) {
@@ -105,7 +105,7 @@ fn rm(conn: &mut MpdConn, name: &str) -> Result<bool, MpdError> {
     }
 }
 
-/// `dj stations import [PATH ...] [--dry-run]`.
+/// `djc stations import [PATH ...] [--dry-run]`.
 fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
     let mut dry_run = false;
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -121,7 +121,7 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
             Some(d) => paths.push(d),
             None => {
                 eprintln!(
-                    "dj stations import: no PATH given and HYPODJ_STATIONS_DIR is not set"
+                    "djc stations import: no PATH given and HYPODJ_STATIONS_DIR is not set"
                 );
                 return Ok(false);
             }
@@ -131,7 +131,7 @@ fn import(conn: &mut MpdConn, args: &[String]) -> Result<bool, MpdError> {
     let files = match collect_pls_files(&paths) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("dj stations import: {e}");
+            eprintln!("djc stations import: {e}");
             return Ok(false);
         }
     };
@@ -537,7 +537,7 @@ fn has_pls_extension(p: &Path) -> bool {
 }
 
 /// Expand a leading `~` to `$HOME`. The shell normally does this, but a quoted path
-/// (`dj stations import "~/radio streams"`) reaches us literally, and silently failing
+/// (`djc stations import "~/radio streams"`) reaches us literally, and silently failing
 /// to find a directory the user can see is the worst outcome of the two.
 fn shell_expand_home(s: &str) -> String {
     expand_home_with(s, std::env::var("HOME").ok().as_deref())
@@ -565,7 +565,7 @@ fn pair(pairs: &[(String, String)], key: &str) -> Option<String> {
 mod tests {
 
     // Deleting from the user's own Navidrome is destructive and not undoable from the
-    // CLI, so `rm` must ask - the bar `dj clear` already sets for the far more
+    // CLI, so `rm` must ask - the bar `djc clear` already sets for the far more
     // recoverable queue. Pinned at the source level because the confirm reads stdin.
     #[test]
     fn stations_rm_asks_before_deleting() {
@@ -930,7 +930,7 @@ mod import_over_a_socket {
             Harness { dir, port, state, thread: Some(thread) }
         }
 
-        /// One `dj stations import <dir>` run: connect, import, hang up.
+        /// One `djc stations import <dir>` run: connect, import, hang up.
         fn import_run(&self) -> bool {
             let mut conn = MpdConn::connect("127.0.0.1", self.port).expect("connect");
             let arg = vec![self.dir.to_string_lossy().to_string()];
