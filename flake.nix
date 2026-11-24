@@ -14,7 +14,13 @@
     in
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        # hypodj is FSL-1.1-MIT (unfree in nixpkgs terms until each release turns MIT),
+        # so the flake's own package set allows exactly its own two packages.
+        pkgs = import nixpkgs {
+          inherit system;
+          config.allowUnfreePredicate = p:
+            builtins.elem (nixpkgs.lib.getName p) [ "hypodj" "hypodj-clients" ];
+        };
 
         # The released semver, read from the workspace manifest so the derivation
         # version tracks the tag and is bumped in exactly one place at release.
@@ -46,7 +52,7 @@
       in
       {
         packages.hypodj = pkgs.callPackage ./nix/package.nix { inherit buildInfo cargoVersion; };
-        # The client bins (dj + dj-gui) - libmpv-free, so a separate, lighter
+        # The client bins (djc + dj + dj-gui) - libmpv-free, so a separate, lighter
         # derivation that a workstation can install without pulling mpv.
         packages.hypodj-clients = pkgs.callPackage ./nix/clients.nix { inherit buildInfo cargoVersion; };
         packages.default = self.packages.${system}.hypodj;
@@ -54,6 +60,10 @@
         apps.hypodj = {
           type = "app";
           program = "${self.packages.${system}.hypodj}/bin/hypodj";
+        };
+        apps.djc = {
+          type = "app";
+          program = "${self.packages.${system}.hypodj-clients}/bin/djc";
         };
         apps.dj = {
           type = "app";

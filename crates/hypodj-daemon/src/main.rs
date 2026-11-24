@@ -349,6 +349,16 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("heard ledger disabled by config");
     }
 
+    // STATION METADATA (task wxpnbso): what hypodj learned about each saved station (ICY
+    // genre/description, heard artists/genres), persisted beside resume state so
+    // `searchall` keeps finding a station by what it plays across restarts. With no
+    // state dir it stays in memory (learned for this run only).
+    if let Some(dir) = state_dir.as_ref() {
+        let path = dir.join("station_meta.json");
+        handler.set_station_meta(hypodj_core::station_meta::StationMetaStore::open(path.clone()));
+        tracing::info!(path = %path.display(), "station metadata open");
+    }
+
     // THE TAPE. Root: an explicit [tape].dir wins, else <state_dir>/tape - the same shape
     // the heard root uses, and a SIBLING of `store/` for the same structural reason: the
     // store's reconciler owns its directory exclusively and deletes everything in it that

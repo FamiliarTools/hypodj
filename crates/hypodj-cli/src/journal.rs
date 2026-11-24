@@ -1,4 +1,4 @@
-//! `dj journal` and `dj undo` - the read-back and the retraction for the daemon's
+//! `djc journal` and `djc undo` - the read-back and the retraction for the daemon's
 //! undo ring.
 //!
 //! The ring holds the last 32 `plan::Action` executions, each with the daemon's OWN
@@ -9,7 +9,7 @@
 //! would be advertising three refusals.
 //!
 //! Like `heard` and `store`, this is intercepted BEFORE `route()`: route is a pure
-//! verb-vs-NL split shared with dj-gui and knows no journal verb, so `dj journal`
+//! verb-vs-NL split shared with dj-gui and knows no journal verb, so `djc journal`
 //! would otherwise be handed to the NL translator, which has no journal action.
 
 use hypodj_client::model::{journal_lines, parse_journal, JournalEntry};
@@ -17,11 +17,11 @@ use hypodj_client::mpd::{MpdConn, MpdError};
 
 const USAGE: &str = "\
 usage:
-  dj journal    what the daemon did, newest first
-  dj undo       retract the newest thing that can still be retracted
+  djc journal   what the daemon did, newest first
+  djc undo      retract the newest thing that can still be retracted
 ";
 
-/// Run `dj journal`. `words` are the argv tokens AFTER the leading `journal`.
+/// Run `djc journal`. `words` are the argv tokens AFTER the leading `journal`.
 /// Returns false (exit non-zero) on a usage error.
 pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
     if !words.is_empty() {
@@ -43,7 +43,7 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
     }
 }
 
-/// Run `dj undo`. Every refusal the daemon makes is loud (an ACK), and it is
+/// Run `djc undo`. Every refusal the daemon makes is loud (an ACK), and it is
 /// printed verbatim - a human who pressed undo and saw nothing would press again.
 pub fn undo(conn: &mut MpdConn) -> Result<bool, MpdError> {
     match conn.command("undo") {
@@ -73,7 +73,7 @@ pub fn render(entries: &[JournalEntry]) -> String {
             .to_string();
     }
     let mut out = vec!["what the daemon did, newest first".to_string()];
-    out.extend(journal_lines(entries, "  <- dj undo").into_iter().map(|l| format!("  {l}")));
+    out.extend(journal_lines(entries, "  <- djc undo").into_iter().map(|l| format!("  {l}")));
     out.join("\n")
 }
 
@@ -107,10 +107,10 @@ mod tests {
             entry(10, 400, "sleep", "faded out", false),
         ];
         let out = render(&rows);
-        assert_eq!(out.matches("<- dj undo").count(), 1, "{out}");
+        assert_eq!(out.matches("<- djc undo").count(), 1, "{out}");
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[1].contains("<- dj undo"), "the NEWEST undoable one: {out}");
-        assert!(!lines[2].contains("<- dj undo"), "not the one under it: {out}");
+        assert!(lines[1].contains("<- djc undo"), "the NEWEST undoable one: {out}");
+        assert!(!lines[2].contains("<- djc undo"), "not the one under it: {out}");
     }
 
     #[test]
@@ -121,11 +121,11 @@ mod tests {
         ];
         let out = render(&rows);
         let lines: Vec<&str> = out.lines().collect();
-        assert!(!lines[1].contains("<- dj undo"));
-        assert!(lines[2].contains("<- dj undo"), "{out}");
+        assert!(!lines[1].contains("<- djc undo"));
+        assert!(lines[2].contains("<- djc undo"), "{out}");
         // And a ring where NOTHING is undoable offers nothing.
         let rows = [entry(12, 4, "mcp:sess-1", "cleared 7", false)];
-        assert!(!render(&rows).contains("<- dj undo"));
+        assert!(!render(&rows).contains("<- djc undo"));
     }
 
     #[test]

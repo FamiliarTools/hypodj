@@ -37,6 +37,11 @@ pub struct NlContext {
     pub tz: chrono::FixedOffset,
     /// The live queue length, for "the last track" and bounds echoes.
     pub queue_len: usize,
+    /// The live queue's rows (title + artist credit), so an artist named in a
+    /// curation ("no Daft Punk") is checked against the credits the queue actually
+    /// carries, with the SAME predicate the remove will run
+    /// ([`crate::plan::curate_matches`]), instead of reading any token as a name.
+    pub queue_rows: Vec<crate::plan::RowMeta>,
 }
 
 /// A cheap trust signal surfaced in the echo ("via rules" / "via local model").
@@ -97,6 +102,11 @@ pub enum NlQuery {
     Favorites,
     /// "is this favorited?" / "is the current song starred?": yes/no for current.
     IsCurrentFavorited,
+    /// "cancel the sleep timer" / "cancel wind down": disarm that feature through
+    /// the same path as `sleep off` / `winddown off`. Answered immediately like a
+    /// question (no plan, no token): it can only take away a pending timer, never
+    /// arm one.
+    CancelSession(NlSession),
 }
 
 /// The injected NL seam. SYNC + `Send + Sync` so the daemon can run it under

@@ -597,13 +597,16 @@ async fn spine<C: Clock>(
                         // track. (The scrobbler already saw it.)
                         pubr.on_paused(qid, song);
                     }
-                    PlayerEvent::StreamMetadata { queue_id, name, title } => {
+                    PlayerEvent::StreamMetadata { queue_id, name, title, genre, description } => {
                         // LIVE ICY now-playing for the current raw stream: store it on the
                         // handler keyed by the latched identity so `currentsong` surfaces
                         // the station Name / now-playing Title instead of the raw URL.
                         // set_stream_meta calls notify_change, waking an idling client to
                         // re-read. A None queue_id is unattributable and dropped.
                         if let Some(qid) = queue_id {
+                            // Station self-description into the station-metadata cache
+                            // (task wxpnbso): a memory move and a channel send, spine-safe.
+                            handler.note_station_icy(qid, genre.as_deref(), description.as_deref());
                             handler.set_stream_meta(qid, name, title);
                         }
                     }

@@ -561,7 +561,7 @@ async fn run_cause(port: u16, cause: &str) -> Vec<Row> {
             r.play(0).await;
             vec![row(
                 &r.record(async {
-                    r.h.handle(MpdCommand::Move { start: 0, end: Some(1), to: 2 }).await;
+                    r.h.handle(MpdCommand::Move { start: 0, end: Some(1), to: crate::mpd::QueuePos::Abs(2) }).await;
                 })
                 .await,
             )]

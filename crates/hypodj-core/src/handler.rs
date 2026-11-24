@@ -70,8 +70,8 @@ use crate::player::{
     StreamMeta,
 };
 use crate::station_identity::{
-    is_nts_stream_url, match_nts_mixtape, StationIdentity, NTS_CATALOGUE_CACHE_KEY,
-    NTS_MIXTAPES_URL,
+    is_nts_stream_url, is_valid_nts_catalogue, match_nts_live, match_nts_mixtape, nts_live_channel,
+    StationIdentity, NTS_CATALOGUE_CACHE_KEY, NTS_LIVE_URL, NTS_MIXTAPES_URL,
 };
 use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
@@ -1001,6 +1001,7 @@ fn recognize_hit_row(
         album: track.album.clone().or_else(|| library.and_then(|m| m.album.clone())),
         year: library.and_then(|m| m.year),
         isrc: track.isrc.clone(),
+        genre: track.genre.clone(),
         shazam_offset_ms: offset_secs.map(|o| (o * 1000.0) as i64),
         ..crate::heard::HeardRow::now("heard")
     }
@@ -1616,6 +1617,40 @@ impl State {
     fn reorder_queue(&mut self, f: impl FnOnce(&mut Self)) {
         f(self);
         self.playlist_version += 1;
+    }
+
+    /// Resolve an MPD 0.23 [`crate::mpd::QueuePos`] to an absolute index. For a
+    /// move, `lifted` is the half-open range being moved: the destination is an
+    /// index in the queue WITHOUT it, so the current song's position is taken
+    /// after the lift, and moving the current song relative to itself is an
+    /// error. `+N` is `cur + 1 + N`, `-N` is `cur - N`. Only bounds below zero are
+    /// checked here; the caller checks the upper bound it owns.
+    fn resolve_queue_pos(
+        &self,
+        pos: crate::mpd::QueuePos,
+        lifted: Option<(usize, usize)>,
+    ) -> Result<usize, (u32, &'static str)> {
+        use crate::mpd::QueuePos;
+        let rel = match pos {
+            QueuePos::Abs(n) => return Ok(n),
+            QueuePos::After(n) | QueuePos::Before(n) => n,
+        };
+        let Some(mut cur) = self.current().filter(|&c| c < self.queue.len()) else {
+            return Err((ACK_ERROR_PLAYER_SYNC, "No current song"));
+        };
+        if let Some((start, end)) = lifted {
+            if (start..end).contains(&cur) {
+                return Err((ACK_ERROR_ARG, "Cannot move current song relative to itself"));
+            }
+            if cur >= end {
+                cur -= end.saturating_sub(start);
+            }
+        }
+        let to = match pos {
+            QueuePos::After(_) => cur.checked_add(1).and_then(|c| c.checked_add(rel)),
+            _ => cur.checked_sub(rel),
+        };
+        to.ok_or((ACK_ERROR_ARG, "Bad song index"))
     }
 
     /// MPD `move START:END TO`: lift the half-open range out and reinsert it so its
@@ -2994,6 +3029,10 @@ pub struct HypodjHandler {
     /// newest one. Separate from the handle because reading is a different capability
     /// from writing (and the read runs in `spawn_blocking`, never on any hot path).
     heard_dir: Mutex<Option<PathBuf>>,
+    /// Station metadata hypodj learns for itself (ICY genre/description, heard
+    /// artists/genres), searched by `searchall` (task wxpnbso). In-memory until the
+    /// daemon registers a persistent store.
+    station_meta: Mutex<crate::station_meta::StationMetaStore>,
     /// The render-time dedupe window, seconds (`[heard].dedupe_window_secs`). Read
     /// locklessly when a `heard` request is built.
     heard_dedupe_window_secs: AtomicU64,
@@ -3587,6 +3626,7 @@ impl HypodjHandler {
             tape_seq: AtomicU64::new(0),
             self_ref: OnceLock::new(),
             heard_dir: Mutex::new(None),
+            station_meta: Mutex::new(crate::station_meta::StationMetaStore::in_memory()),
             heard_dedupe_window_secs: AtomicU64::new(
                 crate::config::DEFAULT_HEARD_DEDUPE_WINDOW_SECS,
             ),
@@ -4263,6 +4303,7 @@ impl HypodjHandler {
                 tracing::warn!(origin = %p.raw.origin, "persisted plan missed while down; dropped");
                 continue;
             };
+            let catch_up = crate::plan_store::missed_daily_occurrence(&chrono::Local, &trigger, now_civil);
             let raw = RawPlan { trigger, ..p.raw };
             let origin = raw.origin.clone();
             let reserved_origin =
@@ -4275,12 +4316,34 @@ impl HypodjHandler {
             match res {
                 Ok(id) => {
                     armed += 1;
+                    if let Some(missed) = catch_up {
+                        tracing::info!(plan = id.0, missed = %missed, "daily occurrence missed while down; firing now");
+                        self.fire_recurring_soon(id);
+                    }
                     tracing::info!(plan = id.0, origin = %origin, "persisted plan re-armed");
                 }
                 Err(e) => tracing::warn!(origin = %origin, error = %e, "persisted plan did not re-arm"),
             }
         }
         armed
+    }
+
+    /// Point a just-armed recurring plan's deadline at one second from now (the
+    /// restart catch-up for an occurrence missed inside the grace). After it
+    /// fires, [`Self::rearm_recurring`] moves it to its next occurrence as usual.
+    fn fire_recurring_soon(&self, id: PlanId) {
+        let (now, now_civil) = (Instant::now(), crate::clock::civil_now());
+        let deadline = now + Duration::from_secs(1);
+        let mut g = self.plan_pending.lock().unwrap();
+        if let Some(pp) = g.iter_mut().find(|pp| pp.armed.id == id) {
+            if let Some(timers) = self.plan_timers.get() {
+                let (tid, guard) = timers.arm(deadline);
+                pp.armed.timer_id = Some(tid);
+                pp.guard = Some(guard);
+            }
+            pp.armed.resolved = Resolved::OnDeadline(deadline);
+            pp.civil_at = Some(now_civil + chrono::Duration::seconds(1));
+        }
     }
 
     /// Replace a plan: cancel `id` (RAII-disarming its timer) then arm `raw` as a
@@ -5803,6 +5866,7 @@ impl HypodjHandler {
             // civil->UTC reduction at translate time.
             tz: *chrono::Local::now().offset(),
             queue_len: snap.entries.len(),
+            queue_rows: self.queue_rows().0,
         }
     }
 
@@ -5924,32 +5988,44 @@ impl HypodjHandler {
         use crate::nl::NlQuery;
         /// Cap the listed favorites so one answer line stays readable.
         const MAX_LISTED: usize = 20;
+        let list_favorites = match q {
+            NlQuery::CancelSession(session) => {
+                let (cancelled, name) = match session {
+                    crate::nl::NlSession::Sleep => (self.sleep_cancel(), "sleep timer"),
+                    crate::nl::NlSession::WindDown => (self.winddown_cancel(), "wind-down"),
+                };
+                let answer = if cancelled { format!("{name} cancelled") } else { format!("no {name} armed") };
+                return MpdResponse::pairs().pair("nl_answer", answer).build();
+            }
+            NlQuery::Favorites => true,
+            NlQuery::IsCurrentFavorited => false,
+        };
         let starred = match self.client.starred_songs().await {
             Ok(s) => s,
             Err(e) => return ack(ACK_ERROR_UNKNOWN, "nl", &format!("could not read favorites: {e}")),
         };
-        let answer = match q {
-            NlQuery::Favorites if starred.is_empty() => "no favorites yet".to_string(),
-            NlQuery::Favorites => {
-                let shown: Vec<String> = starred
-                    .iter()
-                    .take(MAX_LISTED)
-                    .map(|s| match &s.artist {
-                        Some(a) => format!("{a} - {}", s.title),
-                        None => s.title.clone(),
-                    })
-                    .collect();
-                let more = starred.len().saturating_sub(MAX_LISTED);
-                let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
-                format!("{} favorites: {}{tail}", starred.len(), shown.join("; "))
-            }
-            NlQuery::IsCurrentFavorited => match self.current_song() {
+        let answer = if list_favorites && starred.is_empty() {
+            "no favorites yet".to_string()
+        } else if list_favorites {
+            let shown: Vec<String> = starred
+                .iter()
+                .take(MAX_LISTED)
+                .map(|s| match &s.artist {
+                    Some(a) => format!("{a} - {}", s.title),
+                    None => s.title.clone(),
+                })
+                .collect();
+            let more = starred.len().saturating_sub(MAX_LISTED);
+            let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
+            format!("{} favorites: {}{tail}", starred.len(), shown.join("; "))
+        } else {
+            match self.current_song() {
                 None => "nothing (library) is playing".to_string(),
                 Some(cur) if starred.iter().any(|s| s.id == cur.id) => {
                     format!("yes, \"{}\" is a favorite", cur.title)
                 }
                 Some(cur) => format!("no, \"{}\" is not a favorite", cur.title),
-            },
+            }
         };
         MpdResponse::pairs().pair("nl_answer", answer).build()
     }
@@ -6284,7 +6360,12 @@ impl HypodjHandler {
     /// honest outcome). No leaked task: the fetch is bounded by the client's 4s timeout
     /// and lives entirely inside this future.
     async fn resolve_station_identity(&self, gen: u64, qid: QueueId, url: String) {
-        // Only NTS URLs are worth a catalogue fetch (P4 adds more providers here).
+        // An NTS LIVE channel rotates per show: its own provider (task r7ql64x P4).
+        if let Some(channel) = nts_live_channel(&url) {
+            self.resolve_nts_live(gen, qid, channel).await;
+            return;
+        }
+        // Only NTS URLs are worth a catalogue fetch.
         if !is_nts_stream_url(&url) {
             return;
         }
@@ -6296,8 +6377,10 @@ impl HypodjHandler {
                     Ok(r) if r.status().is_success() => r,
                     _ => return,
                 };
+                // PARSE-VALIDATE before caching: a captive portal or CDN error page can
+                // answer 200, and caching it would poison NTS resolution for the TTL.
                 let json = match resp.text().await {
-                    Ok(t) if !t.trim().is_empty() => t,
+                    Ok(t) if is_valid_nts_catalogue(&t) => t,
                     _ => return,
                 };
                 self.nts_catalogue_cache.put(NTS_CATALOGUE_CACHE_KEY.to_string(), json.clone());
@@ -6306,6 +6389,54 @@ impl HypodjHandler {
         };
         if let Some(identity) = match_nts_mixtape(&catalogue, &url) {
             self.set_station_identity(gen, qid, identity);
+        }
+    }
+
+    /// The NTS LIVE provider (task r7ql64x P4): resolve the show now on `channel` from
+    /// `/api/v2/live`, then sleep to the show's `end_timestamp` and re-resolve, so the
+    /// name and cover follow the rotation while the stream keeps playing. EVENT-DRIVEN,
+    /// not polled: one fetch per show boundary. The loop ends the moment this resolve is
+    /// superseded (a newer track-start bumped the generation) or `qid` is no longer the
+    /// current entry, and on any fetch/parse failure (no identity is an honest outcome).
+    /// The endpoint sits behind CloudFront and can lag a boundary by minutes, so a body
+    /// whose show has already ended is retried a bounded number of times, a minute apart.
+    /// `tokio::time::sleep`, so a paused test clock drives it.
+    async fn resolve_nts_live(&self, gen: u64, qid: QueueId, channel: &str) {
+        const BOUNDARY_SLACK_SECS: i64 = 20;
+        const STALE_RETRY_SECS: u64 = 60;
+        const STALE_RETRIES: u32 = 15;
+        let mut stale = 0u32;
+        loop {
+            let still_ours = {
+                let st = self.state.lock().unwrap();
+                st.station_identity_gen == gen
+                    && st.current().and_then(|i| st.queue.get(i)).map(|it| it.id) == Some(qid.0)
+            };
+            if !still_ours {
+                return;
+            }
+            let body = match self.station_identity_http.get(NTS_LIVE_URL).send().await {
+                Ok(r) if r.status().is_success() => match r.text().await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                },
+                _ => return,
+            };
+            let Some((identity, end)) = match_nts_live(&body, channel) else { return };
+            self.set_station_identity(gen, qid, identity);
+            let Some(end) = end else { return };
+            let now = crate::store::now_unix() as i64;
+            let wait = if end + BOUNDARY_SLACK_SECS > now {
+                stale = 0;
+                (end + BOUNDARY_SLACK_SECS - now) as u64
+            } else {
+                stale += 1;
+                if stale > STALE_RETRIES {
+                    return;
+                }
+                STALE_RETRY_SECS
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         }
     }
 
@@ -6828,7 +6959,7 @@ impl HypodjHandler {
         // in the filename and the sidecar.
         if let (Some(secs), Some(cut)) = (row.tape_secs, row.cut.as_deref()) {
             sentence.push_str(&format!(
-                " - kept {} of audio ({cut}); `dj heard` has it",
+                " - kept {} of audio ({cut}); `djc heard` has it",
                 crate::heard::human_secs(secs)
             ));
         } else if let Some(why) = &row.tape_outcome {
@@ -9315,6 +9446,25 @@ impl HypodjHandler {
             .store(dedupe_window_secs, Ordering::Relaxed);
     }
 
+    /// Register the persistent station-metadata store, plumbed once at daemon startup.
+    pub fn set_station_meta(&self, store: crate::station_meta::StationMetaStore) {
+        *self.station_meta.lock().unwrap() = store;
+    }
+
+    /// Record a station's ICY self-description against the stream url of `qid`. ON THE
+    /// DIRECTOR SPINE: one short state lock for the url, then a memory move and a
+    /// lock-free send (the store's writer does the file I/O).
+    pub(crate) fn note_station_icy(&self, qid: QueueId, genre: Option<&str>, description: Option<&str>) {
+        if genre.is_none() && description.is_none() {
+            return;
+        }
+        let url = stream_url_for(&self.state.lock().unwrap(), qid);
+        if let Some(url) = url {
+            let store = self.station_meta.lock().unwrap().clone();
+            store.note_icy(&url, genre, description);
+        }
+    }
+
     /// Enqueue one ledger row, or do nothing when no ledger is registered.
     ///
     /// THE SPINE CONTRACT lives here: this is a SYNC `&self` method whose entire body is
@@ -9323,6 +9473,15 @@ impl HypodjHandler {
     /// `set_stream_meta` (which the director spine invokes synchronously) safe by
     /// construction rather than by care.
     pub(crate) fn append_heard(&self, row: crate::heard::HeardRow) {
+        // Every heard TRACK row on a stream teaches the station-metadata cache what the
+        // station plays (task wxpnbso). Reached from the spine via the ICY path, so this
+        // is a memory move and a channel send only.
+        if row.ev == "heard" && row.kind.as_deref() == Some("track") {
+            if let Some(url) = row.url.as_deref() {
+                let store = self.station_meta.lock().unwrap().clone();
+                store.note_heard(url, row.artist.as_deref(), row.genre.as_deref());
+            }
+        }
         let ledger = self.heard_ledger.lock().unwrap().clone();
         if let Some(l) = ledger {
             l.append(row);
@@ -13490,6 +13649,7 @@ const ACK_ERROR_ARG: u32 = 2;
 const ACK_ERROR_NO_EXIST: u32 = 50;
 const ACK_ERROR_UNKNOWN: u32 = 5;
 const ACK_ERROR_EXIST: u32 = 56;
+const ACK_ERROR_PLAYER_SYNC: u32 = 55;
 
 impl MpdHandler for HypodjHandler {
     async fn idle(&self, _subsystems: Vec<String>) -> Option<String> {
@@ -13931,12 +14091,19 @@ impl MpdHandler for HypodjHandler {
                 Err(e) => ack(ACK_ERROR_NO_EXIST, "add", &e),
             },
             MpdCommand::AddId(uri, pos) => {
-                // MPD rejects a position past the end BEFORE adding anything.
-                if let Some(p) = pos {
-                    if p > self.state.lock().unwrap().queue.len() {
-                        return ack(ACK_ERROR_ARG, "addid", "Bad song index");
+                // MPD rejects a position past the end BEFORE adding anything; a
+                // relative one resolves against the current song now.
+                let pos = match pos {
+                    None => None,
+                    Some(qp) => {
+                        let st = self.state.lock().unwrap();
+                        match st.resolve_queue_pos(qp, None) {
+                            Err((code, msg)) => return ack(code, "addid", msg),
+                            Ok(p) if p > st.queue.len() => return ack(ACK_ERROR_ARG, "addid", "Bad song index"),
+                            Ok(p) => Some(p),
+                        }
                     }
-                }
+                };
                 match self.enqueue_uri(&uri).await {
                 Ok(id) => {
                     if let Some(p) = pos {
@@ -13990,10 +14157,19 @@ impl MpdHandler for HypodjHandler {
                         if start > len || end > len {
                             return ack(ACK_ERROR_ARG, "delete", "Bad song index");
                         }
-                        // Highest first, so each lower index is still the row the
-                        // client named; each delete_at keeps current/skip consistent.
-                        for pos in (start..end).rev() {
-                            self.delete_at(pos).await;
+                        // Name the rows by qid NOW: each delete_at awaits, and another
+                        // connection may insert or move rows meanwhile, so an index
+                        // captured up front would later point at a different row.
+                        // Each qid is re-located just before its (sync) lookup.
+                        let named: Vec<u64> = {
+                            let st = self.state.lock().unwrap();
+                            st.queue[start..end].iter().map(|it| it.id).collect()
+                        };
+                        for qid in named.into_iter().rev() {
+                            let pos = self.state.lock().unwrap().queue.iter().position(|it| it.id == qid);
+                            if let Some(pos) = pos {
+                                self.delete_at(pos).await;
+                            }
                         }
                     }
                     Some((_, None)) => return ack(ACK_ERROR_ARG, "delete", "Bad song index"),
@@ -14006,13 +14182,17 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::Move { start, end, to } => {
-                let ok = {
+                let res = {
                     let mut st = self.state.lock().unwrap();
                     let end = end.unwrap_or(st.queue.len());
-                    st.move_range(start, end, to)
+                    match st.resolve_queue_pos(to, Some((start, end))) {
+                        Ok(to) if st.move_range(start, end, to) => Ok(()),
+                        Ok(_) => Err((ACK_ERROR_ARG, "Bad song index")),
+                        Err(e) => Err(e),
+                    }
                 };
-                if !ok {
-                    return ack(ACK_ERROR_ARG, "move", "Bad song index");
+                if let Err((code, msg)) = res {
+                    return ack(code, "move", msg);
                 }
                 self.notify_change();
                 // A reorder can change what follows the current entry.
@@ -14024,8 +14204,11 @@ impl MpdHandler for HypodjHandler {
                     let mut st = self.state.lock().unwrap();
                     match st.queue.iter().position(|it| it.id == id) {
                         None => Err(ack(ACK_ERROR_NO_EXIST, "moveid", "No such song")),
-                        Some(from) if st.move_range(from, from + 1, to) => Ok(()),
-                        Some(_) => Err(ack(ACK_ERROR_ARG, "moveid", "Bad song index")),
+                        Some(from) => match st.resolve_queue_pos(to, Some((from, from + 1))) {
+                            Ok(to) if st.move_range(from, from + 1, to) => Ok(()),
+                            Ok(_) => Err(ack(ACK_ERROR_ARG, "moveid", "Bad song index")),
+                            Err((code, msg)) => Err(ack(code, "moveid", msg)),
+                        },
                     }
                 };
                 if let Err(e) = res {
@@ -15290,7 +15473,14 @@ impl HypodjHandler {
         // not ACK because the internet-radio endpoint hiccuped.
         let query_lower = query.to_lowercase();
         let stations: Option<Vec<Station>> = match self.client.get_internet_radio_stations().await {
-            Ok(all) => Some(all.into_iter().filter(|s| station_matches(s, &query_lower)).collect()),
+            Ok(all) => {
+                let meta = self.station_meta.lock().unwrap().clone().snapshot();
+                Some(
+                    all.into_iter()
+                        .filter(|s| station_matches(s, &query_lower, meta.get(&s.stream_url)))
+                        .collect(),
+                )
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "searchall: station list unavailable; omitting the station kind");
                 None
@@ -15885,8 +16075,43 @@ fn search_all_pairs(
 /// are not named "radio". Additive, never a mode switch: search3 still runs on the same
 /// query, so an artist, album or song literally called "Stations" is not lost, and the
 /// station block sits between albums and songs exactly as for any other query.
-fn station_matches(s: &Station, query_lower: &str) -> bool {
-    is_station_kind_token(query_lower) || s.name.to_lowercase().contains(query_lower)
+///
+/// LEARNED METADATA (task wxpnbso, part B): `meta` is what hypodj learned about this
+/// station itself ([`crate::station_meta`]) - ICY genre/description and the artists and
+/// genres it was heard playing - so `house` finds a station that played house and
+/// `eclectic` finds KFJC. A query shorter than 3 characters never searches it (two
+/// letters would match half of every heard list).
+///
+/// SCOPED HOST TOKEN: the host is already RENDERED as the row trailer, so it is matched
+/// too - but only as a whole-word PREFIX of one host label other than the TLD, and only
+/// for a single 3+ character word (`somafm`, `nts`, `kfjc`). `http`, `ntslive.net` or
+/// `com` still match nothing, which is the guard that kept url matching out.
+///
+/// PURE: the caller passes the snapshot, so the whole rule is unit-testable.
+fn station_matches(s: &Station, query_lower: &str, meta: Option<&crate::station_meta::StationMeta>) -> bool {
+    if is_station_kind_token(query_lower) || s.name.to_lowercase().contains(query_lower) {
+        return true;
+    }
+    let q = query_lower.trim();
+    if q.chars().count() < 3 {
+        return false;
+    }
+    if meta.is_some_and(|m| m.matches(q)) {
+        return true;
+    }
+    host_token_matches(&s.stream_url, q)
+}
+
+/// Does a single-word query prefix one non-TLD label of the stream host?
+fn host_token_matches(url: &str, q: &str) -> bool {
+    if !q.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return false;
+    }
+    let Some(host) = stream_host(url) else { return false };
+    let host = host.to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len().saturating_sub(1).max(1);
+    labels[..n.min(labels.len())].iter().any(|l| l.starts_with(q))
 }
 
 /// Is this (lowercased) query the station KIND token rather than a text query?
@@ -16311,14 +16536,14 @@ mod tests {
         queue_of(&h, 5).await;
         h.state.lock().unwrap().set_current(Some(1));
         let v0 = h.state.lock().unwrap().playlist_version;
-        let r = h.handle(MpdCommand::Move { start: 0, end: Some(2), to: 3 }).await;
+        let r = h.handle(MpdCommand::Move { start: 0, end: Some(2), to: crate::mpd::QueuePos::Abs(3) }).await;
         assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
         assert_eq!(qids(&h), vec![2, 3, 4, 0, 1]);
         let st = h.state.lock().unwrap();
         assert_eq!(st.current(), Some(4), "the playing entry (id 1) followed the move");
         assert!(st.playlist_version > v0);
         drop(st);
-        let r = h.handle(MpdCommand::Move { start: 3, end: Some(5), to: 4 }).await;
+        let r = h.handle(MpdCommand::Move { start: 3, end: Some(5), to: crate::mpd::QueuePos::Abs(4) }).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }), "dest past end");
         assert_eq!(qids(&h), vec![2, 3, 4, 0, 1], "a rejected move touches nothing");
     }
@@ -16328,12 +16553,12 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 3).await;
         h.state.lock().unwrap().set_current(Some(0));
-        h.handle(MpdCommand::MoveId(0, 2)).await;
+        h.handle(MpdCommand::MoveId(0, crate::mpd::QueuePos::Abs(2))).await;
         assert_eq!(qids(&h), vec![1, 2, 0]);
         assert_eq!(h.state.lock().unwrap().current(), Some(2));
-        let r = h.handle(MpdCommand::MoveId(99, 0)).await;
+        let r = h.handle(MpdCommand::MoveId(99, crate::mpd::QueuePos::Abs(0))).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_NO_EXIST, .. }));
-        let r = h.handle(MpdCommand::MoveId(1, 3)).await;
+        let r = h.handle(MpdCommand::MoveId(1, crate::mpd::QueuePos::Abs(3))).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }));
     }
 
@@ -16372,18 +16597,78 @@ mod tests {
         assert_eq!(qids(&h), vec![0]);
     }
 
+    // Probe (adversarial review G): `delete a:b` deletes row by row with awaits
+    // between. A concurrent insert from another connection landing during one of
+    // those awaits must not shift a DIFFERENT row under the delete: the range
+    // names the rows as they were when the command arrived.
+    #[tokio::test(start_paused = true)]
+    async fn range_delete_is_not_shifted_by_a_concurrent_insert() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 6).await;
+        // The playing row is inside the range, so deleting it awaits the player.
+        h.state.lock().unwrap().set_current(Some(2));
+        let del = h.handle(MpdCommand::Delete(Some("0:3".into())));
+        let ins = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(0))));
+        let (r1, r2) = tokio::join!(del, ins);
+        assert!(!matches!(r1, MpdResponse::Ack { .. }), "{r1:?}");
+        assert!(!matches!(r2, MpdResponse::Ack { .. }), "{r2:?}");
+        let mut left = qids(&h);
+        left.sort();
+        assert_eq!(left, vec![3, 4, 5, 6], "exactly rows 0..3 as named went; the insert survived");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn addid_inserts_at_the_requested_position() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 3).await;
         h.state.lock().unwrap().set_current(Some(1));
-        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(0))).await;
+        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(0)))).await;
         assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
         assert_eq!(qids(&h), vec![3, 0, 1, 2]);
         assert_eq!(h.state.lock().unwrap().current(), Some(2), "current shifted with its entry");
-        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(9))).await;
+        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(9)))).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }));
         assert_eq!(qids(&h).len(), 4, "a bad position adds nothing");
+    }
+
+    // Regression (adversarial review C): MPD 0.23 relative positions. `+N` is N
+    // after the current song and `-N` N before it (`+0` right after, `-0` right
+    // before), for move / moveid / addid alike; `usize::parse` used to read `+N`
+    // as absolute. With nothing playing a relative position ACKs.
+    #[tokio::test(start_paused = true)]
+    async fn relative_positions_are_relative_to_the_current_song() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 5).await;
+        h.state.lock().unwrap().set_current(Some(3));
+        // Lift id 0 out: current (id 3) sits at 2, so `+1` lands at 4.
+        let r = h.handle(crate::mpd::parse("move 0 +1")).await;
+        assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
+        assert_eq!(qids(&h), vec![1, 2, 3, 4, 0]);
+        // `-0` is right before the current song (id 3, now at 2).
+        h.handle(crate::mpd::parse("moveid 0 -0")).await;
+        assert_eq!(qids(&h), vec![1, 2, 0, 3, 4]);
+        // `+0` is right after it.
+        h.handle(crate::mpd::parse("moveid 1 +0")).await;
+        assert_eq!(qids(&h), vec![2, 0, 3, 1, 4]);
+        assert_eq!(h.state.lock().unwrap().current(), Some(2), "current followed its entry");
+        // Moving the current song relative to itself is an ACK.
+        let r = h.handle(crate::mpd::parse("moveid 3 +1")).await;
+        assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }), "{r:?}");
+        // addid `+0` inserts right after the current song.
+        let r = h.handle(crate::mpd::parse(&format!("addid {NTS} +0"))).await;
+        assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
+        assert_eq!(qids(&h), vec![2, 0, 3, 5, 1, 4]);
+        // Out of range below the queue start ACKs and changes nothing.
+        let r = h.handle(crate::mpd::parse("moveid 4 -9")).await;
+        assert!(matches!(r, MpdResponse::Ack { .. }), "{r:?}");
+        assert_eq!(qids(&h), vec![2, 0, 3, 5, 1, 4]);
+        // Nothing playing: a relative position ACKs and nothing moves or is added.
+        h.state.lock().unwrap().set_current(None);
+        for cmd in ["move 0 +1".to_string(), "moveid 0 -0".to_string(), format!("addid {NTS} +0")] {
+            let r = h.handle(crate::mpd::parse(&cmd)).await;
+            assert!(matches!(r, MpdResponse::Ack { .. }), "{cmd}: {r:?}");
+        }
+        assert_eq!(qids(&h), vec![2, 0, 3, 5, 1, 4]);
     }
 
     /// A handler over a TWO-DECK headless player, so the crossfade path is drivable
@@ -21054,6 +21339,32 @@ mod tests {
         assert!(h.find_feature(ORIGIN_SLEEP).is_some(), "and leaves the sleep timer alone");
     }
 
+    // Regression (adversarial review D): an NL cancel goes through the same
+    // cancel path as `sleep off`, answered at once, and touches only its feature.
+    struct CancelTranslator(crate::nl::NlSession);
+    impl crate::nl::Translator for CancelTranslator {
+        fn translate(&self, _u: &str, _c: &crate::nl::NlContext) -> Result<crate::nl::NlHit, crate::nl::NlError> {
+            Err(crate::nl::NlError::NotUnderstood)
+        }
+        fn query(&self, _u: &str) -> Option<crate::nl::NlQuery> {
+            Some(crate::nl::NlQuery::CancelSession(self.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn nl_cancel_disarms_only_its_feature() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.sleep_set(Duration::from_secs(600)).unwrap();
+        h.winddown_set(Some(Duration::from_secs(900))).unwrap();
+        h.set_translator(Arc::new(CancelTranslator(crate::nl::NlSession::Sleep)));
+        let resp = h.handle(nl_translate("cancel the sleep timer", 7)).await;
+        assert_eq!(pair(&resp, "nl_answer"), Some("sleep timer cancelled"), "{resp:?}");
+        assert!(h.find_feature(ORIGIN_SLEEP).is_none());
+        assert!(h.find_feature(ORIGIN_WINDDOWN).is_some(), "the wind-down is not the sleep");
+        let resp = h.handle(nl_translate("cancel the sleep timer", 7)).await;
+        assert_eq!(pair(&resp, "nl_answer"), Some("no sleep timer armed"));
+    }
+
     #[tokio::test]
     async fn nl_translate_echoes_then_confirm_arms() {
         let Some((handler, _events)) = handler_with_null_player() else { return };
@@ -24574,17 +24885,48 @@ mod tests {
 
     // ── stations as the FOURTH searchall result kind ───────────────────────────
 
+    fn station_matches_bare(s: &Station, q: &str) -> bool {
+        station_matches(s, q, None)
+    }
+
+    #[test]
+    fn station_matches_learned_metadata_and_host_token() {
+        use crate::station_meta::{record_heard, record_icy, StationMetaMap};
+        let kfjc = st("2", "KFJC 89.7 FM", "http://netcast.kfjc.org/kfjc-320k-aac");
+        let nts = st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5");
+        let soma = st("4", "Groove Salad", "https://ice2.somafm.com/groovesalad-128-mp3");
+        let mut m = StationMetaMap::new();
+        record_icy(&mut m, &kfjc.stream_url, Some("Eclectic"), Some("Freeform college radio"));
+        record_heard(&mut m, &nts.stream_url, Some("Floorplan"), Some("House"));
+        let km = m.get(&kfjc.stream_url);
+        let nm = m.get(&nts.stream_url);
+        assert!(station_matches(&kfjc, "radio", km), "icy-description");
+        assert!(station_matches(&kfjc, "eclectic", km), "icy-genre");
+        assert!(station_matches(&nts, "house", nm), "a heard genre");
+        assert!(station_matches(&nts, "floorplan", nm), "a heard artist");
+        assert!(!station_matches(&nts, "radio", nm));
+        assert!(!station_matches(&nts, "house", None), "no learned meta, no match");
+        assert!(!station_matches(&nts, "ho", nm), "short queries never search learned text");
+        // Scoped host token: a whole-label prefix, never the TLD or a dotted/scheme query.
+        assert!(station_matches(&soma, "somafm", None));
+        assert!(station_matches(&nts, "ntslive", None));
+        assert!(!station_matches(&soma, "com", None));
+        assert!(!station_matches(&soma, "http", None));
+        assert!(!station_matches(&soma, "somafm.com", None));
+        assert!(!station_matches(&soma, "fm", None));
+    }
+
     #[test]
     fn station_matches_is_name_substring_never_url() {
         let s = st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5");
         // Substring, case-insensitive: FIND is loose where station_for_name is exact.
-        assert!(station_matches(&s, "nts"));
-        assert!(station_matches(&s, "floor"));
-        assert!(station_matches(&s, "4 to the floor"));
-        assert!(!station_matches(&s, "kfjc"));
+        assert!(station_matches_bare(&s, "nts"));
+        assert!(station_matches_bare(&s, "floor"));
+        assert!(station_matches_bare(&s, "4 to the floor"));
+        assert!(!station_matches_bare(&s, "kfjc"));
         // The URL is NEVER searched: `searchall http` must not return every station.
-        assert!(!station_matches(&s, "http"));
-        assert!(!station_matches(&s, "ntslive.net"));
+        assert!(!station_matches_bare(&s, "http"));
+        assert!(!station_matches_bare(&s, "ntslive.net"));
     }
 
     #[test]
@@ -24596,11 +24938,11 @@ mod tests {
             st("3", "The Lot Radio - NYC", "https://www.lvpr.tv/?v=x"),
         ];
         for q in ["stations", "station", " stations "] {
-            assert!(all.iter().all(|s| station_matches(s, q)), "{q:?} lists the whole set");
+            assert!(all.iter().all(|s| station_matches_bare(s, q)), "{q:?} lists the whole set");
         }
         // Only the WHOLE token: a longer query is an ordinary name substring again.
-        assert!(!station_matches(&all[0], "stations nyc"));
-        assert!(!station_matches(&all[0], "stat"));
+        assert!(!station_matches_bare(&all[0], "stations nyc"));
+        assert!(!station_matches_bare(&all[0], "stat"));
     }
 
     #[test]
@@ -26611,6 +26953,33 @@ mod tests {
         assert!(h.wake_cancel());
         assert!(crate::plan_store::load(&path).unwrap().plans.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Regression (adversarial review A): a daemon restarted one minute after a
+    // Daily plan's time fires that missed occurrence right after startup (the
+    // same grace a one-shot gets), instead of silently waiting until tomorrow.
+    #[tokio::test(start_paused = true)]
+    async fn restore_fires_daily_missed_inside_grace() {
+        use chrono::Timelike;
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let missed = (crate::clock::civil_now() - chrono::Duration::minutes(1)).with_timezone(&chrono::Local);
+        let raw = RawPlan {
+            version: 1,
+            trigger: RawTrigger::Daily { hour: missed.hour() as u8, minute: missed.minute() as u8, days: crate::plan::DaySet::EVERY },
+            action: Action::Pause,
+            once: false,
+            origin: "mpd".into(),
+        };
+        let file = crate::plan_store::PlansFile {
+            schema_version: crate::plan_store::PLANS_SCHEMA_VERSION,
+            plans: vec![crate::plan_store::PersistedPlan { reserved: false, raw }],
+        };
+        assert_eq!(h.restore_plans(file), 1);
+        let list = h.plan_list_with_deadlines();
+        let deadline = list[0].2.expect("deadline plan");
+        let wait = deadline.saturating_duration_since(Instant::now());
+        assert!(wait <= Duration::from_secs(1), "missed daily must fire now, not in {wait:?}");
+        assert!(matches!(list[0].1.trigger, RawTrigger::Daily { .. }), "still recurring");
     }
 
     // SAFETY (reserved-origin masquerade): `plan add ... origin sleep` lets a

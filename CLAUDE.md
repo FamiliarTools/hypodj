@@ -18,7 +18,9 @@ usage - this file is only what you need to work in the repo.
   build is model-free.
 - `crates/hypodj-client` - the shared client lib (MpdConn, the `nl` handshake,
   now-playing/queue parsing, verb-vs-NL routing) that both client bins use.
-- `crates/hypodj-cli` - the `dj` jukebox CLI (pure MPD/TCP, no libmpv).
+- `crates/hypodj-cli` - the `djc` jukebox CLI (pure MPD/TCP, no libmpv), plus
+  `dj`, the listening shell: `dj-gui` on an interactive TTY with no args,
+  otherwise exactly `djc` (both bins share the crate's lib).
 - `crates/hypodj-tui` - the `dj-gui` interactive TUI (product name HypoDJ; ratatui
   over `hypodj-client`, no libmpv).
 - `crates/hypodj-dsl` - the plan-DSL quoting rule (`dsl_value`), zero deps. The

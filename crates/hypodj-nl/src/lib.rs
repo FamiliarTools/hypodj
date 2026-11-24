@@ -96,7 +96,17 @@ mod tests {
             now_civil: Utc.with_ymd_and_hms(2026, 7, 15, 5, 30, 0).unwrap(),
             tz: FixedOffset::east_opt(0).unwrap(), // UTC for simple local==UTC math
             queue_len,
+            queue_rows: vec![
+                row("Around the World", "Daft Punk"),
+                row("Get Lucky", "Daft Punk feat. Pharrell Williams"),
+                row("Windowlicker", "Aphex Twin"),
+                row("Happy", "Pharrell"),
+            ],
         }
+    }
+
+    fn row(title: &str, artist: &str) -> hypodj_core::plan::RowMeta {
+        hypodj_core::plan::RowMeta { title: title.into(), artist: Some(artist.into()), ..Default::default() }
     }
 
     fn tr(u: &str, c: &NlContext) -> Result<Vec<RawPlan>, NlError> {
@@ -561,6 +571,51 @@ mod tests {
         assert!(matches!(tr("sleep timer", &c), Err(NlError::Ambiguous(_))));
     }
 
+    // Regression (adversarial review D): a negated or contrasted ask must never
+    // run the very thing it negates. One shared guard in the rules makes these
+    // ambiguous (no plan), while the mode grammar keeps its own "don't shuffle".
+    #[test]
+    fn negated_asks_never_run_what_they_negate() {
+        let c = ctx(None, 5);
+        for u in [
+            "play anything but my favorites",
+            "play something other than my favorites",
+            "play something not in my favorites",
+            "play everything except my favorites",
+            "don't play my favorites",
+            "don't go to sleep in 30 minutes",
+            "do not go to sleep in 30 minutes",
+            "cancel the sleep timer in 30 minutes",
+            "don't start a wind-down",
+            "never wind down",
+            "never allow remixes again",
+            "don't allow remixes again",
+            "don't fade out",
+            "don't stop",
+            "don't wake me at 7",
+        ] {
+            assert!(matches!(tr(u, &c), Err(NlError::Ambiguous(_))), "{u}: {:?}", tr(u, &c));
+        }
+        // The mode grammar's own negation still works.
+        assert!(matches!(tr("don't shuffle", &c).unwrap()[0].action, Action::SetMode { mode: PlayMode::Random, on: false }));
+        // Plain asks are untouched.
+        assert!(tr("play my favorites", &c).is_ok());
+        // A bare cancel maps to the feature's existing cancel path (answered now,
+        // like a question); a timed one is not a cancel.
+        use hypodj_core::nl::{NlQuery, NlSession};
+        let t = HybridTranslator::rules_only();
+        for u in ["cancel the sleep timer", "turn off the sleep timer", "stop the sleep timer", "sleep off"] {
+            assert_eq!(t.query(u), Some(NlQuery::CancelSession(NlSession::Sleep)), "{u}");
+        }
+        for u in ["cancel wind down", "cancel the wind-down", "abort winddown"] {
+            assert_eq!(t.query(u), Some(NlQuery::CancelSession(NlSession::WindDown)), "{u}");
+        }
+        for u in ["cancel the sleep timer in 30 minutes", "sleep in 30 minutes", "cancel", "stop"] {
+            assert_eq!(t.query(u), None, "{u}");
+        }
+        assert!(tr("sleep in 30 minutes", &c).is_ok());
+    }
+
     #[test]
     fn query_class_favorites_questions() {
         use hypodj_core::nl::NlQuery;
@@ -645,6 +700,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Regression (adversarial review E): a bare "no X" read ANY token as an
+    // artist ("no the", "no jazz", "no i mean the other one"). An artist filter
+    // now needs a credit the queue actually carries; stop words never qualify.
+    #[test]
+    fn bare_no_needs_a_credited_artist() {
+        use hypodj_core::plan::{CurateFilter as F, QueueSelector};
+        let c = ctx(Some("s1"), 10);
+        for u in ["no the", "no a", "no jazz", "no i mean the other one", "remove by x", "no Prince"] {
+            match tr(u, &c) {
+                Ok(p) => assert!(
+                    !p.iter().any(|p| matches!(&p.action, Action::Remove { sel: QueueSelector::Upcoming(F::Artist(_) | F::LeadArtist(_)) })),
+                    "{u} read as an artist curation: {p:?}"
+                ),
+                Err(_) => {}
+            }
+        }
+        // A name the queue credits still curates, featured credits included.
+        assert!(tr("no Pharrell Williams", &c).is_ok());
+        assert!(matches!(tr("no Prince", &c), Err(NlError::Ambiguous(_))));
     }
 
     #[test]

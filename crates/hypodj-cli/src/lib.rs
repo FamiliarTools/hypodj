@@ -1,0 +1,770 @@
+//! djc - the hypodj jukebox CLI. Human-native + natural-language-first: say what
+//! you want. A bare control verb (play/pause/stop/next/prev/vol/clear/queue/now)
+//! runs directly; anything else is sent to the daemon as `nl "<phrase>"`, echoed,
+//! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
+
+mod completions;
+mod heard;
+mod journal;
+mod pls;
+mod render;
+mod stations;
+mod store;
+
+use std::io::{BufRead, Write};
+
+use hypodj_client::config::{self, Env};
+use hypodj_client::mpd::{MpdConn, MpdError};
+use hypodj_client::route::{self, Action};
+use hypodj_client::{model, nl};
+
+const HELP: &str = "\
+djc - hypodj jukebox
+
+USAGE:
+  djc                     show the now-playing card
+  djc now | status        show the now-playing card
+  djc queue               list the queue
+  djc play | pause | stop playback control
+  djc next | prev         skip / go back (also \"next song\", \"skip this\")
+  djc fav | favorite      favorite the current track (also \"fav current\")
+  djc mark                mark what is playing: star it if you own it, note it if
+                           not, keeping the audio when that is the only thing that
+                           can still help. On a stream whose title just changed,
+                           say \"mark this\" or \"mark previous\"
+  djc heard [all|marks|limit <n>]
+                          read the heard ledger back: last session, marks first,
+                           unowned only. The first line is the coverage line; a
+                           marked row that kept audio carries [tape <n>: ...]
+  djc heard keep <n> | drop <n>
+                          pin that tape segment against the sweep, or release it
+  djc radio               endless radio from what is playing; it keeps going
+                           (\"radio random\" to start cold, \"radio off\" to stop)
+  djc vol <0-100>         set volume
+  djc random | repeat | single | consume [on|off]
+                          flip a playback mode (or set it); the card shows
+                           which are on
+  djc sleep | wake        what is armed: the sleep timer / the wake alarm
+                           (\"sleep off\", \"wake off\" cancel; arm one in words,
+                           e.g. \"sleep in 30 minutes\", \"wake me at 7\")
+  djc clear               clear the queue (asks first)
+  djc stations import [PATH ...] [--dry-run]
+                          save every .pls under PATH as an internet radio
+                           station (idempotent: a second run writes nothing).
+                           With no PATH, reads $HYPODJ_STATIONS_DIR
+  djc stations list | rm <name>
+                          list / remove saved stations
+  djc store               the offline mirror: what is held, what is still coming,
+                           and every favourite that did not fit
+  djc store limit <size>  how much disk the mirror may use (24G, 500M; \"default\"
+                           restores the configured cap)
+  djc store frontier      the whole ranked order, best to worst, with why
+  djc store now | pause | resume
+                          reconcile now / suspend bulk mirroring / resume it
+  djc journal             what the daemon did, newest first - each line is the
+                           daemon's OWN words for what happened, not a guess
+  djc undo                retract the newest thing that can still be retracted
+                           (it expires the moment anything else touches the world)
+  djc <anything else>     natural language: e.g. \"fade out\", \"stop after this
+                           album\", \"wake me at 7 with jazz\" - echoed + confirmed
+
+OPTIONS:
+  --host <h>    daemon host (default 127.0.0.1)
+  --port <p>    daemon port (default 6600, the daemon's default bind; a dev
+                daemon on another port: HYPODJ_PORT)
+  --nl-translator <auto|rules|daemon|claude|cc>
+                pin the NL path (default auto = Claude Code when available,
+                else daemon nl; rules/daemon force daemon nl, claude/cc prefer
+                Claude Code). Probes: rules. Also HYPODJ_NL_TRANSLATOR.
+                May appear before or after the phrase.
+  -h, --help    this help
+  -V, --version print version and exit
+  --completions fish
+                print the fish completion script
+
+CONFIG precedence: flags > HYPODJ_HOST/HYPODJ_PORT > MPD_HOST/MPD_PORT
+                   > 127.0.0.1:6600
+";
+
+/// The workspace version the `dj` -> `djc` rename ships in. While the crate version
+/// equals it, `dj` invoked with arguments (the old CLI usage) prints a one-line
+/// notice that the CLI is now `djc`; any later release (0.3.1, 0.4.0) drops it
+/// without anyone having to remember to delete it.
+pub const RENAME_NOTICE_VERSION: &str = "0.3.0";
+
+/// The one-line rename notice for `version`, or `None` once the rename release
+/// has passed. Pure so the version gate is testable without a process.
+pub fn rename_notice(version: &str) -> Option<&'static str> {
+    (version == RENAME_NOTICE_VERSION).then_some(
+        "dj: the jukebox CLI is now `djc` (`dj` alone opens the listening shell); \
+         running this as `djc`",
+    )
+}
+
+/// The jukebox CLI entry point for the `djc` bin.
+pub fn main() {
+    main_as("djc");
+}
+
+/// The jukebox CLI run under the name `prog` (`djc`, or `dj` falling back to it):
+/// the name only shapes `--version` and the generated completions.
+pub fn main_as(prog: &str) {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // --version short-circuits before any socket work. Enriched display version:
+    // base semver + commits-since-tag + git short hash on source builds.
+    if raw.iter().any(|a| a == "-V" || a == "--version") {
+        println!(
+            "{prog} {}",
+            hypodj_build_info::version(
+                env!("CARGO_PKG_VERSION"),
+                option_env!("HYPODJ_BUILD_INFO"),
+            )
+        );
+        return;
+    }
+    // `--completions fish` is generated from the verb tables, before any socket work.
+    if let Some(i) = raw.iter().position(|a| a == "--completions") {
+        match raw.get(i + 1).map(String::as_str) {
+            Some("fish") => print!("{}", completions::fish_for(prog)),
+            _ => {
+                eprintln!("djc: --completions needs a shell (fish)");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+    match run(raw) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("djc: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse leading --host/--port/--help flags, leaving the phrase words.
+struct Parsed {
+    host: Option<String>,
+    port: Option<u16>,
+    /// Optional `--nl-translator` pin (auto / rules / claude).
+    nl_translator: Option<String>,
+    help: bool,
+    words: Vec<String>,
+}
+
+fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
+    let mut host = None;
+    let mut port = None;
+    let mut nl_translator = None;
+    let mut help = false;
+    let mut words = Vec::new();
+    let mut it = raw.into_iter();
+    while let Some(a) = it.next() {
+        // `--flag=value` spellings, accepted anywhere like the space-separated form.
+        if let Some(v) = a.strip_prefix("--nl-translator=") {
+            nl_translator = Some(v.to_string());
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--host=") {
+            host = Some(v.to_string());
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--port=") {
+            port = Some(
+                v.parse::<u16>()
+                    .map_err(|_| format!("bad port: {v}"))?,
+            );
+            continue;
+        }
+        match a.as_str() {
+            "--host" => host = Some(it.next().ok_or("--host needs a value")?),
+            "--port" => {
+                let v = it.next().ok_or("--port needs a value")?;
+                port = Some(v.parse::<u16>().map_err(|_| format!("bad port: {v}"))?);
+            }
+            "--nl-translator" => {
+                nl_translator = Some(it.next().ok_or("--nl-translator needs a value")?);
+            }
+            "-h" | "--help" => help = true,
+            // `stations` is a FILESYSTEM gesture, not a phrase: its arguments are
+            // PATHS, and several of the real .pls files carry spaces in their names.
+            // So keep the argv boundaries the shell already established, verbatim,
+            // instead of re-splitting a path into fragments that name nothing.
+            // Claimed only as the FIRST phrase word; a later "stations" is NL text.
+            "stations" if words.is_empty() => {
+                words.push(a);
+                words.extend(it.by_ref());
+                break;
+            }
+            _ => {
+                // Known global flags are recognized ANYWHERE on the command line, so a
+                // trailing `djc "play something calmer" --nl-translator rules` still pins
+                // Rules instead of polluting the phrase and silently taking Auto.
+                // Unknown --words (e.g. `heard --all`) stay phrase text. Flatten each
+                // argv element on whitespace so a single quoted arg ("favorite this
+                // song") and the unquoted form both yield the same WORD tokens.
+                words.extend(a.split_whitespace().map(str::to_string));
+            }
+        }
+    }
+    Ok(Parsed { host, port, nl_translator, help, words })
+}
+
+fn run(raw: Vec<String>) -> Result<(), MpdError> {
+    let parsed = match parse_args(raw) {
+        Ok(p) => p,
+        Err(e) => return Err(MpdError::Io(e)),
+    };
+    if parsed.help {
+        print!("{HELP}");
+        return Ok(());
+    }
+
+    // `stations` is intercepted BEFORE route(): route is deliberately a pure
+    // verb-vs-NL split and is SHARED with dj-gui, so a filesystem gesture does not
+    // belong in it - and left to the fallthrough, "stations import" would be sent to
+    // the NL translator.
+    if parsed.words.first().is_some_and(|w| w == "stations") {
+        let env = Env { get: &|k| std::env::var(k).ok() };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        // A partial import is reported in full and THEN exits non-zero, so a script
+        // sees the failure while the files that did land stay landed.
+        if !stations::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `heard` is intercepted BEFORE route() for the same stated reason as `stations`:
+    // route is deliberately a pure verb-vs-NL split and is SHARED with dj-gui, so it
+    // knows only the bare views (`heard`, `heard all`, `heard marks`) plus the two tape
+    // pins - and left to the fallthrough, `heard limit 5` and `heard --all` would be
+    // handed to the NL translator, which has no heard action at all.
+    if parsed.words.first().is_some_and(|w| w == "heard") {
+        let env = Env { get: &|k| std::env::var(k).ok() };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        if !heard::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `store` is intercepted BEFORE route() for the third time and the same stated
+    // reason: route knows no store verb at all, so every form of this - including the
+    // bare one - would be handed to the NL translator, which has no store action.
+    if parsed.words.first().is_some_and(|w| w == "store") {
+        let env = Env { get: &|k| std::env::var(k).ok() };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        if !store::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `journal` / `undo` are intercepted BEFORE route() for the fourth time and the
+    // same stated reason: route knows neither verb, so both would be handed to the
+    // NL translator, which has no journal action - and "undo" is the last phrase
+    // that should reach a model.
+    if parsed.words.first().is_some_and(|w| w == "journal" || w == "undo") {
+        let env = Env { get: &|k| std::env::var(k).ok() };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        let ok = if parsed.words[0] == "journal" {
+            journal::run(&mut conn, &parsed.words[1..])?
+        } else if parsed.words.len() == 1 {
+            journal::undo(&mut conn)?
+        } else {
+            // `undo` takes no argument here on purpose: naming an entry that is not
+            // the top is a refusal, and the CLI has no listing open to name from.
+            println!("usage: djc undo (no arguments - it retracts the newest one)");
+            false
+        };
+        if !ok {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let action = route::route(&parsed.words);
+    if let Action::Help = action {
+        print!("{HELP}");
+        println!("\n{}", nl::not_understood_hint());
+        return Ok(());
+    }
+
+    let env = Env { get: &|k| std::env::var(k).ok() };
+    let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+    let pin = match nl::NlTranslatorPin::resolve(
+        parsed.nl_translator.as_deref(),
+        std::env::var("HYPODJ_NL_TRANSLATOR").ok().as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return Err(MpdError::Io(e)),
+    };
+    let mut conn = MpdConn::connect(&host, port)?;
+
+    match action {
+        Action::NowPlaying => print_card(&mut conn)?,
+        Action::Queue => {
+            let pairs = conn.command("playlistinfo")?;
+            println!("{}", render::render_queue(&pairs));
+        }
+        Action::Command(line) => run_verb(&mut conn, &line)?,
+        Action::ClearConfirm => {
+            if confirm("clear the whole queue?") {
+                conn.command("clear")?;
+                print_card(&mut conn)?;
+            } else {
+                println!("cancelled");
+            }
+        }
+        Action::FavoriteCurrent => favorite_current(&mut conn)?,
+        Action::ToggleMode(m) => {
+            // Resolve the flip against the daemon's CURRENT flag on this same socket.
+            let status = conn.command("status")?;
+            let line = model::now_playing(&status, &[]).modes.toggle_command(m);
+            run_verb(&mut conn, &line)?
+        }
+        Action::Nl(phrase) => nl_handshake(&mut conn, &phrase, pin)?,
+        Action::Help => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Star the currently playing track. The server exposes only
+/// `playlistadd Starred <uri>` (no favorite-current shorthand), so resolve the
+/// current song's uri from `currentsong` first.
+///
+/// A raw stream is not a library song and has no star surface of its own, so the
+/// gesture goes to the daemon's `mark` verb, which holds everything the decision needs
+/// (the previous ICY title, the subject ages, the provenance-stamped library match, the
+/// ledger) and answers with the one sentence a human reads: it stars the local copy
+/// when the subject is owned and unambiguous, notes a pointer row when it is not, and
+/// refuses to pick between two plausible subjects rather than guessing one.
+fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
+    let current = conn.command("currentsong")?;
+    let np = model::now_playing(&[], &current);
+    let uri = match np.file.as_deref() {
+        Some(u) => u,
+        None => {
+            println!("nothing is playing to favorite");
+            return Ok(());
+        }
+    };
+    if !uri.starts_with("song/") {
+        return run_verb(conn, "mark");
+    }
+    let uri = uri.to_string();
+    let uri = uri.as_str();
+    match conn.command(&format!("playlistadd Starred {uri}")) {
+        Ok(_) => {
+            let label = np.title.as_deref().unwrap_or(uri);
+            println!("favorited: {label}");
+            print_card(conn)?;
+        }
+        Err(MpdError::Ack(msg)) => println!("could not favorite: {msg}"),
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// Run one command line and print the card - plus, first, whatever the verb ANSWERED.
+/// Most MPD verbs answer with a bare OK and the card is the whole feedback, but `mark`
+/// returns `mark_result`, the one sentence a human reads. Dropping it would make
+/// `djc mark` succeed in silence, which is the precise bug the gesture exists to end.
+fn run_verb(conn: &mut MpdConn, line: &str) -> Result<(), MpdError> {
+    let pairs = conn.command(line)?;
+    if let Some((_, sentence)) = pairs.iter().find(|(k, _)| k == "mark_result") {
+        println!("{sentence}");
+    }
+    if let Some(sentence) = model::schedule_reply(&pairs) {
+        println!("{sentence}");
+    }
+    print_card(conn)
+}
+
+/// Fetch status + currentsong on the SAME connection and print the card.
+fn print_card(conn: &mut MpdConn) -> Result<(), MpdError> {
+    let status = conn.command("status")?;
+    let current = conn.command("currentsong")?;
+    let np = model::now_playing(&status, &current);
+    println!("{}", render::render_card(&np));
+    Ok(())
+}
+
+/// The full NL handshake, all on the one open socket. Under `cc` (and only when the
+/// pin prefers Claude and the `claude` CLI is present) the phrase is first translated
+/// CLIENT-SIDE by Claude Code into a validated Plan IR, echoed + confirmed here, and
+/// armed via a normal `plan add <dsl>` (re-clamped + dry-run validated daemon-side,
+/// the same trust boundary as `nl confirm`). Pin `rules` (env `HYPODJ_NL_TRANSLATOR`
+/// or `--nl-translator`) skips CC so probes share one translator path. When `cc` is
+/// off, `claude` is absent, the pin is rules, or the call fails, it falls through to
+/// today's daemon `nl` path unchanged.
+fn nl_handshake(
+    conn: &mut MpdConn,
+    phrase: &str,
+    pin: nl::NlTranslatorPin,
+) -> Result<(), MpdError> {
+    // NOTE: the latent-field pull is set DAEMON-SIDE at the confirmed enqueue
+    // (`plan_enqueue`), never speculatively primed here before the user confirms - a
+    // rejected or non-enqueue ask must never leave a lingering bias behind.
+    #[cfg(feature = "cc")]
+    {
+        // Pin `rules` skips the Claude Code side door so probes share one translator
+        // path with the TUI. Auto / claude keep today's try-CC-then-daemon behavior.
+        if pin.prefer_claude() && hypodj_nl::cc::cc_available() {
+            match cc_nl_handshake(conn, phrase)? {
+                true => return Ok(()),
+                // The CC call failed (spawn/parse/no-DSL); fall through to the daemon.
+                false => {}
+            }
+        }
+    }
+    let _ = pin; // used under feature = "cc"; keep signature stable without cc.
+    let req = nl::nl_request(phrase);
+    let pairs = match conn.command(&req) {
+        Ok(p) => p,
+        // An ACK here is a translate failure: map to a friendly reason.
+        Err(MpdError::Ack(msg)) => {
+            println!("{}", nl::map_ack_reason(&msg));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+
+    // A READ-side question is answered immediately (no plan, nothing to confirm).
+    if let Some(answer) = nl::answer_from_pairs(&pairs) {
+        println!("{answer}");
+        return Ok(());
+    }
+    let token = match nl::token_from_pairs(&pairs) {
+        Some(t) => t,
+        None => {
+            println!("the server did not return a plan to confirm");
+            return Ok(());
+        }
+    };
+
+    if let Some(echo) = nl::echo_from_pairs(&pairs) {
+        let parts = nl::split_echo(&echo);
+        if let Some(trust) = &parts.trust {
+            println!("({trust})");
+        }
+        for step in &parts.steps {
+            println!("{step}");
+        }
+        // Wake caveat surfaced as a warning ABOVE the prompt.
+        if let Some(note) = &parts.note {
+            println!("\n! {note}");
+        }
+    }
+
+    if confirm("confirm?") {
+        match conn.command(&format!("nl confirm {token}")) {
+            Ok(plan_pairs) => {
+                for line in nl::confirm_lines(&plan_pairs) {
+                    println!("{line}");
+                }
+                print_card(conn)?;
+            }
+            Err(MpdError::Ack(msg)) => println!("{}", nl::map_ack_reason(&msg)),
+            Err(e) => return Err(e),
+        }
+    } else {
+        // Best-effort cancel on the open connection before exiting.
+        let _ = conn.command(&format!("nl cancel {token}"));
+        println!("cancelled");
+    }
+    Ok(())
+}
+
+/// The Claude Code client-side NL handshake. Reads the small context the client
+/// already has (queue length, is-playing) from `status`, then makes ONE non-streamed
+/// `claude` call (`--output-format json`): a simple "thinking..." indicator on stderr
+/// keeps the multi-second call from looking frozen (stdout stays clean for the echo +
+/// confirm), and the settled VALIDATED RawPlan is echoed via describe_plan, confirmed
+/// y/N, and armed via `plan add <dsl>`. Returns Ok(true) when it handled the phrase
+/// (armed, cancelled, or a loud user-facing miss), Ok(false) to fall through to the
+/// daemon `nl` path (spawn/parse failure, or a plan not DSL-expressible).
+#[cfg(feature = "cc")]
+fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
+    let status = conn.command("status")?;
+    let queue_len = status
+        .iter()
+        .find(|(k, _)| k == "playlistlength")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let is_playing = status
+        .iter()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v == "play")
+        .unwrap_or(false);
+
+    // GROUND the prompt with REAL library candidates so Claude picks a genre/artist/
+    // query that ACTUALLY exists instead of guessing a blind string. Both reads run on
+    // this same socket BEFORE the claude call and DEGRADE CLEANLY (empty on any MPD
+    // error) - an empty context reproduces today's un-grounded prompt, never a failure.
+    let ctx = hypodj_nl::cc::LibraryContext {
+        genres: hypodj_client::grounding::list_genres(conn),
+        candidates: hypodj_client::grounding::search_labels(conn, phrase, 20),
+        notes: Vec::new(),
+    };
+
+    // Simple "thinking..." indicator on stderr (stdout stays clean for the echo +
+    // y/N). The blocking multi-second call is fine here - the CLI is a one-shot; the
+    // indicator keeps it from ever looking frozen. One non-streamed call returns the
+    // settled VALIDATED plan directly (the installed CLI returns the result intact).
+    eprint!("Claude Code: thinking...");
+    let _ = std::io::stderr().flush();
+    let result = hypodj_nl::cc::run_claude(phrase, queue_len, is_playing, &ctx);
+    // Clear the indicator line before any output.
+    eprint!("\r\x1b[2K");
+    let _ = std::io::stderr().flush();
+
+    let raw = match result {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("Claude Code could not translate that ({e}); trying the built-in translator.");
+            return Ok(false);
+        }
+    };
+
+    let dsl = match hypodj_nl::render_dsl(&raw) {
+        Some(d) => d,
+        None => {
+            // A validated plan the keyword DSL cannot express (e.g. time_remaining);
+            // fall through so the daemon rules can have a go.
+            return Ok(false);
+        }
+    };
+
+    println!("(via Claude Code)");
+    println!("{}", hypodj_nl::describe_plan(&raw));
+
+    if confirm("confirm?") {
+        match conn.command(&format!("plan add {dsl}")) {
+            Ok(plan_pairs) => {
+                // Prefer the REAL execute-time outcome ("added N", "added 0 - no
+                // matches for X", "played X") the daemon returns for an immediate
+                // plan; fall back to the plan-time armed line for a deferred plan.
+                match nl::result_line_from_pairs(&plan_pairs) {
+                    Some(line) => println!("{line}"),
+                    None => {
+                        for (k, v) in &plan_pairs {
+                            if k == "plan_id" {
+                                println!("{}", nl::armed_line(v));
+                            }
+                        }
+                    }
+                }
+                print_card(conn)?;
+            }
+            Err(MpdError::Ack(msg)) => println!("{}", nl::map_ack_reason(&msg)),
+            Err(e) => return Err(e),
+        }
+    } else {
+        println!("cancelled");
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_notice_shows_only_in_the_rename_release() {
+        assert!(rename_notice(RENAME_NOTICE_VERSION).is_some());
+        assert!(rename_notice("0.3.0").is_some(), "the rename ships in 0.3.0");
+        for later in ["0.3.1", "0.3.10", "0.4.0", "1.0.0", "0.2.0"] {
+            assert_eq!(rename_notice(later), None, "{later} must not warn");
+        }
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_splits_single_quoted_phrase_into_word_tokens() {
+        // `djc "favorite this song"` arrives as ONE argv element; it must flatten to
+        // per-word tokens so route() sees the bare-favorite phrase (the live miss).
+        let p = parse_args(v(&["favorite this song"])).unwrap();
+        assert_eq!(p.words, v(&["favorite", "this", "song"]));
+        assert_eq!(route::route(&p.words), Action::FavoriteCurrent);
+    }
+
+    #[test]
+    fn parse_args_keeps_station_paths_whole() {
+        // `stations` takes PATHS, not phrase words. Several of the real .pls files carry
+        // spaces and a comma in their names, so re-splitting an argv element on
+        // whitespace would turn one real path into fragments that name nothing.
+        let p = parse_args(v(&[
+            "stations",
+            "import",
+            "/home/u/radio streams/Moon Mission Recordings, Tokyo Deep and Electronic.pls",
+            "--dry-run",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.words,
+            v(&[
+                "stations",
+                "import",
+                "/home/u/radio streams/Moon Mission Recordings, Tokyo Deep and Electronic.pls",
+                "--dry-run",
+            ])
+        );
+        // The leading flags still parse, and `stations` still reaches the gesture.
+        let p = parse_args(v(&["--port", "6612", "stations", "import", "/a b/c"])).unwrap();
+        assert_eq!(p.port, Some(6612));
+        assert_eq!(p.words, v(&["stations", "import", "/a b/c"]));
+    }
+
+    #[test]
+    fn parse_args_unquoted_words_match_quoted_form() {
+        // Quoted and unquoted phrasings produce IDENTICAL tokens on both surfaces.
+        let quoted = parse_args(v(&["fav current music"])).unwrap();
+        let unquoted = parse_args(v(&["fav", "current", "music"])).unwrap();
+        assert_eq!(quoted.words, unquoted.words);
+        assert_eq!(quoted.words, v(&["fav", "current", "music"]));
+        assert_eq!(route::route(&quoted.words), Action::FavoriteCurrent);
+    }
+
+    #[test]
+    fn parse_args_collapses_internal_whitespace_for_nl() {
+        // Repeated internal whitespace collapses; NL reconstruction stays clean.
+        let p = parse_args(v(&["wake me   at 7  with jazz"])).unwrap();
+        assert_eq!(
+            route::route(&p.words),
+            Action::Nl("wake me at 7 with jazz".into())
+        );
+    }
+
+    #[test]
+    fn heard_must_be_intercepted_because_route_would_send_it_to_the_translator() {
+        // This is WHY `heard` is claimed before route(), exactly as `stations` is:
+        // route is a pure verb-vs-NL split SHARED with dj-gui, so it knows only the
+        // bare views. Every argument-carrying form falls through to NL, where the
+        // question about last night's listening would come back as a phrasing hint.
+        assert_eq!(
+            route::route(&v(&["heard", "limit", "5"])),
+            Action::Nl("heard limit 5".into())
+        );
+        assert_eq!(route::route(&v(&["heard", "--all"])), Action::Nl("heard --all".into()));
+        // And the tokens survive parse_args intact, so the interception sees them.
+        let p = parse_args(v(&["heard", "--all"])).unwrap();
+        assert_eq!(p.words, v(&["heard", "--all"]));
+        assert_eq!(p.words.first().map(String::as_str), Some("heard"));
+        let p = parse_args(v(&["--port", "6699", "heard", "limit", "5"])).unwrap();
+        assert_eq!(p.port, Some(6699));
+        assert_eq!(p.words, v(&["heard", "limit", "5"]));
+        // The bare views DO route, which is what makes `:heard` work in the TUI.
+        assert_eq!(route::route(&v(&["heard"])), Action::Command("heard".into()));
+        assert_eq!(route::route(&v(&["heard", "all"])), Action::Command("heard all".into()));
+    }
+
+    #[test]
+    fn undo_must_be_intercepted_because_route_would_hand_it_to_a_model() {
+        // WHY `journal`/`undo` are claimed before route(): route knows neither verb,
+        // so both fall through to the NL translator. "undo" is the single last
+        // phrase that should reach a model - a retraction that got re-interpreted as
+        // an intent is worse than no retraction at all.
+        assert_eq!(route::route(&v(&["undo"])), Action::Nl("undo".into()));
+        assert_eq!(route::route(&v(&["journal"])), Action::Nl("journal".into()));
+        // And the tokens survive parse_args intact, so the interception sees them.
+        let p = parse_args(v(&["--port", "6699", "undo"])).unwrap();
+        assert_eq!(p.port, Some(6699));
+        assert_eq!(p.words, v(&["undo"]));
+        assert_eq!(p.words.first().map(String::as_str), Some("undo"));
+    }
+
+    #[test]
+    fn store_must_be_intercepted_because_route_knows_no_store_verb_at_all() {
+        // WHY `store` is claimed before route(), and it is a stronger case than
+        // `heard`: route knows the bare `heard` views, but it knows NO store form -
+        // so even `djc store` would be handed to the NL translator, which has no store
+        // action, and the answer to "what did not fit and why" would come back as a
+        // phrasing hint.
+        assert_eq!(route::route(&v(&["store"])), Action::Nl("store".into()));
+        assert_eq!(
+            route::route(&v(&["store", "frontier"])),
+            Action::Nl("store frontier".into())
+        );
+        // And the tokens survive parse_args intact, so the interception sees them.
+        let p = parse_args(v(&["store", "frontier"])).unwrap();
+        assert_eq!(p.words, v(&["store", "frontier"]));
+        assert_eq!(p.words.first().map(String::as_str), Some("store"));
+        let p = parse_args(v(&["--port", "6699", "store"])).unwrap();
+        assert_eq!(p.port, Some(6699));
+        assert_eq!(p.words, v(&["store"]));
+    }
+
+    #[test]
+    fn parse_args_nl_translator_flag() {
+        let p = parse_args(v(&[
+            "--nl-translator",
+            "rules",
+            "--port",
+            "6610",
+            "play something calmer",
+        ]))
+        .unwrap();
+        assert_eq!(p.nl_translator.as_deref(), Some("rules"));
+        assert_eq!(p.port, Some(6610));
+        assert_eq!(p.words, v(&["play", "something", "calmer"]));
+        assert_eq!(
+            nl::NlTranslatorPin::resolve(p.nl_translator.as_deref(), Some("claude")).unwrap(),
+            nl::NlTranslatorPin::Rules
+        );
+    }
+
+    #[test]
+    fn parse_args_flags_still_parse_before_phrase() {
+        let p = parse_args(v(&["--host", "example", "--port", "6601", "next song"])).unwrap();
+        assert_eq!(p.host.as_deref(), Some("example"));
+        assert_eq!(p.port, Some(6601));
+        assert_eq!(p.words, v(&["next", "song"]));
+    }
+
+    #[test]
+    fn parse_args_trailing_nl_translator_after_phrase_still_pins() {
+        // The merged-review blocking bug: parse_args stopped at the first non-flag
+        // word, so `djc "play something calmer" --nl-translator rules` swallowed the
+        // flag into the phrase and silently took Auto. Trailing globals must still
+        // pin (or fail loud on a bad value), never pollute the phrase.
+        let p = parse_args(v(&["play something calmer", "--nl-translator", "rules"])).unwrap();
+        assert_eq!(p.nl_translator.as_deref(), Some("rules"));
+        assert_eq!(p.words, v(&["play", "something", "calmer"]));
+        assert_eq!(
+            nl::NlTranslatorPin::resolve(p.nl_translator.as_deref(), None).unwrap(),
+            nl::NlTranslatorPin::Rules
+        );
+        // Unquoted phrase words plus trailing pin behave the same.
+        let p = parse_args(v(&["play", "something", "calmer", "--nl-translator", "rules"])).unwrap();
+        assert_eq!(p.nl_translator.as_deref(), Some("rules"));
+        assert_eq!(p.words, v(&["play", "something", "calmer"]));
+        // `--flag=value` spelling after the phrase also pins.
+        let p = parse_args(v(&["play something calmer", "--nl-translator=rules"])).unwrap();
+        assert_eq!(p.nl_translator.as_deref(), Some("rules"));
+        assert_eq!(p.words, v(&["play", "something", "calmer"]));
+        // A trailing flag with no value fails loud, never silent Auto.
+        assert!(parse_args(v(&["play something calmer", "--nl-translator"])).is_err());
+    }
+}
+
+/// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm; bare
+/// Enter, "n", EOF (Ctrl-D), all mean No.
+pub(crate) fn confirm(question: &str) -> bool {
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) => false, // EOF
+        Ok(_) => matches!(line.trim().to_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
+    }
+}

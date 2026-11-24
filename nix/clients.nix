@@ -6,20 +6,21 @@
 , installShellFiles
 # DISPLAY-only enrichment (from flake.nix): the semver read from Cargo.toml and
 # the HYPODJ_BUILD_INFO grammar baked into the runtime env (the nix sandbox has
-# no .git, so this is what `dj --version` / `dj-gui --version` shows).
+# no .git, so this is what `djc --version` / `dj-gui --version` shows).
 , buildInfo ? ""
 , cargoVersion ? "0.1.0"
 }:
 
-# The HypoDJ clients: the `dj` jukebox CLI and the `dj-gui` interactive TUI.
+# The HypoDJ clients: the `djc` jukebox CLI, the `dj` listening shell (the TUI on
+# an interactive terminal with no arguments, otherwise `djc`), and the `dj-gui` TUI.
 #
 # The `cc` feature is now DEFAULT (a plain `cargo build` compiles the client-side
 # Claude Code CLI backend), so both bins pull `hypodj-nl` -> `hypodj-core`. That
 # transitively links libmpv (hypodj-core's real player), so - unlike the old
 # thin-client build - this derivation DOES need mpv at build + link time. The owner
 # deliberately dropped the thin-client "never link libmpv" invariant to make cc the
-# default. `cargo build --bin dj --bin dj-gui` still only compiles the dependency
-# graph of the two bins (now including hypodj-nl + hypodj-core, not hypodj-daemon).
+# default. `cargo build --bin djc --bin dj --bin dj-gui` still only compiles the
+# dependency graph of the bins (now including hypodj-nl + hypodj-core, not hypodj-daemon).
 #
 # Runtime cc is gated on `claude` being on PATH (cc_available), so this package runs
 # unchanged on a machine without it (falls back to the daemon `nl` path). The check
@@ -45,7 +46,7 @@ rustPlatform.buildRustPackage {
   # costs one extra link.
   # dj-search-provider (the GNOME Shell search provider) is the same kind of client:
   # hypodj-client + zbus, no hypodj-core, no libmpv.
-  cargoBuildFlags = [ "--bin" "dj" "--bin" "dj-gui" "--bin" "dj-mcp" "--bin" "dj-search-provider" ];
+  cargoBuildFlags = [ "--bin" "djc" "--bin" "dj" "--bin" "dj-gui" "--bin" "dj-mcp" "--bin" "dj-search-provider" ];
 
   # Test only the client crates (offline, no network). The cc tests are pure - a
   # missing `claude` just means cc_available() is false, never a live call.
@@ -68,7 +69,7 @@ rustPlatform.buildRustPackage {
   # spawns it as a child with a cleared environment - so a shell wrapper would be a
   # process and an indirection bought for nothing.
   postInstall = ''
-    for b in dj dj-gui; do
+    for b in djc dj dj-gui; do
       wrapProgram $out/bin/$b \
         --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
         --set-default HYPODJ_BUILD_INFO ${lib.escapeShellArg buildInfo}
@@ -76,8 +77,9 @@ rustPlatform.buildRustPackage {
     # Generated from the verb tables (route::ROUTED_VERBS + the CLI's own), never
     # hand-written, so a rebuild ships completions that match the router. Run via
     # the wrapper so libmpv.so.2 resolves.
+    $out/bin/djc --completions fish > djc.fish
     $out/bin/dj --completions fish > dj.fish
-    installShellCompletion --fish dj.fish
+    installShellCompletion --fish djc.fish dj.fish
 
     # GNOME Shell search provider registration: the provider .ini (read by the Shell
     # from share/gnome-shell/search-providers), the .desktop it names (the Shell
@@ -96,8 +98,11 @@ rustPlatform.buildRustPackage {
   '';
 
   meta = {
-    description = "HypoDJ clients: the dj jukebox CLI, the dj-gui TUI, the dj-mcp agent surface, and the GNOME search provider";
+    description = "HypoDJ clients: the djc jukebox CLI, the dj listening shell, the dj-gui TUI, the dj-mcp agent surface, and the GNOME search provider";
     mainProgram = "dj";
-    license = with lib.licenses; [ mit asl20 ];
+    # FSL-1.1-MIT is source-available (free = false in nixpkgs) until each
+    # release converts to MIT after two years; consumers need allowUnfree or a
+    # predicate. The flake's own pkgs allow exactly these two packages.
+    license = lib.licenses.fsl11Mit;
   };
 }

@@ -112,15 +112,15 @@ pub enum MpdCommand {
     // ── queue ──────────────────────────────────────────────────────────
     Add(String),
     /// `addid <uri> [pos]` - add and return the assigned song id.
-    AddId(String, Option<usize>),
+    AddId(String, Option<QueuePos>),
     Clear,
     /// `delete <pos|range>` - remove a queue entry.
     Delete(Option<String>),
     /// `move FROM[:TO] TO` - move the half-open position range `start..end` so its
     /// first entry lands at `to`. `end` is `None` for an open `START:` range.
-    Move { start: usize, end: Option<usize>, to: usize },
+    Move { start: usize, end: Option<usize>, to: QueuePos },
     /// `moveid ID TO` - move the entry with MPD id `ID` to position `TO`.
-    MoveId(u64, usize),
+    MoveId(u64, QueuePos),
     /// `shuffle [START:END]` - shuffle the queue (or a half-open range of it) in place.
     Shuffle(Option<(usize, Option<usize>)>),
     /// `playlistinfo [pos|range]` - the current queue.
@@ -1091,6 +1091,38 @@ fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
 /// Parse an MPD position or half-open range: `N` is `(N, Some(N + 1))`, `N:M` is
 /// `(N, Some(M))`, and an open `N:` is `(N, None)` (to the end of the queue). A
 /// malformed spec or an inverted range (`M < N`) is `None` so the caller ACKs.
+/// A queue destination as MPD 0.23 spells it: an absolute index, or `+N` / `-N`
+/// relative to the CURRENT song (`+0` right after it, `-0` right before it).
+/// Dispatch resolves the relative forms against the live queue and ACKs when
+/// nothing is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuePos {
+    Abs(usize),
+    After(usize),
+    Before(usize),
+}
+
+/// Parse a [`QueuePos`]; `None` for anything that is not `[+-]?digits`.
+pub fn parse_queue_pos(s: &str) -> Option<QueuePos> {
+    if let Some(n) = s.strip_prefix('+') {
+        return parse_unsigned(n).map(QueuePos::After);
+    }
+    if let Some(n) = s.strip_prefix('-') {
+        return parse_unsigned(n).map(QueuePos::Before);
+    }
+    parse_unsigned(s).map(QueuePos::Abs)
+}
+
+/// A plain unsigned decimal: ASCII digits only. `usize::from_str` also accepts a
+/// leading `+`, which on the wire is MPD's RELATIVE-position marker, so it must
+/// never silently read as an absolute index.
+pub fn parse_unsigned(s: &str) -> Option<usize> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 pub fn parse_pos_range(spec: &str) -> Option<(usize, Option<usize>)> {
     match spec.split_once(':') {
         None => {
@@ -1509,20 +1541,20 @@ pub fn parse(line: &str) -> MpdCommand {
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         "add" => MpdCommand::Add(arg(0).unwrap_or_default()),
-        "addid" => match arg(1).map(|s| s.parse::<usize>()) {
+        "addid" => match arg(1).map(|s| parse_queue_pos(&s)) {
             None => MpdCommand::AddId(arg(0).unwrap_or_default(), None),
-            Some(Ok(pos)) => MpdCommand::AddId(arg(0).unwrap_or_default(), Some(pos)),
+            Some(Some(pos)) => MpdCommand::AddId(arg(0).unwrap_or_default(), Some(pos)),
             // A bad position is a loud ACK, never a silent append.
-            Some(Err(_)) => MpdCommand::Unsupported(line.to_string()),
+            Some(None) => MpdCommand::Unsupported(line.to_string()),
         },
         "clear" => MpdCommand::Clear,
         "delete" => MpdCommand::Delete(arg(0)),
-        "move" => match (arg(0).as_deref().and_then(parse_pos_range), arg(1).and_then(|s| s.parse().ok())) {
+        "move" => match (arg(0).as_deref().and_then(parse_pos_range), arg(1).as_deref().and_then(parse_queue_pos)) {
             (Some((start, end)), Some(to)) => MpdCommand::Move { start, end, to },
             _ => MpdCommand::Unsupported(line.to_string()),
         },
-        "moveid" => match (arg(0).and_then(|s| s.parse().ok()), arg(1).and_then(|s| s.parse().ok())) {
-            (Some(id), Some(to)) => MpdCommand::MoveId(id, to),
+        "moveid" => match (arg(0).as_deref().and_then(parse_unsigned), arg(1).as_deref().and_then(parse_queue_pos)) {
+            (Some(id), Some(to)) => MpdCommand::MoveId(id as u64, to),
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         "shuffle" => match arg(0) {
@@ -1546,11 +1578,16 @@ pub fn parse(line: &str) -> MpdCommand {
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         "playlistadd" => MpdCommand::PlaylistAdd(arg(0).unwrap_or_default(), arg(1).unwrap_or_default()),
-        "playlistdelete" => MpdCommand::PlaylistDelete(
-            arg(0).unwrap_or_default(),
-            arg(1).and_then(|s| s.parse().ok()).unwrap_or(0),
-        ),
-        "playlistclear" => MpdCommand::PlaylistClear(arg(0).unwrap_or_default()),
+        // Both are Navidrome writes (for Starred, an unstar): a missing name or a
+        // missing / non-integer position is a no-op ACK, never "song 0".
+        "playlistdelete" => match (arg(0), arg(1).as_deref().and_then(parse_unsigned)) {
+            (Some(name), Some(pos)) if !name.is_empty() && args.len() == 2 => MpdCommand::PlaylistDelete(name, pos),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "playlistclear" => match arg(0) {
+            Some(name) if !name.is_empty() && args.len() == 1 => MpdCommand::PlaylistClear(name),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
         "lsinfo" => MpdCommand::LsInfo(arg(0)),
         "listall" | "listallinfo" => MpdCommand::ListAllInfo(arg(0)),
         // find/search take `TAG VALUE ...` filters; keep the tag->value pairs so
@@ -1632,16 +1669,20 @@ mod parse_tests {
         assert_eq!(parse_pos_range("2:"), Some((2, None)));
         assert_eq!(parse_pos_range("5:2"), None);
         assert_eq!(parse_pos_range("x"), None);
-        assert!(matches!(parse("move 1 3"), MpdCommand::Move { start: 1, end: Some(2), to: 3 }));
-        assert!(matches!(parse("move 1:4 0"), MpdCommand::Move { start: 1, end: Some(4), to: 0 }));
+        assert!(matches!(parse("move 1 3"), MpdCommand::Move { start: 1, end: Some(2), to: QueuePos::Abs(3) }));
+        assert!(matches!(parse("move 1:4 0"), MpdCommand::Move { start: 1, end: Some(4), to: QueuePos::Abs(0) }));
         assert!(matches!(parse("move 1"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("move a 1"), MpdCommand::Unsupported(_)));
-        assert!(matches!(parse("moveid 7 2"), MpdCommand::MoveId(7, 2)));
+        assert!(matches!(parse("moveid 7 2"), MpdCommand::MoveId(7, QueuePos::Abs(2))));
         assert!(matches!(parse("moveid 7"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("moveid 7 +2"), MpdCommand::MoveId(7, QueuePos::After(2))));
+        assert!(matches!(parse("move 0 -0"), MpdCommand::Move { to: QueuePos::Before(0), .. }));
+        assert!(matches!(parse("move 0 +-1"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("moveid +7 1"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("shuffle"), MpdCommand::Shuffle(None)));
         assert!(matches!(parse("shuffle 1:3"), MpdCommand::Shuffle(Some((1, Some(3))))));
         assert!(matches!(parse("shuffle 3:1"), MpdCommand::Unsupported(_)));
-        assert!(matches!(parse("addid song/1 2"), MpdCommand::AddId(_, Some(2))));
+        assert!(matches!(parse("addid song/1 2"), MpdCommand::AddId(_, Some(QueuePos::Abs(2)))));
     }
 
     #[test]
@@ -2213,6 +2254,21 @@ mod parse_tests {
         }
         // A bare `save` with no name must NOT silently save an empty playlist.
         assert!(matches!(parse("save"), MpdCommand::Unsupported(_)));
+    }
+
+    // Regression (adversarial review B): `playlistdelete` is a Navidrome write
+    // (for Starred, an unstar). A missing, non-integer or negative position must
+    // ACK and change nothing - never fall back to deleting song 0 - and a bare
+    // `playlistclear` must not address an empty-named playlist.
+    #[test]
+    fn playlist_writes_reject_bad_arguments() {
+        assert!(matches!(parse("playlistdelete Mix 3"), MpdCommand::PlaylistDelete(n, 3) if n == "Mix"));
+        for bad in ["playlistdelete Mix", "playlistdelete Mix abc", "playlistdelete Mix -1", "playlistdelete Mix +1", "playlistdelete", "playlistdelete \"\" 0"] {
+            assert!(matches!(parse(bad), MpdCommand::Unsupported(_)), "{bad} must ACK");
+        }
+        assert!(matches!(parse("playlistclear Mix"), MpdCommand::PlaylistClear(n) if n == "Mix"));
+        assert!(matches!(parse("playlistclear"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("playlistclear \"\""), MpdCommand::Unsupported(_)));
     }
 
     #[test]

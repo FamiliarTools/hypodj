@@ -148,6 +148,10 @@ pub struct HeardRow {
     pub year: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isrc: Option<String>,
+    /// The recognized primary genre, when a recognition sent one. Feeds the
+    /// station-metadata cache ([`crate::station_meta`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre: Option<String>,
     /// The configured recognize interval at session open, so the coverage line can name
     /// the clock it is modelling even on a session with too few samples to derive one.
     #[serde(default, skip_serializing_if = "Option::is_none")]

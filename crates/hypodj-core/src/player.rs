@@ -230,6 +230,11 @@ pub enum PlayerEvent {
         queue_id: Option<QueueId>,
         name: Option<String>,
         title: Option<String>,
+        /// The station's ICY self-description (`icy-genre` / `icy-description`),
+        /// verbatim and trimmed; junk filtering is the station-metadata cache's job
+        /// ([`crate::station_meta::clean_icy_value`]). Task wxpnbso.
+        genre: Option<String>,
+        description: Option<String>,
     },
 }
 
@@ -1609,11 +1614,13 @@ fn mpv_actor(
                 // Stamped with the latched `current_qid` so the handler can only ever
                 // decorate the entry the metadata belongs to.
                 if let libmpv2::events::PropertyData::Node(node) = change {
-                    if let Some(meta) = parse_icy_metadata(node) {
+                    if let Some((meta, genre, description)) = parse_icy_metadata(node) {
                         let _ = evt_tx.blocking_send(PlayerEvent::StreamMetadata {
                             queue_id: current_qid,
                             name: meta.name,
                             title: meta.title,
+                            genre,
+                            description,
                         });
                     }
                 }
@@ -2290,15 +2297,39 @@ where
 /// dispatch is a no-op and the URL fallback stays. The pure key-selection lives in
 /// [`select_icy_metadata`] (an MpvNodeMapIter cannot be built offline), mirroring
 /// [`parse_astats_levels`] / [`select_astats_levels`].
-pub(crate) fn parse_icy_metadata(node: libmpv2::mpv_node::MpvNode) -> Option<StreamMeta> {
+///
+/// Also returns the station's `icy-genre` / `icy-description` (trimmed, blank as
+/// absent) beside the meta, for the station-metadata cache (task wxpnbso). They ride
+/// the same dispatch: a node with neither `icy-name` nor `icy-title` still yields
+/// `None`, so a genre alone never fires an event.
+pub(crate) fn parse_icy_metadata(
+    node: libmpv2::mpv_node::MpvNode,
+) -> Option<(StreamMeta, Option<String>, Option<String>)> {
     let map = node.map()?;
-    select_icy_metadata(map.map(|(key, value)| {
-        let s = match value {
-            libmpv2::mpv_node::MpvNode::String(s) => Some(s),
-            _ => None,
-        };
-        (key, s)
-    }))
+    let pairs: Vec<(String, Option<String>)> = map
+        .map(|(key, value)| {
+            let s = match value {
+                libmpv2::mpv_node::MpvNode::String(s) => Some(s),
+                _ => None,
+            };
+            (key, s)
+        })
+        .collect();
+    let meta = select_icy_metadata(pairs.iter().cloned())?;
+    let (genre, description) = select_icy_station_info(&pairs);
+    Some((meta, genre, description))
+}
+
+/// Pure pick of `icy-genre` / `icy-description` (case-insensitive keys, trimmed, a
+/// blank value as absent) from decoded metadata pairs.
+fn select_icy_station_info(pairs: &[(String, Option<String>)]) -> (Option<String>, Option<String>) {
+    let pick = |want: &str| {
+        pairs.iter().find_map(|(k, v)| {
+            let v = v.as_deref()?.trim();
+            (k.eq_ignore_ascii_case(want) && !v.is_empty()).then(|| v.to_string())
+        })
+    };
+    (pick("icy-genre"), pick("icy-description"))
 }
 
 /// Pure key-selection over decoded `(key, Option<String> value)` pairs: pick the
@@ -2470,6 +2501,17 @@ mod tests {
     // The ICY selector reads `icy-name` -> station and `icy-title` -> now-playing
     // out of a metadata map, case-insensitively, trims blanks, and returns None when
     // neither icy key is present (a plain / non-ICY node) so a dispatch is a no-op.
+    #[test]
+    fn icy_station_info_picks_genre_and_description() {
+        let pairs = vec![
+            ("icy-name".to_string(), Some("KFJC".to_string())),
+            ("ICY-Genre".to_string(), Some(" Eclectic ".to_string())),
+            ("icy-description".to_string(), Some("   ".to_string())),
+        ];
+        assert_eq!(select_icy_station_info(&pairs), (Some("Eclectic".to_string()), None));
+        assert_eq!(select_icy_station_info(&[]), (None, None));
+    }
+
     #[test]
     fn parse_icy_metadata_picks_station_and_title() {
         // A realistic mpv `metadata` map for an ICY stream also carries non-icy keys
@@ -2832,7 +2874,7 @@ mod tests {
             let mut got: Option<StreamMeta> = None;
             while std::time::Instant::now() < deadline {
                 match tokio::time::timeout(std::time::Duration::from_secs(1), events.recv()).await {
-                    Ok(Some(PlayerEvent::StreamMetadata { queue_id, name, title })) => {
+                    Ok(Some(PlayerEvent::StreamMetadata { queue_id, name, title, .. })) => {
                         assert_eq!(queue_id, Some(QueueId(1)), "metadata is stamped with the latched qid");
                         if name.is_some() || title.is_some() {
                             got = Some(StreamMeta { name, title, ..Default::default() });
