@@ -1,0 +1,24 @@
+
+[F1]Queue  [F2]Albums  [F3]Playlists  [F4]DJ  [F5]Search
+┌Albums────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌Now Playing─────────────────────────────┐┌Up Next─────────────────────────────┐
+│nothing playing                         ││nothing queued                      │
+│F5 to search, F4 to ask the DJ          ││F5 to search, F4 to ask the DJ      │
+│                                        ││                                    │
+│                                        ││                                    │
+│                                        ││                                    │
+│                                        ││                                    │
+│                                        ││                                    │
+│                                        ││                                    │
+│                                        ││                                    │
+│                                        ││                                    │
+└────────────────────────────────────────┘└────────────────────────────────────┘
+subsonic request: HTTP error: error sending request for url
+(http://10.77.0.1:4533/rest/getAlbumList2?u=fixture&t=5010e4dc665810ff99618a4...

@@ -1,0 +1,73 @@
+id = "drop-mid-song"
+goal = "You are listening to a song streamed from the server when the server drops. Understand what happened and what still plays."
+# Timeline: online at start, the drop happens at step 4, then real time passes.
+# `online` is the control run (no drop).
+start = "online"
+states = ["online", "blocked", "no_network"]
+min_steps = 0          # after the drop, the answer must come to the listener unasked
+step_budget = 4        # the scripted setup to start a streamed song
+script = [
+  "key F2",
+  "wait 2",
+  "key j",
+  "key j",
+  "key Enter",
+  "wait 5",
+  "net {state}",
+  "wait 10",
+  "snap ten-seconds-after",
+  "wait 40",
+  "snap fifty-seconds-after",
+  "wait 75",
+  "snap after-the-buffered-song-ends",
+  "wait 115",
+  "snap when-the-unfetched-song-is-due",
+]
+
+[[check]]
+name = "setup: a streamed (not held) song was playing before the drop"
+at = 6
+truth = ["status.state == play", "currentsong.Album == Stream Summit"]
+
+[[check]]
+name = "within 10s the screen says the server is gone"
+at = 9
+when = ["blocked", "no_network"]
+severity = "S0"
+screen_require_any = ["unreachable", "no network", "server down", "connection lost", "lost the server", "cannot reach"]
+
+[[check]]
+name = "control: no false alarm while online"
+when = ["online"]
+severity = "S0"
+screen_forbid = ["unreachable", "no network", "server down"]
+
+[[check]]
+name = "screen transport word matches the daemon (no stale 'playing')"
+severity = "S0"
+transport_matches = true
+
+[[check]]
+# Not "Up Next lies": the store mirrors the queue window (store.rs, reason=Window)
+# within seconds of the enqueue, so these songs WERE on disk when the server went.
+# Decision (b) still asks every row to say so in words while the server is gone.
+name = "Up Next states availability in words while the server is gone (decision b)"
+at = 11
+when = ["blocked", "no_network"]
+severity = "S1"
+if_truth = ["currentsong.Title exists"]
+screen_require_any = ["on disk", "stream only", "not on disk", "downloaded"]
+
+[[check]]
+name = "when a song that was never fetched is due: still playing, or the screen says why not"
+at = 15
+when = ["blocked", "no_network"]
+severity = "S1"
+if_truth = ["status.state != play"]
+screen_require_any = ["unreachable", "not on disk", "stream only", "could not", "couldn't", "failed", "no network"]
+
+[[check]]
+name = "when a song that was never fetched is due: transport word matches the daemon"
+at = 15
+severity = "S0"
+transport_matches = true
