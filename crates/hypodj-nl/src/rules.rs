@@ -605,8 +605,11 @@ fn curate(text: &str, ctx: &NlContext) -> Result<Option<Vec<RawPlan>>, NlError> 
     // An artist is only an artist if the queue credits one by that name, judged by
     // the very predicate the remove runs - otherwise "no jazz" or "no i mean the
     // other one" would arm an exclusion for a name nobody has.
-    if !ctx.queue_rows.iter().any(|r| hypodj_core::plan::curate_matches(&filter, r, None)) {
-        return Err(NlError::Ambiguous(format!("no artist \"{name}\" in the queue")));
+    // The library artist index qualifies a name too (an exact, case-insensitive
+    // artist name), so an exclusion can be held BEFORE the artist is queued.
+    let in_library = ctx.library_artists.iter().any(|a| a.trim().to_lowercase() == nl.trim());
+    if !in_library && !ctx.queue_rows.iter().any(|r| hypodj_core::plan::curate_matches(&filter, r, None)) {
+        return Err(NlError::Ambiguous(format!("no artist \"{name}\" in the queue or library")));
     }
     remove(filter)
 }

@@ -102,6 +102,7 @@ mod tests {
                 row("Windowlicker", "Aphex Twin"),
                 row("Happy", "Pharrell"),
             ],
+            library_artists: vec!["Boards of Canada".into(), "The The".into()],
         }
     }
 
@@ -747,6 +748,22 @@ mod tests {
         // A name the queue credits still curates, featured credits included.
         assert!(tr("no Pharrell Williams", &c).is_ok());
         assert!(matches!(tr("no Prince", &c), Err(NlError::Ambiguous(_))));
+        // 01m85nn6: a LIBRARY artist not in the queue holds the exclusion too.
+        for u in ["no Boards of Canada", "no more boards of canada", "drop everything by Boards of Canada"] {
+            let got = tr(u, &c).unwrap_or_else(|e| panic!("{u}: {e:?}"));
+            assert!(
+                matches!(&got[0].action, Action::Remove { sel: QueueSelector::Upcoming(F::Artist(n)) } if n.eq_ignore_ascii_case("boards of canada")),
+                "{u}: {got:?}"
+            );
+        }
+        // Stop words never qualify, even when the library has an artist by that
+        // name ("The The"), and a library substring is not a name.
+        for u in ["no the", "no boards", "no canada"] {
+            assert!(
+                !matches!(tr(u, &c), Ok(ref p) if p.iter().any(|p| matches!(&p.action, Action::Remove { sel: QueueSelector::Upcoming(F::Artist(_)) }))),
+                "{u}"
+            );
+        }
     }
 
     #[test]

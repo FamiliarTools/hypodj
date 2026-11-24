@@ -5970,6 +5970,7 @@ impl HypodjHandler {
             tz: *chrono::Local::now().offset(),
             queue_len: snap.entries.len(),
             queue_rows: self.queue_rows().0,
+            library_artists: Vec::new(),
         }
     }
 
@@ -5996,7 +5997,12 @@ impl HypodjHandler {
         if let Some(q) = translator.query(&req) {
             return self.nl_answer(q).await;
         }
-        let ctx = self.nl_context();
+        let mut ctx = self.nl_context();
+        // The library artist index (cached; best effort - a failed fetch leaves
+        // only the queue credits to resolve "no <artist>" against).
+        if let Ok(a) = self.cached_artists().await {
+            ctx.library_artists = a.into_iter().map(|(_, n)| n).collect();
+        }
         // Run the (possibly model-backed) translate OFF the reactor: Rules is
         // instant; a local model can take hundreds of ms. hypodj-nl needs no tokio.
         let hit = match tokio::task::spawn_blocking(move || translator.translate(&req, &ctx)).await {

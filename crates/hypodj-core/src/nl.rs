@@ -42,6 +42,11 @@ pub struct NlContext {
     /// carries, with the SAME predicate the remove will run
     /// ([`crate::plan::curate_matches`]), instead of reading any token as a name.
     pub queue_rows: Vec<crate::plan::RowMeta>,
+    /// The library's artist names (Subsonic `getArtists`, served from the
+    /// handler's artist cache), so "no Daft Punk" holds an exclusion even when no
+    /// queued row credits them yet. Empty when the library is unreachable; then
+    /// only the queue credits qualify.
+    pub library_artists: Vec<String>,
 }
 
 /// A cheap trust signal surfaced in the echo ("via rules" / "via local model").
