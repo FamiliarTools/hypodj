@@ -210,3 +210,24 @@ mod tests {
         assert!(restore_trigger(&RawTrigger::SpanElapsed { secs: 60.0 }, now).is_none());
     }
 }
+
+#[cfg(test)]
+mod adversary_repro {
+    use super::*;
+    use crate::plan::{next_daily_fire, DaySet};
+    use chrono::TimeZone;
+
+    #[test]
+    fn restart_across_seven_swallows_daily_but_not_oneshot() {
+        let seven = chrono::Utc.with_ymd_and_hms(2026, 11, 24, 7, 0, 0).unwrap();
+        let back_up = seven + chrono::Duration::minutes(1);
+        let one = restore_trigger(&RawTrigger::WallClock { at: seven }, back_up);
+        println!("one-shot restored as: {one:?}");
+        let daily = RawTrigger::Daily { hour: 7, minute: 0, days: DaySet::EVERY };
+        let restored = restore_trigger(&daily, back_up).unwrap();
+        let RawTrigger::Daily { hour, minute, days } = restored else { panic!() };
+        let next = next_daily_fire(&chrono::Utc, hour, minute, days, back_up).unwrap();
+        println!("daily restored fires at: {next}");
+        assert!(next - back_up <= MISSED_GRACE, "today's 07:00 daily was swallowed; next fire {next}");
+    }
+}
