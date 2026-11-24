@@ -153,7 +153,7 @@ pub fn hit_of(id: &str) -> Option<Hit> {
     match kind {
         "cmd" => parts.next().filter(|c| is_reversible(c)).map(|c| Hit::Command(c.to_string())),
         // Only the two nudges this provider emits; a forged id carries nothing else.
-        "vol" => parts.next()?.parse::<i32>().ok().filter(|d| d.abs() == VOLUME_STEP).map(Hit::Volume),
+        "vol" => parts.next()?.parse::<i32>().ok().filter(|d| d.unsigned_abs() == VOLUME_STEP.unsigned_abs()).map(Hit::Volume),
         "uri" => {
             let uri = parts.next()?.to_string();
             let name = parts.next().unwrap_or_default().to_string();
