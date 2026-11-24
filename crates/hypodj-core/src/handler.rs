@@ -17395,6 +17395,26 @@ mod tests {
         assert_eq!(qids(&h), vec![0]);
     }
 
+    // Probe (adversarial review G): `delete a:b` deletes row by row with awaits
+    // between. A concurrent insert from another connection landing during one of
+    // those awaits must not shift a DIFFERENT row under the delete: the range
+    // names the rows as they were when the command arrived.
+    #[tokio::test(start_paused = true)]
+    async fn range_delete_is_not_shifted_by_a_concurrent_insert() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 6).await;
+        // The playing row is inside the range, so deleting it awaits the player.
+        h.state.lock().unwrap().current = Some(2);
+        let del = h.handle(MpdCommand::Delete(Some("0:3".into())));
+        let ins = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(0))));
+        let (r1, r2) = tokio::join!(del, ins);
+        assert!(!matches!(r1, MpdResponse::Ack { .. }), "{r1:?}");
+        assert!(!matches!(r2, MpdResponse::Ack { .. }), "{r2:?}");
+        let mut left = qids(&h);
+        left.sort();
+        assert_eq!(left, vec![3, 4, 5, 6], "exactly rows 0..3 as named went; the insert survived");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn addid_inserts_at_the_requested_position() {
         let Some((h, _events)) = handler_with_null_player() else { return };

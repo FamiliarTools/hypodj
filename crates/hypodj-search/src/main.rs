@@ -92,7 +92,7 @@ fn run(host: &str, port: u16, hit: &Hit) -> Result<(), hypodj_client::mpd::MpdEr
         Hit::Volume(d) => {
             let status = c.command("status")?;
             let now = field(&status, "volume").and_then(|v| v.parse::<i32>().ok()).unwrap_or(50);
-            c.command(&format!("setvol {}", (now + d).clamp(0, 100)))?;
+            c.command(&format!("setvol {}", provider::nudged_volume(now, *d)))?;
         }
         // Playing an artist means hearing the artist: the daemon's artist radio
         // (hits first, then drift), the same gesture as `r` in dj-gui.

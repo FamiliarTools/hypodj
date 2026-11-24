@@ -152,7 +152,8 @@ pub fn hit_of(id: &str) -> Option<Hit> {
     let kind = parts.next()?;
     match kind {
         "cmd" => parts.next().filter(|c| is_reversible(c)).map(|c| Hit::Command(c.to_string())),
-        "vol" => parts.next()?.parse().ok().map(Hit::Volume),
+        // Only the two nudges this provider emits; a forged id carries nothing else.
+        "vol" => parts.next()?.parse::<i32>().ok().filter(|d| d.abs() == VOLUME_STEP).map(Hit::Volume),
         "uri" => {
             let uri = parts.next()?.to_string();
             let name = parts.next().unwrap_or_default().to_string();
@@ -295,6 +296,23 @@ mod tests {
         assert_eq!(hit_of("cmd\tsetvol 900"), None);
     }
 
+    // Regression (adversarial review F): a forged `vol` id carried any i32 into
+    // `now + d` (an overflow panic in debug). Only the two ids this provider
+    // emits are accepted, and the arithmetic saturates into 0..=100.
+    #[test]
+    fn forged_volume_ids_are_refused_and_nudges_saturate() {
+        assert_eq!(hit_of(&id_of(&Hit::Volume(VOLUME_STEP))), Some(Hit::Volume(VOLUME_STEP)));
+        assert_eq!(hit_of(&id_of(&Hit::Volume(-VOLUME_STEP))), Some(Hit::Volume(-VOLUME_STEP)));
+        for forged in ["vol\t2147483647", "vol\t-2147483648", "vol\t0", "vol\t7", "vol\t", "vol"] {
+            assert_eq!(hit_of(forged), None, "{forged}");
+        }
+        assert_eq!(nudged_volume(95, VOLUME_STEP), 100);
+        assert_eq!(nudged_volume(3, -VOLUME_STEP), 0);
+        assert_eq!(nudged_volume(i32::MAX, i32::MAX), 100);
+        assert_eq!(nudged_volume(i32::MIN, i32::MIN), 0);
+        assert_eq!(nudged_volume(40, VOLUME_STEP), 50);
+    }
+
     #[test]
     fn a_prefix_offers_the_verb_while_typing() {
         assert_eq!(p("nex").hits, vec![Hit::Command("next".into())]);
@@ -356,4 +374,10 @@ mod tests {
         );
         assert_eq!(library_hits(&pairs, 1).len(), 1, "capped");
     }
+}
+
+/// The level a volume nudge lands on from `now`: saturating, then clamped into
+/// MPD's 0..=100, so no reported level or delta can overflow or escape the range.
+pub fn nudged_volume(now: i32, d: i32) -> i32 {
+    now.clamp(0, 100).saturating_add(d).clamp(0, 100)
 }
