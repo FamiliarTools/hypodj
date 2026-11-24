@@ -1699,6 +1699,19 @@ impl State {
     /// walk remembers, so a delete/move that reindexed the queue in between still lands
     /// on the RIGHT entry - and an entry that is genuinely gone leaves `current` alone
     /// rather than pointing it at whatever took its slot.
+    /// Does the entry a nothing-loaded terminal holds carry a session worth reporting
+    /// as Paused? The Paused terminal promises that a returning server or the offline
+    /// mirror picks the entry up where it was, which only a library song can keep. A
+    /// raw stream that failed to load has no server and no mirror copy behind it and
+    /// was never audible, so there is no paused moment to return to: that terminal
+    /// converges to Stopped, still holding the head so a later play retries it.
+    fn held_is_resumable(&self) -> bool {
+        matches!(
+            self.current().and_then(|i| self.queue.get(i)).map(|it| &it.entry),
+            Some(QueueEntry::Song(_))
+        )
+    }
+
     fn point_current_at_qid(&mut self, qid: u64) -> bool {
         match self.queue.iter().position(|it| it.id == qid) {
             Some(_) => {
@@ -10134,7 +10147,8 @@ impl HypodjHandler {
     /// on - however many times play is pressed while the cause persists. With no walk in
     /// progress (a cascade that began at an ordinary EOF advance, so entries genuinely
     /// ended along the way) `current` stays put, which is the same thing said of a walk
-    /// of length zero. `pending_pause` makes the deck report Paused (the player is
+    /// of length zero. For a held library song (see [`State::held_is_resumable`]; a dead
+    /// stream converges to Stopped instead) `pending_pause` makes the deck report Paused (the player is
     /// already stopped - the failed load published its own honest stop), which is the
     /// state a `play` gesture, an MPRIS widget, or a returning server can all pick up
     /// from. The run counter is left standing: while the cause persists, the next failure
@@ -10162,9 +10176,7 @@ impl HypodjHandler {
                 }
             }
             let held = st.current().and_then(|i| st.queue.get(i)).is_some();
-            if held {
-                st.pending_pause = true;
-            }
+            st.pending_pause = st.held_is_resumable();
             held
         };
         tracing::warn!(
@@ -12193,7 +12205,7 @@ impl HypodjHandler {
                 // End of queue: no pending pause / skip can survive a stopped deck -
                 // unless an entry is still held, which is a nothing-loaded terminal and
                 // is precisely what the intent is for.
-                st.pending_pause = held;
+                st.pending_pause = held && st.held_is_resumable();
                 // No continuation stream is live once the deck stops honestly.
                 st.continuation_active = None;
                 drop(st);
@@ -29681,6 +29693,33 @@ mod tests {
             }
         }
         panic!("the failed-load cascade never settled: the fuse did not stop the walk");
+    }
+
+    /// A DEAD STATION ALONE IN THE QUEUE ENDS STOPPED (task 01m85st). Play on the one
+    /// entry, its load fails, nothing follows: the walk falls off the end of the queue.
+    /// The nothing-loaded terminal reported Paused here, a promise that a returning
+    /// server or the offline mirror picks the session up where it was - but a raw
+    /// stream has no server behind it and no mirror copy, and nothing was ever playing,
+    /// so there is no paused moment to return to. It must converge to stop, still
+    /// holding the entry (MPD keeps `song` on a stop) so a later play retries it.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_station_alone_in_the_queue_ends_stopped_not_paused() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        cascade_failed_loads(&h).await;
+        assert_eq!(h.reported_play_state(), PlayState::Stopped, "no paused moment exists to resume");
+        assert_eq!(h.state.lock().unwrap().current(), Some(0), "the entry is still held");
+        assert_eq!(h.resume_snapshot(0.0).play_state, ResumePlayState::Stopped);
+        // The same dead station walked through the FUSE (three of them) ends the same way.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        for _ in 0..4 {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        cascade_failed_loads(&h).await;
+        assert_eq!(h.reported_play_state(), PlayState::Stopped, "the fuse halt on streams stops too");
+        assert_eq!(h.state.lock().unwrap().current(), Some(0), "back at the gesture's entry");
     }
 
     /// Drive the EOF walk into its halt terminal and return the entry it holds: three
