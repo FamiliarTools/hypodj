@@ -45,7 +45,7 @@ impl Translator for RulesTranslator {
     }
 
     fn query(&self, utterance: &str) -> Option<NlQuery> {
-        query_rules(utterance)
+        query_rules(utterance).or_else(|| cancel_rules(utterance))
     }
 }
 
@@ -96,6 +96,57 @@ pub fn query_rules(utterance: &str) -> Option<NlQuery> {
     None
 }
 
+/// A feature-cancel ask ("cancel the sleep timer", "turn off the wind-down"):
+/// a cancel word plus exactly one feature, and NO time in it - "cancel the sleep
+/// timer in 30 minutes" is a timed cancel hypodj cannot schedule, so it falls to
+/// the action path, where the negation guard makes it ambiguous.
+pub fn cancel_rules(utterance: &str) -> Option<NlQuery> {
+    let w = words(utterance);
+    let wv: Vec<&str> = w.iter().map(String::as_str).collect();
+    let low = utterance.to_lowercase();
+    let cancel = wv.iter().any(|t| matches!(*t, "cancel" | "abort" | "disable" | "kill" | "off" | "stop" | "clear" | "remove"));
+    if !cancel || wv.iter().any(|t| t.chars().any(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    let sleep = wv.contains(&"sleep");
+    let wind = low.contains("wind down") || low.contains("wind-down") || low.contains("winddown");
+    match (sleep, wind) {
+        (true, false) => Some(NlQuery::CancelSession(NlSession::Sleep)),
+        (false, true) => Some(NlQuery::CancelSession(NlSession::WindDown)),
+        _ => None,
+    }
+}
+
+/// The shared NEGATION / CONTRAST guard. A word that negates or inverts the ask
+/// ("don't go to sleep", "anything but my favorites", "never allow remixes",
+/// "cancel ... in 30 minutes") makes every positive rule below read the opposite
+/// of what was meant, so rather than teach each rule to parse it, the action path
+/// refuses the whole utterance as ambiguous. `Some(word)` names the trigger.
+///
+/// Deliberately NOT here: "no" / "without" / "skip" / "drop" (the subtractive
+/// curation grammar IS a negation and owns them), and the mode grammar's own
+/// off-words, which [`rules_body`] lets through before applying this guard.
+fn negation(wv: &[&str]) -> Option<String> {
+    const NEGATORS: &[&str] = &[
+        "don't", "dont", "never", "not", "isn't", "won't", "wont", "shouldn't", "doesn't",
+        "except", "besides", "excluding", "instead", "rather", "cancel", "abort",
+    ];
+    for (i, w) in wv.iter().enumerate() {
+        if NEGATORS.contains(w) {
+            return Some((*w).to_string());
+        }
+        let prev = if i > 0 { wv[i - 1] } else { "" };
+        // "anything but X" / "everything but X", and "other than X".
+        if *w == "but" && matches!(prev, "anything" | "everything" | "something" | "all" | "nothing") {
+            return Some(format!("{prev} but"));
+        }
+        if *w == "than" && prev == "other" {
+            return Some("other than".into());
+        }
+    }
+    None
+}
+
 /// Emit a raw plan with `origin` left empty (the adapter stamps it) and `once`.
 fn plan(trigger: RawTrigger, action: Action, once: bool) -> RawPlan {
     RawPlan { version: 1, trigger, action, once, origin: String::new() }
@@ -121,6 +172,21 @@ fn rules_body(
     let low = text.to_lowercase();
     let toks: Vec<String> = low.split_whitespace().map(String::from).collect();
     let tv: Vec<&str> = toks.iter().map(String::as_str).collect();
+
+    // 0. the negation / contrast guard: only the mode grammar parses its own
+    // negation ("don't shuffle"); every other rule would read the inverse.
+    {
+        let wd = words(text);
+        let wdv: Vec<&str> = wd.iter().map(String::as_str).collect();
+        if let Some(neg) = negation(&wdv) {
+            if let Some(plans) = modes(&wdv)? {
+                return Ok(plans);
+            }
+            return Err(NlError::Ambiguous(format!(
+                "\"{neg}\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")"
+            )));
+        }
+    }
 
     // 1. wake ("wake me at 7 with jazz") - an ordered same-instant batch.
     if tv.contains(&"wake") && tv.contains(&"at") {

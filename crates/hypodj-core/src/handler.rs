@@ -6084,32 +6084,44 @@ impl HypodjHandler {
         use crate::nl::NlQuery;
         /// Cap the listed favorites so one answer line stays readable.
         const MAX_LISTED: usize = 20;
+        let list_favorites = match q {
+            NlQuery::CancelSession(session) => {
+                let (cancelled, name) = match session {
+                    crate::nl::NlSession::Sleep => (self.sleep_cancel(), "sleep timer"),
+                    crate::nl::NlSession::WindDown => (self.winddown_cancel(), "wind-down"),
+                };
+                let answer = if cancelled { format!("{name} cancelled") } else { format!("no {name} armed") };
+                return MpdResponse::pairs().pair("nl_answer", answer).build();
+            }
+            NlQuery::Favorites => true,
+            NlQuery::IsCurrentFavorited => false,
+        };
         let starred = match self.client.starred_songs().await {
             Ok(s) => s,
             Err(e) => return ack(ACK_ERROR_UNKNOWN, "nl", &format!("could not read favorites: {e}")),
         };
-        let answer = match q {
-            NlQuery::Favorites if starred.is_empty() => "no favorites yet".to_string(),
-            NlQuery::Favorites => {
-                let shown: Vec<String> = starred
-                    .iter()
-                    .take(MAX_LISTED)
-                    .map(|s| match &s.artist {
-                        Some(a) => format!("{a} - {}", s.title),
-                        None => s.title.clone(),
-                    })
-                    .collect();
-                let more = starred.len().saturating_sub(MAX_LISTED);
-                let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
-                format!("{} favorites: {}{tail}", starred.len(), shown.join("; "))
-            }
-            NlQuery::IsCurrentFavorited => match self.current_song() {
+        let answer = if list_favorites && starred.is_empty() {
+            "no favorites yet".to_string()
+        } else if list_favorites {
+            let shown: Vec<String> = starred
+                .iter()
+                .take(MAX_LISTED)
+                .map(|s| match &s.artist {
+                    Some(a) => format!("{a} - {}", s.title),
+                    None => s.title.clone(),
+                })
+                .collect();
+            let more = starred.len().saturating_sub(MAX_LISTED);
+            let tail = if more > 0 { format!("; and {more} more") } else { String::new() };
+            format!("{} favorites: {}{tail}", starred.len(), shown.join("; "))
+        } else {
+            match self.current_song() {
                 None => "nothing (library) is playing".to_string(),
                 Some(cur) if starred.iter().any(|s| s.id == cur.id) => {
                     format!("yes, \"{}\" is a favorite", cur.title)
                 }
                 Some(cur) => format!("no, \"{}\" is not a favorite", cur.title),
-            },
+            }
         };
         MpdResponse::pairs().pair("nl_answer", answer).build()
     }
@@ -22024,6 +22036,32 @@ mod tests {
         assert!(pair(&resp, "plan_id").is_some(), "armed: {resp:?}");
         assert!(h.find_feature(ORIGIN_WINDDOWN).is_some(), "wind-down is the feature plan");
         assert!(h.find_feature(ORIGIN_SLEEP).is_some(), "and leaves the sleep timer alone");
+    }
+
+    // Regression (adversarial review D): an NL cancel goes through the same
+    // cancel path as `sleep off`, answered at once, and touches only its feature.
+    struct CancelTranslator(crate::nl::NlSession);
+    impl crate::nl::Translator for CancelTranslator {
+        fn translate(&self, _u: &str, _c: &crate::nl::NlContext) -> Result<crate::nl::NlHit, crate::nl::NlError> {
+            Err(crate::nl::NlError::NotUnderstood)
+        }
+        fn query(&self, _u: &str) -> Option<crate::nl::NlQuery> {
+            Some(crate::nl::NlQuery::CancelSession(self.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn nl_cancel_disarms_only_its_feature() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.sleep_set(Duration::from_secs(600)).unwrap();
+        h.winddown_set(Some(Duration::from_secs(900))).unwrap();
+        h.set_translator(Arc::new(CancelTranslator(crate::nl::NlSession::Sleep)));
+        let resp = h.handle(nl_translate("cancel the sleep timer", 7)).await;
+        assert_eq!(pair(&resp, "nl_answer"), Some("sleep timer cancelled"), "{resp:?}");
+        assert!(h.find_feature(ORIGIN_SLEEP).is_none());
+        assert!(h.find_feature(ORIGIN_WINDDOWN).is_some(), "the wind-down is not the sleep");
+        let resp = h.handle(nl_translate("cancel the sleep timer", 7)).await;
+        assert_eq!(pair(&resp, "nl_answer"), Some("no sleep timer armed"));
     }
 
     #[tokio::test]

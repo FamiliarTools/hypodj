@@ -97,6 +97,11 @@ pub enum NlQuery {
     Favorites,
     /// "is this favorited?" / "is the current song starred?": yes/no for current.
     IsCurrentFavorited,
+    /// "cancel the sleep timer" / "cancel wind down": disarm that feature through
+    /// the same path as `sleep off` / `winddown off`. Answered immediately like a
+    /// question (no plan, no token): it can only take away a pending timer, never
+    /// arm one.
+    CancelSession(NlSession),
 }
 
 /// The injected NL seam. SYNC + `Send + Sync` so the daemon can run it under
