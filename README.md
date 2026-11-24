@@ -190,3 +190,14 @@ finds it).
 | `crates/hypodj-search` | `dj-search-provider`, the GNOME Shell search provider |
 
 Building, testing, and deploying are covered in [CLAUDE.md](CLAUDE.md).
+
+## License
+
+hypodj is licensed under the [Functional Source License, Version 1.1, MIT Future
+License](LICENSE.md) (FSL-1.1-MIT): use, modify and redistribute it for anything
+except a competing commercial product or service, and each release becomes plain
+MIT two years after it is published.
+
+For a commercial license, support, or a use the FSL does not cover, get in touch
+through [Familiar Tools](https://github.com/FamiliarTools) - an issue on this
+repository reaches me.

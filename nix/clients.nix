@@ -100,6 +100,9 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "HypoDJ clients: the djc jukebox CLI, the dj listening shell, the dj-gui TUI, the dj-mcp agent surface, and the GNOME search provider";
     mainProgram = "dj";
-    license = with lib.licenses; [ mit asl20 ];
+    # FSL-1.1-MIT is source-available (free = false in nixpkgs) until each
+    # release converts to MIT after two years; consumers need allowUnfree or a
+    # predicate. The flake's own pkgs allow exactly these two packages.
+    license = lib.licenses.fsl11Mit;
   };
 }
