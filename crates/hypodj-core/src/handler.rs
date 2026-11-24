@@ -31734,4 +31734,25 @@ mod tests {
         assert_eq!(rows(&h).len(), 2, "the refusal changed nothing");
     }
 
+
+    /// Regression (adversary repro): an offline album whose tag holds a newline
+    /// reaches the wire as ONE line through `store albums`, never a forged `OK`.
+    #[tokio::test]
+    async fn store_albums_with_a_newline_tag_stays_one_wire_line() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("adv-newline");
+        let store = open_store(&dir);
+        let mut b = store_song("s-b", 16);
+        b.album = Some("Line1\nOK\nLine2".into());
+        b.album_id = Some(AlbumId("al-2".into()));
+        commit_into(&store, &b);
+        h.set_audio_store(store.clone());
+        let r = h.handle(crate::mpd::parse("store albums")).await;
+        let mut buf = Vec::new();
+        crate::mpd::write_response(&mut buf, &r, false, 0);
+        let wire = String::from_utf8(buf).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(wire.contains("Line1 OK Line2"), "{wire}");
+        assert!(!wire.lines().any(|l| l == "OK" || l == "Line2"), "{wire}");
+    }
 }

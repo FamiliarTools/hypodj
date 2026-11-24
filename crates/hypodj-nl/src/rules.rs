@@ -124,6 +124,21 @@ pub fn offline_rules(utterance: &str) -> Option<NlQuery> {
             | "anything" | "any" | "how" | "can" | "where"
     );
     let bare = wv.len() <= 2 && (is_offline_word(first) || first == "my");
+    // An action verb makes it a REQUEST ("can you play something offline", "do
+    // download the new album", "any downloaded jazz? play it"), which belongs to
+    // the action path. Only a wh-object question keeps the verb as its object
+    // ("what can I play offline", "which albums can I play offline").
+    let acts = wv.iter().any(|t| {
+        matches!(
+            *t,
+            "play" | "download" | "queue" | "enqueue" | "add" | "put" | "start" | "shuffle"
+                | "load" | "fetch" | "save" | "mirror" | "cache"
+        )
+    });
+    let wh = matches!(first, "what" | "what's" | "whats" | "which");
+    if acts && !wh {
+        return None;
+    }
     (asks || bare).then_some(NlQuery::Offline)
 }
 
@@ -1242,7 +1257,9 @@ fn resolve_next_local(ctx: &NlContext, h: u32, m: u32) -> Option<chrono::DateTim
 /// number, written ("70", "2nd", "1.5") or spoken ("ten", "a", "half", "second"
 /// as an ordinal); `spans` holds each duration in seconds: a spoken one only WITH
 /// its unit ("five minutes", "an hour and a half", "a quarter of an hour" - never
-/// the "a" of "in a bit"), a written number in any unit. Over-collecting is harmless (a model number that matches a stray
+/// the "a" of "in a bit"), and a written one only WITH its unit too ("20 minutes",
+/// "30min") - a bare "3" in "play 3 songs" or "70" in "set volume to 70" is a
+/// count or a level, never a time the model may invent. Over-collecting is harmless (a model number that matches a stray
 /// "a" is still a number the human could have meant); under-collecting refuses a
 /// good plan, which only costs a rules-style NotUnderstood.
 pub(crate) fn spoken_quantities(utterance: &str) -> (Vec<f64>, Vec<f64>) {
@@ -1253,12 +1270,15 @@ pub(crate) fn spoken_quantities(utterance: &str) -> (Vec<f64>, Vec<f64>) {
         let bare = t.trim_end_matches('%');
         if let Ok(v) = bare.parse::<f64>() {
             values.push(v);
-            // "20 minutes" is 1200 s only; a bare "20" may be any unit; "2 days"
-            // is no span hypodj can arm.
-            match toks.get(i + 1) {
-                Some(u) if unit_secs(u).is_some() => spans.push(v * unit_secs(u).unwrap_or(1.0)),
-                Some(u) if is_unsupported_time_unit(u) => {}
-                _ => spans.extend([v, v * 60.0, v * 3600.0]),
+            // "20 minutes" is 1200 s only; a bare "20" is no duration at all.
+            if let Some(u) = toks.get(i + 1).and_then(|u| unit_secs(u)) {
+                spans.push(v * u);
+            }
+        } else if let Some(split) = bare.find(|c: char| !(c.is_ascii_digit() || c == '.')) {
+            // A unit glued to its number: "30min", "45m", "2h".
+            if let (Ok(v), Some(u)) = (bare[..split].parse::<f64>(), unit_secs(&bare[split..])) {
+                values.push(v);
+                spans.push(v * u);
             }
         }
         if let Some(n) = parse_ordinal(t) {
@@ -1275,4 +1295,31 @@ pub(crate) fn spoken_quantities(utterance: &str) -> (Vec<f64>, Vec<f64>) {
         }
     }
     (values, spans)
+}
+
+#[cfg(test)]
+mod quantity_tests {
+    use super::spoken_quantities;
+
+    /// Regression: a bare count or level used to ground ANY duration ("play 3
+    /// songs of jazz" grounded "stop in 3 min"), so the model could invent a timer.
+    #[test]
+    fn a_duration_grounds_only_against_a_number_with_its_unit() {
+        for (u, secs) in [("play 3 songs of jazz", [3.0, 180.0, 10800.0]), ("set volume to 70", [70.0, 4200.0, 252000.0])] {
+            let (values, spans) = spoken_quantities(u);
+            assert!(values.contains(&secs[0]), "{u}: the count/level is still a value");
+            assert!(spans.is_empty(), "{u}: no span may come from a bare number, got {spans:?}");
+        }
+        for (u, want) in [
+            ("stop in 20 minutes", 1200.0),
+            ("stop in 2.5 mins", 150.0),
+            ("stop in 30min", 1800.0),
+            ("stop in 45m", 2700.0),
+            ("stop in 90 seconds", 90.0),
+            ("stop in half an hour", 1800.0),
+        ] {
+            assert!(spoken_quantities(u).1.contains(&want), "{u}: {:?}", spoken_quantities(u));
+        }
+        assert!(spoken_quantities("stop in 2 days").1.is_empty());
+    }
 }

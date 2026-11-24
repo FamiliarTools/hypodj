@@ -120,6 +120,18 @@ mod question_tests {
         for u in ["download this album", "play something", "fade out", "play offline jazz"] {
             assert_eq!(rules::offline_rules(u), None, "{u}");
         }
+        // Requests that merely MENTION offline go to the action path (adversary repros).
+        for u in [
+            "can you play something offline",
+            "can you play the downloaded album",
+            "do download the new album",
+            "how do I download this album",
+            "is it ok to play offline jazz",
+            "any downloaded jazz? play it",
+        ] {
+            assert!(!is_question(u), "{u}");
+        }
+        assert!(is_question("which albums can I play offline"));
         // The existing questions still route as questions.
         assert!(is_question("what is favorited"));
         assert!(is_question("cancel the sleep timer"));

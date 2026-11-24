@@ -892,6 +892,27 @@ mod tests {
 
     // GROUNDING: a plan whose words or numbers the human never said is refused;
     // one built only from what was said (or from omitted defaults) passes.
+    /// Regression (adversary adv2): a count or a volume level never grounds a timer.
+    #[test]
+    fn grounding_refuses_a_timer_built_from_a_count_or_level() {
+        let g = |u: &str, j: &str| grounded(u, &serde_json::from_str::<LlmRawPlan>(j).unwrap());
+        for (u, j) in [
+            ("play 3 songs of jazz", r#"{"type":"stop","in":3,"in_unit":"min"}"#),
+            ("play 3 songs of jazz", r#"{"type":"stop","in":3,"in_unit":"h"}"#),
+            ("set volume to 70", r#"{"type":"stop","in":70,"in_unit":"min"}"#),
+        ] {
+            assert!(g(u, j).is_err(), "{u} {j}");
+        }
+        for (u, j) in [
+            ("fade out in 20 minutes", r#"{"type":"fade_out","over":20,"over_unit":"min"}"#),
+            ("stop in 90 seconds", r#"{"type":"stop","in":1.5,"in_unit":"min"}"#),
+            ("stop in 30min", r#"{"type":"stop","in":30,"in_unit":"min"}"#),
+            ("stop in 45m", r#"{"type":"stop","in":45,"in_unit":"min"}"#),
+        ] {
+            assert_eq!(g(u, j), Ok(()), "{u} {j}");
+        }
+    }
+
     #[test]
     fn grounding_refuses_invented_content() {
         let g = |u: &str, json: &str| grounded(u, &parse_llm_flat(json).unwrap());

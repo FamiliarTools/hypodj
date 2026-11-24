@@ -2845,11 +2845,22 @@ impl MpdServer {
 /// Serialize an [`MpdResponse`] for a single (non-list) command into the write
 /// buffer, appending the terminating `OK\n` for success. For `Ack`, only the
 /// ACK line is written (no `OK`).
-fn write_response(buf: &mut Vec<u8>, resp: &MpdResponse, list_ok: bool, idx: usize) -> bool {
+/// One wire line can never become two: a CR or LF inside a key or value (a server
+/// tag "Line1\nOK\nLine2") would forge an `OK` and desync every client, so this,
+/// the single text write boundary, flattens them to a space.
+fn one_line(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(['\n', '\r']) {
+        std::borrow::Cow::Owned(s.replace(['\n', '\r'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+pub(crate) fn write_response(buf: &mut Vec<u8>, resp: &MpdResponse, list_ok: bool, idx: usize) -> bool {
     match resp {
         MpdResponse::Pairs(pairs) => {
             for (k, v) in pairs {
-                buf.extend_from_slice(format!("{k}: {v}\n").as_bytes());
+                buf.extend_from_slice(format!("{}: {}\n", one_line(k), one_line(v)).as_bytes());
             }
             if list_ok {
                 buf.extend_from_slice(b"list_OK\n");
@@ -2868,7 +2879,8 @@ fn write_response(buf: &mut Vec<u8>, resp: &MpdResponse, list_ok: bool, idx: usi
         }
         MpdResponse::Ack { code, command, message } => {
             buf.extend_from_slice(
-                format!("ACK [{code}@{idx}] {{{command}}} {message}\n").as_bytes(),
+                format!("ACK [{code}@{idx}] {{{}}} {}\n", one_line(command), one_line(message))
+                    .as_bytes(),
             );
             false
         }
@@ -3037,6 +3049,22 @@ where
 #[cfg(test)]
 mod wire_tests {
     use super::*;
+
+    /// Regression: a server tag carrying a newline used to be written raw, so
+    /// "Line1\nOK\nLine2" forged an `OK` line mid-response.
+    #[test]
+    fn a_newline_in_a_value_or_ack_cannot_split_the_line() {
+        let mut buf = Vec::new();
+        let resp = MpdResponse::Pairs(vec![
+            ("Album".into(), "Line1\nOK\nLine2".into()),
+            ("Title".into(), "a\r\nb".into()),
+        ]);
+        assert!(write_response(&mut buf, &resp, false, 0));
+        let ack = MpdResponse::Ack { code: 50, command: "x".into(), message: "m\nOK".into() };
+        assert!(!write_response(&mut buf, &ack, false, 0));
+        let wire = String::from_utf8(buf).unwrap();
+        assert_eq!(wire, "Album: Line1 OK Line2\nTitle: a  b\nACK [50@0] {x} m OK\n");
+    }
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, DuplexStream};

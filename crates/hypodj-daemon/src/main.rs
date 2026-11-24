@@ -63,16 +63,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // `opensubsonic` logs every request URL at DEBUG ("GET http://..?u=..&t=..&s=.."),
-    // auth query included, and `reqwest` may echo URLs at DEBUG/TRACE too. Those
-    // targets are capped at INFO AFTER the user's RUST_LOG, so even `RUST_LOG=debug`
-    // (or an explicit `opensubsonic=trace`) can never put a replayable token in the
-    // daemon log. Our own errors are redacted at `subsonic.rs`.
-    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    // auth query included, and the HTTP stack (`reqwest`, `hyper`, ...) may echo
+    // URLs at DEBUG/TRACE too. Appending `target=info` directives to the EnvFilter
+    // is NOT enough: a more specific user directive (`opensubsonic::client=debug`)
+    // wins over it. So the cap is a separate per-layer filter that no RUST_LOG can
+    // reach. Our own errors are redacted at `subsonic.rs`.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info".into());
-    for target in ["opensubsonic=info", "reqwest=info"] {
-        filter = filter.add_directive(target.parse().expect("static directive"));
-    }
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::util::SubscriberInitExt::init(log_subscriber(filter, std::io::stderr));
 
     let cfg_path = std::env::args()
         .nth(1)
@@ -565,6 +563,37 @@ async fn main() -> anyhow::Result<()> {
 /// address would buy nothing but startup latency. It has to happen here regardless,
 /// while we still hold `&mut`, before the client is shared into the handler +
 /// scrobbler (feature 9).
+/// Targets whose DEBUG/TRACE events can carry the Subsonic auth query (u/t/s).
+const URL_ECHOING_TARGETS: &[&str] =
+    &["opensubsonic", "reqwest", "hyper", "hyper_util", "h2", "rustls", "tower"];
+
+/// True unless `meta` is a below-INFO event from an URL-echoing target.
+fn credential_safe(meta: &tracing::Metadata<'_>) -> bool {
+    let t = meta.target();
+    let echoing = URL_ECHOING_TARGETS.iter().any(|p| {
+        t.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    });
+    !echoing || *meta.level() <= tracing::Level::INFO
+}
+
+/// The daemon's subscriber: the user's EnvFilter AND the fixed credential cap.
+fn log_subscriber<W>(
+    filter: tracing_subscriber::EnvFilter,
+    writer: W,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_filter(filter)
+            .with_filter(tracing_subscriber::filter::filter_fn(credential_safe)),
+    )
+}
+
 async fn greet_server(client: &mut SubsonicClient, url: &str) -> bool {
     match client.ping().await {
         Ok(()) => {
@@ -671,6 +700,52 @@ async fn checkpoint_loop(
 
 #[cfg(test)]
 mod tests {
+    /// Regression: `RUST_LOG=opensubsonic::client=debug` (more specific than an
+    /// appended `opensubsonic=info`) used to put the u/t/s query in the log.
+    #[test]
+    fn no_rust_log_reenables_credential_bearing_targets() {
+        use std::sync::{Arc as A, Mutex};
+        use tracing_subscriber::util::SubscriberInitExt;
+        #[derive(Clone, Default)]
+        struct Buf(A<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for directive in [
+            "opensubsonic::client=debug",
+            "trace",
+            "reqwest::connect=trace",
+            "hyper_util=trace,hyper=trace,opensubsonic=trace",
+        ] {
+            let buf = Buf::default();
+            let b2 = buf.clone();
+            let sub = super::log_subscriber(
+                tracing_subscriber::EnvFilter::new(directive),
+                move || b2.clone(),
+            );
+            let _g = sub.set_default();
+            tracing::debug!(target: "opensubsonic::client", "GET http://x/rest/ping?u=fixtureuser-q7");
+            tracing::trace!(target: "reqwest::connect", "u=fixtureuser-q7");
+            tracing::debug!(target: "hyper_util::client", "u=fixtureuser-q7");
+            tracing::info!(target: "opensubsonic::client", "info-survives");
+            tracing::debug!(target: "hypodj", "own-debug-survives");
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(!out.contains("fixtureuser-q7"), "{directive}: leaked: {out}");
+            if directive != "reqwest::connect=trace" {
+                assert!(out.contains("info-survives"), "{directive}: {out}");
+            }
+            if directive == "trace" {
+                assert!(out.contains("own-debug-survives"), "{out}");
+            }
+        }
+    }
+
     use super::*;
     use hypodj_core::config::ServerConfig;
 
