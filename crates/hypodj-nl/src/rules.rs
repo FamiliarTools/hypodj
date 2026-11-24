@@ -215,7 +215,7 @@ fn rules_body(
     if let Some(plans) = allow_again(text) {
         return Ok(plans);
     }
-    if let Some(plans) = curate(text)? {
+    if let Some(plans) = curate(text, ctx)? {
         return Ok(plans);
     }
 
@@ -368,6 +368,12 @@ const NOT_ARTISTS: &[&str] = &[
     "more", "way", "problem", "idea", "", "this", "that", "it",
 ];
 
+/// Function words that are never an artist name on their own ("no the", "no a").
+const STOP_WORDS: &[&str] = &[
+    "the", "a", "an", "i", "me", "my", "you", "we", "he", "she", "they", "them", "of", "to", "and",
+    "or", "but", "so", "is", "it's", "its", "this", "that", "these", "those", "some", "any",
+];
+
 /// Lift a HELD curation exclusion. `None` when the utterance is not one.
 /// "clear filters" / "reset the filters" lifts every one; "allow remixes again" /
 /// "bring Daft Punk back" / "remixes are fine again" lifts one. An unprefixed
@@ -450,7 +456,7 @@ fn allow_again(text: &str) -> Option<Vec<RawPlan>> {
 /// not a curation request (the caller falls through to the other rules). Every
 /// hit is one immediate `Remove { Upcoming(filter) }`, which the daemon journals,
 /// so `undo` restores the rows.
-fn curate(text: &str) -> Result<Option<Vec<RawPlan>>, NlError> {
+fn curate(text: &str, ctx: &NlContext) -> Result<Option<Vec<RawPlan>>, NlError> {
     let t = text.trim().trim_end_matches(['.', '!', '?']).trim();
     let low = t.to_lowercase();
     let lw = words(t);
@@ -537,11 +543,19 @@ fn curate(text: &str) -> Result<Option<Vec<RawPlan>>, NlError> {
             break;
         }
     }
-    if NOT_ARTISTS.contains(&name.to_lowercase().as_str()) {
+    let nl = name.to_lowercase();
+    if NOT_ARTISTS.contains(&nl.as_str()) || STOP_WORDS.contains(&nl.as_str()) {
         return Ok(None);
     }
     let name = name.to_string();
-    remove(if lead_only { CurateFilter::LeadArtist(name) } else { CurateFilter::Artist(name) })
+    let filter = if lead_only { CurateFilter::LeadArtist(name.clone()) } else { CurateFilter::Artist(name.clone()) };
+    // An artist is only an artist if the queue credits one by that name, judged by
+    // the very predicate the remove runs - otherwise "no jazz" or "no i mean the
+    // other one" would arm an exclusion for a name nobody has.
+    if !ctx.queue_rows.iter().any(|r| hypodj_core::plan::curate_matches(&filter, r, None)) {
+        return Err(NlError::Ambiguous(format!("no artist \"{name}\" in the queue")));
+    }
+    remove(filter)
 }
 
 /// "sleep in 30 minutes" / "sleep timer 45 minutes" / "go to sleep in an hour"

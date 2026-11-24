@@ -96,7 +96,17 @@ mod tests {
             now_civil: Utc.with_ymd_and_hms(2026, 7, 15, 5, 30, 0).unwrap(),
             tz: FixedOffset::east_opt(0).unwrap(), // UTC for simple local==UTC math
             queue_len,
+            queue_rows: vec![
+                row("Around the World", "Daft Punk"),
+                row("Get Lucky", "Daft Punk feat. Pharrell Williams"),
+                row("Windowlicker", "Aphex Twin"),
+                row("Happy", "Pharrell"),
+            ],
         }
+    }
+
+    fn row(title: &str, artist: &str) -> hypodj_core::plan::RowMeta {
+        hypodj_core::plan::RowMeta { title: title.into(), artist: Some(artist.into()), ..Default::default() }
     }
 
     fn tr(u: &str, c: &NlContext) -> Result<Vec<RawPlan>, NlError> {
@@ -690,6 +700,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Regression (adversarial review E): a bare "no X" read ANY token as an
+    // artist ("no the", "no jazz", "no i mean the other one"). An artist filter
+    // now needs a credit the queue actually carries; stop words never qualify.
+    #[test]
+    fn bare_no_needs_a_credited_artist() {
+        use hypodj_core::plan::{CurateFilter as F, QueueSelector};
+        let c = ctx(Some("s1"), 10);
+        for u in ["no the", "no a", "no jazz", "no i mean the other one", "remove by x", "no Prince"] {
+            match tr(u, &c) {
+                Ok(p) => assert!(
+                    !p.iter().any(|p| matches!(&p.action, Action::Remove { sel: QueueSelector::Upcoming(F::Artist(_) | F::LeadArtist(_)) })),
+                    "{u} read as an artist curation: {p:?}"
+                ),
+                Err(_) => {}
+            }
+        }
+        // A name the queue credits still curates, featured credits included.
+        assert!(tr("no Pharrell Williams", &c).is_ok());
+        assert!(matches!(tr("no Prince", &c), Err(NlError::Ambiguous(_))));
     }
 
     #[test]

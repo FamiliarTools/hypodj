@@ -5963,6 +5963,7 @@ impl HypodjHandler {
             // civil->UTC reduction at translate time.
             tz: *chrono::Local::now().offset(),
             queue_len: snap.entries.len(),
+            queue_rows: self.queue_rows().0,
         }
     }
 

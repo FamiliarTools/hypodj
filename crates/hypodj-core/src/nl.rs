@@ -37,6 +37,11 @@ pub struct NlContext {
     pub tz: chrono::FixedOffset,
     /// The live queue length, for "the last track" and bounds echoes.
     pub queue_len: usize,
+    /// The live queue's rows (title + artist credit), so an artist named in a
+    /// curation ("no Daft Punk") is checked against the credits the queue actually
+    /// carries, with the SAME predicate the remove will run
+    /// ([`crate::plan::curate_matches`]), instead of reading any token as a name.
+    pub queue_rows: Vec<crate::plan::RowMeta>,
 }
 
 /// A cheap trust signal surfaced in the echo ("via rules" / "via local model").
