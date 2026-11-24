@@ -1,0 +1,11 @@
+# Scoped to llama-cpp-sys-2 only: its build.rs forwards every CMAKE_* env var to
+# cmake as a -D cache define, and no other crate in the tree reads these names,
+# so the workspace RUSTFLAGS and every other crate's codegen stay untouched.
+# Without AVX2 an llm-llama decode blows its 20s deadline. The RELEASE variable
+# (llama-cpp-sys-2 always builds cmake Release) because the cmake crate rewrites
+# plain CMAKE_C_FLAGS and ignores CMAKE_C_FLAGS_INIT. Keep -O3 -DNDEBUG: this
+# replaces cmake's default for that variable.
+# x86_64 only: on another arch drop this or cmake rejects the -march value.
+[env]
+CMAKE_C_FLAGS_RELEASE = "-O3 -DNDEBUG -march=x86-64-v3"
+CMAKE_CXX_FLAGS_RELEASE = "-O3 -DNDEBUG -march=x86-64-v3"
