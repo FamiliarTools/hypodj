@@ -186,12 +186,24 @@ async fn main() -> anyhow::Result<()> {
         // for asks the rules miss; an unset variable or a missing file stays
         // rules-only rather than failing the daemon.
         #[cfg(feature = "llm-llama")]
+        // The model loads and evaluates its fixed prompt prefix on a side thread
+        // at startup, so the first ask the rules miss is answered from the warm
+        // cache instead of paying the load and the prefix (it queues behind the
+        // warm-up if it arrives first).
         let model = std::env::var_os("HYPODJ_NL_MODEL").and_then(|p| {
             let backend = hypodj_nl::llama::LlamaBackend::open(&p);
             if backend.is_none() {
                 tracing::warn!(path = ?p, "HYPODJ_NL_MODEL is not a file; NL stays rules-only");
             }
-            backend.map(|b| Box::new(hypodj_nl::LlmTranslator::new(b)) as Box<dyn Translator>)
+            backend.map(|b| {
+                let b = Arc::new(b);
+                let warm = hypodj_nl::LlmTranslator::new(b.clone());
+                std::thread::spawn(move || match warm.warm() {
+                    Ok(()) => tracing::info!("NL model loaded and prompt prefix cached"),
+                    Err(e) => tracing::warn!(error = %e, "NL model warm-up failed; asks retry cold"),
+                });
+                Box::new(hypodj_nl::LlmTranslator::new(b)) as Box<dyn Translator>
+            })
         });
         #[cfg(not(feature = "llm-llama"))]
         let model: Option<Box<dyn Translator>> = None;
