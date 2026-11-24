@@ -372,7 +372,7 @@ struct Rig {
 
 fn head_of(h: &HypodjHandler) -> Option<String> {
     let st = h.state.lock().unwrap();
-    st.current.and_then(|i| st.queue.get(i)).map(|it| match &it.entry {
+    st.current().and_then(|i| st.queue.get(i)).map(|it| match &it.entry {
         QueueEntry::Song(s) => s.id.0.clone(),
         QueueEntry::Stream { url, .. } => url.clone(),
     })

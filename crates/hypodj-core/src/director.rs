@@ -480,10 +480,10 @@ async fn spine<C: Clock>(
                             // whereas the remaining time simply IS the trigger: seek back
                             // and it stops being true, seek forward into the window and
                             // it becomes true, pause and the ticks stop arriving. The
-                            // handler decides whether to act (see maybe_boundary_crossfade);
-                            // this only asks, ~20 times a second, which is free.
+                            // handler decides whether to declare the successor early (see
+                            // on_position); this only asks, ~20 times a second, which is free.
                             if let Some(rem) = rem {
-                                handler.maybe_boundary_crossfade(rem).await;
+                                handler.on_position(rem).await;
                             }
                         }
                     }
@@ -514,7 +514,7 @@ async fn spine<C: Clock>(
                             let finishing = pubr.track_ref(qid, song.clone());
                             pubr.edge(DjEventKind::TrackEnd(finishing));
                         }
-                        // The next TrackStart surfaces later from play_index's
+                        // The next TrackStart surfaces later from the engine's load's
                         // StateChanged(Playing); clear the latch now (End is done).
                         pubr.clear_latch();
                         // (c): network, inline, must-not-drop, but bounded so a hung
@@ -532,6 +532,7 @@ async fn spine<C: Clock>(
                                 errored,
                                 was_local,
                                 continuation_landed,
+                                queue_id,
                             }),
                         )
                         .await;
@@ -540,7 +541,7 @@ async fn spine<C: Clock>(
                         // advance): observers then see End-then-Start with no
                         // intervening StateChanged(Stopped). A FAILED or timed-out
                         // advance leaves `current` at the finishing track (an Err
-                        // from play_index never repoints it), and an exhausted queue
+                        // from the engine never repoints it), and an exhausted queue
                         // leaves it None - both are REAL halts whose Stopped MUST
                         // surface, so is_some() alone is wrong: compare the new
                         // cursor against the finishing id.

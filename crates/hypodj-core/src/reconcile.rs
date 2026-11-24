@@ -17,12 +17,20 @@
 //!
 //! No em dashes, no double hyphens.
 
-// The executor that consumes the planner lands in the next commit.
-#![allow(dead_code)]
 
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
+use super::{
+    db_to_mpv_volume, fade_task, mpv_volume_to_db, spent_heard_row, FadeHandle, FadeSlot,
+    HypodjHandler, ResolvedPlay, State, Terminal, SKIP_DIP_DB,
+};
+use crate::clock::TokioClock;
 use crate::event::QueueId;
+use crate::fade::{run_crossfade, CrossfadeSink, CrossfadeSpec, FadeOutcome, FadeProgress, FadeTarget};
+use crate::player::{PlayState, PlayerError, PlayerHandle};
 
 // ── declared state ─────────────────────────────────────────────────────────
 
@@ -188,7 +196,8 @@ pub(crate) fn plan(a: Audible, d: &Declared, c: Caps) -> Step {
     let is_head = |leg: Leg| d.head == Some(leg.qid) && leg.rev >= d.fresh;
     if d.intent == Intent::Stop {
         return match a {
-            Audible::Silent => Step::Settled,
+            // Silent already, or a fade-out is carrying it to the stop.
+            Audible::Silent | Audible::Single { leaving: true, .. } => Step::Settled,
             _ => Step::Quiesce { fade: None },
         };
     }
@@ -263,6 +272,807 @@ fn quiesce_fade(c: Caps) -> Duration {
     } else {
         c.dip
     }
+}
+
+// ── the impure half: the one path that changes what the decks play ─────────
+
+/// The capability to change what a deck plays. Constructible ONLY in this module (its
+/// field is private), and every head-changing player primitive (`play_url`,
+/// `crossfade_arm`, `crossfade_commit`, `crossfade_abort`) demands one. So a handler
+/// path that loads a track without declaring a head does not compile: the reconciler
+/// below is the single path by construction, not by convention.
+pub(crate) struct HeadKey {
+    _private: (),
+}
+
+const KEY: HeadKey = HeadKey { _private: () };
+
+/// The key a [`crate::player::ProbeDeck`] uses: a deck no handler owns has no engine
+/// to go through. Only the player module's probe wrapper may call this.
+pub(crate) fn probe_key() -> &'static HeadKey {
+    &KEY
+}
+
+/// TEST-ONLY: the player's own tests drive its primitives directly.
+#[cfg(test)]
+pub(crate) fn test_key() -> &'static HeadKey {
+    &KEY
+}
+
+/// An overlap in flight: which legs, where its envelope stands, and how it lands.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Overlap {
+    /// The leg going away.
+    pub out: Leg,
+    /// The leg arriving.
+    pub inn: Leg,
+    /// Reference levels of the two legs (see [`crate::fade::crossfade_pair`]).
+    pub out_db: f64,
+    pub in_db: f64,
+    /// Balance when the running schedule started, and when.
+    pub from_t: f64,
+    pub started: tokio::time::Instant,
+    /// The length of a WHOLE 0-to-1 transition at this overlap's speed.
+    pub dur: Duration,
+    /// The outgoing track played out (a boundary), so its finish is published.
+    pub attribute: bool,
+    /// The ACTIVE deck (the one owning identity) is the INCOMING leg: this overlap is
+    /// running back to the row it started from, and lands by silencing the spare deck
+    /// rather than promoting it.
+    pub reversed: bool,
+}
+
+impl Overlap {
+    /// The envelope's balance now (0 = all outgoing, 1 = all incoming).
+    fn position(&self) -> f64 {
+        let secs = self.dur.as_secs_f64();
+        if secs <= 0.0 {
+            return 1.0;
+        }
+        (self.from_t + self.started.elapsed().as_secs_f64() / secs).clamp(0.0, 1.0)
+    }
+}
+
+/// The engine's in-flight transition, held in [`State`] (one owner).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Transit {
+    Overlap(Overlap),
+    /// A single-deck duck-swap-rise is under way.
+    Dip,
+}
+
+/// The reconciler's own state, owned by the handler.
+pub(crate) struct Engine {
+    /// Held for one whole reconcile pass: steps execute one at a time, in order.
+    run: tokio::sync::Mutex<()>,
+    /// The coalescing poke: whoever changes what is audible outside a pass (an overlap
+    /// landing, a fade-out the user cut short) wakes the reconciler task through it.
+    wake: Arc<Notify>,
+}
+
+impl Engine {
+    pub(crate) fn new() -> Self {
+        Engine { run: tokio::sync::Mutex::new(()), wake: Arc::new(Notify::new()) }
+    }
+}
+
+/// The bound on one reconcile pass. The planner converges in at most four steps from
+/// any snapshot (pinned by `plan_converges_and_is_idempotent`); the margin absorbs
+/// declarations that land mid-pass.
+const MAX_STEPS: usize = 12;
+
+/// The bounded fast-finish of an overlap a third declaration interrupts.
+const SETTLE: Duration = Duration::from_millis(200);
+
+/// The equal-power pair, in deck terms. Forward: the active deck is outgoing. Reversed:
+/// the active deck is the one coming back.
+struct PairSink {
+    player: PlayerHandle,
+    reversed: bool,
+}
+
+impl CrossfadeSink for PairSink {
+    fn set_pair_db(
+        &self,
+        outgoing_db: f64,
+        incoming_db: f64,
+    ) -> impl std::future::Future<Output = Result<(), PlayerError>> + Send {
+        let (active, spare) =
+            if self.reversed { (incoming_db, outgoing_db) } else { (outgoing_db, incoming_db) };
+        let player = self.player.clone();
+        async move { player.set_deck_pair_db(&KEY, active, spare).await }
+    }
+}
+
+impl HypodjHandler {
+    /// Spawn the reconciler TASK: it re-runs a pass whenever something outside a pass
+    /// changed what is audible (an overlap's own terminal, a fade-out cut short). Needs
+    /// the `Arc` (it outlives any one call), so it starts with [`Self::set_self_ref`];
+    /// a raw handler in a unit test reconciles inline in every declaring call instead.
+    pub(crate) fn spawn_reconciler(weak: Weak<HypodjHandler>, wake: Arc<Notify>) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        rt.spawn(async move {
+            loop {
+                wake.notified().await;
+                let Some(h) = weak.upgrade() else { break };
+                let _ = h.reconcile().await;
+            }
+        });
+    }
+
+    pub(crate) fn engine_wake(&self) -> Arc<Notify> {
+        self.engine.wake.clone()
+    }
+
+    /// Wake the reconciler task (coalescing; never blocks).
+    pub(crate) fn poke(&self) {
+        self.engine.wake.notify_one();
+    }
+
+    /// THE DECLARATION ENTRY POINT. Every head change runs here: `mutate` writes the
+    /// declaration (through the `State` declarers) under the state lock, the cause's
+    /// hook runs atomically with it, and the reconciler drives the room to it before
+    /// this returns - so a `play` reply still means "the load landed".
+    ///
+    /// The hook, derived from the cause rather than passed as a bool: a gesture takes
+    /// the gain back (cancels a running fade, recommits the baseline, retires a pending
+    /// pause) under the SAME slot lock as the declaration, unless an overlap owns the
+    /// gain - the planner re-aims an overlap itself (reverse, finish), and aborting its
+    /// task here would strand the second deck. The live gain is left where the deck
+    /// really is, so a crossfade out of a cancelled fade-out starts from that level.
+    /// A gesture also arms the EOF fuse at its head.
+    pub(super) async fn declare<R>(
+        &self,
+        cause: Cause,
+        mutate: impl FnOnce(&mut State) -> R,
+    ) -> Result<R, String> {
+        let r = if cause.resyncs_gain() {
+            let state = self.state.clone();
+            self.fade
+                .cancel_unless(
+                    || matches!(state.lock().unwrap().transit, Some(Transit::Overlap(_))),
+                    || {
+                        let mut st = self.state.lock().unwrap();
+                        let r = mutate(&mut st);
+                        let v = st.target_volume;
+                        st.logical_gain_db = mpv_volume_to_db(v as f64);
+                        st.baseline_committed = true;
+                        st.fading = false;
+                        st.pending_pause = false;
+                        r
+                    },
+                )
+                .await
+        } else {
+            let mut st = self.state.lock().unwrap();
+            mutate(&mut st)
+        };
+        if cause.is_gesture() {
+            let head = self.state.lock().unwrap().head_qid();
+            self.arm_eof_fuse_at(head.map(|q| q.0));
+        }
+        self.notify_change();
+        self.reconcile().await.map(|()| r)
+    }
+
+    /// Run the reconciler: snapshot, plan, execute, until the room is what was declared
+    /// or an overlap's own terminal owns the rest. Serialized by the engine's run lock,
+    /// level-triggered (it re-reads the declaration every step, so a declaration that
+    /// lands mid-pass is never lost), and bounded.
+    ///
+    /// `Err` only when the CURRENT declaration was abandoned at the bottom of the
+    /// fallback ladder (its load failed every way): the caller surfaces that as an ACK.
+    pub(crate) async fn reconcile(&self) -> Result<(), String> {
+        let _pass = self.engine.run.lock().await;
+        let mut err = None;
+        for _ in 0..MAX_STEPS {
+            let (a, d, c) = self.snapshot();
+            let step = plan(a, &d, c);
+            tracing::trace!(?a, ?d, ?step, "reconcile");
+            match step {
+                Step::Settled | Step::AwaitOverlap => {
+                    if a == Audible::Silent {
+                        // A deck carrying nothing carries nothing off the network: the
+                        // store's bulk work stops deferring, whatever emptied it.
+                        self.set_store_playback_remote(false);
+                    }
+                    break;
+                }
+                _ => {
+                    if let Err(e) = self.execute(step, &d, &c).await {
+                        err = Some(e);
+                    }
+                }
+            }
+        }
+        let abandoned = {
+            let st = self.state.lock().unwrap();
+            st.abandoned_rev == Some(st.declared.rev)
+        };
+        match err {
+            Some(e) if abandoned => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Hold the engine's run lock: no reconcile pass runs until the guard drops. For a
+    /// transport act that must not interleave with a load (stop).
+    pub(crate) async fn engine_pass(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.engine.run.lock().await
+    }
+
+    /// Wait for any pass in progress to finish (a dip landing, a load completing) and
+    /// run one more. Transport gestures that take the gain (pause) call this first so
+    /// they act on the room as declared, never on a transition half done.
+    pub(crate) async fn settle_transitions(&self) {
+        let _ = self.reconcile().await;
+    }
+
+    /// The (Audible, Declared, Caps) the planner sees, read under ONE state lock.
+    fn snapshot(&self) -> (Audible, Declared, Caps) {
+        let raw = self.player.state();
+        let st = self.state.lock().unwrap();
+        let mut d = st.declared;
+        if d.head.is_some() && st.head_qid().is_none() {
+            // The head's row left the queue: nothing that is not queued may play.
+            d.head = None;
+        }
+        let a = match (st.transit, st.deck) {
+            (Some(Transit::Overlap(o)), _) => Audible::Overlap { out: o.out, inn: o.inn },
+            (_, Some(leg)) if raw != PlayState::Stopped => Audible::Single {
+                leg,
+                playing: raw == PlayState::Playing,
+                leaving: st.fading && st.quiesce_epoch == Some(st.fade_epoch),
+                committed: st.deck_committed,
+            },
+            _ => Audible::Silent,
+        };
+        let c = Caps {
+            can_crossfade: self.player.can_crossfade(),
+            crossfade_skip: self.crossfade_skip_dur().unwrap_or(Duration::ZERO),
+            crossfade_bound: self.crossfade_bound_dur().unwrap_or(Duration::ZERO),
+            dip: self.skip_fade_dur(),
+            settle: SETTLE,
+            incoming_loads: st.xf_failed_rev != Some(d.rev),
+            abandoned: st.abandoned_rev == Some(d.rev),
+        };
+        (a, d, c)
+    }
+
+    async fn execute(&self, step: Step, d: &Declared, c: &Caps) -> Result<(), String> {
+        match step {
+            Step::Settled | Step::AwaitOverlap => Ok(()),
+            Step::Commit => {
+                self.commit_head(d.cause).await;
+                Ok(())
+            }
+            Step::Begin { shape, attribute_finish } => self.begin(shape, attribute_finish, d).await,
+            Step::Reverse => {
+                self.reverse_overlap().await;
+                Ok(())
+            }
+            Step::FinishThenReplan => {
+                self.finish_overlap(c.settle).await;
+                Ok(())
+            }
+            Step::Quiesce { fade: Some(dur) } => {
+                self.fade_out(dur).await;
+                Ok(())
+            }
+            Step::Quiesce { fade: None } => {
+                self.halt_decks().await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve the declared head into play arguments, or abandon the declaration.
+    fn resolve_head(&self, d: &Declared) -> Result<ResolvedPlay, String> {
+        let item = {
+            let st = self.state.lock().unwrap();
+            d.head.and_then(|q| st.queue.iter().find(|it| it.id == q.0).cloned())
+        };
+        let resolved = match item {
+            Some(item) => self.resolve_play(&item),
+            None => Err("Bad song index".to_string()),
+        };
+        if resolved.is_err() {
+            self.state.lock().unwrap().abandoned_rev = Some(d.rev);
+        }
+        resolved
+    }
+
+    async fn begin(&self, shape: Shape, attribute: bool, d: &Declared) -> Result<(), String> {
+        let play = self.resolve_head(d)?;
+        // The target is about to be current but is not in the store's window yet: pin
+        // it against eviction until its commit releases the pin.
+        if let Some(id) = play.song_id.clone() {
+            self.set_store_skip_pin(Some(id));
+        }
+        match shape {
+            Shape::Xf(dur) => {
+                self.begin_overlap(&play, d, dur, attribute).await;
+                Ok(())
+            }
+            Shape::Dip(dur) => self.begin_dip(&play, d, dur).await,
+            Shape::Cut => {
+                if d.cause.resyncs_gain() {
+                    // Over a paused or silent deck: re-assert the baseline before the
+                    // load, since mpv's gain persists across loadfile and a completed
+                    // pause fade left it near zero.
+                    let v = self.state.lock().unwrap().target_volume;
+                    let _ = self.player.set_volume(v).await;
+                    self.state.lock().unwrap().live_gain_db = mpv_volume_to_db(v as f64);
+                }
+                self.load(&play, d.rev).await
+            }
+            Shape::FromSilence => {
+                // Something still audible (an undo while another track plays) is taken
+                // DOWN first, never cut from full: the dip's own duck to its shallow
+                // floor, and the silence below that is the same small step the dip's
+                // trough already takes. A duck the user supersedes just re-plans.
+                let audible = self.state.lock().unwrap().deck.is_some()
+                    && self.player.state() == PlayState::Playing;
+                if audible {
+                    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    let dur = self.skip_fade_dur();
+                    if self
+                        .install_engine_fade(FadeTarget::Db(SKIP_DIP_DB), dur, Terminal::Trough(tx))
+                        .await
+                        .is_ok()
+                        && (rx.await.is_err() || self.state.lock().unwrap().declared.rev != d.rev)
+                    {
+                        return Ok(());
+                    }
+                }
+                // Silent BEFORE the first buffer; the caller owns the rise, from the floor.
+                let _ = self.player.set_volume(0).await;
+                {
+                    let mut st = self.state.lock().unwrap();
+                    st.live_gain_db = self.fade_cfg.synth_floor_db;
+                }
+                self.load(&play, d.rev).await
+            }
+        }
+    }
+
+    /// Load `play` on the ACTIVE deck and record it as what the deck plays. A failure
+    /// abandons this declaration (the reconciler stops retrying it) and is returned for
+    /// the caller to surface.
+    async fn load(&self, play: &ResolvedPlay, rev: u64) -> Result<(), String> {
+        self.set_store_playback_remote(!play.local);
+        let loaded = self
+            .player
+            .play_url(&KEY, play.song_id.clone(), Some(play.qid), &play.url, play.local)
+            .await
+            .map_err(|e| e.to_string());
+        let mut st = self.state.lock().unwrap();
+        match loaded {
+            Ok(()) => {
+                st.deck = Some(Leg { qid: play.qid, rev });
+                st.deck_committed = false;
+                Ok(())
+            }
+            Err(e) => {
+                st.abandoned_rev = Some(rev);
+                Err(e)
+            }
+        }
+    }
+
+    /// Xf: arm the spare deck silent, then hand both gains to one envelope in the fade
+    /// slot. The outgoing leg starts from its LIVE gain, so a crossfade that lands
+    /// inside a fade-out continues it rather than jumping back up. A refused arm leaves
+    /// nothing audible changed and marks the ladder to continue below the crossfade.
+    async fn begin_overlap(&self, play: &ResolvedPlay, d: &Declared, dur: Duration, attribute: bool) {
+        let armed = self
+            .player
+            .crossfade_arm(&KEY, play.song_id.clone(), Some(play.qid), &play.url, play.local)
+            .await;
+        if armed.is_err() || self.state.lock().unwrap().declared.rev != d.rev {
+            // Refused, or superseded while loading: silence the spare, re-plan.
+            let _ = self.player.crossfade_abort(&KEY).await;
+            if armed.is_err() {
+                self.state.lock().unwrap().xf_failed_rev = Some(d.rev);
+            }
+            return;
+        }
+        self.set_store_playback_remote(!play.local);
+        // The warm (if any) belongs to the outgoing deck, which is about to stop; a
+        // parked entry there could still auto-advance during the overlap.
+        self.disarm_continuation_warm().await;
+        let mut slot = self.fade.inner.lock().await;
+        if let Some(mut h) = slot.take() {
+            h.abort.abort();
+            if let Some(join) = h.join.take() {
+                let _ = join.await;
+            }
+        }
+        let tick = Duration::from_millis(self.fade_cfg.crossfade_tick_ms);
+        let installed = {
+            let mut st = self.state.lock().unwrap();
+            // No outgoing leg to overlap (it ended under the arm): the ladder goes on.
+            st.deck.and_then(|out| {
+            let out_db = st.live_gain_db;
+            // The queue's own motion keeps the level the room is at (a winddown rides
+            // through a boundary); a gesture lands on the baseline.
+            let in_db = if d.cause.resyncs_gain() {
+                mpv_volume_to_db(st.target_volume as f64)
+            } else {
+                st.live_gain_db
+            };
+            let o = Overlap {
+                out,
+                inn: Leg { qid: play.qid, rev: d.rev },
+                out_db,
+                in_db,
+                from_t: 0.0,
+                started: tokio::time::Instant::now(),
+                dur,
+                attribute,
+                reversed: false,
+            };
+            CrossfadeSpec::between(out_db, in_db, 0.0, dur, tick).ok().map(|spec| {
+                st.fade_epoch += 1;
+                st.fading = true;
+                st.baseline_committed = false;
+                st.quiesce_epoch = None;
+                st.transit = Some(Transit::Overlap(o));
+                (spec, o, st.fade_epoch)
+            })
+            })
+        };
+        let Some((spec, o, epoch)) = installed else {
+            drop(slot);
+            let _ = self.player.crossfade_abort(&KEY).await;
+            self.state.lock().unwrap().xf_failed_rev = Some(d.rev);
+            return;
+        };
+        *slot = Some(self.spawn_overlap(spec, o, epoch));
+        drop(slot);
+        self.notify_change();
+    }
+
+    fn spawn_overlap(&self, spec: CrossfadeSpec, o: Overlap, epoch: u64) -> FadeHandle {
+        let join = tokio::spawn(overlap_task(
+            self.player.clone(),
+            spec,
+            o,
+            self.state.clone(),
+            self.changed.clone(),
+            epoch,
+            self.fade.clone(),
+            self.engine.wake.clone(),
+        ));
+        FadeHandle { abort: join.abort_handle(), join: Some(join) }
+    }
+
+    /// Take the running overlap out of the slot (abort + join its task) and return it
+    /// with its live balance. `None` when no overlap is in flight.
+    async fn seize_overlap(
+        &self,
+    ) -> Option<(tokio::sync::MutexGuard<'_, Option<FadeHandle>>, Overlap, f64)> {
+        let mut slot = self.fade.inner.lock().await;
+        let o = match self.state.lock().unwrap().transit {
+            Some(Transit::Overlap(o)) => o,
+            _ => return None,
+        };
+        if let Some(mut h) = slot.take() {
+            h.abort.abort();
+            if let Some(join) = h.join.take() {
+                let _ = join.await;
+            }
+        }
+        // Bump under the lock so an aborted straggler's last report is already stale.
+        self.state.lock().unwrap().fade_epoch += 1;
+        let t = o.position();
+        Some((slot, o, t))
+    }
+
+    /// Reverse: the declared head is the row the overlap is LEAVING. Run the same
+    /// envelope back from where it stands - no settle, no step in either gain.
+    async fn reverse_overlap(&self) {
+        let Some((mut slot, o, t)) = self.seize_overlap().await else { return };
+        let tick = Duration::from_millis(self.fade_cfg.crossfade_tick_ms);
+        let back_db = mpv_volume_to_db(self.state.lock().unwrap().target_volume as f64);
+        let r = Overlap {
+            out: o.inn,
+            inn: o.out,
+            out_db: o.in_db,
+            in_db: back_db,
+            from_t: 1.0 - t,
+            started: tokio::time::Instant::now(),
+            dur: o.dur,
+            attribute: false,
+            reversed: !o.reversed,
+        };
+        let Ok(spec) = CrossfadeSpec::between(r.out_db, r.in_db, r.from_t, r.dur, tick) else {
+            land_overlap(&self.player, &self.state, &o).await;
+            return;
+        };
+        let epoch = {
+            let mut st = self.state.lock().unwrap();
+            st.transit = Some(Transit::Overlap(r));
+            st.fading = true;
+            st.fade_epoch
+        };
+        *slot = Some(self.spawn_overlap(spec, r, epoch));
+    }
+
+    /// Finish the running overlap within `within` (scaled by what is left of it), land
+    /// it, and leave the next plan to start from the promoted deck. Two decks is the
+    /// bound, so a third head is never a third deck: it is this, then a normal
+    /// transition. `within == 0` lands at once (a manual volume taking the gain).
+    async fn finish_overlap(&self, within: Duration) {
+        let Some((slot, o, t)) = self.seize_overlap().await else { return };
+        let tick = Duration::from_millis(self.fade_cfg.crossfade_tick_ms);
+        if !within.is_zero() && t < 1.0 {
+            if let Ok(spec) = CrossfadeSpec::between(o.out_db, o.in_db, t, within, tick) {
+                let sink = PairSink { player: self.player.clone(), reversed: o.reversed };
+                let mut report = |_p: FadeProgress| {};
+                let _ = run_crossfade(&sink, &spec, &TokioClock, &mut report).await;
+            }
+        }
+        land_overlap(&self.player, &self.state, &o).await;
+        drop(slot);
+        self.changed.notify_waiters();
+    }
+
+    /// Promote an in-flight overlap at once, before something else takes the gain (a
+    /// manual volume, a stop). A no-op with nothing in flight.
+    pub(crate) async fn settle_overlap(&self) {
+        self.finish_overlap(Duration::ZERO).await;
+    }
+
+    /// Dip: duck the playing deck to the skip floor, load the head at the trough, rise.
+    /// The single-deck floor. A manual volume or pause that takes the gain mid-duck
+    /// aborts it, and the next plan starts again from wherever the gain was left.
+    async fn begin_dip(&self, play: &ResolvedPlay, d: &Declared, dur: Duration) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let duck = self
+            .install_engine_fade(FadeTarget::Db(SKIP_DIP_DB), dur, Terminal::Trough(tx))
+            .await;
+        if duck.is_err() {
+            // An unbuildable duck must not turn the gesture into a no-op: cut.
+            return self.load(play, d.rev).await;
+        }
+        self.state.lock().unwrap().transit = Some(Transit::Dip);
+        let reached = rx.await.is_ok();
+        let still = self.state.lock().unwrap().declared.rev == d.rev;
+        if !(reached && still) {
+            self.state.lock().unwrap().transit = None;
+            return Ok(());
+        }
+        let loaded = self.load(play, d.rev).await;
+        self.state.lock().unwrap().transit = None;
+        // Rise from the floor, loaded or not: a failed load must not leave the room
+        // ducked under a track that keeps playing.
+        let target = self.state.lock().unwrap().target_volume;
+        let _ = self
+            .install_engine_fade(
+                FadeTarget::Db(mpv_volume_to_db(target as f64)),
+                dur,
+                Terminal::SetBaseline(target),
+            )
+            .await;
+        loaded
+    }
+
+    /// A one-legged fade-out to a stop: the head went away under a playing track
+    /// (clear, remove the last row). The engine records its epoch, so a declaration
+    /// landing during it plans a crossfade from its live gain.
+    async fn fade_out(&self, dur: Duration) {
+        let res = self
+            .install_engine_fade(FadeTarget::Silence, dur, Terminal::StopRestore { evict: None })
+            .await;
+        if res.is_err() {
+            self.halt_decks().await;
+            return;
+        }
+        {
+            let mut st = self.state.lock().unwrap();
+            st.quiesce_epoch = Some(st.fade_epoch);
+        }
+        // Nothing drains next behind a deck fading to a stop.
+        self.disarm_continuation_warm().await;
+        self.notify_change();
+    }
+
+    /// Silence every deck NOW: stop, or nothing playable with a paused deck. Any fade or
+    /// overlap dies with it (both decks stop, so no leg is stranded).
+    pub(crate) async fn halt_decks(&self) {
+        let mut slot = self.fade.inner.lock().await;
+        if let Some(mut h) = slot.take() {
+            h.abort.abort();
+            if let Some(join) = h.join.take() {
+                let _ = join.await;
+            }
+        }
+        let v = {
+            let mut st = self.state.lock().unwrap();
+            st.fade_epoch += 1;
+            st.transit = None;
+            st.quiesce_epoch = None;
+            st.deck = None;
+            let v = st.target_volume;
+            st.set_manual_volume(v, false);
+            st.pending_pause = false;
+            v
+        };
+        let _ = self.player.crossfade_abort(&KEY).await;
+        let _ = self.player.stop().await;
+        let _ = self.player.set_volume(v).await;
+        drop(slot);
+        self.set_store_playback_remote(false);
+        self.disarm_continuation_warm().await;
+        self.notify_change();
+    }
+
+    /// Install an engine-owned single-gain fade (a duck, a rise, a fade-out) through
+    /// the ONE fade slot, from the live gain, deliberate and clamped up so it always
+    /// lands. Validate-before-abort, epoch-bumped under the slot lock.
+    async fn install_engine_fade(
+        &self,
+        target: FadeTarget,
+        dur: Duration,
+        terminal: Terminal,
+    ) -> Result<(), crate::fade::FadeError> {
+        let from_db = self.state.lock().unwrap().live_gain_db;
+        let spec = self.build_deliberate_spec(from_db, target, dur)?;
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        let mut slot = self.fade.inner.lock().await;
+        if let Some(mut h) = slot.take() {
+            h.abort.abort();
+            if let Some(join) = h.join.take() {
+                let _ = join.await;
+            }
+        }
+        let epoch = {
+            let mut st = self.state.lock().unwrap();
+            st.fade_epoch += 1;
+            st.fading = true;
+            st.baseline_committed = false;
+            st.fade_epoch
+        };
+        let join = tokio::spawn(fade_task(
+            self.player.clone(),
+            spec,
+            self.state.clone(),
+            self.changed.clone(),
+            epoch,
+            terminal,
+            self.fade.clone(),
+            synth_floor,
+        ));
+        *slot = Some(FadeHandle { abort: join.abort_handle(), join: Some(join) });
+        Ok(())
+    }
+
+    /// THE ONE COMMIT: the head is audible, so do its bookkeeping. Replaces the four
+    /// duplicated tails (the plain load, the gapless landing, the crossfade terminal,
+    /// the dip terminal). Runs once per load.
+    pub(crate) async fn commit_head(&self, cause: Cause) {
+        let (item, trimmed, retired) = {
+            let mut st = self.state.lock().unwrap();
+            let Some(leg) = st.deck else { return };
+            st.deck_committed = true;
+            // A track is now current: a pending fresh-enqueue gesture is consumed.
+            st.fresh_enqueue_anchor = None;
+            // One track moved forward, so retire one track's worth of history.
+            let trimmed = st.trim_spent();
+            // A gesture's head landing retires a standing pause intent (the wake from
+            // the nothing-loaded terminal); the queue's own motion leaves it alone so a
+            // pause fade descending across a boundary keeps its intent.
+            let retired = cause.is_gesture() && std::mem::replace(&mut st.pending_pause, false);
+            (st.queue.iter().find(|it| it.id == leg.qid.0).cloned(), trimmed, retired)
+        };
+        for it in &trimmed {
+            if let Some(row) = spent_heard_row(it) {
+                self.append_heard(row);
+            }
+        }
+        // The head is current, so no skip target needs pinning any more.
+        self.set_store_skip_pin(None);
+        if let Some(play) = item.as_ref().and_then(|it| self.resolve_play(it).ok()) {
+            self.set_store_playback_remote(!play.local);
+        }
+        let _ = retired;
+        self.notify_change();
+        // Re-arm the warm behind the freshly current entry.
+        self.reschedule_continuation_warm().await;
+    }
+
+    /// A position tick from the director: if the head is within the boundary crossfade
+    /// length of its natural end, DECLARE its successor early as the queue's own motion.
+    /// The planner turns that into an attributed crossfade. Almost always a cheap no.
+    ///
+    /// Same-album consecutive tracks are never declared early: they flow through the
+    /// gapless advance as their makers sequenced them.
+    pub(crate) async fn on_position(&self, remaining: Duration) {
+        let Some(dur) = self.crossfade_bound_dur() else { return };
+        if !self.player.can_crossfade() || remaining > dur {
+            return;
+        }
+        let next = {
+            let mut st = self.state.lock().unwrap();
+            if st.transit.is_some() || st.fading || st.deck.map(|l| l.qid) != st.head_qid() {
+                return;
+            }
+            let Some(cur) = st.current() else { return };
+            let Some(next) = st.peek_next_from(cur, false) else { return };
+            if next == cur || super::same_album_run(&st, cur, next) {
+                return;
+            }
+            QueueId(st.queue[next].id)
+        };
+        let _ = self
+            .declare(Cause::Natural, |st| {
+                st.declare_head(Some(next), Cause::Natural);
+            })
+            .await;
+    }
+}
+
+/// Land an overlap: promote the incoming deck (forward) or silence the spare (a
+/// reversed run back), re-assert the reached level, and record what the active deck
+/// now plays. The head bookkeeping is the reconciler's ([`HypodjHandler::commit_head`]).
+async fn land_overlap(player: &PlayerHandle, state: &Mutex<State>, o: &Overlap) {
+    if o.reversed {
+        let _ = player.crossfade_abort(&KEY).await;
+    } else {
+        let _ = player.crossfade_commit(&KEY, o.attribute).await;
+    }
+    let _ = player.set_volume_f64(db_to_mpv_volume(o.in_db)).await;
+    let mut st = state.lock().unwrap();
+    st.transit = None;
+    st.live_gain_db = o.in_db;
+    st.fading = false;
+    st.baseline_committed = (o.in_db - mpv_volume_to_db(st.target_volume as f64)).abs() < 1e-9;
+    if !o.reversed {
+        st.deck = Some(o.inn);
+        st.deck_committed = false;
+    }
+}
+
+/// Drive one overlap to its end, then land it - the two-deck counterpart of
+/// `fade_task`, sharing its slot, epoch and abort discipline. Its terminal runs UNDER
+/// the slot lock and only while its epoch is current, so a re-aim that seized the
+/// overlap first (reverse, finish) is the only one that lands it.
+#[allow(clippy::too_many_arguments)]
+fn overlap_task(
+    player: PlayerHandle,
+    spec: CrossfadeSpec,
+    o: Overlap,
+    state: Arc<Mutex<State>>,
+    changed: Arc<Notify>,
+    epoch: u64,
+    fade_slot: Arc<FadeSlot>,
+    wake: Arc<Notify>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = FadeOutcome> + Send>> {
+    Box::pin(async move {
+        let outcome = {
+            let state_r = state.clone();
+            let mut report = move |p: FadeProgress| {
+                let mut st = state_r.lock().unwrap();
+                if st.fade_epoch == epoch {
+                    // The room's level is the incoming reference throughout.
+                    st.live_gain_db = p.gain_db;
+                }
+            };
+            let sink = PairSink { player: player.clone(), reversed: o.reversed };
+            run_crossfade(&sink, &spec, &TokioClock, &mut report).await
+        };
+        let mut slot_guard = fade_slot.inner.lock().await;
+        if state.lock().unwrap().fade_epoch == epoch {
+            land_overlap(&player, &state, &o).await;
+            *slot_guard = None;
+            drop(slot_guard);
+            changed.notify_waiters();
+            // The deck changed outside any pass: the reconciler commits the head.
+            wake.notify_one();
+        }
+        outcome
+    })
 }
 
 #[cfg(test)]
@@ -347,6 +1157,7 @@ mod tests {
             ("paused deck: a new head is a plain load", Audible::Single { leg: leg(1, 0), playing: false, leaving: false, committed: true }, decl(Some(2), Cause::Gesture, 1), caps(), Step::Begin { shape: Shape::Cut, attribute_finish: false }),
             ("paused deck: clear halts", Audible::Single { leg: leg(1, 0), playing: false, leaving: false, committed: true }, decl(None, Cause::Gesture, 1), caps(), Step::Quiesce { fade: None }),
             ("stop halts whatever plays", Audible::Overlap { out: leg(1, 0), inn: leg(2, 1) }, Declared { intent: Intent::Stop, ..decl(Some(2), Cause::Gesture, 2) }, caps(), Step::Quiesce { fade: None }),
+            ("a fade-out to a stop is left to land", Audible::Single { leg: leg(1, 0), playing: true, leaving: true, committed: true }, Declared { intent: Intent::Stop, ..decl(Some(1), Cause::Gesture, 2) }, caps(), Step::Settled),
             ("stop when silent is settled", Audible::Silent, Declared { intent: Intent::Stop, ..decl(Some(2), Cause::Gesture, 2) }, caps(), Step::Settled),
         ];
         for (name, a, d, c, want) in rows {

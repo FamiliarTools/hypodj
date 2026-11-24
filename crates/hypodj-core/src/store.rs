@@ -6508,7 +6508,7 @@ content_type = "audio/flac"
             entry("evictable", 100, 999),
         ];
         // The window is current plus the queue-ahead upcoming entries; the skip
-        // target is the handler's explicit pin, set when `pending_skip` is armed.
+        // target is the handler's explicit pin, set while a declared head is arriving.
         input.window = vec![sid("current"), sid("upcoming")];
         input.protected = HashSet::from([sid("skip-target")]);
         input.pins = Some(PinSet::of_songs(vec![song("pinned", 100, "flac", Some("2024-05-01T12:00:00Z"))]));

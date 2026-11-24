@@ -28,6 +28,7 @@
 //! Phase-1 `MpvPlayer` slots in behind the SAME [`PlayerHandle`] by swapping the
 //! actor body for the mpv thread; nothing above it changes.
 
+use crate::handler::reconcile::HeadKey;
 use crate::event::QueueId;
 use crate::model::SongId;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -180,7 +181,7 @@ pub enum PlayerEvent {
         errored: bool,
         /// Whether the entry that just ended was playing LOCAL STORE BYTES rather than a
         /// network URL. Latched by the actor at load time (it rides `play_url` /
-        /// `switch_warmed` into the actor and back out here), NEVER re-derived at
+        /// a continuation warm into the actor and back out here), NEVER re-derived at
         /// processing time: the handler's `st.current` is repointed after the `play_url`
         /// await, so an interleaved play would misattribute a re-read.
         was_local: bool,
@@ -296,52 +297,18 @@ enum PlayerCommand {
     EmitCrossfadedEof {
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
-    /// Warm (prefetch) a target stream in the background WITHOUT switching the
-    /// audible output: `playlist-clear` (drop any prior appended target, KEEPING the
-    /// current entry) then `loadfile <url> append`. With `prefetch-playlist=yes` mpv
-    /// opens + demuxes + decodes the appended entry ahead of time. Best-effort: an
-    /// append failure is logged, never fatal, and leaves NO warmed entry so a later
-    /// [`SwitchWarmed`](PlayerCommand::SwitchWarmed) falls back to a plain
-    /// loadfile-replace (today's trough behavior, never worse).
-    PrefetchWarm {
-        url: String,
-        reply: oneshot::Sender<Result<(), PlayerError>>,
-    },
-    /// Switch to a previously warmed entry AT THE SKIP TROUGH. If a warmed appended
-    /// entry exists: `playlist-play-index 1` (switch - mpv softvol at the dip floor
-    /// persists) then `playlist-remove 0` (leave the target as the sole entry so its
-    /// natural EOF advances exactly like today). FALLS BACK to `loadfile <url>
-    /// replace` when no warm entry exists (append failed / was cleared), so it is
-    /// always correct. Latches identity + emits `StateChanged(Playing)` IDENTICALLY
-    /// to [`PlayUrl`](PlayerCommand::PlayUrl).
-    SwitchWarmed {
-        song: Option<SongId>,
-        queue_id: Option<QueueId>,
-        url: String,
-        /// Whether `url` is a LOCAL offline-store path (see
-        /// [`PlayUrl`](PlayerCommand::PlayUrl)). The skip gesture pre-resolves ONCE and
-        /// hands the same value to the warm and to this terminal, so local/remote can
-        /// never flip inside a gesture.
-        local: bool,
-        reply: oneshot::Sender<Result<(), PlayerError>>,
-    },
-    /// Drop a parked (warmed) skip target WITHOUT switching to it: `playlist-clear`
-    /// (removes the appended entry, KEEPS the current playing entry) and restore
-    /// `keep-open=no` so the current track's own natural EOF once again auto-ends
-    /// (fires `EndFile(Eof)`) exactly like a plain single-entry track. Called by the
-    /// handler when a skip dip is SUPERSEDED (a pause/setvol/knob fade aborts it
-    /// before [`SwitchWarmed`](PlayerCommand::SwitchWarmed) runs), so a stale warm
-    /// entry can never sit parked behind the still-playing current track. Idempotent
-    /// and best-effort: with no warm entry it is a harmless no-op.
+    /// Drop a parked (warmed) continuation entry WITHOUT switching to it:
+    /// `playlist-clear` (removes the appended entry, KEEPS the current playing entry)
+    /// and restore `keep-open=no` so the current track's own natural EOF once again
+    /// auto-ends exactly like a plain single-entry track. Idempotent and best-effort:
+    /// with no warm entry it is a harmless no-op.
     DropWarm {
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
     /// Warm (prefetch) the end-of-queue CONTINUATION station behind a finite current
-    /// track for a GAPLESS handoff. Same `playlist-clear` + `loadfile ... append` chain
-    /// as [`PrefetchWarm`](PlayerCommand::PrefetchWarm) EXCEPT keep-open stays `no`: the
-    /// skip warm sets keep-open=always to PREVENT the current's EOF auto-advancing into
-    /// the appended entry, but here that auto-advance IS the feature (the gapless
-    /// continuation handoff). On Ok the actor latches
+    /// track for a GAPLESS handoff: `playlist-clear` then `loadfile ... append`, with
+    /// keep-open `no`, because here the current's EOF auto-advancing into the appended
+    /// entry IS the feature (the gapless continuation handoff). On Ok the actor latches
     /// [`WarmKind::Continuation`] with the station's queue id + url so the `EndFile(Eof)`
     /// arm can ATTRIBUTE the landed advance (emit the finishing track's Eof with
     /// `continuation_landed: true` and repoint its own latches onto the station). Purely
@@ -594,8 +561,9 @@ impl PlayerHandle {
     /// Does NOT flip `active`: through the whole transition the OUTGOING deck still
     /// owns the identity, so a supersede that aborts mid-crossfade leaves a deck that
     /// is playing what the queue says it is playing.
-    pub async fn crossfade_arm(
+    pub(crate) async fn crossfade_arm(
         &self,
+        _key: &HeadKey,
         song: Option<SongId>,
         queue_id: Option<QueueId>,
         url: &str,
@@ -629,7 +597,11 @@ impl PlayerHandle {
     /// deliberately not an Eof. A SKIP crossfade passes `false`: the outgoing track was
     /// abandoned mid-play, exactly as it is on today's dip path, and inventing a finish
     /// for it would scrobble music he skipped.
-    pub async fn crossfade_commit(&self, attribute_finish: bool) -> Result<(), PlayerError> {
+    pub(crate) async fn crossfade_commit(
+        &self,
+        _key: &HeadKey,
+        attribute_finish: bool,
+    ) -> Result<(), PlayerError> {
         if self.decks.len() < 2 {
             return Err(PlayerError::Backend("no second deck to promote".into()));
         }
@@ -648,7 +620,7 @@ impl PlayerHandle {
     /// gain to the baseline - this only guarantees the other deck goes quiet, which is
     /// the half that must never be skipped (two decks left audible is the one outcome
     /// worse than either alone).
-    pub async fn crossfade_abort(&self) -> Result<(), PlayerError> {
+    pub(crate) async fn crossfade_abort(&self, _key: &HeadKey) -> Result<(), PlayerError> {
         let Some(spare) = self.spare().cloned() else {
             return Ok(());
         };
@@ -678,19 +650,22 @@ impl PlayerHandle {
     }
 }
 
-impl crate::fade::CrossfadeSink for PlayerHandle {
-    fn set_pair_db(
+impl PlayerHandle {
+    /// Write both decks' gains as one step of an overlap: `active_db` to the deck that
+    /// owns the identity, `spare_db` to the other. Engine-only (it is how an overlap,
+    /// forward or reversed, drives the pair); the crossfade never learns mpv's softvol
+    /// curve, the cube inversion lives below the dB seam here as for the single gain.
+    pub(crate) async fn set_deck_pair_db(
         &self,
-        outgoing_db: f64,
-        incoming_db: f64,
-    ) -> impl std::future::Future<Output = Result<(), PlayerError>> + Send {
-        // The cube inversion lives below the dB seam here exactly as it does for the
-        // single-gain sink; the crossfade never learns mpv's softvol curve.
+        _key: &HeadKey,
+        active_db: f64,
+        spare_db: f64,
+    ) -> Result<(), PlayerError> {
         let out = self.deck().clone();
         let inc = self.spare().cloned();
-        let out_vol = db_to_mpv_volume(outgoing_db);
-        let in_vol = db_to_mpv_volume(incoming_db);
-        async move {
+        let out_vol = db_to_mpv_volume(active_db);
+        let in_vol = db_to_mpv_volume(spare_db);
+        {
             // The INCOMING leg first. If the pair is ever momentarily inconsistent -
             // two property writes can never be one atom - the harmless order is the one
             // that briefly holds the total slightly LOW, which is inaudible, rather than
@@ -717,8 +692,9 @@ impl PlayerHandle {
     /// `local` says whether `url` is an offline-store PATH rather than a network URL;
     /// the actor latches it beside the identity so a later [`PlayerEvent::Eof`] carries
     /// `was_local` (the offline store's suspect attribution).
-    pub async fn play_url(
+    pub(crate) async fn play_url(
         &self,
+        _key: &HeadKey,
         song: Option<SongId>,
         queue_id: Option<QueueId>,
         url: &str,
@@ -734,43 +710,9 @@ impl PlayerHandle {
         .await
     }
 
-    /// Warm the next skip target in the background (see
-    /// [`PlayerCommand::PrefetchWarm`]). Called during the skip dip so the target
-    /// stream is demuxed/decoded and ready by the time the trough switch fires.
-    /// Best-effort: callers IGNORE the result (a warm failure just degrades the
-    /// following [`switch_warmed`](Self::switch_warmed) to today's trough loadfile).
-    pub async fn prefetch_warm(&self, url: &str) -> Result<(), PlayerError> {
-        self.request(|reply| PlayerCommand::PrefetchWarm {
-            url: url.to_string(),
-            reply,
-        })
-        .await
-    }
-
-    /// Switch to the warmed target at the dip trough, or fall back to a plain
-    /// loadfile-replace when no warm entry exists (see
-    /// [`PlayerCommand::SwitchWarmed`]). Same identity/latch/state contract as
-    /// [`play_url`](Self::play_url).
-    pub async fn switch_warmed(
-        &self,
-        song: Option<SongId>,
-        queue_id: Option<QueueId>,
-        url: &str,
-        local: bool,
-    ) -> Result<(), PlayerError> {
-        self.request(|reply| PlayerCommand::SwitchWarmed {
-            song,
-            queue_id,
-            url: url.to_string(),
-            local,
-            reply,
-        })
-        .await
-    }
-
-    /// Drop a parked (warmed) skip target without switching to it (see
-    /// [`PlayerCommand::DropWarm`]). Called when a skip dip is superseded so a stale
-    /// warm entry cannot auto-advance behind the still-playing current track.
+    /// Drop a parked (warmed) entry without switching to it (see
+    /// [`PlayerCommand::DropWarm`]), so a stale warm cannot auto-advance behind the
+    /// still-playing current track.
     /// Best-effort + idempotent: the caller IGNORES the result.
     pub async fn drop_warm(&self) -> Result<(), PlayerError> {
         self.request(|reply| PlayerCommand::DropWarm { reply }).await
@@ -923,6 +865,23 @@ impl PlayerHandle {
     }
 }
 
+/// A handler-less deck for the probe binaries (see [`MpvPlayer::spawn_probe`]).
+pub struct ProbeDeck(PlayerHandle);
+
+impl ProbeDeck {
+    pub async fn play_url(&self, song: Option<SongId>, url: &str) -> Result<(), PlayerError> {
+        self.0.play_url(crate::handler::reconcile::probe_key(), song, None, url, false).await
+    }
+
+    pub fn state(&self) -> PlayState {
+        self.0.state()
+    }
+
+    pub async fn stop(&self) -> Result<(), PlayerError> {
+        self.0.stop().await
+    }
+}
+
 /// A no-op player ACTOR over the real [`PlayerHandle`] boundary. Used to exercise
 /// the handle contract and the MPD layer without an audio device (headless CI,
 /// unit tests). It is a genuine actor (owns state, processes the command loop,
@@ -930,16 +889,12 @@ impl PlayerHandle {
 /// backend - that is `MpvPlayer` (next-phase).
 pub struct NullPlayer;
 
-/// TEST-ONLY observability for the headless warm-skip surface: the NullPlayer
-/// no-ops PrefetchWarm / SwitchWarmed / DropWarm (there is no mpv), so a handler
-/// test cannot otherwise see WHICH warm command a skip / supersede path issued.
-/// This shared probe counts them so the fake-clock handler tests can assert e.g.
-/// "a pause during a skip dip dropped the parked warm" (finding 3).
+/// TEST-ONLY observability for the headless warm surface: the NullPlayer no-ops
+/// DropWarm / PrefetchContinuation (there is no mpv), so a handler test cannot
+/// otherwise see WHICH warm command a path issued. This shared probe counts them.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct WarmProbe {
-    pub prefetch: std::sync::atomic::AtomicUsize,
-    pub switch: std::sync::atomic::AtomicUsize,
     pub drop: std::sync::atomic::AtomicUsize,
     /// Counts `PrefetchContinuation` commands so a fake-clock handler test can assert
     /// the continuation warm actually reached the actor at fire time.
@@ -1053,31 +1008,6 @@ impl NullPlayer {
                             .send(PlayerEvent::StateChanged(PlayState::Playing, song, queue_id))
                             .await;
                     }
-                    PlayerCommand::PrefetchWarm { url: _, reply } => {
-                        // Headless: no mpv to warm. A no-op keeps the command total
-                        // and the match exhaustive; SwitchWarmed below plays normally.
-                        #[cfg(test)]
-                        if let Some(p) = &probe {
-                            p.prefetch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        let _ = reply.send(Ok(()));
-                    }
-                    PlayerCommand::SwitchWarmed { song, queue_id, url: _, local, reply } => {
-                        // No real warm entry exists headless, so this is exactly a
-                        // PlayUrl: latch identity, go Playing, reply before the event.
-                        #[cfg(test)]
-                        if let Some(p) = &probe {
-                            p.switch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        current = song.clone();
-                        current_qid = queue_id;
-                        current_local = local;
-                        let _ = state_tx.send(PlayState::Playing);
-                        let _ = reply.send(Ok(()));
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(PlayState::Playing, song, queue_id))
-                            .await;
-                    }
                     PlayerCommand::EmitCrossfadedEof { reply } => {
                         // Same shape as the mpv arm: report the entry this deck was
                         // carrying as FINISHED-by-crossfade, then forget it.
@@ -1100,7 +1030,7 @@ impl NullPlayer {
                     }
                     PlayerCommand::DropWarm { reply } => {
                         // Headless: no mpv playlist to prune. A no-op keeps the command
-                        // total; no warm entry ever exists here (PrefetchWarm is a no-op).
+                        // total; no warm entry ever exists here.
                         #[cfg(test)]
                         if let Some(p) = &probe {
                             p.drop.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1306,6 +1236,15 @@ impl MpvPlayer {
         Self::spawn_decks(out, 2)
     }
 
+    /// A standalone deck for a PROBE binary: it loads a URL directly because no
+    /// handler (and so no transition engine) owns it. A [`ProbeDeck`] cannot be turned
+    /// into the [`PlayerHandle`] a handler is built from, so this is not a way around
+    /// the engine's single path - it is a different, handler-less use of the actor.
+    pub fn spawn_probe(out: AudioOut) -> (ProbeDeck, mpsc::Receiver<PlayerEvent>) {
+        let (h, ev) = Self::spawn_decks(out, 1);
+        (ProbeDeck(h), ev)
+    }
+
     fn spawn_decks(out: AudioOut, want: usize) -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
         let (evt_tx, evt_rx) = mpsc::channel::<PlayerEvent>(64);
         let mut links: Vec<DeckLink> = Vec::with_capacity(want);
@@ -1348,33 +1287,11 @@ impl MpvPlayer {
             init.set_property("terminal", "no")?;
             // WARM-SKIP PREFETCH: with prefetch-playlist=yes mpv opens + demuxes +
             // decodes an appended playlist entry in the BACKGROUND (its own demuxer
-            // cache), so a later `playlist-play-index` switch to it lands near-instant
-            // instead of paying the ~network first-byte cost at the skip trough. It is
-            // a harmless global during normal single-entry playback (nothing to warm
-            // until a skip appends a next entry); the warming only ever runs inside the
-            // brief 2-entry window of a live skip. The prefetched entry is decoded into
-            // its OWN demuxer cache, NOT routed to the audio output, so nothing bleeds at
-            // the duck WHILE the current track keeps playing.
-            //
-            // THE TRAP: a 2-entry playlist lets mpv AUTO-ADVANCE into the appended warm
-            // entry the instant the current track hits its natural EOF (e.g. a Next
-            // pressed within the skip dip near a finite track's end) - making the warmed
-            // track audible before the trough switch and firing a phantom EndFile(Eof)
-            // that double-advances the queue. keep-open=always is set around the warm
-            // window (PrefetchWarm, restored to no in SwitchWarmed / DropWarm / PlayUrl /
-            // Stop) as belt-and-suspenders, but it is NOT sufficient on its own:
-            // empirically on this libmpv (0.41.0) keep-open only holds at the LAST
-            // playlist entry, so an appended entry makes the current a NON-last entry and
-            // it STILL auto-advances at EOF (proven in
-            // live_warm_skip_eof_during_dip_no_phantom_advance). The real defenses are:
-            //   (1) the handler NEAR-EOF GUARD - DECLINE the warm whenever the current is
-            //       within the dip's own duration + margin of its natural end, so a warm
-            //       is never parked when the current could EOF before the trough switch
-            //       (the primary no-bleed guarantee); and
-            //   (2) the `warmed`-flag guard in the EndFile arm below - even if mpv does
-            //       auto-advance, the actor SUPPRESSES the phantom EndFile(Eof) so no
-            //       phantom queue advance ever escapes, and SwitchWarmed's index re-check
-            //       still lands the intended target.
+            // cache). Only the gapless CONTINUATION warm appends an entry now (the skip
+            // warm is gone: the transition engine crossfades on a second deck instead),
+            // and there the auto-advance into the appended entry at the current's
+            // natural EOF IS the feature. The prefetched entry is decoded into its OWN
+            // demuxer cache, NOT routed to the audio output.
             init.set_property("prefetch-playlist", "yes")?;
             // PIN THE RAM CEILING the tape reads from. This block previously set NO cache
             // options at all, so mpv's defaults were in force and the retained history had
@@ -1560,20 +1477,14 @@ fn emit_honest_stop(
 }
 
 /// The actor-local warm latch: what (if anything) sits prefetched at playlist index
-/// 1 behind the current entry. Widened from the original bare `warmed: bool` so the
-/// `EndFile(Eof)` arm can distinguish a SKIP warm (swallow the current's EOF; the
-/// pending [`SwitchWarmed`](PlayerCommand::SwitchWarmed) owns the transition) from a
-/// CONTINUATION warm (the current's natural EOF AUTO-ADVANCES mpv into the warmed
-/// station - that advance IS the gapless handoff, attributed by the arm, never
-/// swallowed). Both suppress the top-level load-failure honest-stop gate while parked
+/// 1 behind the current entry - a CONTINUATION warm, whose natural-EOF auto-advance IS
+/// the gapless handoff (attributed by the `EndFile(Eof)` arm, never swallowed). It
+/// suppresses the top-level load-failure honest-stop gate while parked
 /// (a warm-target open failure must not stop the audible current track).
 enum WarmKind {
     /// Nothing warmed: the current entry is the sole playlist entry (a fresh play
     /// cleared any leftover), so its natural EOF advances the queue normally.
     None,
-    /// A prefetched SKIP target. keep-open=always is set so the current PAUSES at its
-    /// EOF instead of auto-advancing; `SwitchWarmed` consumes it at the dip trough.
-    Skip,
     /// A prefetched CONTINUATION station appended behind a FINITE current track with
     /// keep-open=no, so mpv auto-advances into it at the current's natural EOF. Carries
     /// the station's queue identity + url so the `EndFile(Eof)` arm can attribute the
@@ -1620,7 +1531,7 @@ fn mpv_actor(
     let mut current: Option<SongId> = None;
     let mut current_qid: Option<QueueId> = None;
     // Whether the LATCHED entry is playing local offline-store bytes. It rides the load
-    // in (PlayUrl/SwitchWarmed carry it) and rides back out on the entry's own
+    // in (PlayUrl carries it) and rides back out on the entry's own
     // [`PlayerEvent::Eof`], which is what makes suspect attribution race-free: nothing
     // downstream ever has to re-read mutable state that may already point elsewhere.
     let mut current_local = false;
@@ -1632,7 +1543,7 @@ fn mpv_actor(
     // Whether the deck is currently playing, for the Viz `playing` flag.
     let mut playing = false;
     // What (if anything) sits prefetched at playlist index 1 behind the current entry
-    // (see [`WarmKind`]): a SKIP target consumed by SwitchWarmed, or a CONTINUATION
+    // (see [`WarmKind`]): a CONTINUATION
     // station the current's natural EOF auto-advances into. None during plain playback.
     let mut warm = WarmKind::None;
 
@@ -1730,34 +1641,14 @@ fn mpv_actor(
                 // loadfile failure returns Err synchronously in handle_cmd and
                 // does not repoint `current`, so this path only covers post-load
                 // failures.)
-                // WARM-WINDOW GUARD (finding 1b/4): while a prefetched skip target is
-                // parked (`warmed`), we are mid skip-dip and the current track's own EOF
-                // must NOT drive a director advance - the pending SwitchWarmed owns the
-                // transition to the target. keep-open=always is set around the warm, but
-                // it does NOT stop a non-last entry from auto-advancing (proven live), so
-                // mpv CAN fire EndFile(Eof) here at the current's natural end. Guarding on
-                // `warmed` is what actually makes the no-phantom-advance guarantee hold:
-                // we swallow that EndFile entirely rather than turn it into a queue Eof.
-                // The handler's near-EOF guard makes this race rare in the first place; if
-                // it does happen, SwitchWarmed's index re-check still lands the intended
-                // target via loadfile-replace. A SUPERSEDED dip clears `warmed` via
-                // DropWarm (and restores keep-open=no), so the current track's later
-                // natural EOF then advances normally through this arm.
-                // Take the warm latch by value (leaving None) so each arm can freely
-                // re-latch: Skip restores itself (a swallowed EOF does not consume it),
-                // Continuation and None stay consumed.
+                // Take the warm latch by value (leaving None): a landed continuation
+                // consumes it.
                 match std::mem::replace(&mut warm, WarmKind::None) {
-                    // SKIP warm parked (findings 1b/4): swallow the current's EOF exactly
-                    // as today - the pending SwitchWarmed owns the transition to the
-                    // target. Restore the latch so SwitchWarmed still sees it.
-                    WarmKind::Skip => {
-                        warm = WarmKind::Skip;
-                    }
                     // CONTINUATION warm parked: the current track's natural EOF
                     // AUTO-ADVANCES mpv into the warmed station (keep-open=no here; the
                     // auto-advance is the FEATURE, not a hazard). Attribute the landed
-                    // handoff rather than swallow it. A structural re-check (mirroring
-                    // SwitchWarmed's can_switch) trusts the handoff ONLY if the warmed
+                    // handoff rather than swallow it. A structural re-check trusts the
+                    // handoff ONLY if the warmed
                     // station url is still present in the playlist as the entry mpv
                     // advances into - a disarm (DropWarm / playlist-clear) removed it, so
                     // the re-check fails and we take the honest-stop body -> the handler's
@@ -1883,10 +1774,8 @@ fn mpv_actor(
                 // advance_on_eof: queue advance, or the continuation one-shot stop)
                 // and clear the play latch + publish Stopped so MPD reports stop, never
                 // a phantom Playing over silence. Guard on a latched entry
-                // (current_qid present) and NOT mid warm-skip (the SwitchWarmed
-                // machinery owns that transition, exactly like the EndFile arm above,
-                // and a warm-target open failure must not stop the audible current
-                // track). Any OTHER event error is unrelated / transient - only logged.
+                // (current_qid present) and NO warm parked (a warm-target open failure
+                // must not stop the audible current track). Any OTHER event error is unrelated / transient - only logged.
                 // This is ALSO the route on which local bytes replaced by garbage
                 // surface: mpv cannot open/decode them, and because loadfile's Ok is
                 // premature that failure never becomes an EndFile(Error). So the Eof it
@@ -1931,9 +1820,9 @@ fn handle_cmd(
     // volume + play-state actually change) and read by the af-metadata arm.
     cur_vol: &mut f64,
     playing: &mut bool,
-    // What (if anything) sits prefetched at playlist index 1 (see [`WarmKind`]): a SKIP
-    // target (PrefetchWarm) or a CONTINUATION station (PrefetchContinuation). Cleared /
-    // re-latched here so the EndFile arm and SwitchWarmed pick the right path.
+    // What (if anything) sits prefetched at playlist index 1 (see [`WarmKind`]): a
+    // CONTINUATION entry (PrefetchContinuation). Cleared / re-latched here so the
+    // EndFile arm picks the right path.
     warm: &mut WarmKind,
     cmd: PlayerCommand,
 ) -> bool {
@@ -1974,34 +1863,8 @@ fn handle_cmd(
             }
             let _ = reply.send(res);
         }
-        PlayerCommand::PrefetchWarm { url, reply } => {
-            // Drop any prior appended target (keeps the current entry), set
-            // keep-open=always so mpv PAUSES at the current track's natural EOF instead
-            // of auto-advancing into the appended warm entry (the no-bleed guard), then
-            // append the new one. With prefetch-playlist=yes mpv warms it in the
-            // background - opened/demuxed/decoded into its OWN demuxer cache, NOT routed
-            // to the audio output, so nothing is heard at the shallow duck. Purely
-            // best-effort: on ANY failure restore keep-open=no and leave no warm entry so
-            // SwitchWarmed falls back to today's trough loadfile-replace (never worse,
-            // never a panic, never silence, never an auto-advance into a stale target).
-            let res = mpv
-                .command("playlist-clear", &[])
-                .and_then(|_| mpv.set_property("keep-open", "always"))
-                .and_then(|_| mpv.command("loadfile", &[&quote(&url), "append"]))
-                .map_err(|e| PlayerError::Backend(e.to_string()));
-            if res.is_err() {
-                // Undo the keep-open flip so a failed warm never wedges the current
-                // track paused at its own EOF (it must advance normally).
-                let _ = mpv.set_property("keep-open", "no");
-            }
-            *warm = if res.is_ok() { WarmKind::Skip } else { WarmKind::None };
-            if let Err(e) = &res {
-                tracing::warn!(error = %e, "mpv prefetch-warm failed; skip will fall back to trough loadfile");
-            }
-            let _ = reply.send(res);
-        }
         PlayerCommand::PrefetchContinuation { url, queue_id, song, local, reply } => {
-            // Same warm chain as PrefetchWarm but keep-open stays `no`: the auto-advance
+            // The warm chain with keep-open `no`: the auto-advance
             // into the appended station at the current track's natural EOF IS the gapless
             // continuation handoff (attributed by the EndFile arm), not a hazard to guard.
             // playlist-clear drops any prior appended target (keeps the current entry),
@@ -2026,78 +1889,6 @@ fn handle_cmd(
                     *warm = WarmKind::None;
                     tracing::warn!(error = %e, "mpv prefetch-continuation failed; continuation falls back to the cold-start");
                 }
-            }
-            let _ = reply.send(res);
-        }
-        PlayerCommand::SwitchWarmed { song, queue_id, url, local, reply } => {
-            // At the dip trough: if a warmed entry exists switch to it (near-instant,
-            // the ~network first-byte cost was paid during the dip); else fall back to
-            // a plain loadfile-replace (today's behavior, never worse). Either branch
-            // ends unpaused with softvol still at the dip floor - the follow-on
-            // ResumeIn owns the rise, exactly as across loadfile-replace today. The
-            // outgoing entry fires EndFile reason=Stop, which the EndFile arm already
-            // ignores (the phantom-skip-cascade cure is untouched).
-            // Restore keep-open=no on either branch: the target becomes the sole entry
-            // and its OWN natural EOF must once again auto-end (fire EndFile(Eof)) to
-            // advance the queue. The warm window's keep-open=always guard is over.
-            //
-            // INDEX RE-CHECK (findings 2, 6, 7): do NOT trust that the warmed entry is
-            // still at index 1 with the outgoing entry at index 0. keep-open=always
-            // SHOULD have stopped any auto-advance, but we verify structurally before
-            // switching so a stale index / consumed entry / auto-advance race can never
-            // switch to the WRONG track: require a 2-entry playlist with playlist-pos
-            // still on 0, AND (finding 6/7) the entry at index 1 to be the exact url we
-            // warmed - so an entry that was replaced/auto-advanced, or a warm that never
-            // actually opened as this url, does NOT get switched to blindly. On ANY
-            // mismatch we FALL BACK to `loadfile <url> replace`: today's proven trough
-            // behavior loading the INTENDED target (latched identity always matches the
-            // url actually loaded), never worse, never the wrong entry.
-            let can_switch = matches!(warm, WarmKind::Skip) && {
-                let count: i64 = mpv.get_property("playlist-count").unwrap_or(0);
-                let pos: i64 = mpv.get_property("playlist-pos").unwrap_or(-1);
-                // Read the appended entry's filename; if unreadable, rely on structure.
-                let identity_ok = match mpv.get_property::<String>("playlist/1/filename") {
-                    Ok(f) => f == url,
-                    Err(_) => true,
-                };
-                count == 2 && pos == 0 && identity_ok
-            };
-            let res = if can_switch {
-                mpv.command("playlist-play-index", &["1"])
-                    .and_then(|_| mpv.command("playlist-remove", &["0"]))
-                    .and_then(|_| mpv.set_property("keep-open", "no"))
-                    .and_then(|_| mpv.set_property("pause", false))
-                    .map_err(|e| PlayerError::Backend(e.to_string()))
-            } else {
-                // No usable warm (never warmed, index moved, entry not our url, or a
-                // warm that did not become the expected playable entry): plain replace.
-                // playlist-clear first so a leftover appended entry can never linger and
-                // auto-advance behind the freshly loaded target.
-                mpv.command("playlist-clear", &[])
-                    .and_then(|_| mpv.command("loadfile", &[&quote(&url), "replace"]))
-                    .and_then(|_| mpv.set_property("keep-open", "no"))
-                    .and_then(|_| mpv.set_property("pause", false))
-                    .map_err(|e| PlayerError::Backend(e.to_string()))
-            };
-            *warm = WarmKind::None;
-            match &res {
-                Ok(()) => {
-                    *current = song.clone();
-                    *current_qid = queue_id;
-                    *current_local = local;
-                    *playing = true;
-                    let _ = state_tx.send(PlayState::Playing);
-                    // Reply BEFORE the StateChanged blocking_send (deadlock-avoidance),
-                    // identical to PlayUrl.
-                    let _ = reply.send(res);
-                    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
-                        PlayState::Playing,
-                        song,
-                        queue_id,
-                    ));
-                    return false;
-                }
-                Err(e) => tracing::error!(error = %e, "mpv switch-warmed failed"),
             }
             let _ = reply.send(res);
         }
@@ -2732,7 +2523,7 @@ mod tests {
         assert_eq!(player.state(), PlayState::Stopped);
 
         player
-            .play_url(Some(SongId("42".into())), Some(QueueId(0)), "http://example/stream", false)
+            .play_url(crate::handler::reconcile::test_key(), Some(SongId("42".into())), Some(QueueId(0)), "http://example/stream", false)
             .await
             .unwrap();
         assert_eq!(player.state(), PlayState::Playing);
@@ -2771,7 +2562,7 @@ mod tests {
 
         // With an entry latched, both transports publish exactly as before.
         player
-            .play_url(Some(SongId("7".into())), Some(QueueId(3)), "http://example/s", false)
+            .play_url(crate::handler::reconcile::test_key(), Some(SongId("7".into())), Some(QueueId(3)), "http://example/s", false)
             .await
             .unwrap();
         player.pause().await.unwrap();
@@ -2793,7 +2584,7 @@ mod tests {
     async fn eof_reports_the_local_fact_latched_at_load_time() {
         let (player, mut events) = NullPlayer::spawn();
         player
-            .play_url(Some(SongId("cached".into())), Some(QueueId(1)), "/store/cached.flac", true)
+            .play_url(crate::handler::reconcile::test_key(), Some(SongId("cached".into())), Some(QueueId(1)), "/store/cached.flac", true)
             .await
             .unwrap();
         player.test_emit_eof().await.unwrap();
@@ -2813,7 +2604,7 @@ mod tests {
         // And a remote load does not claim locality, so a failed stream can never
         // de-offer a stored file.
         player
-            .play_url(Some(SongId("streamed".into())), Some(QueueId(2)), "http://x/stream", false)
+            .play_url(crate::handler::reconcile::test_key(), Some(SongId("streamed".into())), Some(QueueId(2)), "http://x/stream", false)
             .await
             .unwrap();
         player.test_emit_eof().await.unwrap();
@@ -3027,7 +2818,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(None, Some(QueueId(1)), url, false)
+                .play_url(crate::handler::reconcile::test_key(), None, Some(QueueId(1)), url, false)
                 .await
                 .expect("play NTS stream");
 
@@ -3084,7 +2875,7 @@ mod tests {
             // loadfile Ok is premature: the play_url call itself SUCCEEDS even though
             // the URL is dead (the failure only surfaces later, over events).
             player
-                .play_url(None, Some(QueueId(1)), url, false)
+                .play_url(crate::handler::reconcile::test_key(), None, Some(QueueId(1)), url, false)
                 .await
                 .expect("play_url returns Ok (loadfile is premature) for a dead URL");
 
@@ -3115,36 +2906,6 @@ mod tests {
                 "the watch state settles to Stopped so MPD reports stop, never silent Playing"
             );
         });
-    }
-
-    // The warm-skip surface over the headless actor: prefetch_warm is a graceful
-    // no-op (there is no mpv to warm) and switch_warmed plays the target exactly like
-    // play_url (latches identity, goes Playing, emits StateChanged). This is the
-    // graceful-degradation contract in miniature - no warm entry ever exists here, so
-    // switch_warmed takes its fallback and still lands the target correctly.
-    #[tokio::test]
-    async fn warm_then_switch_over_null_player_plays_target() {
-        let (player, mut events) = NullPlayer::spawn();
-        // A warm never fails from the caller's view (best-effort, no-op headless).
-        player.prefetch_warm("http://target/stream").await.unwrap();
-        assert_eq!(player.state(), PlayState::Stopped, "warm does not start playback");
-
-        player
-            .switch_warmed(Some(SongId("7".into())), Some(QueueId(9)), "http://target/stream", false)
-            .await
-            .unwrap();
-        assert_eq!(player.state(), PlayState::Playing, "switch plays the target");
-
-        // The StateChanged edge latches the target's identity, same as play_url.
-        let mut saw = false;
-        while let Ok(ev) = events.try_recv() {
-            if let PlayerEvent::StateChanged(PlayState::Playing, song, qid) = ev {
-                assert_eq!(song, Some(SongId("7".into())));
-                assert_eq!(qid, Some(QueueId(9)));
-                saw = true;
-            }
-        }
-        assert!(saw, "switch_warmed emits a Playing StateChanged for the target");
     }
 
     // LIVE empirical proof of the Tier-A warm-skip mechanism on THIS installed
@@ -3265,116 +3026,6 @@ mod tests {
         let _ = std::fs::remove_file(&b);
     }
 
-    // Was DEAD: a stray duplicated `#[test]` above the previous test swallowed this
-    // one's, so `cargo test --ignored` never ran it and the compiler filed it as an
-    // unused function. A live proof that cannot be invoked is worse than no proof - the
-    // gate reads as covered.
-    #[test]
-    #[ignore = "needs a real libmpv runtime; run manually to confirm the warm-skip prefetch"]
-    fn live_warm_skip_no_bleed_and_switches() {
-        use libmpv2::Mpv;
-        use std::io::Write;
-
-        // Synthesize a short mono s16le WAV of a given frequency so A and B are
-        // distinct streams (the point is only that they are two real decodable files).
-        fn write_tone(path: &std::path::Path, freq: f64, secs: f64) {
-            let sr = 44100u32;
-            let n = (sr as f64 * secs) as usize;
-            let mut pcm: Vec<u8> = Vec::with_capacity(n * 2);
-            for i in 0..n {
-                let t = i as f64 / sr as f64;
-                let s = (2.0 * std::f64::consts::PI * freq * t).sin() * 0.5;
-                pcm.extend_from_slice(&((s * i16::MAX as f64) as i16).to_le_bytes());
-            }
-            let data_len = pcm.len() as u32;
-            let mut wav: Vec<u8> = Vec::with_capacity(44 + pcm.len());
-            wav.extend_from_slice(b"RIFF");
-            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
-            wav.extend_from_slice(b"WAVE");
-            wav.extend_from_slice(b"fmt ");
-            wav.extend_from_slice(&16u32.to_le_bytes());
-            wav.extend_from_slice(&1u16.to_le_bytes());
-            wav.extend_from_slice(&1u16.to_le_bytes());
-            wav.extend_from_slice(&sr.to_le_bytes());
-            wav.extend_from_slice(&(sr * 2).to_le_bytes());
-            wav.extend_from_slice(&2u16.to_le_bytes());
-            wav.extend_from_slice(&16u16.to_le_bytes());
-            wav.extend_from_slice(b"data");
-            wav.extend_from_slice(&data_len.to_le_bytes());
-            wav.extend_from_slice(&pcm);
-            std::fs::File::create(path)
-                .and_then(|mut f| f.write_all(&wav))
-                .expect("write tone wav");
-        }
-
-        let dir = std::env::temp_dir();
-        let a = dir.join("hypodj_warm_a.wav");
-        let b = dir.join("hypodj_warm_b.wav");
-        write_tone(&a, 220.0, 8.0);
-        write_tone(&b, 660.0, 8.0);
-
-        let mpv = Mpv::with_initializer(|init| {
-            init.set_property("vid", "no")?;
-            init.set_property("ao", "null")?;
-            init.set_property("terminal", "no")?;
-            init.set_property("prefetch-playlist", "yes")?;
-            Ok(())
-        })
-        .expect("construct mpv");
-
-        // Play A, let it get rolling.
-        mpv.command("loadfile", &[&quote(&a.to_string_lossy()), "replace"])
-            .expect("loadfile A");
-        mpv.set_property("pause", false).expect("unpause");
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let pos_before: f64 = mpv.get_property("time-pos").unwrap_or(0.0);
-        let plpos_before: i64 = mpv.get_property("playlist-pos").unwrap_or(-1);
-        assert_eq!(plpos_before, 0, "still on entry 0 before the warm");
-
-        // WARM: clear stray, guard with keep-open=always (so A's EOF can never
-        // auto-advance into the appended entry), + append B. mpv prefetches it in the
-        // background.
-        mpv.command("playlist-clear", &[]).expect("playlist-clear");
-        mpv.set_property("keep-open", "always").expect("keep-open always");
-        mpv.command("loadfile", &[&quote(&b.to_string_lossy()), "append"])
-            .expect("append B");
-        // Let the warm run while A keeps playing. NO BLEED: audio stays on A, and the
-        // playing entry never leaves index 0.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let pos_during: f64 = mpv.get_property("time-pos").unwrap_or(0.0);
-        let plpos_during: i64 = mpv.get_property("playlist-pos").unwrap_or(-1);
-        assert_eq!(plpos_during, 0, "warm must NOT switch the audible entry (no bleed)");
-        assert!(
-            pos_during > pos_before,
-            "A's timeline keeps advancing during the warm (pos {pos_before} -> {pos_during})"
-        );
-
-        // SWITCH at the trough: play index 1, drop the old entry. Measure how fast
-        // audio starts flowing on the new entry.
-        let t0 = std::time::Instant::now();
-        mpv.command("playlist-play-index", &["1"]).expect("play index 1");
-        mpv.command("playlist-remove", &["0"]).expect("remove old");
-        mpv.set_property("keep-open", "no").expect("keep-open no");
-        mpv.set_property("pause", false).expect("unpause");
-        // Poll until playlist-pos reports the (now sole) target entry and audio-pts
-        // resets onto B's fresh timeline.
-        let mut switched = false;
-        while t0.elapsed() < std::time::Duration::from_secs(3) {
-            let plpos: i64 = mpv.get_property("playlist-pos").unwrap_or(-1);
-            let pos: f64 = mpv.get_property("time-pos").unwrap_or(f64::NAN);
-            if plpos == 0 && pos.is_finite() && pos < pos_during {
-                switched = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        let switch_ms = t0.elapsed().as_millis();
-        eprintln!("warm switch settled in ~{switch_ms} ms (target reset onto its own timeline)");
-        assert!(switched, "the warmed target became the sole playing entry after the switch");
-
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
-    }
 
     // THE live proof, and the only one that can exist: two real mpv contexts decoding at
     // the SAME INSTANT. Every unit test above runs over headless actors that would report
@@ -3391,7 +3042,7 @@ mod tests {
     #[test]
     #[ignore = "needs a real libmpv runtime; run manually to confirm two decks overlap"]
     fn live_two_decks_overlap_through_an_equal_power_crossfade() {
-        use crate::fade::{crossfade_gains, CrossfadeSink};
+        use crate::fade::crossfade_gains;
         use std::time::Duration;
         let dir = std::env::temp_dir().join("hypodj-xfade-live");
         let _ = std::fs::create_dir_all(&dir);
@@ -3417,7 +3068,7 @@ mod tests {
 
             // Deck A alone, at the baseline.
             player
-                .play_url(None, Some(QueueId(1)), a.to_str().unwrap(), true)
+                .play_url(crate::handler::reconcile::test_key(), None, Some(QueueId(1)), a.to_str().unwrap(), true)
                 .await
                 .expect("deck A loads");
             tokio::time::sleep(Duration::from_millis(800)).await;
@@ -3431,12 +3082,12 @@ mod tests {
             // Arm deck B silent and walk the envelope by hand, checking the overlap at
             // the midpoint rather than trusting the driver to have happened.
             player
-                .crossfade_arm(None, Some(QueueId(2)), b.to_str().unwrap(), true)
+                .crossfade_arm(crate::handler::reconcile::test_key(), None, Some(QueueId(2)), b.to_str().unwrap(), true)
                 .await
                 .expect("deck B arms");
             for k in 0..=20 {
                 let (out_db, in_db) = crossfade_gains(k as f64 / 20.0, 0.0);
-                player.set_pair_db(out_db, in_db).await.expect("both gains take");
+                player.set_deck_pair_db(crate::handler::reconcile::test_key(), out_db, in_db).await.expect("both gains take");
                 if k == 10 {
                     let playing =
                         player.deck_states().iter().filter(|s| **s == PlayState::Playing).count();
@@ -3450,7 +3101,7 @@ mod tests {
             }
 
             // Promote: the incoming deck keeps playing, the outgoing one goes.
-            player.crossfade_commit(false).await.expect("promote");
+            player.crossfade_commit(crate::handler::reconcile::test_key(), false).await.expect("promote");
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(player.state(), PlayState::Playing, "the promoted deck plays on");
             assert_eq!(
@@ -3495,80 +3146,6 @@ mod tests {
             .expect("write tone wav");
     }
 
-    // LIVE regression proof of THE TRAP + the defense (finding 1/1b/4, task LIVE
-    // PROOF b): drive the REAL MpvPlayer actor through the EXACT reverted-critical
-    // path - a warm target is parked behind the CURRENT file and the current then
-    // reaches its OWN NATURAL EOF while a dip is notionally in progress (we do NOT
-    // switch first). Empirically on this libmpv (0.41.0) the 2-entry auto-advance vs
-    // keep-open behaviour at a non-last entry's EOF is TIMING-DEPENDENT (a short,
-    // barely-buffered current can auto-advance into the warm; a fully-buffered one can
-    // be held) - which is exactly why keep-open=always is NOT relied upon and the
-    // handler NEAR-EOF GUARD (declines the warm near the end, tested fake-clocked in
-    // handler::tests::near_eof_guard_declines_the_warm) is the primary defense. What
-    // this test pins is the INVARIANT that must hold either way: with a warm parked and
-    // the current reaching its natural EOF, NO phantom queue advance escapes to the
-    // director (the `warmed` guard in the EndFile arm swallows any EndFile(Eof)), and a
-    // following SwitchWarmed still lands the intended target (its index re-check takes
-    // the loadfile-replace fallback when the playlist collapsed). Ignored by default
-    // (needs a real libmpv runtime); run:
-    //   cargo test -p hypodj-core -- --ignored live_warm_skip_eof_during_dip
-    #[test]
-    #[ignore = "needs a real libmpv runtime; run manually to confirm the EOF-during-dip guard"]
-    fn live_warm_skip_eof_during_dip_no_phantom_advance() {
-        let dir = std::env::temp_dir();
-        let a = dir.join("hypodj_eof_a.wav");
-        let b = dir.join("hypodj_eof_b.wav");
-        // A is short-ish so it reaches its natural EOF quickly (but long enough that
-        // the warm is definitely parked first); B is long.
-        write_tone_wav(&a, 220.0, 1.5);
-        write_tone_wav(&b, 660.0, 8.0);
-
-        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
-        rt.block_on(async {
-            let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
-
-            // Play the SHORT current file A as the latched entry (id present, so a real
-            // EOF WOULD normally emit PlayerEvent::Eof and advance the queue).
-            player
-                .play_url(Some(SongId("A".into())), Some(QueueId(1)), &a.to_string_lossy(), false)
-                .await
-                .expect("play A");
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-
-            // WARM B behind A (PrefetchWarm): parks it as the appended entry.
-            player.prefetch_warm(&b.to_string_lossy()).await.expect("warm B");
-
-            // Let A run PAST its natural EOF (~1.5s) WITHOUT switching - the reverted
-            // regression's exact timing (a skip landing near the current's end).
-            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-
-            // THE PROOF (finding 1b/4): mpv auto-advanced into the warm entry at A's EOF,
-            // but the actor's `warmed` guard suppressed the phantom EndFile(Eof) - so NOT
-            // A SINGLE Eof event reached the director. No phantom queue advance.
-            let mut saw_eof = false;
-            while let Ok(ev) = events.try_recv() {
-                if let PlayerEvent::Eof { .. } = ev {
-                    saw_eof = true;
-                }
-            }
-            assert!(
-                !saw_eof,
-                "the warmed guard MUST suppress the phantom EndFile(Eof) at the current's EOF"
-            );
-
-            // And SwitchWarmed still lands the intended target B (its index re-check sees
-            // the collapsed playlist and takes the loadfile-replace fallback), going
-            // Playing with B's identity latched.
-            player
-                .switch_warmed(Some(SongId("B".into())), Some(QueueId(2)), &b.to_string_lossy(), false)
-                .await
-                .expect("switch to B");
-            assert_eq!(player.state(), PlayState::Playing, "target B is playing after the switch");
-        });
-
-        let _ = std::fs::remove_file(&a);
-        let _ = std::fs::remove_file(&b);
-    }
 
     // The handle is cloneable and shared: a second clone sees the same state,
     // which is what the (shared-across-connections) MPD handler relies on.
@@ -3577,7 +3154,7 @@ mod tests {
         let (player, _events) = NullPlayer::spawn();
         let other = player.clone();
         player
-            .play_url(Some(SongId("1".into())), Some(QueueId(1)), "http://x", false)
+            .play_url(crate::handler::reconcile::test_key(), Some(SongId("1".into())), Some(QueueId(1)), "http://x", false)
             .await
             .unwrap();
         assert_eq!(other.state(), PlayState::Playing);
@@ -3664,7 +3241,7 @@ mod tests {
     }
 
     /// THE proof no headless test can reach, and the one the whole design is built around:
-    /// a real bounded dump returns real audio, and the instant a warm switch lands the same
+    /// a real bounded dump returns real audio, and the instant the next load lands the same
     /// call must FAIL rather than hand back a named zero-byte file.
     ///
     /// A `let Some(..) = handler_with_null_player()` test provably cannot prove an mpv path
@@ -3673,7 +3250,7 @@ mod tests {
     ///   cargo test -p hypodj-core -- --ignored live_bounded_dump
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a real libmpv runtime + a local socket; run from the devshell"]
-    async fn live_bounded_dump_returns_audio_and_refuses_after_a_warm_switch() {
+    async fn live_bounded_dump_returns_audio_and_refuses_after_a_reload() {
         let url = serve_wav(120.0);
         let dir = std::env::temp_dir().join(format!("hypodj-livedump-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3681,7 +3258,7 @@ mod tests {
 
         // AudioOut::Null, always: a live proof must leave no sound in the human's room.
         let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
-        player.play_url(None, Some(QueueId(1)), &url, false).await.expect("load");
+        player.play_url(crate::handler::reconcile::test_key(), None, Some(QueueId(1)), &url, false).await.expect("load");
 
         // Wait for real playback to pass the window we intend to ask for. Wall clock here
         // is not a scheduling decision, it is waiting for a physical process; the
@@ -3754,12 +3331,11 @@ mod tests {
             ),
         }
 
-        // THE MEASURED VOLATILITY. A warm switch is `playlist-play-index 1` +
-        // `playlist-remove 0`, which destroyed 110s of history while the dump still
-        // returned success and wrote a zero-byte file. The shipped path must FAIL here.
+        // THE MEASURED VOLATILITY. Loading the next entry replaces the deck's history,
+        // which once destroyed 110s of it while the dump still returned success and wrote
+        // a zero-byte file. The shipped path must FAIL here.
         let url2 = serve_wav(120.0);
-        player.prefetch_warm(&url2).await.expect("warm");
-        player.switch_warmed(None, Some(QueueId(2)), &url2, false).await.expect("switch");
+        player.play_url(crate::handler::reconcile::test_key(), None, Some(QueueId(2)), &url2, false).await.expect("load next");
         let second = dir.join("second.mkv");
         let after = player
             .dump_cache(15.0, 0.0, 1200.0, crate::tape::TAPE_MIN_SECS, &second)
@@ -3858,7 +3434,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
+                .play_url(crate::handler::reconcile::test_key(), Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
                 .await
                 .expect("play the finite current");
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -3919,7 +3495,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
+                .play_url(crate::handler::reconcile::test_key(), Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
                 .await
                 .expect("play the finite current");
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -3980,7 +3556,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
+                .play_url(crate::handler::reconcile::test_key(), Some(SongId("cur".into())), Some(QueueId(1)), &cur.to_string_lossy(), false)
                 .await
                 .expect("play the finite current");
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -4037,7 +3613,7 @@ mod tests {
         rt.block_on(async {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             player
-                .play_url(
+                .play_url(crate::handler::reconcile::test_key(), 
                     Some(SongId("good".into())),
                     Some(QueueId(1)),
                     &good.to_string_lossy(),
@@ -4094,7 +3670,7 @@ mod tests {
             let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
             // loadfile Ok is PREMATURE: this succeeds even though nothing is playable.
             player
-                .play_url(
+                .play_url(crate::handler::reconcile::test_key(), 
                     Some(SongId("rotten".into())),
                     Some(QueueId(7)),
                     &rotten.to_string_lossy(),
@@ -4164,7 +3740,7 @@ mod tests {
 
             // With a real track loaded, the pair publishes exactly as before.
             player
-                .play_url(Some(SongId("tone".into())), Some(QueueId(1)), &tone.to_string_lossy(), true)
+                .play_url(crate::handler::reconcile::test_key(), Some(SongId("tone".into())), Some(QueueId(1)), &tone.to_string_lossy(), true)
                 .await
                 .expect("play the local tone");
             assert_eq!(player.state(), PlayState::Playing);
