@@ -19,21 +19,37 @@ pub fn schema_json() -> String {
     serde_json::to_string_pretty(&schema).expect("schema serializes")
 }
 
-/// A minimal, deterministic GBNF for the restricted plan surface. Kept explicit
-/// (rather than a full json-schema-to-grammar port) so it is auditable and
-/// diffable; the drift test asserts the schema it targets is unchanged, and the
-/// round-trip test asserts every canned corpus JSON still deserializes.
-pub const GBNF: &str = r##"root   ::= "{" ws "\"type\"" ws ":" ws actkind rest ws "}"
-actkind ::= "\"fade_out\"" | "\"fade_in\"" | "\"stop\"" | "\"pause\"" | "\"set_volume\"" | "\"enqueue\"" | "\"play_now\"" | "\"remove\"" | "\"move\"" | "\"clear\"" | "\"play\"" | "\"noop\""
-rest ::= ( ws "," ws string ws ":" ws value )*
-value ::= object | array | string | number | bool
-object ::= "{" ws ( string ws ":" ws value ( ws "," ws string ws ":" ws value )* )? ws "}"
-array ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
-bool ::= "true" | "false"
-number ::= "-"? [0-9]+ ( "." [0-9]+ )?
-string ::= "\"" char{0,64} "\""
-char ::= [^"\\]
-ws ::= [ \t\n]*
+/// The STRICT plan grammar a constrained decode runs under. Every sentence it
+/// generates is one flat [`crate::llm::LlmRawPlan`] that [`crate::llm::parse_llm_output`]
+/// turns into a [`hypodj_core::plan::RawPlan`]: each action lists exactly the
+/// scalars its `TryFrom` arm requires, so "set_volume without level" or "move
+/// without dest" is not merely rejected afterwards, it cannot be decoded at all.
+/// Numbers are bounded (a u8 volume, at most 4-digit slots, 5-digit seconds),
+/// strings are length-capped and free of JSON escapes, there is no whitespace to
+/// pad, and every plan ends `"once":true` like the rules path. Queue edits take no
+/// `queue_position` trigger because that would reuse the selector's `slot` key.
+/// Hand-written rather than a json-schema-to-grammar port so it stays auditable;
+/// the tests below decode a sentence from every alternative.
+pub const GBNF: &str = r##"root ::= "{" plan ",\"once\":true}"
+plan ::= fade | halt | vol | content | qedit | mv | clr | noop
+fade ::= "\"type\":" ( "\"fade_out\"" | "\"fade_in\"" ) ( ",\"secs\":" num )? when?
+halt ::= "\"type\":" ( "\"stop\"" | "\"pause\"" ) when?
+vol ::= "\"type\":\"set_volume\",\"level\":" level when?
+content ::= "\"type\":" ( "\"enqueue\"" | "\"play_now\"" ) "," csel ( ",\"count\":" int )? when?
+csel ::= "\"query\":" string | "\"genre\":" string | "\"radio\":true" | "\"sel\":\"similar_to_current\""
+qedit ::= "\"type\":" ( "\"remove\"" | "\"play\"" ) "," qsel
+mv ::= "\"type\":\"move\"," qsel "," dest
+qsel ::= "\"sel\":\"current\"" | "\"sel\":\"position\",\"slot\":" int | "\"sel\":\"last\",\"count\":" int | "\"sel\":\"range\"," range | "\"sel\":\"query\",\"query\":" string
+dest ::= "\"dest\":\"position\",\"dest_slot\":" int | "\"dest\":\"relative\",\"dest_rel\":" "-"? int
+clr ::= "\"type\":\"clear\",\"scope\":" ( "\"all\"" | "\"after_current\"" | "\"range\"," range )
+range ::= "\"range_start\":" int ",\"range_end\":" int
+noop ::= "\"type\":\"noop\""
+when ::= ",\"when\":" ( "\"after_current\"" | "\"album_boundary\"" | "\"after_secs\",\"when_secs\":" num | "\"time_remaining\",\"when_secs\":" num | "\"queue_position\",\"slot\":" int )
+level ::= "100" | [1-9]? [0-9]
+int ::= [0-9]{1,4}
+num ::= [0-9]{1,5} ( "." [0-9]{1,2} )?
+string ::= "\"" char{1,64} "\""
+char ::= [^"\\\x00-\x1F]
 "##;
 
 #[cfg(test)]
@@ -78,7 +94,7 @@ mod tests {
         assert!(GBNF.contains("fade_out"));
         assert!(GBNF.contains("enqueue"));
         assert!(!GBNF.contains("wall_clock"));
-        assert!(GBNF.contains(&format!("char{{0,{STRING_CAP}}}")), "string state is length-capped");
+        assert!(GBNF.contains(&format!("char{{1,{STRING_CAP}}}")), "string state is length-capped");
     }
 
     /// ROUND-TRIP: every canned corpus JSON (the FLAT shape a constrained decode
@@ -98,6 +114,62 @@ mod tests {
         ];
         for json in corpus {
             assert!(parse_llm_output(json).is_ok(), "canned json must parse: {json}");
+        }
+    }
+
+    /// GRAMMAR SOUNDNESS: a sentence through every alternative of [`GBNF`] (each
+    /// action, selector, destination, scope and trigger, plus the bound edges of
+    /// the number rules) parses into a RawPlan. A grammar edit that opens a path
+    /// the parser refuses must add its sentence here and fail.
+    #[test]
+    fn every_grammar_alternative_parses() {
+        let whens = [
+            "",
+            r#","when":"after_current""#,
+            r#","when":"album_boundary""#,
+            r#","when":"after_secs","when_secs":99999.99"#,
+            r#","when":"time_remaining","when_secs":0"#,
+            r#","when":"queue_position","slot":9999"#,
+        ];
+        let timed = [
+            r#""type":"fade_out""#,
+            r#""type":"fade_in","secs":1200"#,
+            r#""type":"stop""#,
+            r#""type":"pause""#,
+            r#""type":"set_volume","level":100"#,
+            r#""type":"set_volume","level":0"#,
+            r#""type":"enqueue","query":"x""#,
+            r#""type":"play_now","genre":"bossa nova","count":5"#,
+            r#""type":"enqueue","radio":true"#,
+            r#""type":"play_now","sel":"similar_to_current","count":3"#,
+        ];
+        let mut sentences = Vec::new();
+        for t in timed {
+            for w in whens {
+                sentences.push(format!("{{{t}{w},\"once\":true}}"));
+            }
+        }
+        let qsels = [
+            r#""sel":"current""#,
+            r#""sel":"position","slot":3"#,
+            r#""sel":"last","count":2"#,
+            r#""sel":"range","range_start":1,"range_end":4"#,
+            r#""sel":"query","query":"Daft Punk""#,
+        ];
+        for q in qsels {
+            for k in ["remove", "play"] {
+                sentences.push(format!("{{\"type\":\"{k}\",{q},\"once\":true}}"));
+            }
+            for d in [r#""dest":"position","dest_slot":1"#, r#""dest":"relative","dest_rel":-2"#] {
+                sentences.push(format!("{{\"type\":\"move\",{q},{d},\"once\":true}}"));
+            }
+        }
+        for scope in [r#""all""#, r#""after_current""#, r#""range","range_start":2,"range_end":3"#] {
+            sentences.push(format!("{{\"type\":\"clear\",\"scope\":{scope},\"once\":true}}"));
+        }
+        sentences.push(r#"{"type":"noop","once":true}"#.into());
+        for s in &sentences {
+            assert!(parse_llm_output(s).is_ok(), "grammar sentence must parse: {s}: {:?}", parse_llm_output(s));
         }
     }
 }

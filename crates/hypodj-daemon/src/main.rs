@@ -182,9 +182,23 @@ async fn main() -> anyhow::Result<()> {
     // were skipped, `nl` would ACK NotAvailable.
     {
         use hypodj_core::nl::Translator;
-        let translator: Arc<dyn Translator> = Arc::new(hypodj_nl::HybridTranslator::rules_only());
+        // `llm-llama` builds consult a local GGUF named by HYPODJ_NL_MODEL, and only
+        // for asks the rules miss; an unset variable or a missing file stays
+        // rules-only rather than failing the daemon.
+        #[cfg(feature = "llm-llama")]
+        let model = std::env::var_os("HYPODJ_NL_MODEL").and_then(|p| {
+            let backend = hypodj_nl::llama::LlamaBackend::open(&p);
+            if backend.is_none() {
+                tracing::warn!(path = ?p, "HYPODJ_NL_MODEL is not a file; NL stays rules-only");
+            }
+            backend.map(|b| Box::new(hypodj_nl::LlmTranslator::new(b)) as Box<dyn Translator>)
+        });
+        #[cfg(not(feature = "llm-llama"))]
+        let model: Option<Box<dyn Translator>> = None;
+        let with_model = model.is_some();
+        let translator: Arc<dyn Translator> = Arc::new(hypodj_nl::HybridTranslator::new(model));
         handler.set_translator(translator);
-        tracing::info!("P3 NL translator injected (rules fast-path; model backend cfg-gated)");
+        tracing::info!(with_model, "P3 NL translator injected (rules fast-path, local model behind it when wired)");
     }
 
     // MPRIS (org.mpris.MediaPlayer2.hypodj) on the session bus: desktops get
