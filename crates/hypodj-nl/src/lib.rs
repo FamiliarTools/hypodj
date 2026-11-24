@@ -596,6 +596,32 @@ mod tests {
         ] {
             assert!(matches!(tr(u, &c), Err(NlError::Ambiguous(_))), "{u}: {:?}", tr(u, &c));
         }
+        // Negation scoped to its clause (01m85nn): a negated or contrasted tail
+        // that names a thing, or rides a hard action, still refuses.
+        for u in [
+            "something calmer, not my favorites",
+            "something calmer, except Daft Punk",
+            "don't play something calmer, not too loud",
+            "fade out, not too fast",
+            "stop, not too abruptly",
+            "something calmer, not too loud, play my favorites",
+            "something calmer not too loud",
+        ] {
+            assert!(matches!(tr(u, &c), Err(NlError::Ambiguous(_))), "{u}: {:?}", tr(u, &c));
+        }
+        // A trailing DEGREE qualifier on a mood ask governs neither verb nor
+        // object: the head clause is read alone, identically.
+        let cc = ctx(Some("song-42"), 5);
+        for (u, head) in [
+            ("something calmer, not too loud", "something calmer"),
+            ("something calmer, but nothing too slow", "something calmer"),
+            ("play something calmer; not so heavy please", "play something calmer"),
+            ("more like this, not too loud", "more like this"),
+            ("Something calmer - not very loud.", "Something calmer"),
+        ] {
+            assert_eq!(format!("{:?}", tr(u, &cc)), format!("{:?}", tr(head, &cc)), "{u}");
+            assert!(tr(u, &cc).is_ok(), "{u}");
+        }
         // The mode grammar's own negation still works.
         assert!(matches!(tr("don't shuffle", &c).unwrap()[0].action, Action::SetMode { mode: PlayMode::Random, on: false }));
         // Plain asks are untouched.

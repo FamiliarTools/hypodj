@@ -147,6 +147,52 @@ fn negation(wv: &[&str]) -> Option<String> {
     None
 }
 
+/// The utterance split into clauses at `,` / `;` / a spaced dash, trimmed, empty
+/// clauses dropped. Always at least one entry (the whole text when unsplit).
+fn clauses(text: &str) -> Vec<&str> {
+    let v: Vec<&str> = text
+        .split([',', ';'])
+        .flat_map(|c| c.split(" - "))
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    if v.is_empty() { vec![text.trim()] } else { v }
+}
+
+/// The ONE negation shape the guard lets through: the head clause is a mood ask
+/// (calmer / like this) carrying no negation of its own, and every negation sits
+/// in a LATER clause that is only a degree qualifier ("not too loud", "but
+/// nothing too fast", "not so heavy"). Such a clause cannot negate the verb or the
+/// object, and a soft mood selector already leans the way it asks. Anything else
+/// (a negated head, a tail that names a thing - "not my favorites", "except Daft
+/// Punk" - or a hard action like a fade or stop) stays refused.
+fn tolerated_degree_tail(text: &str) -> bool {
+    let cs = clauses(text);
+    if cs.len() < 2 {
+        return false;
+    }
+    let head = words(cs[0]);
+    let hv: Vec<&str> = head.iter().map(String::as_str).collect();
+    if negation(&hv).is_some() {
+        return false;
+    }
+    let hl = cs[0].to_lowercase();
+    if !(hl.contains("calmer") || hl.contains("more like this") || hl.contains("something like this")) {
+        return false;
+    }
+    cs[1..].iter().all(|c| {
+        let w = words(c);
+        let wv: Vec<&str> = w.iter().map(String::as_str).collect();
+        let wv: Vec<&str> = match wv.first() {
+            Some(&"but") | Some(&"and") => wv[1..].to_vec(),
+            _ => wv,
+        };
+        matches!(wv.as_slice(), [neg, deg, _] | [neg, deg, _, "please"]
+            if matches!(*neg, "not" | "nothing")
+                && matches!(*deg, "too" | "so" | "very" | "overly"))
+    })
+}
+
 /// Emit a raw plan with `origin` left empty (the adapter stamps it) and `once`.
 fn plan(trigger: RawTrigger, action: Action, once: bool) -> RawPlan {
     RawPlan { version: 1, trigger, action, once, origin: String::new() }
@@ -179,6 +225,13 @@ fn rules_body(
         let wd = words(text);
         let wdv: Vec<&str> = wd.iter().map(String::as_str).collect();
         if let Some(neg) = negation(&wdv) {
+            if tolerated_degree_tail(text) {
+                // The negation is scoped to a trailing degree qualifier of a mood
+                // ask ("something calmer, not too loud"): it governs neither the
+                // verb nor the object, so the head clause is read alone.
+                let head = clauses(text)[0];
+                return rules_body(head, ctx, session);
+            }
             if let Some(plans) = modes(&wdv)? {
                 return Ok(plans);
             }
