@@ -103,6 +103,34 @@ pub enum LlmWhen {
     TimeRemaining,
 }
 
+/// The unit a spoken span was given in. The model copies the number and the
+/// unit it heard ("20" + "min"); Rust does the arithmetic, so a small model never
+/// has to multiply by 60.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LlmUnit {
+    S,
+    Min,
+    H,
+}
+
+impl LlmUnit {
+    fn secs(self) -> f64 {
+        match self {
+            LlmUnit::S => 1.0,
+            LlmUnit::Min => 60.0,
+            LlmUnit::H => 3600.0,
+        }
+    }
+}
+
+/// `n` in `unit` (seconds when the unit is omitted) as seconds, else the legacy
+/// seconds field.
+fn span(n: Option<f64>, unit: Option<LlmUnit>, legacy: Option<f64>) -> Option<f64> {
+    n.map(|n| n * unit.map_or(1.0, LlmUnit::secs)).or(legacy)
+}
+
 /// The FLAT model surface: one object, a required closed discriminator plus
 /// OPTIONAL scalars. deny_unknown_fields is deliberately OFF (Claude's payload
 /// key names drift run-to-run); load-bearing fields carry aliases for the names
@@ -166,6 +194,25 @@ pub struct LlmRawPlan {
     #[serde(default)]
     pub scope: Option<LlmClearScope>,
 
+    // -- spoken spans: number + unit as heard, converted in TryFrom. Preferred
+    //    over the legacy seconds fields (`secs`/`when_secs`, which the cc backend
+    //    still emits) when both are present. --
+    /// Fade length: "over 20 minutes" -> over 20, over_unit min.
+    #[serde(default)]
+    pub over: Option<f64>,
+    #[serde(default)]
+    pub over_unit: Option<LlmUnit>,
+    /// Delay before the action: "in 20 minutes" -> in 20, in_unit min.
+    #[serde(default, rename = "in")]
+    pub in_: Option<f64>,
+    #[serde(default)]
+    pub in_unit: Option<LlmUnit>,
+    /// Time left in the current track for when = time_remaining.
+    #[serde(default)]
+    pub left: Option<f64>,
+    #[serde(default)]
+    pub left_unit: Option<LlmUnit>,
+
     #[serde(default)]
     pub once: bool,
 }
@@ -199,24 +246,37 @@ fn build_qsel(p: &LlmRawPlan) -> Result<QueueSelector, String> {
 impl TryFrom<LlmRawPlan> for RawPlan {
     type Error = String;
     fn try_from(p: LlmRawPlan) -> Result<Self, String> {
-        // plan.rs validate() clamps fade secs to [min_dur, max_dur], so any
-        // default is safe; only supplied so an omitted duration still plans.
-        const DEFAULT_FADE_SECS: f64 = 5.0;
+        // A missing number means the default the rules use for the same ask, so
+        // "fade in" from the model and from the rules arm the same plan. plan.rs
+        // validate() still clamps fade secs to [min_dur, max_dur].
+        use crate::rules::{DEFAULT_ENQUEUE_COUNT, DEFAULT_FADE_SECS};
+        let delay = span(p.in_, p.in_unit, p.when_secs);
+        let left = span(p.left, p.left_unit, None).or(delay);
+        let fade_secs = span(p.over, p.over_unit, p.secs).unwrap_or(DEFAULT_FADE_SECS);
+        // A specific title plays once; a genre, the radio or "more like this" is a
+        // mix of the rules' default size.
+        let content_count = |s: &Selector| {
+            p.count.unwrap_or(if matches!(s, Selector::Query(_)) { 1 } else { DEFAULT_ENQUEUE_COUNT })
+        };
 
+        let queue_edit = matches!(p.kind, LlmActionKind::Remove | LlmActionKind::Play | LlmActionKind::Move);
         let trigger = match p.when {
             // Claude routinely omits `when` (-> Now) yet still expresses a delay
             // via when_secs/slot alone. Treating that as Immediate would silently
             // drop the delay and fire NOW, so infer the trigger from the timing
             // scalar rather than discarding it: a bare when_secs is a span, a bare
-            // slot is a queue position. Only a truly bare Now stays Immediate.
-            LlmWhen::Now => match (p.when_secs, p.slot) {
+            // slot is a queue position. Only a truly bare Now stays Immediate. A
+            // queue edit's `slot` is its SELECTOR ("remove the 2nd track"), never
+            // a trigger: reading it as both armed "remove track 2 once track 2
+            // plays" for an ask that meant "now".
+            LlmWhen::Now => match (delay, p.slot.filter(|_| !queue_edit)) {
                 (Some(secs), _) => RawTrigger::SpanElapsed { secs },
                 (None, Some(n)) => RawTrigger::QueuePosition { n, base: PosBase::Absolute },
                 (None, None) => RawTrigger::Immediate,
             },
             LlmWhen::AfterCurrent => RawTrigger::TrackAfterCurrent,
             LlmWhen::AfterSecs => RawTrigger::SpanElapsed {
-                secs: p.when_secs.ok_or("after_secs needs when_secs")?,
+                secs: delay.ok_or("after_secs needs a delay")?,
             },
             LlmWhen::AlbumBoundary => RawTrigger::AlbumBoundary { track: TrackSel::Current },
             LlmWhen::QueuePosition => RawTrigger::QueuePosition {
@@ -225,16 +285,16 @@ impl TryFrom<LlmRawPlan> for RawPlan {
             },
             LlmWhen::TimeRemaining => RawTrigger::TimeRemaining {
                 track: TrackSel::Current,
-                secs: p.when_secs.ok_or("time_remaining needs when_secs")?,
+                secs: left.ok_or("time_remaining needs a time left")?,
             },
         };
 
         let action = match p.kind {
             LlmActionKind::FadeOut => {
-                Action::Fade(FadeIntentIr::Out { secs: p.secs.unwrap_or(DEFAULT_FADE_SECS) })
+                Action::Fade(FadeIntentIr::Out { secs: fade_secs })
             }
             LlmActionKind::FadeIn => {
-                Action::Fade(FadeIntentIr::In { secs: p.secs.unwrap_or(DEFAULT_FADE_SECS) })
+                Action::Fade(FadeIntentIr::In { secs: fade_secs })
             }
             LlmActionKind::Stop => Action::Stop,
             LlmActionKind::Pause => Action::Pause,
@@ -248,14 +308,15 @@ impl TryFrom<LlmRawPlan> for RawPlan {
                     Selector::SimilarToCurrent
                 } else if p.radio {
                     Selector::Radio
-                } else if let Some(g) = p.genre {
+                } else if let Some(g) = p.genre.clone() {
                     Selector::Genre(g)
-                } else if let Some(q) = p.query {
+                } else if let Some(q) = p.query.clone() {
                     Selector::Query(q)
                 } else {
                     return Err("enqueue needs query, genre, radio, or similar_to_current".into());
                 };
-                Action::Enqueue { selector, count: p.count.unwrap_or(1) }
+                let count = content_count(&selector);
+                Action::Enqueue { selector, count }
             }
             LlmActionKind::PlayNow => {
                 // Same inference as Enqueue (similar_to_current > radio > genre > query);
@@ -264,14 +325,15 @@ impl TryFrom<LlmRawPlan> for RawPlan {
                     Selector::SimilarToCurrent
                 } else if p.radio {
                     Selector::Radio
-                } else if let Some(g) = p.genre {
+                } else if let Some(g) = p.genre.clone() {
                     Selector::Genre(g)
-                } else if let Some(q) = p.query {
+                } else if let Some(q) = p.query.clone() {
                     Selector::Query(q)
                 } else {
                     return Err("play_now needs query, genre, radio, or similar_to_current".into());
                 };
-                Action::PlayNow { selector, count: p.count.unwrap_or(1) }
+                let count = content_count(&selector);
+                Action::PlayNow { selector, count }
             }
             LlmActionKind::Remove => Action::Remove { sel: build_qsel(&p)? },
             LlmActionKind::Play => Action::Play { sel: build_qsel(&p)? },
@@ -312,17 +374,73 @@ impl TryFrom<LlmRawPlan> for RawPlan {
 /// compiled - the SINGLE model-free choke point. An off-surface or malformed reply
 /// surfaces a readable error rather than panicking or fabricating a plan.
 pub fn parse_llm_output(json: &str) -> Result<RawPlan, String> {
+    RawPlan::try_from(parse_llm_flat(json)?)
+}
+
+/// The flat surface object of a reply, before conversion (see
+/// [`parse_llm_output`] for the accepted shapes).
+pub fn parse_llm_flat(json: &str) -> Result<LlmRawPlan, String> {
     #[derive(Deserialize)]
     struct Wrapper {
         actions: Vec<LlmRawPlan>,
     }
 
     let t = json.trim();
-    let flat: LlmRawPlan = match serde_json::from_str::<Wrapper>(t) {
-        Ok(w) => w.actions.into_iter().next().ok_or("empty actions array")?,
-        Err(_) => serde_json::from_str::<LlmRawPlan>(t).map_err(|e| e.to_string())?,
-    };
-    RawPlan::try_from(flat)
+    match serde_json::from_str::<Wrapper>(t) {
+        Ok(w) => w.actions.into_iter().next().ok_or_else(|| "empty actions array".into()),
+        Err(_) => serde_json::from_str::<LlmRawPlan>(t).map_err(|e| e.to_string()),
+    }
+}
+
+/// GROUNDING: every free-text string and every number in a model plan must be
+/// something the human actually SAID. A small model under a grammar always
+/// produces a well-formed plan, so well-formedness proves nothing; what it gets
+/// wrong is inventing content - a delay for "in a bit", a genre for "more like
+/// this", a count for "some". A query/genre must occur in the utterance (case
+/// folded); a count/level/slot/range/destination must be one of the quantities it
+/// says; a span (number x unit) must equal a said duration in seconds, where a
+/// spoken quantity counts only with its unit (the "a" of "in a bit" is no span). Omitted numbers take the rules' defaults
+/// in `TryFrom`, so "never invent a number" costs the model nothing. `Err` names
+/// the first ungrounded field; the translator folds it to NotUnderstood.
+pub fn grounded(utterance: &str, p: &LlmRawPlan) -> Result<(), String> {
+    let said = utterance.to_lowercase();
+    for (name, text) in [("query", &p.query), ("genre", &p.genre)] {
+        if let Some(t) = text {
+            let t = t.trim().to_lowercase();
+            if t.is_empty() || !said.contains(&t) {
+                return Err(format!("{name} {t:?} is not in the request"));
+            }
+        }
+    }
+    let (values, spans) = crate::rules::spoken_quantities(utterance);
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let is_value = |v: f64| values.iter().any(|&x| close(x, v));
+    let is_span = |secs: f64| spans.iter().any(|&x| close(x, secs));
+    let numbers = [
+        ("level", p.level.map(f64::from)),
+        ("count", p.count.map(f64::from)),
+        ("slot", p.slot.map(|v| v as f64)),
+        ("range_start", p.range_start.map(|v| v as f64)),
+        ("range_end", p.range_end.map(|v| v as f64)),
+        ("dest_slot", p.dest_slot.map(|v| v as f64)),
+        ("dest_rel", p.dest_rel.map(|v| f64::from(v.unsigned_abs()))),
+    ];
+    for (name, v) in numbers {
+        if let Some(v) = v.filter(|&v| !is_value(v)) {
+            return Err(format!("{name} {v} is not in the request"));
+        }
+    }
+    let spans_given = [
+        ("over", span(p.over, p.over_unit, p.secs)),
+        ("in", span(p.in_, p.in_unit, p.when_secs)),
+        ("left", span(p.left, p.left_unit, None)),
+    ];
+    for (name, secs) in spans_given {
+        if let Some(secs) = secs.filter(|&s| !is_span(s)) {
+            return Err(format!("{name} {secs}s is not in the request"));
+        }
+    }
+    Ok(())
 }
 
 // ── constrained-decode backend (feature = "llm") ─────────────────────────────
@@ -351,6 +469,17 @@ mod backend {
         }
     }
 
+    /// A shared backend is a backend, so one model can be warmed on a side
+    /// thread while the translator that owns it serves asks.
+    impl<B: LlmBackend> LlmBackend for std::sync::Arc<B> {
+        fn generate(&self, chat: &[ChatTurn], gbnf: &str) -> Result<String, String> {
+            (**self).generate(chat, gbnf)
+        }
+        fn prefill(&self, chat: &[ChatTurn]) -> Result<(), String> {
+            (**self).prefill(chat)
+        }
+    }
+
     /// The model translator: build a prompt, constrained-decode against the
     /// IR-derived GBNF, parse the output into a [`RawPlan`].
     pub struct LlmTranslator<B: LlmBackend> {
@@ -365,56 +494,87 @@ mod backend {
 
         /// The raw constrained-decode text for one ask, before parsing; the
         /// backend's reason on failure (the translator folds it to NotUnderstood).
-        pub fn decode(&self, utterance: &str, ctx: &NlContext) -> Result<String, String> {
-            self.backend.generate(&Self::prompt(utterance, ctx), self.gbnf)
+        pub fn decode(&self, utterance: &str, _ctx: &NlContext) -> Result<String, String> {
+            self.backend.generate(&Self::prompt(utterance), self.gbnf)
         }
 
-        /// Evaluate the fixed instructions once, before the first ask, so a
-        /// caching backend answers every later ask from the warm prefix.
-        pub fn warm(&self, ctx: &NlContext) {
-            let _ = self.backend.prefill(&Self::prompt("", ctx));
+        /// Evaluate the fixed instructions and examples once, before the first
+        /// ask, so a caching backend answers every later ask from the warm prefix.
+        /// Loads the model on first use; the daemon runs it off the async runtime.
+        pub fn warm(&self) -> Result<(), String> {
+            let mut chat = Self::prompt("");
+            chat.pop();
+            self.backend.prefill(&chat)
         }
 
-        /// Parse an already-decoded plan for `utterance` (every refusal folds to
-        /// NotUnderstood).
-        pub fn translate_decoded(&self, _utterance: &str, out: &str) -> Result<NlHit, NlError> {
-            let raw = super::parse_llm_output(out).map_err(|_| NlError::NotUnderstood)?;
+        /// Parse an already-decoded plan for `utterance`, refuse it unless it is
+        /// [`super::grounded`] in what was said, and convert it. Every refusal
+        /// folds to NotUnderstood, the same answer the rules gave.
+        pub fn translate_decoded(&self, utterance: &str, out: &str) -> Result<NlHit, NlError> {
+            let flat = super::parse_llm_flat(out).map_err(|_| NlError::NotUnderstood)?;
+            super::grounded(utterance, &flat).map_err(|_| NlError::NotUnderstood)?;
+            let raw = hypodj_core::plan::RawPlan::try_from(flat).map_err(|_| NlError::NotUnderstood)?;
             Ok(NlHit { plans: vec![raw], source: NlSource::Llm, session: None })
         }
 
-        /// The instruction a small local model decodes under. The grammar already
-        /// fixes the SHAPE, so this carries only the MEANING: durations are in
-        /// seconds, and worked examples anchor the mapping a 0.5B model will not
-        /// infer from a schema alone.
-        fn prompt(utterance: &str, ctx: &NlContext) -> Vec<ChatTurn> {
-            vec![ChatTurn { role: "user", content: format!(
-                "You translate a music player request into one JSON plan.\n\
-                 All times are in SECONDS (1 minute = 60). \"in N minutes\" delays the \
-                 action (when after_secs); \"over N minutes\" is the fade length (secs). \
-                 \"after this track\" is when after_current; \"after this album\" is when \
-                 album_boundary. \"the Nth track\" is when queue_position with slot N. \
-                 \"more like this\" is sel similar_to_current. A request that is not \
-                 about music or playback is noop.\n\
-                 Examples:\n\
-                 fade the music out -> {{\"type\":\"fade_out\",\"secs\":30,\"once\":true}}\n\
-                 fade out over 5 minutes -> {{\"type\":\"fade_out\",\"secs\":300,\"once\":true}}\n\
-                 stop in 15 minutes -> {{\"type\":\"stop\",\"when\":\"after_secs\",\"when_secs\":900,\"once\":true}}\n\
-                 pause after this track -> {{\"type\":\"pause\",\"when\":\"after_current\",\"once\":true}}\n\
-                 fade out the 4th track -> {{\"type\":\"fade_out\",\"secs\":30,\"when\":\"queue_position\",\"slot\":4,\"once\":true}}\n\
-                 volume 40 -> {{\"type\":\"set_volume\",\"level\":40,\"once\":true}}\n\
-                 queue 3 jazz songs -> {{\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":3,\"once\":true}}\n\
-                 play some bon iver -> {{\"type\":\"play_now\",\"query\":\"bon iver\",\"count\":5,\"once\":true}}\n\
-                 add more like this -> {{\"type\":\"enqueue\",\"sel\":\"similar_to_current\",\"count\":5,\"once\":true}}\n\
-                 remove the 2nd track -> {{\"type\":\"remove\",\"sel\":\"position\",\"slot\":2,\"once\":true}}\n\
-                 what is the capital of France -> {{\"type\":\"noop\",\"once\":true}}\n\
-                 Queue length: {}. Something is {}playing.\n\
-                 {} ->",
-                ctx.queue_len,
-                if ctx.current.is_some() { "" } else { "NOT " },
-                utterance,
-            ) }]
+        /// The conversation a small local model decodes under: fixed
+        /// instructions, then worked examples as real user/assistant turns, then
+        /// the ask. Everything before the ask is identical on every call, so a
+        /// caching backend evaluates it once. The grammar already fixes the
+        /// SHAPE; the examples carry the MEANING, chosen in contrast pairs where a
+        /// small model confuses two readings ("fade out in" vs "over"), with a
+        /// default-only example per number ("fade in" carries no length), and with
+        /// as many refusals as a small model needs to see that noop is a real
+        /// answer. The queue state is deliberately NOT in the prompt: no answer
+        /// depends on it, and it would split the cached prefix.
+        fn prompt(utterance: &str) -> Vec<ChatTurn> {
+            let mut chat = vec![ChatTurn { role: "system", content: SYSTEM.into() }];
+            for (ask, plan) in SHOTS {
+                chat.push(ChatTurn { role: "user", content: (*ask).into() });
+                chat.push(ChatTurn { role: "assistant", content: (*plan).into() });
+            }
+            chat.push(ChatTurn { role: "user", content: utterance.into() });
+            chat
         }
     }
+
+    const SYSTEM: &str = "You turn one request to a music player into one JSON plan. \
+Copy a number and its unit exactly as the request says it; never invent a \
+        number, and leave a number out when the request gives none. \"in N minutes\" \
+        or \"after N minutes\" DELAYS the action (in, in_unit). \"over N minutes\" \
+        or \"for N minutes\" is how LONG a fade takes (over, over_unit). \"after this track\" is when after_current; \"after this album\" \
+        is when album_boundary. \"more like this\" is sel similar_to_current. A \
+        query or genre must be words from the request. If the request is vague \
+        about when, is not about playing music, or you are not sure, answer noop.";
+
+    /// Worked examples: (ask, plan) pairs in the grammar's exact output form.
+    /// Refusals are spread through the list rather than bunched at its end, where
+    /// recency made a 1.5B model answer noop to the very asks it had an example
+    /// for ("more like this", "stop after this track").
+    pub(super) const SHOTS: &[(&str, &str)] = &[
+        ("fade in", r#"{"type":"fade_in","once":true}"#),
+        ("fade out over 20 minutes", r#"{"type":"fade_out","over":20,"over_unit":"min","once":true}"#),
+        ("fade out in 20 minutes", r#"{"type":"fade_out","in":20,"in_unit":"min","once":true}"#),
+        ("stop in a bit", r#"{"type":"noop","once":true}"#),
+        ("pause after this track", r#"{"type":"pause","when":"after_current","once":true}"#),
+        ("more like this", r#"{"type":"enqueue","sel":"similar_to_current","once":true}"#),
+        ("what is the capital of France", r#"{"type":"noop","once":true}"#),
+        ("in 10 minutes fade out over 30 seconds", r#"{"type":"fade_out","over":30,"over_unit":"s","in":10,"in_unit":"min","once":true}"#),
+        ("volume 40", r#"{"type":"set_volume","level":40,"once":true}"#),
+        ("fade out later", r#"{"type":"noop","once":true}"#),
+        ("queue 3 jazz songs", r#"{"type":"enqueue","genre":"jazz","count":3,"once":true}"#),
+        ("stop when the album is over", r#"{"type":"stop","when":"album_boundary","once":true}"#),
+        ("what song is this", r#"{"type":"noop","once":true}"#),
+        ("play some bon iver", r#"{"type":"play_now","query":"bon iver","once":true}"#),
+        ("fade the music out", r#"{"type":"fade_out","once":true}"#),
+        ("turn on the kitchen lights", r#"{"type":"noop","once":true}"#),
+        ("remove the 2nd track", r#"{"type":"remove","sel":"position","slot":2,"once":true}"#),
+        ("stop in an hour", r#"{"type":"stop","in":1,"in_unit":"h","once":true}"#),
+        ("make me a sandwich", r#"{"type":"noop","once":true}"#),
+        ("fade out the 4th track", r#"{"type":"fade_out","when":"queue_position","slot":4,"once":true}"#),
+        ("clear the queue", r#"{"type":"clear","scope":"all","once":true}"#),
+        ("set a reminder for tomorrow", r#"{"type":"noop","once":true}"#),
+    ];
 
     impl<B: LlmBackend> Translator for LlmTranslator<B> {
         fn translate(&self, utterance: &str, ctx: &NlContext) -> Result<NlHit, NlError> {
@@ -426,6 +586,8 @@ mod backend {
 
 #[cfg(feature = "llm")]
 pub use backend::{ChatTurn, LlmBackend, LlmTranslator};
+#[cfg(all(feature = "llm", test))]
+use backend::SHOTS;
 
 #[cfg(test)]
 mod tests {
@@ -487,11 +649,11 @@ mod tests {
             other => panic!("expected enqueue(genre), got {other:?}"),
         }
 
-        // enqueue(radio); omitted count defaults to 1.
+        // enqueue(radio); an omitted count is the rules' mix size, 5.
         let p = parse_llm_output(r#"{"type":"enqueue","radio":true}"#).unwrap();
         assert!(matches!(
             p.action,
-            Action::Enqueue { selector: Selector::Radio, count: 1 }
+            Action::Enqueue { selector: Selector::Radio, count: 5 }
         ));
 
         // The {"actions":[...]} wrapper Claude gravitates to; first action wins.
@@ -553,6 +715,10 @@ mod tests {
             p.action,
             Action::Remove { sel: QueueSelector::Last(3) }
         ));
+        // A queue edit's slot selects the row; it is not a deferred trigger.
+        let p = parse_llm_output(r#"{"type":"remove","sel":"position","slot":2}"#).unwrap();
+        assert!(matches!(p.trigger, RawTrigger::Immediate));
+        assert!(matches!(p.action, Action::Remove { sel: QueueSelector::Position(2) }));
         // remove current.
         let p = parse_llm_output(r#"{"type":"remove","sel":"current"}"#).unwrap();
         assert!(matches!(p.action, Action::Remove { sel: QueueSelector::Current }));
@@ -667,11 +833,11 @@ mod tests {
             }
             other => panic!("expected enqueue(similar_to_current), got {other:?}"),
         }
-        // play_now "play more like what is playing"; omitted count defaults to 1.
+        // play_now "play more like what is playing"; an omitted count is 5.
         let p = parse_llm_output(r#"{"type":"play_now","sel":"similar_to_current"}"#).unwrap();
         assert!(matches!(
             p.action,
-            Action::PlayNow { selector: Selector::SimilarToCurrent, count: 1 }
+            Action::PlayNow { selector: Selector::SimilarToCurrent, count: 5 }
         ));
         // similar_to_current wins even if the model ALSO (wrongly) attaches an id or
         // query: the id is ignored (no field lands it) and the selector stays id-free.
@@ -699,6 +865,70 @@ mod tests {
         assert!(parse_llm_output(r#"{"type":"move","sel":"current"}"#).is_err());
         assert!(parse_llm_output(r#"{"type":"move","sel":"current","dest":"relative"}"#).is_err());
         assert!(parse_llm_output(r#"{"type":"play"}"#).is_err());
+    }
+
+    // Spoken spans: the model copies number + unit, Rust multiplies, and an
+    // omitted number takes the rules' default rather than a guess.
+    #[test]
+    fn spans_convert_in_rust_and_defaults_match_the_rules() {
+        let p = parse_llm_output(r#"{"type":"fade_out","over":20,"over_unit":"min"}"#).unwrap();
+        assert!(matches!(p.action, Action::Fade(FadeIntentIr::Out { secs }) if secs == 1200.0));
+        assert!(matches!(p.trigger, RawTrigger::Immediate));
+        let p = parse_llm_output(r#"{"type":"fade_out","when":"after_secs","in":20,"in_unit":"min"}"#).unwrap();
+        assert!(matches!(p.trigger, RawTrigger::SpanElapsed { secs } if secs == 1200.0));
+        assert!(matches!(p.action, Action::Fade(FadeIntentIr::Out { secs }) if secs == 30.0));
+        let p = parse_llm_output(r#"{"type":"stop","in":1.5,"in_unit":"h"}"#).unwrap();
+        assert!(matches!(p.trigger, RawTrigger::SpanElapsed { secs } if secs == 5400.0));
+        let p = parse_llm_output(r#"{"type":"stop","when":"time_remaining","left":30,"left_unit":"s"}"#).unwrap();
+        assert!(matches!(p.trigger, RawTrigger::TimeRemaining { secs, .. } if secs == 30.0));
+        let p = parse_llm_output(r#"{"type":"fade_in"}"#).unwrap();
+        assert!(matches!(p.action, Action::Fade(FadeIntentIr::In { secs }) if secs == 30.0));
+        // A specific title plays once; a mix is the rules' default size.
+        let p = parse_llm_output(r#"{"type":"play_now","query":"at the door"}"#).unwrap();
+        assert!(matches!(p.action, Action::PlayNow { count: 1, .. }));
+        let p = parse_llm_output(r#"{"type":"enqueue","genre":"jazz"}"#).unwrap();
+        assert!(matches!(p.action, Action::Enqueue { count: 5, .. }));
+    }
+
+    // GROUNDING: a plan whose words or numbers the human never said is refused;
+    // one built only from what was said (or from omitted defaults) passes.
+    #[test]
+    fn grounding_refuses_invented_content() {
+        let g = |u: &str, json: &str| grounded(u, &parse_llm_flat(json).unwrap());
+        // Invented numbers: the 0.5B/1.5B failure shapes.
+        assert!(g("stop in a bit", r#"{"type":"stop","when":"after_secs","in":60,"in_unit":"s"}"#).is_err());
+        assert!(g("fade in", r#"{"type":"fade_in","over":5,"over_unit":"s"}"#).is_err());
+        assert!(g("queue some jazz", r#"{"type":"enqueue","genre":"jazz","count":5}"#).is_err());
+        assert!(g("volume up", r#"{"type":"set_volume","level":60}"#).is_err());
+        // Invented words.
+        assert!(g("more like this", r#"{"type":"enqueue","genre":"pop"}"#).is_err());
+        assert!(g("play something nice", r#"{"type":"play_now","query":"bon iver"}"#).is_err());
+        // What was said, in any unit the said quantity converts to.
+        assert!(g("fade out in 20 minutes", r#"{"type":"fade_out","when":"after_secs","in":20,"in_unit":"min"}"#).is_ok());
+        assert!(g("fade out in 20 minutes", r#"{"type":"fade_out","when":"after_secs","in":1200,"in_unit":"s"}"#).is_ok());
+        assert!(g("fade it out over a quarter hour", r#"{"type":"fade_out","over":15,"over_unit":"min"}"#).is_ok());
+        assert!(g("fade it out over a quarter hour", r#"{"type":"fade_out","over":0.25,"over_unit":"h"}"#).is_ok());
+        assert!(g("stop in an hour and a half", r#"{"type":"stop","in":90,"in_unit":"min"}"#).is_ok());
+        assert!(g("shut it off in forty-five minutes", r#"{"type":"stop","in":45,"in_unit":"min"}"#).is_ok());
+        assert!(g("queue 3 Jazz songs", r#"{"type":"enqueue","genre":"jazz","count":3}"#).is_ok());
+        assert!(g("get rid of the second song", r#"{"type":"remove","sel":"position","slot":2}"#).is_ok());
+        assert!(g("make it louder, like 70%", r#"{"type":"set_volume","level":70}"#).is_ok());
+        assert!(g("move it up two", r#"{"type":"move","sel":"current","dest":"relative","dest_rel":-2}"#).is_ok());
+        // Defaults are never ungrounded, and noop says nothing.
+        assert!(g("fade in", r#"{"type":"fade_in"}"#).is_ok());
+        assert!(g("tell me a joke", r#"{"type":"noop"}"#).is_ok());
+    }
+
+    // Every worked example teaches a plan the parser accepts and the grounding
+    // check would let through, so the prompt never demonstrates a refused answer.
+    #[cfg(feature = "llm")]
+    #[test]
+    fn every_shot_parses_and_is_grounded() {
+        for (ask, plan) in SHOTS {
+            let flat = parse_llm_flat(plan).unwrap_or_else(|e| panic!("{ask:?}: {e}"));
+            grounded(ask, &flat).unwrap_or_else(|e| panic!("{ask:?}: {e}"));
+            RawPlan::try_from(flat).unwrap_or_else(|e| panic!("{ask:?}: {e}"));
+        }
     }
 
     // An OFF-surface intent must be REJECTED even if a backend ignores the schema.

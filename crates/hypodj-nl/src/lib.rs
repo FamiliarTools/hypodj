@@ -995,7 +995,7 @@ mod tests {
         let t = LlmTranslator::new(llama::LlamaBackend::open(&model).expect("model file exists"));
         let c = ctx(Some("song-42"), 5);
         let t0 = std::time::Instant::now();
-        t.warm(&c);
+        t.warm().expect("warm the prompt prefix");
         println!("warm {} ms", t0.elapsed().as_millis());
         let mut ms = Vec::new();
         let ask = |u: &str| -> (Option<RawPlan>, String, u128) {

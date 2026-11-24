@@ -15,7 +15,7 @@ pause when this song is done	trigger after action pause once
 make it louder, like 70	trigger immediate action setvol 70 once
 bring the volume down to 20	trigger immediate action setvol 20 once
 throw some jazz on the queue	trigger immediate action enqueue genre jazz 5 once
-put on radiohead	trigger immediate action playnow query radiohead 5 once
+put on radiohead	trigger immediate action playnow query radiohead 1 once
 I want to hear more stuff like this song	trigger immediate action enqueue similar_current 5 once
 get rid of the second song	trigger immediate action remove pos 2 once
 jump to track 4	trigger immediate action play pos 4 once
