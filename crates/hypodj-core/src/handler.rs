@@ -7062,7 +7062,7 @@ impl HypodjHandler {
         // in the filename and the sidecar.
         if let (Some(secs), Some(cut)) = (row.tape_secs, row.cut.as_deref()) {
             sentence.push_str(&format!(
-                " - kept {} of audio ({cut}); `dj heard` has it",
+                " - kept {} of audio ({cut}); `djc heard` has it",
                 crate::heard::human_secs(secs)
             ));
         } else if let Some(why) = &row.tape_outcome {
