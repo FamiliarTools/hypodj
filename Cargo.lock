@@ -992,6 +992,7 @@ dependencies = [
  "hypodj-dsl",
  "libc",
  "libmpv2",
+ "libmpv2-sys",
  "mpris-server",
  "opensubsonic",
  "reqwest",

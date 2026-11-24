@@ -256,6 +256,22 @@ fn dominant(s: &Sample) -> Option<String> {
         .and_then(|d| d.src.clone())
 }
 
+/// `HYPODJ_WITNESS_DUMP=1` prints every sample (t, per-deck src@vol, head), for reading
+/// a classification back against the raw timeline.
+fn dump(cause: &str, samples: &[Sample]) {
+    if !std::env::var("HYPODJ_WITNESS_DUMP").is_ok_and(|v| v == "1") {
+        return;
+    }
+    for s in samples {
+        let decks: Vec<String> = s
+            .decks
+            .iter()
+            .map(|d| format!("{}@{:.1}", d.src.as_deref().unwrap_or("."), d.vol))
+            .collect();
+        eprintln!("dump {cause}\t{}\t{}\t{}", s.t, decks.join(" "), s.head.as_deref().unwrap_or("-"));
+    }
+}
+
 pub(crate) fn classify(cause: &str, samples: &[Sample]) -> Row {
     let dash = || "-".to_string();
     let before: Vec<&Sample> = samples.iter().filter(|s| s.t < 0).collect();
@@ -292,7 +308,13 @@ pub(crate) fn classify(cause: &str, samples: &[Sample]) -> Row {
         }
         return row;
     };
-    let dt = SAMPLE_MS as i64;
+    // Each sample stands for the time until the NEXT one, measured, never the nominal
+    // SAMPLE_MS: a probe is a round trip to every deck actor, so the real cadence is
+    // slower and varies. Counting samples times SAMPLE_MS under-read a 1.5 s overlap
+    // as ~300 ms.
+    let span = |i: usize| -> i64 {
+        after.get(i + 1).map(|n| n.t - after[i].t).unwrap_or(SAMPLE_MS as i64).max(0)
+    };
     let g = |v: f64| (v / 100.0).powi(3);
     let first_new = after.iter().position(|s| audible(s, &n).is_some());
     if let Some(i) = first_new {
@@ -307,9 +329,9 @@ pub(crate) fn classify(cause: &str, samples: &[Sample]) -> Row {
         row.old_min_vol =
             after[..upto].iter().filter_map(|s| audible(s, o)).fold(base_vol, f64::min);
         let mut dev: f64 = 0.0;
-        for s in &after {
+        for (i, s) in after.iter().enumerate() {
             if let (Some(vo), Some(vn)) = (audible(s, o), audible(s, &n)) {
-                row.overlap_ms += dt;
+                row.overlap_ms += span(i);
                 let p = g(vo).powi(2) + g(vn).powi(2);
                 let pb = g(base_vol).powi(2).max(1e-9);
                 dev = dev.max(((p - pb) / pb).abs() * 100.0);
@@ -322,11 +344,10 @@ pub(crate) fn classify(cause: &str, samples: &[Sample]) -> Row {
     let gap_from = last_old.map(|i| i + 1).unwrap_or(0);
     let gap_to = first_new.unwrap_or(after.len());
     if gap_to > gap_from {
-        row.gap_ms = after[gap_from..gap_to]
-            .iter()
-            .filter(|s| s.decks.iter().all(|d| d.src.is_none()))
-            .count() as i64
-            * dt;
+        row.gap_ms = (gap_from..gap_to)
+            .filter(|&i| after[i].decks.iter().all(|d| d.src.is_none()))
+            .map(span)
+            .sum();
     }
     let ducked = row.old_min_vol < 0.8 * base_vol || row.new_first_vol < 0.8 * base_vol;
     row.shape = if row.overlap_ms > 0 {
@@ -478,7 +499,10 @@ pub(crate) const CAUSES: &[&str] = &[
 ];
 
 async fn run_cause(port: u16, cause: &str) -> Vec<Row> {
-    let row = |s: &[Sample]| classify(cause, s);
+    let row = |s: &[Sample]| {
+        dump(cause, s);
+        classify(cause, s)
+    };
     match cause {
         "next" => {
             let r = Rig::new(port, &["A", "B", "C"]).await;

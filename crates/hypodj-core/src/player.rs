@@ -475,6 +475,56 @@ fn resting_viz(cur_vol: f64) -> PlayerEvent {
 struct DeckLink {
     cmd_tx: mpsc::Sender<PlayerCommand>,
     state_rx: watch::Receiver<PlayState>,
+    /// Interrupts the actor's blocking `wait_event` so a command is served NOW rather
+    /// than at mpv's next event. `None` for actors that do not block (the null player).
+    waker: Option<MpvWaker>,
+}
+
+impl DeckLink {
+    /// Queue `cmd` on this deck and wake its actor. Every command goes through here:
+    /// the actor drains commands only between `wait_event` returns, so without the wake
+    /// a command waits up to that timeout (100 ms) for an unrelated mpv event. That
+    /// latency is paid PER COMMAND, and a crossfade step is two of them, so a 1.5 s
+    /// envelope of 25 ms steps stretched past 3.5 s.
+    async fn send(&self, cmd: PlayerCommand) -> Result<(), mpsc::error::SendError<PlayerCommand>> {
+        self.cmd_tx.send(cmd).await?;
+        if let Some(w) = &self.waker {
+            w.wake();
+        }
+        Ok(())
+    }
+}
+
+/// A thread-safe `mpv_wakeup` for one actor's handle. The raw handle is only ever
+/// touched under the mutex, and the actor clears it (under the same mutex) before the
+/// `Mpv` is destroyed, so a wake racing the actor's exit finds `None` instead of a
+/// freed handle.
+#[derive(Clone)]
+struct MpvWaker(Arc<std::sync::Mutex<Option<MpvCtx>>>);
+
+/// The raw handle, asserted `Send` so the waker can cross threads. Sound because
+/// `mpv_wakeup` is documented thread-safe and every use is guarded as above.
+struct MpvCtx(std::ptr::NonNull<libmpv2_sys::mpv_handle>);
+// SAFETY: see MpvCtx; the pointer is only dereferenced by libmpv's thread-safe
+// mpv_wakeup, under the MpvWaker mutex, while the owning Mpv is alive.
+unsafe impl Send for MpvCtx {}
+
+impl MpvWaker {
+    fn new(mpv: &libmpv2::Mpv) -> Self {
+        MpvWaker(Arc::new(std::sync::Mutex::new(Some(MpvCtx(mpv.ctx)))))
+    }
+
+    fn wake(&self) {
+        if let Some(ctx) = self.0.lock().unwrap().as_ref() {
+            // SAFETY: the handle is alive while it is Some (cleared before drop).
+            unsafe { libmpv2_sys::mpv_wakeup(ctx.0.as_ptr()) };
+        }
+    }
+
+    /// Called by the actor before its `Mpv` drops.
+    fn retire(&self) {
+        *self.0.lock().unwrap() = None;
+    }
 }
 
 /// The cloneable handle every other layer holds. Cheap to clone (just channel
@@ -608,7 +658,7 @@ impl PlayerHandle {
     /// A one-deck handle: no crossfade, every command to the one actor.
     fn single(cmd_tx: mpsc::Sender<PlayerCommand>, state_rx: watch::Receiver<PlayState>) -> Self {
         PlayerHandle {
-            decks: Arc::new(vec![DeckLink { cmd_tx, state_rx }]),
+            decks: Arc::new(vec![DeckLink { cmd_tx, state_rx, waker: None }]),
             active: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -623,7 +673,7 @@ impl PlayerHandle {
         F: FnOnce(oneshot::Sender<Result<(), PlayerError>>) -> PlayerCommand,
     {
         let (tx, rx) = oneshot::channel();
-        deck.cmd_tx.send(make(tx)).await.map_err(|_| PlayerError::Gone)?;
+        deck.send(make(tx)).await.map_err(|_| PlayerError::Gone)?;
         rx.await.map_err(|_| PlayerError::Gone)?
     }
 }
@@ -754,7 +804,7 @@ impl PlayerHandle {
         let mut out = Vec::with_capacity(self.decks.len());
         for d in self.decks.iter() {
             let (tx, rx) = oneshot::channel();
-            let probe = if d.cmd_tx.send(PlayerCommand::WitnessProbe(tx)).await.is_ok() {
+            let probe = if d.send(PlayerCommand::WitnessProbe(tx)).await.is_ok() {
                 rx.await.unwrap_or_default()
             } else {
                 DeckProbe::default()
@@ -772,7 +822,6 @@ impl PlayerHandle {
         drop(tx);
         drop(rx);
         self.deck()
-            .cmd_tx
             .send(PlayerCommand::TestEof)
             .await
             .map_err(|_| PlayerError::Gone)
@@ -853,7 +902,6 @@ impl PlayerHandle {
     ) -> Result<DumpOutcome, DumpFailure> {
         let (tx, rx) = oneshot::channel();
         self.deck()
-            .cmd_tx
             .send(PlayerCommand::DumpCache {
                 back,
                 fwd,
@@ -1277,11 +1325,13 @@ impl MpvPlayer {
                 }
             };
             let evt_tx = evt_tx.clone();
+            let waker = MpvWaker::new(&mpv);
+            let actor_waker = waker.clone();
             std::thread::Builder::new()
                 .name(format!("mpv-player-{i}"))
-                .spawn(move || mpv_actor(mpv, cmd_rx, state_tx, evt_tx))
+                .spawn(move || mpv_actor(mpv, cmd_rx, state_tx, evt_tx, actor_waker))
                 .expect("spawn mpv thread");
-            links.push(DeckLink { cmd_tx, state_rx });
+            links.push(DeckLink { cmd_tx, state_rx, waker: Some(waker) });
         }
         // The template sender is dropped here so the receiver closes when the last
         // ACTOR goes, not merely when this function returns.
@@ -1538,6 +1588,7 @@ fn mpv_actor(
     mut cmd_rx: mpsc::Receiver<PlayerCommand>,
     state_tx: watch::Sender<PlayState>,
     evt_tx: mpsc::Sender<PlayerEvent>,
+    waker: MpvWaker,
 ) {
     use libmpv2::{Format, events::Event};
 
@@ -1859,6 +1910,7 @@ fn mpv_actor(
             None => {}
         }
     }
+    waker.retire();
     tracing::debug!("mpv actor exiting (command channel closed)");
 }
 
