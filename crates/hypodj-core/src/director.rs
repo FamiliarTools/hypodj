@@ -289,6 +289,12 @@ impl<C: Clock> Publisher<C> {
         self.suppress_next_stopped = true;
     }
 
+    /// Whether an end stamped `qid` belongs to a leg that is no longer the latched
+    /// head: some other row is latched, so the head already moved past it.
+    fn stops_a_stale_leg(&self, qid: Option<QueueId>) -> bool {
+        qid.is_some() && self.latch.is_some() && self.latch != qid
+    }
+
     fn set_latch(&mut self, qid: QueueId, duration: Option<Duration>) {
         self.latch = Some(qid);
         self.latched_duration = duration;
@@ -496,27 +502,39 @@ async fn spine<C: Clock>(
                     // reason this arm exists separately rather than as a flag inside the
                     // ordinary one.
                     PlayerEvent::Eof { song, queue_id, crossfaded: true, .. } => {
-                        if let Some(qid) = queue_id {
-                            let finishing = pubr.track_ref(qid, song.clone());
-                            pubr.edge(DjEventKind::TrackEnd(finishing));
+                        // The incoming leg's Playing edge usually lands first (it plays
+                        // from the arm), and it already closed this track with a
+                        // TrackEnd and latched the new head. Clearing that latch here
+                        // would orphan every later tick of the head.
+                        if !pubr.stops_a_stale_leg(queue_id) {
+                            if let Some(qid) = queue_id {
+                                let finishing = pubr.track_ref(qid, song.clone());
+                                pubr.edge(DjEventKind::TrackEnd(finishing));
+                            }
+                            pubr.clear_latch();
+                            // The queue DID move (the crossfade moved it), so the
+                            // trailing transient Stopped from the outgoing deck must be
+                            // swallowed just as it is for a gapless advance - observers
+                            // see End-then-Start with no phantom stop in between.
+                            pubr.mark_advanced();
                         }
-                        pubr.clear_latch();
-                        // The queue DID move (the crossfade moved it), so the trailing
-                        // transient Stopped from the outgoing deck must be swallowed just
-                        // as it is for a gapless advance - observers see End-then-Start
-                        // with no phantom stop in between.
-                        pubr.mark_advanced();
                     }
                     PlayerEvent::Eof { song, queue_id, continuation_landed, errored, was_local, .. } => {
-                        if let Some(qid) = queue_id {
-                            // (a)+(b): build the finishing ref and publish TrackEnd
-                            // BEFORE advance repoints current (End before Start).
-                            let finishing = pubr.track_ref(qid, song.clone());
-                            pubr.edge(DjEventKind::TrackEnd(finishing));
+                        // The outgoing leg of an overlap can reach its own end after the
+                        // incoming one latched the head: that end was already closed by
+                        // the head's TrackStart, and advance_on_eof ignores it as stale.
+                        let stale = pubr.stops_a_stale_leg(queue_id);
+                        if !stale {
+                            if let Some(qid) = queue_id {
+                                // (a)+(b): build the finishing ref and publish TrackEnd
+                                // BEFORE advance repoints current (End before Start).
+                                let finishing = pubr.track_ref(qid, song.clone());
+                                pubr.edge(DjEventKind::TrackEnd(finishing));
+                            }
+                            // The next TrackStart surfaces later from the engine's load's
+                            // StateChanged(Playing); clear the latch now (End is done).
+                            pubr.clear_latch();
                         }
-                        // The next TrackStart surfaces later from the engine's load's
-                        // StateChanged(Playing); clear the latch now (End is done).
-                        pubr.clear_latch();
                         // (c): network, inline, must-not-drop, but bounded so a hung
                         // stream_url cannot pin the spine. The WHOLE Eof payload is
                         // threaded through: `continuation_landed` so the None-branch
@@ -550,15 +568,21 @@ async fn spine<C: Clock>(
                             .current
                             .map(|c| Some(c.queue_id) != queue_id)
                             .unwrap_or(false);
-                        if advanced {
+                        if advanced && !stale {
                             pubr.mark_advanced();
                         }
                     }
-                    PlayerEvent::StateChanged(PlayState::Stopped, _, _) => {
-                        pubr.on_stopped();
-                        // Nothing is playing: clear any lingering stream label so a later
-                        // currentsong on a re-queued entry never shows a stale now-playing.
-                        handler.clear_stream_meta_except(None);
+                    PlayerEvent::StateChanged(PlayState::Stopped, _, qid) => {
+                        // A deck that stops while the OTHER deck already carries the
+                        // latched head is the outgoing leg of a committed overlap, not a
+                        // transport stop: the head is still sounding.
+                        if !pubr.stops_a_stale_leg(qid) {
+                            pubr.on_stopped();
+                            // Nothing is playing: clear any lingering stream label so a
+                            // later currentsong on a re-queued entry never shows a stale
+                            // now-playing.
+                            handler.clear_stream_meta_except(None);
+                        }
                     }
                     PlayerEvent::Viz { rms_db, peak_db, gain_db, playing } => {
                         // Cosmetic level sample: republish on the DEDICATED viz
@@ -1143,6 +1167,44 @@ mod tests {
             }
         }
         assert!(saw_stop, "the real stop after a cleared suppress surfaces as StateChanged(Stopped)");
+    }
+
+    // A committed overlap: the incoming leg's Playing edge latches the new head while
+    // the outgoing leg is still sounding, then the outgoing leg stops (or ends). That
+    // end belongs to a stale leg; only an end of the latched row, or an unstamped
+    // one, is a real stop. Before this, the outgoing Stop cleared the latch and every
+    // later tick of the head was dropped (elapsed froze at 0, no boundary crossfade).
+    #[tokio::test]
+    async fn an_overlaps_outgoing_end_keeps_the_heads_latch() {
+        let Some(client) = maybe_client() else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let (player, _ev) = NullPlayer::spawn();
+        let handler = Arc::new(HypodjHandler::new(client.clone(), player));
+        let (bcast, _br) = broadcast::channel(16);
+        let (viz, _vr) = broadcast::channel(16);
+        let (watch_tx, _wr) = watch::channel(handler.queue_snapshot());
+        let mut pubr = Publisher {
+            clock: TokioClock,
+            bcast,
+            viz,
+            watch: watch_tx,
+            triggers: Arc::new(StdMutex::new(Vec::new())),
+            handler: handler.clone(),
+            seq: 0,
+            latch: None,
+            latched_duration: None,
+            version: 0,
+            last_state: PlayState::Playing,
+            suppress_next_stopped: false,
+        };
+        pubr.on_playing(QueueId(3), None);
+        pubr.on_playing(QueueId(5), None);
+        assert!(pubr.stops_a_stale_leg(Some(QueueId(3))), "the outgoing leg's end is stale");
+        assert!(!pubr.stops_a_stale_leg(Some(QueueId(5))), "the head's own end is real");
+        assert!(!pubr.stops_a_stale_leg(None), "an unstamped stop is a transport stop");
+        assert_eq!(pubr.latch, Some(QueueId(5)));
     }
 
     // RESYNC CORRECTNESS (C): an OFF-spine queue mutation (not a player-event

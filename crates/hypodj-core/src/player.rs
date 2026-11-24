@@ -1473,7 +1473,9 @@ fn emit_honest_stop(
             crossfaded: false,
         });
     }
-    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
+    // Stamped with the row that ended, so the director can tell this deck's own end
+    // from a head change: during an overlap the other deck already carries the head.
+    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, qid));
 }
 
 /// The actor-local warm latch: what (if anything) sits prefetched at playlist index
@@ -1988,7 +1990,7 @@ fn handle_cmd(
             // later play is never wedged paused at its own EOF. Best-effort.
             let _ = mpv.set_property("keep-open", "no");
             *current = None;
-            *current_qid = None;
+            let stopped_qid = current_qid.take();
             *current_local = false;
             *playing = false;
             // mpv `stop` empties the playlist, so any warmed entry is gone too.
@@ -1997,7 +1999,10 @@ fn handle_cmd(
             // pre-stop loudness (the af-metadata arm goes silent once decode stops).
             let _ = evt_tx.try_send(resting_viz(*cur_vol));
             let _ = state_tx.send(PlayState::Stopped);
-            let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
+            // Stamped with the row this deck held: the outgoing deck of a committed
+            // crossfade stops while the other deck carries the head, and that is not
+            // a transport stop.
+            let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, stopped_qid));
             let _ = reply.send(res);
         }
         PlayerCommand::Seek { secs, reply } => {
