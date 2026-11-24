@@ -15010,10 +15010,19 @@ impl MpdHandler for HypodjHandler {
                         if start > len || end > len {
                             return ack(ACK_ERROR_ARG, "delete", "Bad song index");
                         }
-                        // Highest first, so each lower index is still the row the
-                        // client named; each delete_at keeps current/skip consistent.
-                        for pos in (start..end).rev() {
-                            self.delete_at(pos).await;
+                        // Name the rows by qid NOW: each delete_at awaits, and another
+                        // connection may insert or move rows meanwhile, so an index
+                        // captured up front would later point at a different row.
+                        // Each qid is re-located just before its (sync) lookup.
+                        let named: Vec<u64> = {
+                            let st = self.state.lock().unwrap();
+                            st.queue[start..end].iter().map(|it| it.id).collect()
+                        };
+                        for qid in named.into_iter().rev() {
+                            let pos = self.state.lock().unwrap().queue.iter().position(|it| it.id == qid);
+                            if let Some(pos) = pos {
+                                self.delete_at(pos).await;
+                            }
                         }
                     }
                     Some((_, None)) => return ack(ACK_ERROR_ARG, "delete", "Bad song index"),
