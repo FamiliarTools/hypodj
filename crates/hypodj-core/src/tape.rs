@@ -11,7 +11,7 @@
 //! Three rules shape every function here.
 //!
 //! **Rule 0 - dump wide, refine on disk.** The cache is VOLATILE: the instant
-//! `SwitchWarmed` lands (`playlist-play-index 1` + `playlist-remove 0`) 110 seconds of
+//! a reload lands (`playlist-play-index 1` + `playlist-remove 0`) 110 seconds of
 //! retained history vanished and `dump-cache` wrote a ZERO-BYTE FILE while returning
 //! `"error":"success"`. So a press dumps a generous window IMMEDIATELY and only then
 //! reasons about boundaries, re-cutting the LOCAL file with `ffmpeg -c copy` - no

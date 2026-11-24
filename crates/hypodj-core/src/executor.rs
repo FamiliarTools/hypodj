@@ -969,6 +969,8 @@ mod tests {
 
         // Skip to track 1: current is now QueueId(1); an edge disarms the plan.
         rig.handler.play_for_test(1).await;
+        // The skip's own dip rise is not the plan firing: let it run out first.
+        rig.handler.settle_fades_for_test().await;
         rig.push(DjEventKind::TrackStart(tref(1)));
         settle().await;
 
@@ -1244,11 +1246,17 @@ mod tests {
         // Cross 2h.
         tokio::time::advance(Duration::from_secs(5401)).await;
         settle().await;
+        // The rig's track is audible, so the engine first takes it DOWN to silence (a
+        // short duck) and only then loads at the floor: watch the gain through that and
+        // the start of the wake ramp.
+        let mut lowest = f64::INFINITY;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            lowest = lowest.min(rig.handler.live_gain_db_for_test());
+        }
+        settle().await;
         assert!(rig.handler.fade_active_for_test().await, "wake ramp installed at the deadline");
-        assert!(
-            rig.handler.live_gain_db_for_test() <= SYNTH_FLOOR_DB + 5.0,
-            "wake ramp starts near silence"
-        );
+        assert!(lowest <= SYNTH_FLOOR_DB + 5.0, "wake ramp starts near silence: {lowest}");
         assert!(rig.handler.plan_list().is_empty(), "once wake plan removed");
     }
 

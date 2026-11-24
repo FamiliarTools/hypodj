@@ -1,0 +1,129 @@
+//! Candidate B: DECLARATIVE transition engine. Sketch only; bodies are todo!().
+//! Module: crates/hypodj-core/src/reconcile.rs (pure half: `plan`, types)
+//!         + the `Reconciler` task in the same file (impure half: executes Steps).
+//! No em dashes, no double hyphens.
+
+use std::time::Duration;
+
+// ---------------------------------------------------------------- declared state
+
+/// Why the head was last declared. Written by the DECLARER (the only party that knows),
+/// read only by `plan`. One field replaces today's gesture/autonomous bool, the
+/// play_index / inner / from_silence trio, FadeIntent::OutEvicting and WarmKind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cause {
+    /// A human asked: next/prev/play N/playid/MPRIS/plan Play/radio start/queue swap.
+    /// Resyncs gain, retires pending_pause, arms the EOF fuse (as one `on_declared` hook).
+    Gesture,
+    /// The queue's own motion: EOF advance, autofill walk, continuation station.
+    /// Must not disturb a winddown/sleep ramp.
+    Natural,
+    /// The head's row was removed; declared head is its successor. Outgoing is unattributed.
+    Removed,
+    /// Nothing was audible by design: wake, resume restore, undo install_snapshot.
+    /// Caller owns the WakeTo ramp; engine only guarantees mpv vol 0 before first buffer.
+    FromSilence,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Intent { Play, Pause, Stop }
+
+/// The ONLY thing call sites write about the head. Lives inside `State` (one owner).
+/// `head` is a QueueId, not an index, so a whole-queue swap is "head changed", and a
+/// removed row is "audible qid not in queue", never a special case.
+#[derive(Clone, Debug)]
+pub struct Declared {
+    pub head: Option<QueueId>,
+    pub intent: Intent,
+    pub cause: Cause,
+    /// Bumped by every declaration; the reconciler commits a step only if it still
+    /// matches (epoch guard, same discipline as fade_epoch). Mid-flight redeclare = bump.
+    pub rev: u64,
+}
+
+// ---------------------------------------------------------------- audible state
+
+/// What the decks are actually doing. DERIVED from PlayerHandle + the one in-flight
+/// `Transit` record; never stored a second time (single source of truth).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Audible {
+    Silent,
+    /// One deck owns identity. `warm`: a parked gapless successor in mpv's playlist.
+    Single { qid: QueueId, warm: Option<QueueId> },
+    /// Two decks audible. `out` owns identity until commit (existing invariant).
+    Overlap { out: QueueId, inn: QueueId },
+}
+
+// ---------------------------------------------------------------- the pure core
+
+#[derive(Clone, Copy, Debug)]
+pub struct Caps {
+    pub can_crossfade: bool,      // decks >= 2
+    pub crossfade_skip: Duration, // 0 = off
+    pub crossfade_bound: Duration,// boundary crossfade (crossfade_secs), 0 = off
+    pub dip: Duration,
+    pub settle: Duration,         // bounded fast-finish of an Overlap (~200ms)
+    pub same_album_run: bool,     // computed by the caller for (audible, head)
+    pub incoming_loads: bool,     // false after a failed arm; forces the fallback ladder
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Shape {
+    Xf(Duration),   // equal-power two-deck
+    Dip(Duration),  // duck-swap-rise
+    Cut,            // hard load at baseline
+    FromSilence,    // vol 0 first, then load
+    Gapless,        // advance into the parked warm entry
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Step {
+    Settled,
+    /// Begin loading+transiting to `head`. `attribute_finish` = natural boundary.
+    Begin { shape: Shape, attribute_finish: bool },
+    /// Overlap exists and `head` is the incoming deck: wait for its terminal.
+    AwaitOverlap,
+    /// Overlap exists, `head` is the OUTGOING deck: reverse the envelope, drop incoming.
+    Reverse,
+    /// Overlap exists, `head` is neither: finish it within `caps.settle`, then re-plan.
+    FinishThenReplan,
+    /// Declared Stop / Pause / empty head: fade out (or halt) the audible head.
+    Quiesce,
+}
+
+/// PURE. All shape policy lives here and nowhere else. Property tests: idempotent
+/// (plan after applying Begin's result = Settled), total, never returns a Shape the
+/// caps forbid, fallback ladder Xf -> Dip -> Cut is monotone in caps.
+pub fn plan(a: Audible, d: &Declared, in_queue: &dyn Fn(QueueId) -> bool, c: Caps) -> Step { todo!() }
+
+// ---------------------------------------------------------------- the impure half
+
+/// One tokio task, spawned with the handler. Level-triggered: wakes on a `Notify`
+/// (coalescing permit), loops `plan` until `Settled`, never trusts an edge.
+pub struct Reconciler { /* wake: Arc<Notify>, handler: Weak<MpdHandler> */ }
+
+impl Reconciler {
+    pub fn spawn(h: &Arc<MpdHandler>) -> Self { todo!() }
+    /// Called from `State::declare` commit tail (== notify_change's choke). Cheap, sync.
+    pub fn poke(&self) { todo!() }
+    /// body: loop { snap = lock{(audible(), declared.clone())}; match plan(..) {...} }
+    /// Execute reads `rev` before awaiting; commits under the state lock only if rev unchanged,
+    /// else discards the result of the load (the loaded-but-stale incoming is aborted: crossfade_arm
+    /// does not flip `active`, so abort is safe) and re-plans.
+    async fn run(self: Arc<Self>) { todo!() }
+    async fn execute(&self, step: Step, snap_rev: u64) -> Result<(), LoadFailed> { todo!() }
+}
+
+// ---------------------------------------------------------------- call-site API (the whole surface)
+
+impl State {
+    /// Replace queue AND head atomically. The only queue-structure mutator that can move the head.
+    pub fn declare_queue(&mut self, q: Vec<QueueItem>, head: Option<QueueId>, intent: Intent, cause: Cause) { todo!() }
+    /// Head-only: play N / next / prev / MPRIS / radio. Queue untouched.
+    pub fn declare_head(&mut self, head: Option<QueueId>, intent: Intent, cause: Cause) { todo!() }
+    /// remove row; if it was the declared head, head := successor-at-same-position, cause Removed.
+    pub fn remove_row(&mut self, qid: QueueId) { todo!() }
+}
+
+/// Observation feeding the declaration (EOF, load failure). Runs in the director, sync, lossless.
+pub fn on_eof(st: &mut State, ev: EofSignal) { todo!() }

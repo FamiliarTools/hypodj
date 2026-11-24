@@ -37,7 +37,7 @@ use crate::clock::TokioClock;
 use crate::config::{ContinuationMode, FadeConfig, StreamConfig};
 use crate::executor::PendingPlan;
 use crate::fade::{
-    min_deliberate_dur, run_crossfade, run_fade, CrossfadeSpec, Curve, FadeError, FadeOutcome,
+    min_deliberate_dur, run_fade, Curve, FadeError, FadeOutcome,
     FadeProgress, FadeSpec, FadeTarget, StartleBounds,
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot, TimerId};
@@ -80,6 +80,11 @@ use crate::resume::{
 use crate::store::{AudioStore, StoreWaiting};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
 use crate::timer::{TimerGuard, TimerHandle};
+use reconcile::Cause;
+
+/// The transition engine: the declarative head and its one reconciler.
+#[path = "reconcile.rs"]
+pub(crate) mod reconcile;
 
 /// One queue entry: a playable [`QueueEntry`] (Subsonic song OR raw stream) plus
 /// its MPD song id (a monotonically increasing integer, MPD's stable per-song
@@ -174,8 +179,32 @@ const COVER_PREFETCH_ROUNDS: usize = 3;
 struct State {
     queue: Vec<QueueItem>,
     next_id: u64,
-    /// Index into `queue` of the current song, if any.
-    current: Option<usize>,
+    /// THE DECLARED HEAD: what should be playing, by stable queue id, plus how and why
+    /// it was declared. The single owner of "current" - the index every surface
+    /// reports is DERIVED from it ([`State::current`]), so a queue edit can never leave
+    /// a stale index pointing at the wrong row, and a whole-queue swap is simply a new
+    /// head. Written only through the declarers; the reconciler makes it audible.
+    declared: reconcile::Declared,
+    /// What the engine last put on the ACTIVE deck (row + the declaration rev it was
+    /// loaded under), or `None` once that load ended or was stopped. With the player's
+    /// raw state and [`Self::transit`] it is what [`reconcile::Audible`] is derived from.
+    deck: Option<reconcile::Leg>,
+    /// Whether the head bookkeeping ([`HypodjHandler::commit_head`]) ran for `deck`.
+    deck_committed: bool,
+    /// The engine's in-flight transition, if any: a two-deck overlap or a dip.
+    transit: Option<reconcile::Transit>,
+    /// The fade epoch of an in-flight one-legged fade-out the engine installed (clear,
+    /// remove-last). Live only while that epoch is still the running fade.
+    quiesce_epoch: Option<u64>,
+    /// The declaration rev whose crossfade arm failed: the ladder continues below it.
+    xf_failed_rev: Option<u64>,
+    /// The declaration rev that failed at the bottom of the ladder: nothing retries it.
+    abandoned_rev: Option<u64>,
+    /// The declaration rev whose head the engine is loading onto a STOPPED deck right
+    /// now (a natural advance after a track ended, a play from stop). The deck reads
+    /// Stopped until the load lands, but the room was declared playing: status reports
+    /// what was declared, not the gap between two tracks.
+    loading_rev: Option<u64>,
     /// The user-facing baseline volume (0..=100): what a manual `setvol` sets and
     /// what a completed `fade out` restores to. During a fade this stays put; the
     /// LIVE level rides in `live_gain_db`.
@@ -215,36 +244,6 @@ struct State {
     /// Paused at request time, so an ACK, a mid-fade checkpoint, and a Play-during-
     /// fade branch all see the true intent, not a stale Playing.
     pending_pause: bool,
-    /// PENDING-SKIP intent: the TARGET index of an in-flight startle-safe user
-    /// skip (Next/Previous while playing). Set the instant the skip is requested,
-    /// mirroring [`Self::pending_pause`], so status/MPRIS/currentsong report the
-    /// TARGET track IMMEDIATELY during the dip-to-silence WITHOUT mutating
-    /// `current` yet (mpv still plays the OLD track through the dip). Committed to
-    /// `current` and cleared in the [`Terminal::SkipLoad`] terminal when the target
-    /// actually loads; cleared by any manual volume set / stop / end-of-queue / pause
-    /// so a superseded skip never leaves the reported current pointing at a track
-    /// that never loaded.
-    pending_skip: Option<usize>,
-    /// A CROSSFADE is in flight: two decks are audible and the envelope owns both
-    /// gains. Distinct from `fading` (which is true as well) because the settlement is
-    /// different in kind - a superseded ordinary fade just stops writing, while a
-    /// superseded crossfade has left a second deck playing that somebody must promote
-    /// or silence. Read by [`MpdHandler::settle_crossfade`], which every path that
-    /// takes over the gain runs FIRST.
-    crossfading: bool,
-    /// The queue entry an in-flight crossfade will DROP when it commits (the "remove
-    /// the playing track" gesture). Held in state rather than only inside the task
-    /// because [`MpdHandler::settle_crossfade`] finishes a crossfade the task will never
-    /// finish itself, and the eviction has to land with the promotion either way - a
-    /// settled crossfade that promoted the incoming track but forgot to remove the
-    /// outgoing one would leave the queue holding a row nothing plays.
-    pending_crossfade_evict: Option<QueueId>,
-    /// Whether the in-flight crossfade's OUTGOING track is playing out (a natural
-    /// boundary) rather than being abandoned (a skip). Decides whether the promotion
-    /// reports a finish for it - see [`PlayerHandle::crossfade_commit`]. Held in state
-    /// for the same reason as the eviction: `settle_crossfade` finishes crossfades the
-    /// task never will, and it has to make the same call.
-    pending_crossfade_finish: bool,
     /// Does `logical_gain_db` currently reflect a COMMITTED baseline the knob can
     /// step from directly? `true` at rest and while a knob/glide fade animates (its
     /// baseline is committed synchronously at install, so N rapid presses = N
@@ -1297,9 +1296,6 @@ impl State {
     ///   material" - so it is left whole.
     /// - NEVER UNDER `random`. The walk draws from the WHOLE queue, so a played row is
     ///   still a candidate; removing it changes the pool the user chose.
-    /// - NEVER WHILE A SKIP IS IN FLIGHT. [`State::pending_skip`] is an INDEX, not a
-    ///   qid, so a trim underneath it would silently repoint the reported current at the
-    ///   wrong track. The next advance trims instead.
     ///
     /// And it never removes the [`State::fresh_enqueue_anchor`] row. That anchor is a
     /// qid and survives removals BY DESIGN, but its whole job is to name the freshly
@@ -1312,8 +1308,8 @@ impl State {
     /// `current` is shifted down by exactly the number removed and `playlist_version` is
     /// bumped once, so MPD clients see one ordinary queue change.
     fn trim_spent(&mut self) -> Vec<QueueItem> {
-        let Some(cur) = self.current else { return Vec::new() };
-        if self.repeat || self.random || self.pending_skip.is_some() {
+        let Some(cur) = self.current() else { return Vec::new() };
+        if self.repeat || self.random {
             return Vec::new();
         }
         let mut spent = 0usize;
@@ -1331,8 +1327,8 @@ impl State {
         if n == 0 {
             return Vec::new();
         }
+        // The head is a queue id, so it needs no shifting over the removal.
         let removed: Vec<QueueItem> = self.queue.drain(0..n).collect();
-        self.current = Some(cur - n);
         self.playlist_version += 1;
         removed
     }
@@ -1343,7 +1339,14 @@ impl Default for State {
         Self {
             queue: Vec::new(),
             next_id: 0,
-            current: None,
+            declared: reconcile::Declared::idle(),
+            deck: None,
+            deck_committed: false,
+            transit: None,
+            quiesce_epoch: None,
+            xf_failed_rev: None,
+            abandoned_rev: None,
+            loading_rev: None,
             target_volume: 100,
             // 100 -> 0 dB (see mpv_volume_to_db); the two start in sync.
             live_gain_db: 0.0,
@@ -1352,10 +1355,6 @@ impl Default for State {
             fade_epoch: 0,
             fading: false,
             pending_pause: false,
-            pending_skip: None,
-            crossfading: false,
-            pending_crossfade_evict: None,
-            pending_crossfade_finish: false,
             // At rest the committed logical target IS the current baseline.
             baseline_committed: true,
             playlist_version: 0,
@@ -1463,19 +1462,123 @@ impl State {
         if deck_loaded {
             self.pending_pause = false;
         }
-        // A manual volume commit also supersedes any in-flight skip: the deck is
-        // being reconciled to a concrete baseline on the STILL-loaded current
-        // track, so the reported current must revert from the (never-loaded) skip
-        // target back to `current` (mirrors clearing `pending_pause`).
-        self.pending_skip = None;
     }
 
-    /// The current index to REPORT outward (status/MPRIS/currentsong). During an
-    /// in-flight user skip this is the SKIP TARGET (`pending_skip`), so the outward
-    /// view collapses the dip window to the target immediately; otherwise it is the
-    /// real `current`. Mirrors [`Self::reported_play_state`]'s pending-pause layer.
+    /// The index of the DECLARED head, which is what every surface reports
+    /// (status/MPRIS/currentsong): during a transition that is the track arriving, the
+    /// same thing the room is moving to. `None` when nothing is declared or its row left
+    /// the queue.
+    fn current(&self) -> Option<usize> {
+        let head = self.declared.head?;
+        self.queue.iter().position(|it| it.id == head.0)
+    }
+
+    /// Alias kept for the reporting call sites: the declared head IS what is reported.
     fn reported_current(&self) -> Option<usize> {
-        self.pending_skip.or(self.current)
+        self.current()
+    }
+
+    /// The declared head's stable id, if its row is still queued.
+    fn head_qid(&self) -> Option<QueueId> {
+        self.current().map(|i| QueueId(self.queue[i].id))
+    }
+
+    /// Point the declared head at the row now at `idx` WITHOUT asking for a load: the
+    /// intent and the freshness floor are left as they are. For call sites that only
+    /// restate which row is current (a restore, a fixture), never for a head change.
+    fn set_current(&mut self, idx: Option<usize>) {
+        self.declared.head = idx.and_then(|i| self.queue.get(i)).map(|it| QueueId(it.id));
+    }
+
+    /// DECLARE a new head (the declarers' only write): bump the rev, make `head` the
+    /// row that should be audible, require a load at least this fresh, and play.
+    /// Returns the rev so the caller can tell whether its declaration still stands.
+    fn declare_head(&mut self, head: Option<QueueId>, cause: reconcile::Cause) -> u64 {
+        let rev = self.declared.rev + 1;
+        self.declared = reconcile::Declared {
+            head,
+            intent: reconcile::Intent::Play,
+            cause,
+            rev,
+            fresh: rev,
+        };
+        rev
+    }
+
+    /// Declare the row at `idx` (by its stable id) as the head.
+    fn declare_head_at(&mut self, idx: usize, cause: reconcile::Cause) -> Option<u64> {
+        let qid = QueueId(self.queue.get(idx)?.id);
+        Some(self.declare_head(Some(qid), cause))
+    }
+
+    /// HOLD `head` without playing it: the declared head stays (status keeps reporting
+    /// it) but the decks are to be silent. `stop`, and the nothing-loaded terminals
+    /// (a halted failed walk, an offline restore), whose whole promise is that the
+    /// entry is held until a play gesture picks it up.
+    fn hold_head(&mut self, head: Option<QueueId>) -> u64 {
+        let rev = self.declared.rev + 1;
+        self.declared = reconcile::Declared {
+            head,
+            intent: reconcile::Intent::Stop,
+            cause: reconcile::Cause::Gesture,
+            rev,
+            fresh: self.declared.fresh,
+        };
+        rev
+    }
+
+    /// Remove the row `qid` AS A DECLARATION OF THE NEW STATE. If it is not the head
+    /// this is a plain queue edit. If it is the head, the head moves to `successor`
+    /// (`Cause::Removed`), except in the one case the listener's gesture means "not that
+    /// one": the head was a transition still ARRIVING (the deck still plays an earlier
+    /// row that is itself still queued), and then the head goes back to that row - the
+    /// deck simply stays on what it is already playing. Returns whether the head moved.
+    fn remove_row(&mut self, qid: QueueId, successor: Option<QueueId>) -> bool {
+        let Some(pos) = self.queue.iter().position(|it| it.id == qid.0) else { return false };
+        self.queue.remove(pos);
+        self.playlist_version += 1;
+        self.head_removed(qid, successor)
+    }
+
+    /// The head rule of [`Self::remove_row`], for a caller that already removed the
+    /// rows itself (a multi-row removal). A no-op unless `qid` was the head.
+    fn head_removed(&mut self, qid: QueueId, successor: Option<QueueId>) -> bool {
+        if self.declared.head != Some(qid) {
+            return false;
+        }
+        let arriving_from = self
+            .deck
+            .map(|leg| leg.qid)
+            .filter(|q| *q != qid && self.queue.iter().any(|it| it.id == q.0));
+        match arriving_from {
+            Some(staying) => {
+                let rev = self.declare_head(Some(staying), reconcile::Cause::Removed);
+                // Re-stating the row already on the deck: no fresh load wanted.
+                self.declared.fresh = 0;
+                let _ = rev;
+            }
+            None => {
+                self.declare_head(successor, reconcile::Cause::Removed);
+            }
+        }
+        true
+    }
+
+    /// Whether the declared head is still ARRIVING: the active deck plays some OTHER
+    /// row, or the engine is loading the head onto an empty deck (a natural advance
+    /// after its track ended). The lockless playhead then belongs to the track being
+    /// left, so it is not reported against the head. An empty deck that is NOT loading
+    /// (a restored session held paused) keeps its saved playhead.
+    fn head_arriving(&self) -> bool {
+        let head = self.head_qid();
+        let loading = self.loading_rev == Some(self.declared.rev);
+        head.is_some() && self.deck.map(|l| l.qid) != head && (self.deck.is_some() || loading)
+    }
+
+    /// Whether the engine has a transition in flight (an overlap or a dip). The
+    /// continuation warm and the spent-history trim stay out of its way.
+    fn in_transit(&self) -> bool {
+        self.transit.is_some()
     }
 
     /// The index a normal advance from `cur` would go to, honoring `single` (auto
@@ -1507,46 +1610,22 @@ impl State {
         }
     }
 
-    /// Remove the entry with `qid` from the queue, bump the playlist version, and
-    /// REMAP every index that outlives the shrink (`current`, `pending_skip`) over
-    /// it: an index after the removed slot shifts down one, an index AT it is
-    /// cleared (that entry is gone), an index before it is unchanged. Returns the
-    /// index the entry occupied, or `None` when no such entry is queued (an idempotent
-    /// no-op - a concurrent delete/clear already took it).
-    ///
-    /// The ONE place a queue eviction may happen outside `plan_next`'s `consume`, so
-    /// the remap arithmetic exists once rather than at each caller. Callers that also
-    /// commit a new `current` must write it AFTER this (see [`Terminal::SkipLoad`]).
+    /// Remove the entry with `qid` from the queue and bump the playlist version, as a
+    /// plain queue edit: the declared head is a queue id, so nothing needs remapping,
+    /// and if `qid` WAS the head the head simply no longer resolves (reports `None`).
+    /// Returns the index the entry occupied, or `None` when no such entry is queued (an
+    /// idempotent no-op - a concurrent delete/clear already took it).
     fn evict_qid(&mut self, qid: QueueId) -> Option<usize> {
         let pos = self.queue.iter().position(|it| it.id == qid.0)?;
         self.queue.remove(pos);
         self.playlist_version += 1;
-        let remap = |i: Option<usize>| match i {
-            Some(c) if c == pos => None,
-            Some(c) if c > pos => Some(c - 1),
-            other => other,
-        };
-        self.current = remap(self.current);
-        self.pending_skip = remap(self.pending_skip);
         Some(pos)
     }
 
-    /// Reorder the queue with `f` while keeping `current` and `pending_skip` on the
-    /// SAME entries: both are indices, so they are pinned by qid before the reorder and
-    /// re-found after it. Nothing is removed, so both always re-resolve. Bumps
-    /// `playlist_version` once.
+    /// Reorder the queue with `f`. The declared head is a queue id, so it stays on the
+    /// same entry by construction. Bumps `playlist_version` once.
     fn reorder_queue(&mut self, f: impl FnOnce(&mut Self)) {
-        let qid_at = |st: &Self, i: Option<usize>| i.and_then(|i| st.queue.get(i)).map(|it| it.id);
-        let cur = qid_at(self, self.current);
-        let skip = qid_at(self, self.pending_skip);
         f(self);
-        let find = |st: &Self, q: Option<u64>| q.and_then(|q| st.queue.iter().position(|it| it.id == q));
-        if cur.is_some() {
-            self.current = find(self, cur);
-        }
-        if skip.is_some() {
-            self.pending_skip = find(self, skip);
-        }
         self.playlist_version += 1;
     }
 
@@ -1566,7 +1645,7 @@ impl State {
             QueuePos::Abs(n) => return Ok(n),
             QueuePos::After(n) | QueuePos::Before(n) => n,
         };
-        let Some(mut cur) = self.current.filter(|&c| c < self.queue.len()) else {
+        let Some(mut cur) = self.current().filter(|&c| c < self.queue.len()) else {
             return Err((ACK_ERROR_PLAYER_SYNC, "No current song"));
         };
         if let Some((start, end)) = lifted {
@@ -1622,8 +1701,10 @@ impl State {
     /// rather than pointing it at whatever took its slot.
     fn point_current_at_qid(&mut self, qid: u64) -> bool {
         match self.queue.iter().position(|it| it.id == qid) {
-            Some(i) => {
-                self.current = Some(i);
+            Some(_) => {
+                // A HOLD, never a play: this is the nothing-loaded terminal putting the
+                // position back, and the engine must not load what it holds.
+                self.hold_head(Some(QueueId(qid)));
                 true
             }
             None => false,
@@ -1705,7 +1786,7 @@ impl State {
     /// `None` for a stream anchor, a song with no `album_id` (a server that does not
     /// report one cannot support album mode at all), or a run that is too short.
     fn album_context(&self) -> Option<AlbumId> {
-        let anchor = match self.current {
+        let anchor = match self.current() {
             Some(i) if i < self.queue.len() => i,
             _ => self
                 .queue
@@ -1778,7 +1859,7 @@ fn drain_is_next(st: &State) -> bool {
 /// does NOT re-arm; only a genuinely playing draining deck (re)arms. It mirrors the
 /// fire hook's Paused-drop, but at the predicate so it also covers the Stopped edge.
 ///
-/// Deliberately NOT [`HypodjHandler::current_can_warm`] (the SKIP near-EOF guard): the
+/// Deliberately NOT the old skip near-EOF guard: the
 /// [`NEAR_EOF_GUARD_SECS`] decline exists to avoid a swallowed-EOF stall, which cannot
 /// occur for a continuation warm because the actor's `WarmKind::Continuation` ATTRIBUTES
 /// the auto-advance instead of swallowing it - so this predicate omits that guard on
@@ -1838,10 +1919,10 @@ fn peek_next_deterministic(st: &State, cur: usize) -> Option<usize> {
 }
 
 fn warm_ready(st: &State, station_ok: bool, playing: bool) -> Option<(f64, WarmTarget)> {
-    if !(playing && st.pending_skip.is_none() && st.continuation_active.is_none()) {
+    if !(playing && !st.in_transit() && st.continuation_active.is_none()) {
         return None;
     }
-    let cur = st.current?;
+    let cur = st.current()?;
     // The current entry must be a finite Song with a usable duration for EITHER target.
     let dur = match st.queue.get(cur).map(|it| &it.entry) {
         Some(QueueEntry::Song(s)) => match s.duration_secs {
@@ -1890,13 +1971,13 @@ fn continuation_warm_ready_station(st: &State, station_ok: bool, playing: bool) 
     if !(playing
         && st.continuation
         && station_ok
-        && st.pending_skip.is_none()
+        && !st.in_transit()
         && st.continuation_active.is_none()
         && drain_is_next(st))
     {
         return None;
     }
-    let cur = st.current?;
+    let cur = st.current()?;
     match st.queue.get(cur).map(|it| &it.entry) {
         Some(QueueEntry::Song(s)) => match s.duration_secs {
             Some(d) if d > 0 => Some(d as f64),
@@ -1960,6 +2041,22 @@ impl FadeSlot {
         apply()
     }
 
+    /// [`Self::cancel_with`], except that the in-flight fade is left running when
+    /// `keep()` says so (read under the slot lock). The declaration hook uses it so a
+    /// gesture never aborts an OVERLAP from under the planner, which re-aims it itself.
+    async fn cancel_unless<R>(&self, keep: impl FnOnce() -> bool, apply: impl FnOnce() -> R) -> R {
+        let mut slot = self.inner.lock().await;
+        if !keep() {
+            if let Some(mut h) = slot.take() {
+                h.abort.abort();
+                if let Some(join) = h.join.take() {
+                    let _ = join.await;
+                }
+            }
+        }
+        apply()
+    }
+
     /// Atomically replace the active fade: validate/build the new fade FIRST, and
     /// only once it is a valid replacement abort+join the old one, THEN run
     /// `spawn` under the SAME lock. `spawn` reads the now-settled live gain,
@@ -2007,7 +2104,7 @@ impl FadeSlot {
 /// signal. `Default` is an ORDINARY natural EOF of a remote track - the shape almost
 /// every caller (and every fake-clock test that just wants an advance) wants.
 ///
-/// The song id is carried BY VALUE off the event on purpose: `st.current` is repointed
+/// The song id is carried BY VALUE off the event on purpose: `st.current()` is repointed
 /// after the `play_url` await, so a re-read at processing time would misattribute the
 /// mark to whatever an interleaved play just loaded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2021,6 +2118,11 @@ pub struct EofSignal {
     pub was_local: bool,
     /// A warmed continuation station AUTO-ADVANCED at this EOF (slice 2).
     pub continuation_landed: bool,
+    /// The queue entry that ENDED (the deck's latched identity), when the event
+    /// carried one. An end for a row that is no longer the declared head (the outgoing
+    /// leg of an overlap, the old track under a dip) is STALE: the head already moved
+    /// on, so it advances nothing. `None` means "the head" (the tests' shorthand).
+    pub queue_id: Option<QueueId>,
 }
 
 /// A target's play arguments, pre-resolved SYNCHRONOUSLY (the Subsonic
@@ -2041,9 +2143,7 @@ struct ResolvedPlay {
     local: bool,
 }
 
-// NOTE: no `Copy` - the `SkipLoad` arm carries owned, non-Copy fields
-// (`ResolvedPlay`, `FadeSpec`) that are MOVED exactly once (into the terminal,
-// then into the follow-on spawn). The remaining arms stay trivially matchable.
+// NOTE: no `Copy` - the `Trough` arm carries a oneshot sender.
 enum Terminal {
     /// A bare ramp: adopt the reached level as the new baseline, clear `fading`,
     /// nothing else (no stop, no `set_volume` re-assert).
@@ -2079,37 +2179,11 @@ enum Terminal {
     /// so this restore never causes a resume to skip the ramp. Distinct from
     /// [`Terminal::StopRestore`] (which stops and restores).
     Pause,
-    /// The heart of SKIP-FADE: the dip-to-silence has landed, so LOAD the
-    /// pre-resolved target from silence and hand off to a follow-on ResumeIn.
-    /// Runs UNDER the fade slot lock, only when still the current epoch (a
-    /// superseding skip/setvol/stop aborted this task before it reached here, so a
-    /// stale dip can NEVER load the wrong track). The deck is already at silence;
-    /// `sink.play_url` loads the target (mpv softvol ~0 persists across loadfile),
-    /// then `current` is committed, `pending_skip` cleared, and a fresh ResumeIn
-    /// fade (`resume_spec` -> `SetBaseline(resume_vol)`) is spawned into the SAME
-    /// slot - one path, one arbiter.
-    SkipLoad {
-        idx: usize,
-        /// The entry to DROP from the queue at the instant the target commits - the
-        /// queue-delete half of a "remove the currently playing track" gesture. Held
-        /// as a [`QueueId`], never an index, so a concurrent queue edit cannot make
-        /// it point at the wrong track; the terminal re-derives the committed index
-        /// from `play.qid` after the shrink. `None` for an ordinary skip.
-        ///
-        /// THE INVARIANT: the eviction and the successor's commit land TOGETHER,
-        /// under one lock. A superseded dip never runs this terminal, so it never
-        /// evicts either - the queue and the deck stay in lockstep in both outcomes,
-        /// and no orphaned deck (audible track with no queue slot) is reachable.
-        evict: Option<QueueId>,
-        play: ResolvedPlay,
-        resume_spec: FadeSpec,
-        resume_vol: u8,
-        /// The dB level the dip bottomed out at (the deck sits here when the target
-        /// loads, and the ResumeIn rises FROM here). A shallow dip (see
-        /// [`SKIP_DIP_DB`]) keeps a skip snappy: the dip/resume step count scales
-        /// with this depth, so a shallower floor means far fewer 250ms steps.
-        dip_floor_db: f64,
-    },
+    /// The engine's dip has reached its trough: signal the reconciler, which loads
+    /// the head there and installs the rise. `fading` stays set (the rise follows) and
+    /// nothing else is touched. A superseded duck never reaches here, so the sender is
+    /// dropped instead and the reconciler re-plans from wherever the gain was left.
+    Trough(tokio::sync::oneshot::Sender<()>),
 }
 
 /// A fade-NATIVE request: the abstract intent plus the (already resolved +
@@ -2138,14 +2212,6 @@ pub struct FadeRequest {
 pub enum FadeIntent {
     /// Ramp to silence, then stop playback and restore the pre-fade baseline.
     Out,
-    /// REMOVE THE PLAYING TRACK when it is the last thing to play: a SHORT
-    /// DELIBERATE ramp to silence (like [`FadeIntent::PauseOut`], so the deck never
-    /// hard-cuts and the request always lands rather than being rejected as
-    /// too-short), then stop - and drop entry `qid` from the queue in the same lock
-    /// as the stop. Distinct from [`FadeIntent::Out`] only in the eviction and the
-    /// deliberate/clamp-up policy; it is still a transport STOP, so `installs_stop`
-    /// treats the two alike.
-    OutEvicting { qid: u64 },
     /// Startle-safe transport PAUSE: a SHORT DELIBERATE ramp to silence (3 dB/step,
     /// NOT the long sub-JND fade), then PAUSE mpv (not stop) leaving the baseline
     /// volume untouched, so a later RESUME ramps back to exactly the pre-pause level.
@@ -2370,15 +2436,6 @@ impl FadeIntent {
     ) -> (FadeTarget, bool, Terminal, bool) {
         match self {
             FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore { evict: None }, false),
-            // Deliberate + clamp_dur_up (NOT the long sub-JND `Out`): a queue delete is
-            // a responsive gesture, so it gets the same short click-safe ramp the pause
-            // transport uses, and must never be rejected for being too short.
-            FadeIntent::OutEvicting { qid } => (
-                FadeTarget::Silence,
-                false,
-                Terminal::StopRestore { evict: Some(QueueId(qid)) },
-                true,
-            ),
             // Short DELIBERATE ramp to silence, then PAUSE (not stop): the baseline
             // is preserved as the resume level. clamp_dur_up so a 0.5s request over a
             // large span extends to the safe minimum rather than being rejected.
@@ -2441,11 +2498,8 @@ impl FadeIntent {
 /// straggler), so an aborted fade's last in-flight report cannot clobber a newer
 /// fade's live gain.
 // Returns a BOXED, explicitly-`Send` future rather than being a plain
-// `async fn`: `fade_task` is RECURSIVE (the `Terminal::SkipLoad` arm spawns a
-// follow-on `fade_task`), and a recursive `async fn` has an infinitely-sized,
-// self-referential future whose `Send` auto-trait cannot be inferred (cyclic).
-// Boxing to a `dyn Future + Send` breaks the type cycle and asserts `Send` at
-// the boundary, so `tokio::spawn(fade_task(..))` type-checks at every call site.
+// `async fn`: boxing to a `dyn Future + Send` asserts `Send` at the boundary, so
+// `tokio::spawn(fade_task(..))` type-checks at every call site.
 #[allow(clippy::too_many_arguments)]
 fn fade_task(
     sink: PlayerHandle,
@@ -2501,7 +2555,8 @@ fn fade_task(
     // so the `still_current` check is stable and meaningful: if a supersede
     // already ran, it aborted this task before it reached here, OR it is blocked
     // waiting for this lock and will abort a task that has already finished.
-    let mut slot_guard = fade_slot.inner.lock().await;
+    // Held (not dropped) for the whole terminal below.
+    let _slot_guard = fade_slot.inner.lock().await;
     // Only settle if still the current generation (a superseding fade owns the
     // state otherwise). On completion, run the terminal action AND clear `fading`;
     // on a sink error, settle the baseline to the last-good level and clear
@@ -2572,6 +2627,9 @@ fn fade_task(
                         if let Some(qid) = evict {
                             st.evict_qid(qid);
                         }
+                        // The deck holds nothing now: what the engine put on it ended.
+                        st.deck = None;
+                        st.quiesce_epoch = None;
                     }
                     changed.notify_waiters();
                 }
@@ -2641,85 +2699,8 @@ fn fade_task(
                     // widget refresh) and MPD `idle` wakes.
                     changed.notify_waiters();
                 }
-                Terminal::SkipLoad { idx, evict, play, resume_spec, resume_vol, dip_floor_db } => {
-                    // The dip reached its floor AND this is still the current epoch, so
-                    // no superseding skip/setvol/stop got here first: it is SAFE to
-                    // load the target. mpv's softvol (at the dip floor) persists across
-                    // the switch, so the new track starts at that shallow-duck level
-                    // and the follow-on ResumeIn owns the rise back to the baseline.
-                    // switch_warmed lands on the prefetched entry near-instant (the
-                    // trough gap collapses toward ~0); if the warm never completed it
-                    // falls back to a plain loadfile-replace - today's behavior, so a
-                    // prefetch miss/failure is never worse than before.
-                    // `play.local` is the value resolved ONCE for this gesture (the same
-                    // one the warm used), so the actor latches the right local/remote
-                    // fact for the target's own later Eof - resolution cannot flip
-                    // inside a gesture.
-                    // Captured before the partial move below: the target's stable queue
-                    // identity, which an `evict` makes the only trustworthy way to name
-                    // the committed slot (its INDEX shifts under the removal).
-                    let qid_for_commit = play.qid.0;
-                    let _ = sink
-                        .switch_warmed(play.song_id, Some(play.qid), &play.url, play.local)
-                        .await;
-                    // Commit the target as the real current, clear the reported-target
-                    // override, pin the live gain to the dip floor (where the deck and
-                    // the ResumeIn's from_db agree) and keep `fading` true - the
-                    // follow-on ResumeIn continues the envelope without a gap. Bump the
-                    // epoch so the follow-on is tagged strictly newer than this
-                    // (now-finished) dip.
-                    let epoch2 = {
-                        let mut st = state.lock().unwrap();
-                        // DELETE-THE-PLAYING-TRACK: drop the outgoing entry in the SAME
-                        // lock that commits the incoming one.
-                        if let Some(gone) = evict {
-                            st.evict_qid(gone);
-                        }
-                        // ALWAYS re-derive the committed index from the target's own
-                        // QueueId, never from the `idx` captured at install time. The
-                        // queue can shrink under a live dip from ANY direction - an
-                        // eviction here, but equally an ordinary `delete` of some
-                        // unrelated row on another connection - and a stale index then
-                        // commits the WRONG entry, or one past the end (which reports
-                        // Stopped over audible playback and drains the queue at the next
-                        // EOF). `_idx` is kept only to document what was targeted.
-                        let _ = idx;
-                        // A target that is no longer queued commits NOTHING rather than a
-                        // phantom index. delete_at supersedes the dip when the target
-                        // itself is deleted, so this is the belt-and-braces arm.
-                        st.current = st.queue.iter().position(|it| it.id == qid_for_commit);
-                        st.pending_skip = None;
-                        // A track is now current: clear any fresh-enqueue anchor
-                        // (defensive - a skip always starts from a playing deck, so the
-                        // anchor is already None; keeps the "cleared the instant any
-                        // track becomes current" invariant total across every commit).
-                        st.fresh_enqueue_anchor = None;
-                        st.live_gain_db = dip_floor_db;
-                        st.fading = true;
-                        st.fade_epoch += 1;
-                        st.fade_epoch
-                    };
-                    // Spawn the follow-on ResumeIn (silence -> baseline) into the SAME
-                    // slot we already hold, reclaiming the dip's now-finished handle.
-                    // REUSES fade_task verbatim: the FadeSlot + fade_epoch stay the sole
-                    // arbiter (a 2nd skip during this ramp is an ordinary slot fade that
-                    // supersede aborts, SetBaseline never running).
-                    // fade_task returns a boxed Send future (it is recursive), so
-                    // this follow-on spawn is a plain call - the FadeSlot + epoch
-                    // stay the sole arbiter.
-                    let join = tokio::spawn(fade_task(
-                        sink,
-                        resume_spec,
-                        state.clone(),
-                        changed.clone(),
-                        epoch2,
-                        Terminal::SetBaseline(resume_vol),
-                        fade_slot.clone(),
-                        synth_floor_db,
-                    ));
-                    *slot_guard = Some(FadeHandle { abort: join.abort_handle(), join: Some(join) });
-                    // Notify the Playing / new-track edge (MPD idle + MPRIS refresh).
-                    changed.notify_waiters();
+                Terminal::Trough(reached) => {
+                    let _ = reached.send(());
                 }
             },
             FadeOutcome::SinkError(_) => {
@@ -2768,96 +2749,6 @@ fn same_album_run(st: &State, a: usize, b: usize) -> bool {
         (Some(tx), Some(ty)) => ty == tx + 1,
         _ => false,
     }
-}
-
-/// What a finished crossfade has to land, carried into the task so its terminal does no
-/// handler-side work under the slot lock.
-struct CrossfadeCommit {
-    /// The incoming entry's STABLE queue identity. Never an index: an index captured at
-    /// install is exactly as wrong here as it is in [`Terminal::SkipLoad`], and for the
-    /// same reason - the queue can shrink from any connection while the envelope runs.
-    qid: u64,
-    /// The outgoing entry to drop from the queue as the incoming one commits (the
-    /// "remove the playing track" gesture). `None` for an ordinary crossfade.
-    evict: Option<QueueId>,
-    /// The baseline both legs were measured against, re-asserted on the promoted deck.
-    baseline: u8,
-    /// Whether the outgoing track PLAYED OUT (a boundary crossfade) and so must be
-    /// published and scrobbled as finished, rather than having been skipped away from.
-    attribute_finish: bool,
-}
-
-/// Drive a crossfade to completion, then promote the incoming deck - the two-deck
-/// counterpart of [`fade_task`], sharing its slot, its epoch and its abort discipline.
-///
-/// The terminal runs UNDER the slot lock for exactly the reason `fade_task`'s does: so
-/// its check-and-act is atomic against supersede. The difference is what a supersede
-/// MEANS here. An ordinary superseded fade simply stops writing; a superseded crossfade
-/// has left a SECOND DECK PLAYING, and abandoning that is the one outcome worse than
-/// either track alone. So this task never cleans up after itself - whoever supersedes it
-/// runs [`MpdHandler::settle_crossfade`] FIRST, which finishes the promotion before the
-/// new gesture touches a gain.
-fn crossfade_task(
-    sink: PlayerHandle,
-    spec: CrossfadeSpec,
-    state: Arc<Mutex<State>>,
-    changed: Arc<Notify>,
-    epoch: u64,
-    commit: CrossfadeCommit,
-    fade_slot: Arc<FadeSlot>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = FadeOutcome> + Send>> {
-    Box::pin(async move {
-        let clock = TokioClock;
-        let outcome = {
-            let state_r = state.clone();
-            let mut report = move |p: FadeProgress| {
-                let mut st = state_r.lock().unwrap();
-                if st.fade_epoch != epoch {
-                    return; // a superseded straggler: no-op, exactly like fade_task.
-                }
-                // The driver hands back the CONSTANT baseline, so the status never
-                // animates a dip the listener cannot hear. No per-step change
-                // notification either, for the same reason: nothing a client renders is
-                // moving.
-                st.live_gain_db = p.gain_db;
-            };
-            run_crossfade(&sink, &spec, &clock, &mut report).await
-        };
-
-        let mut slot_guard = fade_slot.inner.lock().await;
-        let still_current = state.lock().unwrap().fade_epoch == epoch;
-        if still_current {
-            // Promote FIRST, then write the state. crossfade_commit flips the active
-            // deck before it stops the outgoing one, so from here on every ordinary
-            // command addresses the track the queue is about to call current.
-            let _ = sink.crossfade_commit(commit.attribute_finish).await;
-            // Re-assert the baseline on the promoted deck. The envelope's last step
-            // already put it there, so this is inaudible - it exists so the u8 seam and
-            // the fractional gain agree for whatever comes next.
-            let _ = sink.set_volume(commit.baseline).await;
-            {
-                let mut st = state.lock().unwrap();
-                if let Some(gone) = commit.evict {
-                    st.evict_qid(gone);
-                }
-                // Re-derived from the QueueId, never the install-time index (see
-                // Terminal::SkipLoad). A target that left the queue commits NOTHING
-                // rather than a phantom index.
-                st.current = st.queue.iter().position(|it| it.id == commit.qid);
-                st.pending_skip = None;
-                st.fresh_enqueue_anchor = None;
-                st.crossfading = false;
-                st.fading = false;
-                // The deck is loaded and playing by construction - the incoming deck has
-                // been audible for the whole transition - so this baseline commit may
-                // retire a pending pause exactly as a manual one would.
-                st.set_manual_volume(commit.baseline, true);
-            }
-            *slot_guard = None;
-            changed.notify_waiters();
-        }
-        outcome
-    })
 }
 
 /// The http-loopback exemption for [`HypodjHandler::fetch_remote_cover`] (task njvsh8w):
@@ -2917,6 +2808,8 @@ pub struct HypodjHandler {
     /// fade task can hold a handle and take the slot lock for its terminal action
     /// (C3: the terminal's check-and-act is atomic against supersede/cancel).
     fade: Arc<FadeSlot>,
+    /// The transition engine's run lock and wake (see [`reconcile`]).
+    engine: reconcile::Engine,
     /// Per-user fade tunables (startle bounds, tick, durations).
     fade_cfg: FadeConfig,
     /// Bounded LRU+TTL cache for STABLE listings (artists, albums, genres, smart
@@ -3201,7 +3094,7 @@ pub struct HypodjHandler {
     /// any evidence that a track actually PLAYED - a live playback position
     /// ([`Self::note_playback_progress`], the director's identity-matched `TimePos`), a
     /// natural (non-errored) EOF, or a fresh-play GESTURE
-    /// ([`Self::arm_eof_fuse_for_gesture`]) - so it only ever counts an unbroken run of
+    /// ([`Self::arm_eof_fuse_at`]) - so it only ever counts an unbroken run of
     /// loads that never produced sound.
     ///
     /// The position tick is the LOAD-BEARING reset, because neither of the other two
@@ -3216,7 +3109,7 @@ pub struct HypodjHandler {
     consecutive_eof_failures: AtomicU32,
     /// WHERE THE CURRENT FAILED-LOAD WALK STARTED: the MPD id ([`QueueItem::id`]) of the
     /// entry a fresh-play GESTURE chose, plus one (0 = no walk in progress), latched by
-    /// [`Self::arm_eof_fuse_for_gesture`] and cleared by the SAME two pieces of
+    /// [`Self::arm_eof_fuse_at`] and cleared by the SAME two pieces of
     /// audio evidence that re-arm the fuse. So "latched" means exactly: a gesture asked
     /// for this entry and not one frame of sound has been produced since.
     ///
@@ -3286,15 +3179,6 @@ const NL_TOKEN_TTL: Duration = Duration::from_secs(300);
 /// the baseline). Closer to 0 = shallower + faster; deeper = slower.
 const SKIP_DIP_DB: f64 = -18.0;
 
-/// NEAR-EOF GUARD threshold for the warm-skip prefetch. When the CURRENT track is
-/// within this many seconds of its natural end, [`HypodjHandler::skip_with_fade`]
-/// DECLINES the background warm and takes the plain trough loadfile-replace path.
-/// A warm appends the target as a 2nd playlist entry, and mpv would AUTO-ADVANCE
-/// into it at the current track's natural EOF - so a skip pressed this close to the
-/// end could make the warm target audible at the shallow duck AND fire a phantom
-/// queue advance for the outgoing track. Declining sidesteps that entirely; the
-/// warm has no time to pay off this near the end anyway.
-const NEAR_EOF_GUARD_SECS: f64 = 2.0;
 
 /// How far AHEAD of a finite current track's natural EOF the continuation station is
 /// LEAD-warmed (slice 2). At `duration - CONTINUATION_WARM_LEAD_SECS` the pending-warm
@@ -3691,6 +3575,7 @@ impl HypodjHandler {
             changed: Arc::new(Notify::new()),
             snapshot_tx: OnceLock::new(),
             fade: Arc::new(FadeSlot::new()),
+            engine: reconcile::Engine::new(),
             fade_cfg,
             listings: TtlLru::new(256, Duration::from_secs(60)),
             dir_cache: TtlLru::new(256, Duration::from_secs(60)),
@@ -4044,7 +3929,7 @@ impl HypodjHandler {
         let elapsed_ms = self.last_elapsed_ms.load(Ordering::Relaxed);
         let state = self.reported_play_state();
         let st = self.state.lock().unwrap();
-        let current = st.current;
+        let current = st.current();
         let current_qid = current.and_then(|i| st.queue.get(i)).map(|it| it.id);
         let target_volume = st.target_volume;
         let snap = Snapshot {
@@ -4080,7 +3965,7 @@ impl HypodjHandler {
         let ids: Vec<u64> = st.queue.iter().map(|it| it.id).collect();
         let key = WorldKey {
             playlist_version: st.playlist_version,
-            current_qid: st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
+            current_qid: st.current().and_then(|i| st.queue.get(i)).map(|it| it.id),
             state,
             target_volume: st.target_volume,
             modes: st.modes(),
@@ -4096,7 +3981,7 @@ impl HypodjHandler {
         let st = self.state.lock().unwrap();
         WorldKey {
             playlist_version: st.playlist_version,
-            current_qid: st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
+            current_qid: st.current().and_then(|i| st.queue.get(i)).map(|it| it.id),
             state,
             target_volume: st.target_volume,
             modes: st.modes(),
@@ -4911,10 +4796,9 @@ impl HypodjHandler {
             self.plan_enqueue(sel, count).await?;
         }
 
-        // (2) Force start-from-silence BEFORE the first buffer: a stopped player's
-        // baseline is the comfort volume, so without this the WakeTo ramp would
-        // snapshot from_db=comfort and not rise from silence.
-        let synth_floor = self.fade_cfg.synth_floor_db;
+        // (2) Start-from-silence BEFORE the first buffer is the engine's half of a
+        // FromSilence declaration (step 3): it starts the row at the floor, so the
+        // WakeTo ramp snapshots from_db = floor and rises from silence.
         // An ALARM wakes to a stable comfort level - the configured wake ceiling -
         // NOT `target_volume`, which a preceding `winddown` may have lowered to the
         // floor (that would ramp the alarm to a barely-audible level). This is the
@@ -4923,14 +4807,13 @@ impl HypodjHandler {
         let comfort_db = self.fade_cfg.wake_ceiling_db;
         let comfort_vol = db_to_mpv_volume(comfort_db).round().clamp(0.0, 100.0) as u8;
         let idx = {
-            let mut st = self.state.lock().unwrap();
-            st.live_gain_db = synth_floor;
+            let st = self.state.lock().unwrap();
             // Wake INTO the enqueued selection (its first track) when one was
             // enqueued; otherwise resume `current` or the head of the queue.
             match enqueue_start {
                 Some(start) if start < st.queue.len() => Some(start),
                 _ => st
-                    .current
+                    .current()
                     .filter(|&i| i < st.queue.len())
                     .or_else(|| (!st.queue.is_empty()).then_some(0)),
             }
@@ -4938,10 +4821,9 @@ impl HypodjHandler {
         let Some(idx) = idx else {
             return Err("wake: nothing to play (empty queue and no selector)".into());
         };
-        let _ = self.player.set_volume(0).await;
-
-        // (3) Play from silence.
-        self.play_index_from_silence(idx).await?;
+        // (3) Play from silence (the engine takes anything audible down first, and
+        // starts the row at the floor the ramp below rises from).
+        self.declare_play(idx, Cause::FromSilence).await?;
 
         // (4) Sub-JND ramp silence -> saved comfort level (startle-safe by
         // construction; WakeTo resolves sub_jnd=true / SetBaseline).
@@ -5208,7 +5090,7 @@ impl HypodjHandler {
             // Jump to (and start) the just-enqueued track. When a track was already
             // playing this interrupts it (the intended "play X now"); on a stopped
             // deck it simply starts.
-            self.play_index(start_idx).await?;
+            self.declare_play(start_idx, Cause::Gesture).await?;
         }
         Ok(n)
     }
@@ -5218,7 +5100,7 @@ impl HypodjHandler {
     /// `.await` held.
     fn current_song(&self) -> Option<Song> {
         let st = self.state.lock().unwrap();
-        match st.current.and_then(|i| st.queue.get(i)) {
+        match st.current().and_then(|i| st.queue.get(i)) {
             Some(item) => match &item.entry {
                 QueueEntry::Song(s) => Some(s.clone()),
                 QueueEntry::Stream { .. } => None,
@@ -5263,7 +5145,7 @@ impl HypodjHandler {
         let st = self.state.lock().unwrap();
         // 1. the CURRENT playing library song (a live stream has no library id, so
         //    the current-song branch yields None and we fall through to recency).
-        if let Some(item) = st.current.and_then(|i| st.queue.get(i)) {
+        if let Some(item) = st.current().and_then(|i| st.queue.get(i)) {
             if let QueueEntry::Song(s) = &item.entry {
                 return Some(SeedSource {
                     kind: SeedKind::NowPlaying,
@@ -5282,7 +5164,7 @@ impl HypodjHandler {
         //    (the reset discipline already clears the anchor the instant any track
         //    becomes current, so this guard is defense in depth). Self-heals: a dangling
         //    anchor finds no position and falls through to recency.
-        if st.current.is_none() {
+        if st.current().is_none() {
             if let Some(anchor) = st.fresh_enqueue_anchor {
                 if let Some(pos) = st.queue.iter().position(|it| it.id == anchor) {
                     if let Some(s) = st.queue[pos..].iter().find_map(|it| match &it.entry {
@@ -5341,7 +5223,7 @@ impl HypodjHandler {
     /// is current (the current-song branch wins the seed there anyway).
     fn arm_fresh_enqueue_anchor(&self, first_qid: u64) {
         let mut st = self.state.lock().unwrap();
-        if st.current.is_none() {
+        if st.current().is_none() {
             st.fresh_enqueue_anchor = Some(first_qid);
         }
     }
@@ -5372,7 +5254,7 @@ impl HypodjHandler {
         }
         let heard = self.last_elapsed_secs();
         let mut st = self.state.lock().unwrap();
-        let Some(song) = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
+        let Some(song) = st.current().and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
             QueueEntry::Song(s) => Some((s.id.clone(), s.duration_secs)),
             QueueEntry::Stream { .. } => None,
         }) else {
@@ -5521,7 +5403,7 @@ impl HypodjHandler {
         let st = self.state.lock().unwrap();
         let texts = st.queue.iter().map(|it| Self::item_search_text(&it.entry)).collect();
         let qids = st.queue.iter().map(|it| it.id).collect();
-        (texts, qids, st.current)
+        (texts, qids, st.current())
     }
 
     /// [`Self::queue_texts`] with the structured fields a
@@ -5547,7 +5429,7 @@ impl HypodjHandler {
             })
             .collect();
         let qids = st.queue.iter().map(|it| it.id).collect();
-        (rows, qids, st.current)
+        (rows, qids, st.current())
     }
 
     /// How many rows a queue selector names RIGHT NOW (the echo's dry-run count).
@@ -5578,7 +5460,7 @@ impl HypodjHandler {
                 crate::plan::ClearScope::AfterCurrent => {
                     let idxs: Vec<usize> = {
                         let st = self.state.lock().unwrap();
-                        match st.current {
+                        match st.current() {
                             Some(c) => ((c + 1)..st.queue.len()).collect(),
                             // Nothing is playing: there is no "after current", so this
                             // is a clean no-op rather than a surprise clear-all.
@@ -5611,7 +5493,7 @@ impl HypodjHandler {
                     // he wants under the needle, and it already is - so loading it
                     // would restart from zero the music he is in the middle of, which
                     // is the one thing a jump onto the current row must never do.
-                    // `play_index` has no already-current guard on purpose (a wire
+                    // `declare_play` has no already-current guard on purpose (a wire
                     // `play <pos>` deliberately restarts), so the guard sits here, on
                     // the plan arm. Nothing changes, so nothing is journaled and no
                     // banner offers to undo a jump that never happened.
@@ -5622,7 +5504,7 @@ impl HypodjHandler {
                         Ok(1)
                     }
                     Some(&idx) => {
-                        self.play_index(idx).await?;
+                        self.declare_play(idx, Cause::Gesture).await?;
                         Ok(1)
                     }
                     None => Ok(0),
@@ -5644,10 +5526,20 @@ impl HypodjHandler {
         let mut sorted: Vec<usize> = idxs.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        let (removed, current_gone) = {
-            let mut st = self.state.lock().unwrap();
+        // The head's fate is decided against the queue as it stands now: its successor
+        // is the first row after it that survives the removal.
+        let (head_pos, survivors) = {
+            let st = self.state.lock().unwrap();
+            let doomed = |i: usize| sorted.binary_search(&i).is_ok();
+            let head_pos = st.current().filter(|&c| doomed(c));
+            let survivors: Vec<QueueId> = (0..st.queue.len())
+                .filter(|&i| !doomed(i))
+                .map(|i| QueueId(st.queue[i].id))
+                .collect();
+            (head_pos, survivors)
+        };
+        let remove = |st: &mut State| -> usize {
             let len = st.queue.len();
-            let cur_id = st.current.and_then(|c| st.queue.get(c).map(|it| it.id));
             let mut removed = 0usize;
             for &i in sorted.iter().rev() {
                 if i < st.queue.len() && i < len {
@@ -5657,18 +5549,33 @@ impl HypodjHandler {
             }
             if removed > 0 {
                 st.playlist_version += 1;
-                // Re-anchor current by the tracked id; None if it was removed.
-                st.current = cur_id.and_then(|id| st.queue.iter().position(|it| it.id == id));
             }
-            (removed, removed > 0 && cur_id.is_some() && st.current.is_none())
+            removed
         };
-        if current_gone {
-            // The playing entry itself was removed: stop rather than leave the player
-            // running a track no longer in the queue.
-            let _ = self.player.stop().await;
-            // And the deck is empty, so bulk store work stops deferring.
-            self.set_store_playback_remote(false);
-        }
+        let removed = match head_pos {
+            // The head is among the removed rows: declare the new state, exactly like
+            // deleting the playing row - its successor, or nothing.
+            Some(pos) => {
+                let playing = self.reported_play_state() == PlayState::Playing;
+                self.declare(Cause::Removed, |st| {
+                    let head = st.queue[pos].id;
+                    let successor = if playing {
+                        st.queue[pos + 1..]
+                            .iter()
+                            .map(|it| QueueId(it.id))
+                            .find(|q| survivors.contains(q))
+                    } else {
+                        None
+                    };
+                    let n = remove(st);
+                    st.head_removed(QueueId(head), successor);
+                    n
+                })
+                .await
+                .unwrap_or(0)
+            }
+            None => remove(&mut self.state.lock().unwrap()),
+        };
         if removed > 0 {
             self.notify_change();
             // A removal changes what drains next: re-evaluate the continuation warm (slice
@@ -5697,7 +5604,7 @@ impl HypodjHandler {
             if sorted.iter().any(|&i| i >= len) {
                 return 0;
             }
-            let cur_id = st.current.and_then(|c| st.queue.get(c).map(|it| it.id));
+            let cur_id = st.current().and_then(|c| st.queue.get(c).map(|it| it.id));
             // Extract the moving items in order; keep the remainder.
             let selset: std::collections::HashSet<usize> = sorted.iter().copied().collect();
             let mut moving: Vec<QueueItem> = Vec::with_capacity(sorted.len());
@@ -5726,8 +5633,8 @@ impl HypodjHandler {
                 out.insert(insert_at + k, it);
             }
             st.queue = out;
+            // The head is a queue id: it stays on its entry by construction.
             st.playlist_version += 1;
-            st.current = cur_id.and_then(|id| st.queue.iter().position(|it| it.id == id));
             moved
         };
         if moved > 0 {
@@ -6598,7 +6505,7 @@ impl HypodjHandler {
             let still_ours = {
                 let st = self.state.lock().unwrap();
                 st.station_identity_gen == gen
-                    && st.current.and_then(|i| st.queue.get(i)).map(|it| it.id) == Some(qid.0)
+                    && st.current().and_then(|i| st.queue.get(i)).map(|it| it.id) == Some(qid.0)
             };
             if !still_ours {
                 return;
@@ -8740,7 +8647,7 @@ impl HypodjHandler {
         // DropWarm the prefetched station entry): the fresh tail means the current is no
         // longer the last entry, so the warm can never legitimately auto-advance behind
         // it now. Nothing to re-arm here (the deck no longer drains next); the next
-        // play_index_inner / reschedule re-arms cleanly when the queue drains down again.
+        // declare_play / reschedule re-arms cleanly when the queue drains down again.
         self.disarm_continuation_warm().await;
     }
 
@@ -8812,29 +8719,14 @@ impl HypodjHandler {
         // behind a deck that is fading to a stop. Every other fade leaves the deck
         // playing (glide / knob / wind-down / resume-in) or pausing (PauseOut, which the
         // predicate's play-state gate already refuses via `pending_pause`).
-        let installs_stop = matches!(intent, FadeIntent::Out | FadeIntent::OutEvicting { .. });
-        // ANY fade that installs here SUPERSEDES whatever is running. If it superseded
-        // a live skip dip, that dip's Terminal::SkipLoad/switch_warmed will NEVER run,
-        // so `pending_skip` and the prefetched warm target are now STALE - the warm
-        // stays appended behind the still-playing current track and mpv would
-        // auto-advance into it (audible bleed at the live gain) at the current track's
-        // natural EOF, and the `warmed` guard would then swallow that EOF and stall the
-        // queue. This is TRUE regardless of intent: a committing fade (setvol glide /
-        // knob) AND every non-committing fade (resume-in, wind-down `fade to`/`toFloor`/
-        // `fade in`, scheduled wake) alike abort the dip. `start_fade_spec` is NEVER the
-        // skip machinery itself (the dip installs via `install_skip_dip`; the follow-on
-        // ResumeIn spawns straight from the SkipLoad terminal), so a superseded skip is
-        // always dead here. The install closure therefore clears `pending_skip`
-        // unconditionally and the warm is dropped after the abort+join below - both
-        // idempotent no-ops when nothing was skipping/warmed.
-
-        // A running CROSSFADE cannot simply be superseded the way a fade can. Aborting a
-        // fade leaves one deck at a known level; aborting a crossfade strands a SECOND
-        // audible deck with nobody driving it, and leaves the pair's real gains disagreeing
-        // with the `live_gain_db` the build closure below is about to read as `from_db`.
-        // Settling first makes both true again - one deck, at the baseline the live gain
-        // already claims - so everything downstream is correct unchanged.
-        self.settle_crossfade(true).await;
+        let installs_stop = matches!(intent, FadeIntent::Out);
+        // A running OVERLAP cannot simply be superseded the way a fade can: aborting it
+        // strands a second audible deck and leaves the pair's real gains disagreeing with
+        // the `live_gain_db` the build closure is about to read. The engine lands it
+        // first (one deck, at the level the live gain claims), so everything below is
+        // correct unchanged. A dip the engine is running is simply superseded: the
+        // engine sees its duck aborted and re-plans from wherever this leaves the gain.
+        self.settle_overlap().await;
 
         let cfg = self.fade_cfg.clone();
         let state_read = self.state.clone();
@@ -8884,6 +8776,21 @@ impl HypodjHandler {
                         let mut st = state_task.lock().unwrap();
                         st.fade_epoch += 1;
                         st.fading = true;
+                        if matches!(terminal, Terminal::StopRestore { .. }) {
+                            // `fade out` is a STOP that takes its time: hold the head
+                            // (the engine must never reload what this is stopping) and
+                            // mark the fade as the head leaving, atomically with the
+                            // install.
+                            let head = st.head_qid();
+                            st.hold_head(head);
+                            st.quiesce_epoch = Some(st.fade_epoch);
+                        } else if st.quiesce_epoch.take().is_some()
+                            && st.declared.intent == reconcile::Intent::Stop
+                        {
+                            // This fade SUPERSEDES a `fade out` before its stop landed:
+                            // the stop is retracted with it, so the head plays on.
+                            st.declared.intent = reconcile::Intent::Play;
+                        }
                         // Synchronously commit the logical target + baseline at
                         // INSTALL (under this slot lock, atomic against supersede),
                         // before any tick. A superseded key-mash / slider-drag thus
@@ -8896,14 +8803,6 @@ impl HypodjHandler {
                         // supersedes an in-flight PauseOut) nor at a never-loaded
                         // skip target - the difference from set_manual_volume is it
                         // leaves `fading`/`live_gain_db` alone so the ramp animates.
-                        // Clear `pending_skip` for EVERY install, committing or not: if
-                        // this fade superseded a live skip dip, that dip is dead (its
-                        // SkipLoad never runs) and the reported current must revert from
-                        // the never-loaded target back to `current`. A no-op when no skip
-                        // was in flight. Pairs with the drop_warm below (which discards the
-                        // now-orphaned parked warm entry) so a non-committing wake/resume/
-                        // wind-down can never leave a stale target to auto-advance.
-                        st.pending_skip = None;
                         if let Some((db, vol)) = commit_logical {
                             st.logical_gain_db = db;
                             st.target_volume = vol;
@@ -8944,22 +8843,9 @@ impl HypodjHandler {
         // On rejection nothing was disturbed: the in-flight fade (if any) is still
         // running and no volume was touched, so just surface the ACK error.
         //
-        // On ANY successful install, `pending_skip` was cleared (a superseded skip):
-        // drop any now-stale parked warm target so it can never auto-advance behind the
-        // still-playing current track. This must run for NON-committing fades too
-        // (scheduled wake, reconnect restart, user resume-in, wind-down `fade to`/
-        // `toFloor`/`fade in`) - each supersedes and aborts a live skip dip just like a
-        // committing setvol/knob does, so leaving the warm parked would let mpv
-        // auto-advance into it at the current track's natural EOF (audible bleed) and
-        // then stall the queue on the swallowed `warmed` EOF. Best-effort + idempotent
-        // (a no-op when nothing was warmed). Done after the supersede's abort+join, so it
-        // never races a SkipLoad. Intent no longer gates this drop - the install closure
-        // still distinguishes the baseline-commit behavior separately above.
+        // On ANY successful install, drop a parked warm entry first so nothing stale
+        // sits behind the current track to auto-advance, then re-evaluate it below.
         if res.is_ok() {
-            // One actor playlist-clear discards ANY parked entry: the superseded skip
-            // target (pending_skip was cleared above) AND, if a continuation warm had
-            // already landed, its prefetched station alike. Done FIRST so no stale entry
-            // sits parked to auto-advance behind the still-playing current track.
             let _ = self.player.drop_warm().await;
             if installs_stop {
                 // A fade-OUT drives the deck to a StopRestore stop: the warm must DIE and
@@ -8988,6 +8874,9 @@ impl HypodjHandler {
                 self.reschedule_continuation_warm().await;
             }
         }
+        // This fade may have taken the gain from the engine (a dip's duck, a fade-out):
+        // wake the reconciler so the room still converges on what was declared.
+        self.poke();
         res
     }
 
@@ -9018,11 +8907,14 @@ impl HypodjHandler {
     /// One source of truth shared by `status`, the MPRIS surface, and the resume
     /// checkpoint - so they can never disagree about the play state.
     pub fn reported_play_state(&self) -> PlayState {
-        let (has_current, pending) = {
+        let (has_current, pending, loading) = {
             let st = self.state.lock().unwrap();
             (
-                st.current.and_then(|i| st.queue.get(i)).is_some(),
+                st.current().and_then(|i| st.queue.get(i)).is_some(),
                 st.pending_pause,
+                st.loading_rev.is_some_and(|r| {
+                    r == st.declared.rev && st.declared.intent == reconcile::Intent::Play
+                }),
             )
         };
         if !has_current {
@@ -9031,7 +8923,11 @@ impl HypodjHandler {
         if pending {
             return PlayState::Paused;
         }
-        effective_play_state(self.player.state(), has_current)
+        let raw = self.player.state();
+        if raw == PlayState::Stopped && loading {
+            return PlayState::Playing;
+        }
+        effective_play_state(raw, has_current)
     }
 
     /// The clamped pause/resume fade duration (float-second `pause_fade_secs` into
@@ -9063,6 +8959,13 @@ impl HypodjHandler {
     /// level. Both notify on the transition so the MPRIS PropertiesChanged loop (and
     /// MPD `idle`) refresh - the fix for a desktop widget that would otherwise never
     /// see the Paused edge (it never went through `notify_change`).
+    /// Seek the HEAD. The player seeks its active deck, which through an overlap is the
+    /// leg being left, so the transition settles to one committed deck first.
+    pub(crate) async fn seek_head(&self, secs: f64) -> Result<(), PlayerError> {
+        self.settle_transitions().await;
+        self.player.seek(secs).await
+    }
+
     pub async fn set_pause(&self, want: Option<bool>) -> Result<(), PlayerError> {
         // Decide from the EFFECTIVE (pending-pause-aware) state, not the raw mpv
         // state: during a pause-out fade mpv is still raw-Playing but the intent is
@@ -9230,31 +9133,22 @@ impl HypodjHandler {
     /// fade is installed. A rejected spec (should not happen for a sub-JND Silence
     /// fade) degrades to a direct pause so playback never stays audible.
     async fn pause_with_fade(&self) -> Result<(), PlayerError> {
+        // A pause acts on the room as DECLARED: a transition in progress lands first,
+        // so the pause freezes the track the listener was told is playing rather than
+        // aborting a dip half way and leaving the head and the deck disagreeing.
+        self.settle_transitions().await;
         // Flip the REPORTED state to Paused IMMEDIATELY (F2): set the pending-pause
         // intent and notify BEFORE the fade runs, so status/MPRIS/checkpoints see
         // Paused at once and the whole fade window is consistent.
         {
             let mut st = self.state.lock().unwrap();
             st.pending_pause = true;
-            // A pause issued during a skip dip supersedes that dip: the PauseOut fade
-            // aborts it before Terminal::SkipLoad runs, so the skip target never
-            // loads and mpv stays paused on the OLD (still-loaded) track. Clear the
-            // skip intent so the reported current reverts from the never-loaded
-            // target back to `current`, matching what mpv actually holds (mirrors
-            // set_manual_volume clearing pending_skip).
-            st.pending_skip = None;
         }
         self.notify_change();
         let dur = self.pause_fade_dur();
         let r = self
             .start_fade_spec(FadeRequest { intent: FadeIntent::PauseOut, dur, commit_logical: None })
             .await;
-        // A pause issued during a skip dip supersedes it (above): the skip target never
-        // loads, so drop any parked warm entry - else the OLD track (still loaded, now
-        // paused) would auto-advance into the stale target at its natural EOF once
-        // resumed. Best-effort + idempotent; PauseOut is non-committing so start_fade_spec
-        // does not do this itself. Done after the fade install (abort+join), no SkipLoad race.
-        let _ = self.player.drop_warm().await;
         // Disarm any pending continuation warm too (slice 2): a parked ICY connection
         // through an open-ended pause is stale-warm waste, and this cancels the timer so
         // resume re-arms cleanly from the resumed position. drop_warm above already
@@ -9372,25 +9266,28 @@ impl HypodjHandler {
     /// The gesture gets a full fuse budget from here, so a queue that is only PARTLY
     /// mirrored still finds its next cached entry and plays - and when nothing in reach
     /// loads, the walk's terminal puts `current` back on THIS entry
-    /// ([`Self::arm_eof_fuse_for_gesture`]), so the position is held however many times
+    /// ([`Self::arm_eof_fuse_at`]), so the position is held however many times
     /// play is pressed while the server stays away.
     async fn resume_by_loading_current(&self) -> Result<(), PlayerError> {
         // Brief lock, dropped BEFORE the load await (never hold State across `.await`).
-        let held = self.state.lock().unwrap().current;
+        let held = self.state.lock().unwrap().current();
         let Some(idx) = held else {
             // The entry went away between the state read and here: nothing to load,
             // and the deck already reports Stopped without a current.
             return Ok(());
         };
-        match self.play_index(idx).await {
+        match self.declare_play(idx, Cause::Gesture).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 {
                     let mut st = self.state.lock().unwrap();
                     // Only while an entry is actually held: `pending_pause` over an
                     // empty queue would report Paused with nothing to resume.
-                    if st.current.and_then(|i| st.queue.get(i)).is_some() {
+                    if st.current().and_then(|i| st.queue.get(i)).is_some() {
                         st.pending_pause = true;
+                        // Held: the failed load is not retried behind his back.
+                        let head = st.head_qid();
+                        st.hold_head(head);
                     }
                 }
                 self.notify_change();
@@ -9404,34 +9301,20 @@ impl HypodjHandler {
     /// baseline gain, then notify. Shared by the MPD `stop` command and MPRIS Stop
     /// (so an MPRIS-initiated stop also refreshes the desktop widget).
     pub async fn stop_playback(&self) {
-        // A stop takes over the gain, so any crossfade finishes first (see
-        // settle_crossfade) - otherwise the stop silences one deck and leaves the other
-        // playing into a room that was told everything stopped.
-        self.settle_crossfade(true).await;
-        self.fade
-            .cancel_with(|| {
-                let mut st = self.state.lock().unwrap();
-                let v = st.target_volume;
-                st.set_manual_volume(v, self.deck_loaded());
-                // A stop clears any pending-pause intent (the deck is stopping, not
-                // paused): the reported state must not stick at Paused. Explicit and
-                // UNGATED, because a stop is a TRANSPORT gesture - the one thing that
-                // retires the intent no matter what the player currently holds (the
-                // baseline commit above deliberately cannot).
-                st.pending_pause = false;
-            })
-            .await;
-        let _ = self.player.stop().await;
-        // A stopped deck carries no bytes at all, so the store's bulk backfill must
-        // stop deferring: an idle daemon is exactly when the mirror should fill.
-        self.set_store_playback_remote(false);
-        // Disarm any pending continuation warm (slice 2): a stop kills the deck, so a
-        // parked station warm must die (its timer cancelled, any prefetch dropped) rather
-        // than surprise the user by auto-advancing behind a stopped track.
-        self.disarm_continuation_warm().await;
-        let v = self.state.lock().unwrap().target_volume;
-        let _ = self.player.set_volume(v).await;
-        self.notify_change();
+        // A stop HOLDS the head and silences the decks: a declaration like any other, so
+        // an overlap or a dip in flight is resolved by the engine (both decks stop)
+        // rather than left playing into a room that was told everything stopped.
+        {
+            let mut st = self.state.lock().unwrap();
+            let head = st.head_qid();
+            st.hold_head(head);
+        }
+        // Serialized with any pass in progress (a load landing after this stop would
+        // otherwise play into it), then every deck stops: the stop's transport
+        // semantics (baseline, no pending pause, no warm) apply even over a deck that
+        // already held nothing.
+        let _pass = self.engine_pass().await;
+        self.halt_decks().await;
     }
 
     // ── smooth-restart (resume) ─────────────────────────────────────────────
@@ -9905,6 +9788,10 @@ impl HypodjHandler {
     /// Register the handler's own `Arc`, WEAKLY. Called once by the daemon right after
     /// the `Arc` exists; see [`Self::self_ref`] for why a `&self` dispatch needs it.
     pub fn set_self_ref(&self, weak: std::sync::Weak<HypodjHandler>) {
+        if self.self_ref.get().is_none() {
+            // The reconciler task needs the Arc this ref names; start it exactly once.
+            Self::spawn_reconciler(weak.clone(), self.engine_wake());
+        }
         let _ = self.self_ref.set(weak);
     }
 
@@ -10021,7 +9908,7 @@ impl HypodjHandler {
     /// download ahead of everything else.
     ///
     /// Keyed on the EVENT's own song id (see [`EofSignal`]) - never a re-read of
-    /// `st.current`, which the advance below is about to repoint. Runs before the
+    /// `st.current()`, which the advance below is about to repoint. Runs before the
     /// pending-skip early return, because "these local bytes failed" is true regardless
     /// of who owns the next load.
     ///
@@ -10130,7 +10017,7 @@ impl HypodjHandler {
     /// Arm the consecutive-failure run for a fresh-play GESTURE: the full budget, plus
     /// the entry the gesture CHOSE latched as the walk's origin
     /// ([`Self::walk_origin_qid`]). Only the two gesture wrappers arm here
-    /// ([`Self::play_index`] and [`Self::play_index_from_silence`]); every other path that
+    /// ([`Self::declare_play`] and [`Self::declare_play`] (from silence)); every other path that
     /// leads to real audio re-arms through [`Self::note_playback_progress`] once the
     /// position starts moving.
     ///
@@ -10142,9 +10029,8 @@ impl HypodjHandler {
     /// what both terminals return `current` to, and what keeps `consume` from eating the
     /// entries the walk never played, so a search that finds nothing leaves the session
     /// exactly as it was - however many times play is pressed while the cause persists.
-    fn arm_eof_fuse_for_gesture(&self, idx: usize) {
+    fn arm_eof_fuse_at(&self, qid: Option<u64>) {
         self.consecutive_eof_failures.store(0, Ordering::Relaxed);
-        let qid = self.state.lock().unwrap().queue.get(idx).map(|it| it.id);
         self.latch_walk_origin(qid);
     }
 
@@ -10178,7 +10064,7 @@ impl HypodjHandler {
     /// state a `play` gesture, an MPRIS widget, or a returning server can all pick up
     /// from. The run counter is left standing: while the cause persists, the next failure
     /// stops immediately instead of walking two more entries; a fresh gesture re-arms it
-    /// in full ([`Self::arm_eof_fuse_for_gesture`]), and so does the first position tick
+    /// in full ([`Self::arm_eof_fuse_at`]), and so does the first position tick
     /// of the first entry that plays again once the cause clears.
     ///
     /// This intent is LONG-LIVED - it stands until a transport gesture picks the entry
@@ -10191,10 +10077,16 @@ impl HypodjHandler {
         let origin = self.walk_origin();
         let held = {
             let mut st = self.state.lock().unwrap();
-            if let Some(qid) = origin {
-                st.point_current_at_qid(qid);
+            match origin {
+                Some(qid) => {
+                    st.point_current_at_qid(qid);
+                }
+                None => {
+                    let head = st.head_qid();
+                    st.hold_head(head);
+                }
             }
-            let held = st.current.and_then(|i| st.queue.get(i)).is_some();
+            let held = st.current().and_then(|i| st.queue.get(i)).is_some();
             if held {
                 st.pending_pause = true;
             }
@@ -10226,7 +10118,7 @@ impl HypodjHandler {
     /// ONE lock acquisition covers the slot swap AND the protected-set edit. Splitting
     /// them (swap under the lock, protect/unprotect after releasing it) reopens exactly
     /// the leak the single slot exists to close: two concurrent skips - or the gap
-    /// between this pin and `pending_skip` being written - can interleave so that A's
+    /// between this pin and the declared head being written - can interleave so that A's
     /// `protect(X)` lands AFTER B's `unprotect(X)`, stranding X in the protected set
     /// forever with no slot left holding it. Both store calls are SYNC (a short internal
     /// set lock, no await), so nothing is held across an `.await`; only the kick, which
@@ -10529,7 +10421,7 @@ impl HypodjHandler {
     /// one. This is Enter plus one promise - the thing you pointed at plays FIRST, one
     /// batch of the EXISTING autofill walk is prefetched behind it, and the walk owns
     /// the drain edge from then on. There is no second engine here: the append is the
-    /// same tail push `add` does, the play is the same [`Self::play_index`] gesture
+    /// same tail push `add` does, the play is the same [`Self::declare_play`] gesture
     /// `play <pos>` does, and the refill is [`Self::autofill_once`] - literally the body
     /// the drain edge calls, handed an explicit seed.
     ///
@@ -10667,7 +10559,7 @@ impl HypodjHandler {
                 .queue
                 .iter()
                 .position(|it| it.id == first_qid);
-            // The plain deliberate-gesture play path (NOT play_index_inner): a radio
+            // The plain deliberate-gesture play path (NOT declare_play): a radio
             // press IS a fresh play and must behave exactly like `play <pos>` - it arms
             // the EOF failure fuse and latches the walk origin, it supersedes an
             // in-flight PauseOut fade atomically under one slot lock and re-asserts
@@ -10675,7 +10567,7 @@ impl HypodjHandler {
             // TRANSPORT event. Taking the no-resync path here would leave a superseded
             // pause fade free to drag the fresh track to silence.
             let played = match idx {
-                Some(i) => self.play_index(i).await,
+                Some(i) => self.declare_play(i, Cause::Gesture).await,
                 None => Err("the queue moved under the radio start".to_string()),
             };
             if let Err(e) = played {
@@ -10708,7 +10600,7 @@ impl HypodjHandler {
                 // nothing-loaded terminal and resumes each correctly (fade back in vs
                 // load the held entry), so the resume shapes stay in ONE place.
                 RadioPickup::Resume => self.set_pause(Some(false)).await.map_err(|e| e.to_string()),
-                RadioPickup::Start(idx) => self.play_index(idx).await,
+                RadioPickup::Start(idx) => self.declare_play(idx, Cause::Gesture).await,
                 RadioPickup::Empty => {
                     // Nothing on the deck to pick up (an empty queue, or a drained one):
                     // the prefetch below owns the start.
@@ -10741,7 +10633,7 @@ impl HypodjHandler {
         //    hammer the server. Same body as the drain edge, handed the explicit seed.
         let ahead = {
             let st = self.state.lock().unwrap();
-            match st.current {
+            match st.current() {
                 // The rows AFTER the play position are the music still to come.
                 Some(i) => st.queue.len().saturating_sub(i + 1),
                 // Step 4 found nothing to pick up, so whatever rows are left are spent:
@@ -10836,7 +10728,7 @@ impl HypodjHandler {
             PlayState::Paused => RadioPickup::Resume,
             PlayState::Stopped => {
                 let st = self.state.lock().unwrap();
-                if let Some(i) = st.current.filter(|i| *i < st.queue.len()) {
+                if let Some(i) = st.current().filter(|i| *i < st.queue.len()) {
                     return RadioPickup::Start(i);
                 }
                 if let Some(pos) = st
@@ -10902,7 +10794,7 @@ impl HypodjHandler {
             // itself, so the reflex press also costs ZERO wire calls.
             let current = {
                 let st = self.state.lock().unwrap();
-                st.current
+                st.current()
                     .and_then(|i| st.queue.get(i))
                     .and_then(|it| match &it.entry {
                         QueueEntry::Song(s) => Some(s.clone()),
@@ -11056,7 +10948,7 @@ impl HypodjHandler {
         // started it at 0:00. An ordinary `stop` has no pending intent and still zeroes.
         {
             let st = self.state.lock().unwrap();
-            if st.pending_pause && st.current.is_some() {
+            if st.pending_pause && st.current().is_some() {
                 return;
             }
         }
@@ -11102,7 +10994,7 @@ impl HypodjHandler {
         let snap = ResumeState {
             schema_version: RESUME_SCHEMA_VERSION,
             queue,
-            current: st.current,
+            current: st.current(),
             elapsed_secs,
             volume: st.target_volume,
             play_state,
@@ -11356,7 +11248,12 @@ impl HypodjHandler {
                 })
                 .collect();
             st.next_id = st.queue.len() as u64;
-            st.current = new_current;
+            // HELD, not played: a restore that is to play declares its own head below
+            // (from silence); every other arm leaves the position held and the decks
+            // quiet, so the engine must never load it on its own.
+            st.set_current(new_current);
+            let held = st.head_qid();
+            st.hold_head(held);
             st.playlist_version = s.playlist_version;
             st.target_volume = s.volume.min(100);
             // Rehydrate the persisted continuation arming (default false for a
@@ -11409,7 +11306,7 @@ impl HypodjHandler {
             // Silence BEFORE the first buffer: mpv volume 0 persists across the
             // loadfile so the wake ramp owns the rise.
             let _ = self.player.set_volume(0).await;
-            if let Err(e) = self.play_index_from_silence(idx).await {
+            if let Err(e) = self.declare_play(idx, Cause::FromSilence).await {
                 return Err(e);
             }
             // A library song seeks to (saved elapsed - LEAD), clamped >= 0 so it
@@ -11482,14 +11379,13 @@ impl HypodjHandler {
     /// baseline, and a step there is exactly the startle the fade machinery exists to
     /// prevent.
     pub(crate) async fn install_snapshot(&self, snap: &Snapshot) -> Result<(), String> {
+        // A transition in progress lands first, so "what the deck holds" below is a
+        // settled fact rather than half of a dip or an overlap.
+        self.settle_transitions().await;
         // Read what the deck holds NOW, before anything is mutated.
-        let (live_qid, dipping, live_vol) = {
+        let (live_qid, live_vol) = {
             let st = self.state.lock().unwrap();
-            (
-                st.current.and_then(|i| st.queue.get(i)).map(|it| it.id),
-                st.pending_skip.is_some(),
-                st.target_volume,
-            )
+            (st.head_qid().map(|q| q.0), st.target_volume)
         };
         let live_state = self.reported_play_state();
         let snap_qid = snap.current.and_then(|i| snap.queue.get(i)).map(|it| it.id);
@@ -11505,7 +11401,7 @@ impl HypodjHandler {
         let modes = snap.modes;
         let excludes = snap.excludes.clone();
 
-        if deck_ok && !dipping {
+        if deck_ok {
             // THE QUIET PATH, and the common one: the rows go back and nothing else
             // is disturbed. No fade-slot lock, because nothing here is a manual volume
             // change - whatever envelope is in flight belongs to whoever started it and
@@ -11516,7 +11412,7 @@ impl HypodjHandler {
                 // FORWARD only: an id minted after the snapshot must never be
                 // re-issued to a different song.
                 st.next_id = next_qid.max(st.next_id);
-                st.current = current;
+                st.set_current(current);
                 st.set_modes(modes);
                 st.set_excludes(excludes);
                 // FORWARD only, never back to the snapshot's own version: a client
@@ -11535,10 +11431,12 @@ impl HypodjHandler {
             return Ok(());
         }
 
+        // An overlap cannot be cancelled like a fade (it would strand a deck): land it.
+        self.settle_overlap().await;
         // ONE fade-slot lock: CANCEL the in-flight fade and apply the whole state
         // mutation indivisibly (the manual-volume invariant - releasing between the
         // cancel and the mutation lets a concurrent fade from another connection slip
-        // in). The abort+join also kills a pending `Terminal::SkipLoad` /
+        // in). The abort+join also kills a pending the engine's dip /
         // `Terminal::Pause`, which would otherwise land on the RESTORED queue and
         // load a row nobody asked for. The cost is named rather than hidden: an
         // UNRELATED envelope dies here too, and with it any terminal it was carrying.
@@ -11549,37 +11447,21 @@ impl HypodjHandler {
                 let mut st = self.state.lock().unwrap();
                 st.queue = queue;
                 st.next_id = next_qid.max(st.next_id);
-                st.current = current;
+                st.set_current(current);
                 st.set_modes(modes);
                 st.set_excludes(excludes);
                 st.playlist_version = st.playlist_version.wrapping_add(1);
-                // Any in-flight skip target belongs to the world being replaced.
-                st.pending_skip = None;
                 st.target_volume = vol;
                 st.logical_gain_db = mpv_volume_to_db(vol as f64);
                 st.baseline_committed = true;
                 st.fading = false;
-                if !deck_ok {
-                    // A load follows: start SILENT so the first buffer is inaudible and
-                    // the ramp below owns the rise.
-                    st.live_gain_db = synth_floor;
-                    st.pending_pause = false;
-                }
-                // deck_ok here means only the dip died; the live gain stays where the
-                // dip left it and the ramp below carries it back to the baseline.
+                // A load follows from silence: the engine takes whatever is audible
+                // down first and starts the new row at the floor (live gain included),
+                // so the ramp below owns the rise.
+                st.pending_pause = false;
             })
             .await;
         self.notify_change();
-
-        if deck_ok {
-            // The superseded dip's `Terminal::SkipLoad` will never run, so its
-            // prefetched warm is stale - drop it, else the still-playing current
-            // track's natural EOF auto-advances into it.
-            let _ = self.player.drop_warm().await;
-            self.restore_baseline_volume(vol).await;
-            self.reschedule_continuation_warm().await;
-            return Ok(());
-        }
 
         match (snap.state, snap.current) {
             (PlayState::Playing, Some(idx)) => {
@@ -11597,8 +11479,7 @@ impl HypodjHandler {
                     .ok()
                     .and_then(|spec| spec.time_to_reach_db(AUDIBILITY_DB))
                     .unwrap_or(Duration::ZERO);
-                let _ = self.player.set_volume(0).await;
-                self.play_index_from_silence(idx).await?;
+                self.declare_play(idx, Cause::FromSilence).await?;
                 let seek_to = (elapsed - lead.as_secs_f64()).max(0.0);
                 if seek_to > 0.0 {
                     let _ = self.player.seek(seek_to).await;
@@ -11614,8 +11495,7 @@ impl HypodjHandler {
                 // genuinely paused deck at the saved position rather than a stopped one
                 // pretending to be one. Nothing audible escapes - the load runs at mpv
                 // volume 0 and the pause lands before any ramp is installed.
-                let _ = self.player.set_volume(0).await;
-                self.play_index_from_silence(idx).await?;
+                self.declare_play(idx, Cause::FromSilence).await?;
                 let seek_to = snap.elapsed_ms as f64 / 1000.0;
                 if seek_to > 0.0 {
                     let _ = self.player.seek(seek_to).await;
@@ -11631,7 +11511,7 @@ impl HypodjHandler {
                     let mut st = self.state.lock().unwrap();
                     st.live_gain_db = mpv_volume_to_db(vol as f64);
                     st.fading = false;
-                    // `play_index_from_silence` retires the intent on its way in; the
+                    // `declare_play` (from silence) retires the intent on its way in; the
                     // snapshot says Paused, so re-assert it now that the freeze landed.
                     st.pending_pause = true;
                 }
@@ -11721,12 +11601,27 @@ impl HypodjHandler {
         if let Some(j) = join {
             let _ = j.await;
         }
+        // A raw test handler has no reconciler TASK (it needs the Arc): stand in for its
+        // wake, so whatever that fade changed is committed as in production.
+        let _ = self.reconcile().await;
     }
 
     /// TEST-ONLY: is a fade task currently installed in the slot?
     #[cfg(test)]
     async fn fade_active(&self) -> bool {
         self.fade.inner.lock().await.is_some()
+    }
+
+    /// TEST-ONLY (crate): let the fade a gesture installed (a dip's rise) run out and
+    /// empty the slot, so a test can then watch for a NEW fade.
+    #[cfg(test)]
+    pub(crate) async fn settle_fades_for_test(&self) {
+        self.wait_for_fade().await;
+        self.wait_for_fade().await;
+        let mut slot = self.fade.inner.lock().await;
+        if slot.as_ref().is_some_and(|h| h.join.is_none() || h.join.as_ref().is_some_and(|j| j.is_finished())) {
+            *slot = None;
+        }
     }
 
     /// TEST-ONLY (crate): is a fade active? Exposed to the executor tests, which
@@ -11818,7 +11713,7 @@ impl HypodjHandler {
     /// director test can close the play -> event loop headlessly.
     #[cfg(test)]
     pub(crate) async fn play_for_test(&self, idx: usize) {
-        let _ = self.play_index(idx).await;
+        let _ = self.declare_play(idx, Cause::Gesture).await;
     }
 
     /// TEST-ONLY: perform an off-spine `next` (mutates the current index while
@@ -11835,15 +11730,10 @@ impl HypodjHandler {
         {
             let mut st = self.state.lock().unwrap();
             if pos < st.queue.len() {
+                // The head is a queue id: removing its row unresolves it, and any
+                // other removal leaves it on its entry.
                 st.queue.remove(pos);
                 st.playlist_version += 1;
-                if let Some(c) = st.current {
-                    if c == pos {
-                        st.current = None;
-                    } else if c > pos {
-                        st.current = Some(c - 1);
-                    }
-                }
             }
         }
         // Mirror the real MPD `delete` path, which notifies (refreshing the
@@ -11862,7 +11752,7 @@ impl HypodjHandler {
             .iter()
             .map(entry_snapshot)
             .collect::<Vec<_>>();
-        let current = st.current.and_then(|idx| {
+        let current = st.current().and_then(|idx| {
             st.queue.get(idx).map(|it| Cursor {
                 index: idx,
                 queue_id: QueueId(it.id),
@@ -11911,7 +11801,7 @@ impl HypodjHandler {
         // Anchor on the REPORTED current so a manual `next`/`prev` during an
         // in-flight skip steps past the target the user already sees, not the
         // still-loaded old track. On the auto (EOF) path this equals `current` -
-        // advance_on_eof early-returns whenever a skip is pending, so pending_skip
+        // advance_on_eof early-returns whenever a skip is pending, so the declared head
         // is always None here for auto advances.
         let cur = st.reported_current()?;
         let len = st.queue.len();
@@ -11964,12 +11854,6 @@ impl HypodjHandler {
     pub async fn advance_on_eof(&self, ev: EofSignal) {
         let continuation_landed = ev.continuation_landed;
         self.note_eof_playability(&ev);
-        // A skip dip in flight (pending_skip Some) OWNS the next load: the OLD
-        // track keeps playing audibly through the dip and may reach its natural
-        // EOF inside that window. Advancing here would load an unrelated track and
-        // collide with the pending Terminal::SkipLoad, which still fires afterward
-        // and loads the skip target a second time - a spurious load plus an audible
-        // double-load glitch. Leave the advance to the skip terminal.
         // Captured under ONE short lock scope, BEFORE plan_next mutates the queue
         // (consume removes the current entry): (a) whether the entry that just ended
         // was itself the active continuation stream - the ONE-SHOT re-entrancy guard
@@ -11977,9 +11861,23 @@ impl HypodjHandler {
         // `single`-mode stop that left tracks queued.
         let (finishing_is_continuation, true_drain, pausing) = {
             let mut st = self.state.lock().unwrap();
-            if st.pending_skip.is_some() {
-                return;
+            // THE STALE-EOF RULE. The declared head moved on after this entry was
+            // loaded (a skip crossfading away from it, a dip heading elsewhere), so its
+            // end is not the queue's motion: the declaration already says what plays
+            // next, and the engine owns getting there. Only the deck record learns the
+            // leg is gone, so the next plan starts from silence rather than from it.
+            if let Some(ended) = ev.queue_id {
+                if st.declared.head != Some(ended) {
+                    if st.transit.is_none() && st.deck.map(|l| l.qid) == Some(ended) {
+                        st.deck = None;
+                    }
+                    drop(st);
+                    self.poke();
+                    return;
+                }
             }
+            // The head's own load ended (a landed continuation repoints it below).
+            st.deck = None;
             // A pause gesture whose PauseOut fade is still descending (or a halt's held
             // pause): the user asked for quiet, so a drain must neither start a station
             // nor leave that fade orphaned over the stopped deck.
@@ -11990,7 +11888,7 @@ impl HypodjHandler {
             // leaves `last_finished` at the last real track that ended. The whole Song
             // is captured (not just its id) so the synchronous status render can name
             // the title, and so it survives consume mode evicting the queue entry.
-            if let Some(song) = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
+            if let Some(song) = st.current().and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
                 QueueEntry::Song(s) => Some(s.clone()),
                 QueueEntry::Stream { .. } => None,
             }) {
@@ -12008,7 +11906,7 @@ impl HypodjHandler {
             // finite/dropped stream likewise re-enters. Either way, if THIS is that
             // stream, we must NOT re-fire continuation.
             let finishing_is_continuation = st.continuation_active.is_some()
-                && st.current.and_then(|i| st.queue.get(i)).map(|it| it.id)
+                && st.current().and_then(|i| st.queue.get(i)).map(|it| it.id)
                     == st.continuation_active;
             (finishing_is_continuation, st.is_true_drain(), pausing)
         };
@@ -12058,7 +11956,16 @@ impl HypodjHandler {
                     ok
                 };
                 if landed_next {
-                    self.commit_landed_advance(idx).await;
+                    // mpv ALREADY advanced into the warmed row: record that as what the
+                    // deck plays and declare it, so the plan is a bare commit (gapless).
+                    let _ = self
+                        .declare(Cause::Natural, |st| {
+                            if let Some(rev) = st.declare_head_at(idx, Cause::Natural) {
+                                st.deck = st.head_qid().map(|qid| reconcile::Leg { qid, rev });
+                                st.deck_committed = false;
+                            }
+                        })
+                        .await;
                     self.top_up_lookahead().await;
                     return;
                 }
@@ -12066,8 +11973,8 @@ impl HypodjHandler {
                 // in-flight fade or snap mpv's gain back to the baseline. A slow ramp
                 // (winddown/sleep) has to survive across the track boundary (mpv
                 // `volume` persists across loadfile replace), so play WITHOUT the
-                // resync that play_index performs for fresh-play gestures.
-                let _ = self.play_index_inner(idx, false).await;
+                // resync that declare_play performs for fresh-play gestures.
+                let _ = self.declare_play(idx, Cause::Natural).await;
                 // LOOKAHEAD: top the walk up while music is still ahead, instead of
                 // only at the drain edge. Refilling only when the queue is EXHAUSTED
                 // means the up-next list is always empty, so an endless radio is
@@ -12104,13 +12011,17 @@ impl HypodjHandler {
                                 // step 4 (a raw Stream, no song id -> never scrobbles), point
                                 // current at it, and REUSE the slice-1 one-shot latch verbatim
                                 // (set only once the stream is genuinely current). No
-                                // play_index_inner / loadfile - mpv already advanced.
+                                // declare_play / loadfile - mpv already advanced.
                                 st.queue.push(QueueItem::queued(
                                     w.qid,
                                     QueueEntry::Stream { url: w.url, title: w.title },
                                 ));
                                 st.playlist_version += 1;
-                                st.current = Some(st.queue.len() - 1);
+                                // The deck already plays it: declare it and record that,
+                                // so the engine's pass below is the bare commit.
+                                let rev = st.declare_head(Some(QueueId(w.qid)), Cause::Natural);
+                                st.deck = Some(reconcile::Leg { qid: QueueId(w.qid), rev });
+                                st.deck_committed = false;
                                 st.pending_pause = false;
                                 st.continuation_active = Some(w.qid);
                                 true
@@ -12121,11 +12032,9 @@ impl HypodjHandler {
                         }
                     };
                     if committed {
-                        // The station mpv auto-advanced into is a NETWORK stream, and
-                        // this arm never passes through play_index_inner - so the deck's
-                        // remoteness is published here or not at all.
-                        self.set_store_playback_remote(true);
+                        // The one commit publishes the station's remoteness and the rest.
                         self.notify_change();
+                        let _ = self.reconcile().await;
                         return;
                     }
                     // landed=true but nothing appended: the actor auto-advanced into an
@@ -12204,13 +12113,12 @@ impl HypodjHandler {
                 let mut st = self.state.lock().unwrap();
                 let held = origin.is_some_and(|qid| st.point_current_at_qid(qid));
                 if !held {
-                    st.current = None;
+                    st.set_current(None);
                 }
                 // End of queue: no pending pause / skip can survive a stopped deck -
                 // unless an entry is still held, which is a nothing-loaded terminal and
                 // is precisely what the intent is for.
                 st.pending_pause = held;
-                st.pending_skip = None;
                 // No continuation stream is live once the deck stops honestly.
                 st.continuation_active = None;
                 drop(st);
@@ -12248,7 +12156,7 @@ impl HypodjHandler {
     /// consume were honored). When the runtime toggle is ARMED and a station is
     /// configured, resolve it to a stream URL, append it as a first-class
     /// [`QueueEntry::Stream`], point `current` at it, and cold-load it - publishing
-    /// the normal TrackStart/StateChanged (via [`Self::play_index_inner`]) so clients
+    /// the normal TrackStart/StateChanged (via [`Self::declare_play`]) so clients
     /// update. Returns `true` when a continuation stream started playing, `false` in
     /// EVERY inert/failure case (disarmed, no station, unresolvable, or a cold-load
     /// error) so the caller performs the honest stop.
@@ -12296,8 +12204,8 @@ impl HypodjHandler {
         self.notify_change();
         // 5. Cold loadfile from the drained deck. Match the natural-advance sibling
         //    (no volume resync) so an in-flight winddown/sleep ramp survives the
-        //    handoff. play_index_inner sets `current` + publishes on success.
-        if self.play_index_inner(idx, false).await.is_ok() {
+        //    handoff. declare_play sets `current` + publishes on success.
+        if self.declare_play(idx, Cause::Natural).await.is_ok() {
             // Latch this stream's id as the ACTIVE continuation stream. loadfile's Ok
             // is premature (the stream may still fail to connect), so this is what lets
             // the NEXT advance_on_eof recognize an EndFile(Error)/Eof on THIS entry as
@@ -12375,7 +12283,7 @@ impl HypodjHandler {
             if !st.continuation {
                 return;
             }
-            match st.current {
+            match st.current() {
                 Some(i) => st.queue.len().saturating_sub(i + 1),
                 None => 0,
             }
@@ -12601,8 +12509,8 @@ impl HypodjHandler {
         //    ordinary library Songs on the normal player path - they scrobble, seek, become
         //    last_finished, and ride the existing song-to-song warm-skip for gapless.
         let played = match start {
-            AutofillStart::Gesture => self.play_index(first_idx).await,
-            _ => self.play_index_inner(first_idx, false).await,
+            AutofillStart::Gesture => self.declare_play(first_idx, Cause::Gesture).await,
+            _ => self.declare_play(first_idx, Cause::Natural).await,
         };
         if played.is_ok() {
             return appended;
@@ -12679,7 +12587,7 @@ impl HypodjHandler {
     }
 
     /// (Re)arm the LEAD continuation warm at the end of a successful play / resume /
-    /// seek. (1) DISARM any existing slot (this IS the disarm at the play_index_inner
+    /// seek. (1) DISARM any existing slot (this IS the disarm at the declare_play
     /// funnel, so a manual play/next/prev supersedes a pending warm); (2) evaluate the
     /// arm predicate; (3) arm ONE fresh timer at `now + (duration - elapsed -
     /// CONTINUATION_WARM_LEAD_SECS)` (clamped to now when already inside the LEAD).
@@ -12827,8 +12735,8 @@ impl HypodjHandler {
                     if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
                         return;
                     }
-                    // A skip owns the warm slot in both directions: refuse while pending_skip.
-                    if st.pending_skip.is_some() {
+                    // A transition owns the warm slot: refuse while one is in flight.
+                    if st.in_transit() {
                         return;
                     }
                     let minted = st.next_id;
@@ -12844,7 +12752,7 @@ impl HypodjHandler {
                     if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
                         return;
                     }
-                    if st.pending_skip.is_some() {
+                    if st.in_transit() {
                         return;
                     }
                     st.queue.get(*idx).cloned()
@@ -12854,7 +12762,7 @@ impl HypodjHandler {
                     return;
                 };
                 // Same resolution the cold advance performs, so the warmed URL and the
-                // one play_index_inner would have loaded cannot diverge.
+                // one declare_play would have loaded cannot diverge.
                 let Ok(play) = self.resolve_play(&item) else {
                     self.disarm_continuation_warm().await;
                     return;
@@ -12872,7 +12780,7 @@ impl HypodjHandler {
         let discard_landed_prefetch = {
             let mut st = self.state.lock().unwrap();
             let ours = matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id);
-            let skip_pending = st.pending_skip.is_some();
+            let skip_pending = st.in_transit();
             if ours && ok && !skip_pending {
                 if let Some(w) = st.pending_continuation_warm.as_mut() {
                     w.warmed = true;
@@ -12901,7 +12809,7 @@ impl HypodjHandler {
     /// Resolve a queue item's play args SYNCHRONOUSLY (the Subsonic `stream_url`
     /// is sync), so a caller can hand a sink-level [`ResolvedPlay`] to a fade
     /// terminal that runs under the slot lock (no `&self` handler call there).
-    /// Shared by [`Self::play_index_inner`] and [`Self::skip_with_fade`].
+    /// Shared by [`Self::declare_play`] and the transition engine.
     ///
     /// OFFLINE STORE: a library song PREFERS local bytes. The probe is
     /// [`AudioStore::lookup`] - one short index lock plus one stat, no parsing, no
@@ -12961,239 +12869,13 @@ impl HypodjHandler {
         Duration::try_from_secs_f64(secs).ok()
     }
 
-    /// Finish an in-flight crossfade NOW, before something else takes the gain.
-    ///
-    /// The asymmetry with an ordinary superseded fade is the whole reason this exists.
-    /// Aborting a fade leaves one deck at a known level; aborting a crossfade leaves TWO
-    /// decks audible with nobody driving either. So every path that takes over the gain
-    /// runs this first, and it always resolves the transition the SAME way: COMMIT it.
-    ///
-    /// Commit, never abort back, because the reported current already moved. `pending_skip`
-    /// names the incoming track from the instant the crossfade starts, so status, MPRIS
-    /// and `currentsong` have been saying "this one" for the whole overlap - rolling back
-    /// to the outgoing track would make the surfaces retract a track change the listener
-    /// has already half-heard. It also keeps the arithmetic honest: `live_gain_db` holds
-    /// the constant baseline throughout, which is TRUE of the promoted deck at full and
-    /// false of a half-faded pair, so the superseding fade reads a `from_db` that matches
-    /// the deck it is about to drive.
-    ///
-    /// The one caller that passes `promote: false` is the gesture that DELETES the
-    /// incoming track mid-crossfade. Committing there would promote a row that is about
-    /// to leave the queue, landing the deck on an entry the queue no longer has - the
-    /// orphaned deck this design promises is unreachable. "Not that one" means the deck
-    /// stays on what it is already playing, so that path stops the incoming deck, puts
-    /// the outgoing one back at the baseline, and drops the reported target.
-    ///
-    /// Idempotent and a no-op when nothing is crossfading, so callers need no condition.
-    async fn settle_crossfade(&self, promote: bool) {
-        // The slot lock is taken for the WHOLE settlement, not once per step: releasing
-        // between the abort and the promotion is exactly the window that lets a
-        // concurrent fade from another connection install against a pair of decks
-        // nobody owns.
-        let mut slot = self.fade.inner.lock().await;
-        if !self.state.lock().unwrap().crossfading {
-            return;
-        }
-        if let Some(mut h) = slot.take() {
-            h.abort.abort();
-            if let Some(join) = h.join.take() {
-                let _ = join.await;
-            }
-        }
-        // Bump the epoch under this lock so the aborted task's last straggling report
-        // (if it is mid-`report` right now) is already stale and cannot write a gain.
-        let (qid, evict, baseline, attribute_finish) = {
-            let mut st = self.state.lock().unwrap();
-            st.fade_epoch += 1;
-            let target = st.pending_skip.and_then(|i| st.queue.get(i).map(|it| it.id));
-            (
-                target,
-                st.pending_crossfade_evict.take(),
-                st.target_volume,
-                std::mem::take(&mut st.pending_crossfade_finish),
-            )
-        };
-        if promote {
-            let _ = self.player.crossfade_commit(attribute_finish).await;
-        } else {
-            // Silence the incoming deck and leave the outgoing one owning the identity
-            // it never gave up (`active` was never flipped, which is exactly why this
-            // direction is available at all).
-            let _ = self.player.crossfade_abort().await;
-        }
-        let _ = self.player.set_volume(baseline).await;
-        {
-            let mut st = self.state.lock().unwrap();
-            if promote {
-                if let Some(gone) = evict {
-                    st.evict_qid(gone);
-                }
-                if let Some(qid) = qid {
-                    st.current = st.queue.iter().position(|it| it.id == qid);
-                }
-                st.fresh_enqueue_anchor = None;
-            }
-            // Either way the reported target is retired: promoted into `current` above,
-            // or abandoned back to the track that never stopped playing.
-            st.pending_skip = None;
-            st.crossfading = false;
-            st.fading = false;
-            st.set_manual_volume(baseline, true);
-        }
-        self.changed.notify_waiters();
-    }
-
-    /// Start the BOUNDARY crossfade when the current track is within `crossfade_secs`
-    /// of its natural end. Asked on every position tick; almost always a cheap `false`.
-    ///
-    /// The gate order matters more than any individual gate: everything that can be
-    /// answered from state is answered before anything is resolved or armed, because
-    /// this runs ~20 times a second and must cost nothing in the overwhelmingly common
-    /// case of "not near the end".
-    ///
-    /// SAME-ALBUM CONSECUTIVE TRACKS ARE NEVER CROSSFADED. Two tracks that were
-    /// sequenced to run together already flow through the existing gapless advance
-    /// exactly as their makers intended, and blending them is the one place this feature
-    /// makes a record WORSE - a live album's applause, a segue, a fade the artist wrote.
-    /// The rule is deliberately narrow (same album id AND ascending track numbers) so it
-    /// protects real sequences without silently disabling the feature for anyone whose
-    /// queue happens to be one album on shuffle.
-    pub(crate) async fn maybe_boundary_crossfade(&self, remaining: Duration) {
+    /// The boundary crossfade length (`crossfade_secs`), or `None` when it is off.
+    fn crossfade_bound_dur(&self) -> Option<Duration> {
         let secs = self.fade_cfg.crossfade_secs;
-        if secs <= 0.0 || !self.player.can_crossfade() {
-            return;
+        if secs <= 0.0 {
+            return None;
         }
-        let Ok(dur) = Duration::try_from_secs_f64(secs) else { return };
-        if remaining > dur {
-            return;
-        }
-        // Everything below reads or mutates the transition, so one state look decides
-        // whether this tick has anything to do at all.
-        let (from_idx, next_idx) = {
-            let mut st = self.state.lock().unwrap();
-            // Already transitioning (this tick is one of many inside the window), or a
-            // skip dip is mid-flight: either way something already owns the handoff.
-            if st.crossfading || st.fading || st.pending_skip.is_some() {
-                return;
-            }
-            let Some(cur) = st.current else { return };
-            // A NON-mutating peek, like delete_at's: this is a prediction, not an
-            // advance, and the real advance is the crossfade's own commit.
-            let Some(next) = st.peek_next_from(cur, false) else { return };
-            if next == cur {
-                return; // repeat-one: there is no boundary to cross.
-            }
-            if same_album_run(&st, cur, next) {
-                return;
-            }
-            (cur, next)
-        };
-        let item = {
-            let st = self.state.lock().unwrap();
-            st.queue.get(next_idx).cloned()
-        };
-        let Some(item) = item else { return };
-        let Ok(play) = self.resolve_play(&item) else { return };
-        if let Some(id) = play.song_id.clone() {
-            self.set_store_skip_pin(Some(id));
-        }
-        self.set_store_playback_remote(!play.local);
-        // The warm belongs to the OUTGOING deck and would auto-advance behind it during
-        // the overlap; the crossfade replaces that mechanism entirely.
-        self.disarm_continuation_warm().await;
-        let _ = self.player.drop_warm().await;
-        // `true`: this track is PLAYING OUT, so its finish is real and must be published
-        // and scrobbled - the one thing that distinguishes a boundary crossfade from a
-        // skip, and the reason the outgoing deck reports an Eof before it is stopped.
-        if self.start_crossfade(next_idx, &play, None, dur, true).await.is_err() {
-            // Nothing audible changed: the current track simply plays on to its own
-            // natural EOF and the ordinary gapless advance takes it, which is precisely
-            // the behaviour with the feature turned off.
-            let _ = from_idx;
-            self.reschedule_continuation_warm().await;
-        }
-    }
-
-    /// Install a crossfade into the ONE fade slot: arm the incoming deck silent, report
-    /// the target immediately, then hand both gains to a single envelope.
-    ///
-    /// Returns `Err` without having touched anything when the incoming deck refuses to
-    /// load, so the caller can fall back to the dip - a crossfade that cannot start must
-    /// never turn a skip into a no-op.
-    async fn start_crossfade(
-        &self,
-        idx: usize,
-        play: &ResolvedPlay,
-        evict: Option<QueueId>,
-        dur: Duration,
-        attribute_finish: bool,
-    ) -> Result<(), FadeError> {
-        let baseline = self.state.lock().unwrap().target_volume;
-        let baseline_db = mpv_volume_to_db(baseline as f64);
-        let tick = Duration::from_millis(self.fade_cfg.crossfade_tick_ms);
-        let spec = CrossfadeSpec::new(baseline_db, dur, tick)?;
-
-        // ARM the incoming deck: silent, loaded, playing. Silent FIRST (inside
-        // crossfade_arm) so it is never audible for even one buffer before the envelope
-        // owns it. A load failure here is the ONE thing that must abandon the crossfade
-        // shape entirely, and it does so having changed nothing the listener can hear:
-        // the outgoing deck is still at the baseline and still the reported current.
-        if self
-            .player
-            .crossfade_arm(play.song_id.clone(), Some(play.qid), &play.url, play.local)
-            .await
-            .is_err()
-        {
-            let _ = self.player.crossfade_abort().await;
-            return Err(FadeError::NonFinite);
-        }
-
-        let state_task = self.state.clone();
-        let changed = self.changed.clone();
-        let sink = self.player.clone();
-        let slot_for_task = self.fade.clone();
-        let commit =
-            CrossfadeCommit { qid: play.qid.0, evict, baseline, attribute_finish };
-
-        let mut slot = self.fade.inner.lock().await;
-        // Nothing to validate-before-abort here the way `supersede` does: the spec was
-        // built above and the incoming deck is already armed, so the replacement is in
-        // hand before the outgoing envelope is touched.
-        if let Some(mut h) = slot.take() {
-            h.abort.abort();
-            if let Some(join) = h.join.take() {
-                let _ = join.await;
-            }
-        }
-        let epoch = {
-            let mut st = state_task.lock().unwrap();
-            st.fade_epoch += 1;
-            st.fading = true;
-            st.crossfading = true;
-            // Report the TARGET at once, exactly as the dip does - the listener can
-            // already hear it arriving, so a status that still named the outgoing track
-            // would be the surface lagging the room.
-            st.pending_skip = Some(idx);
-            st.pending_crossfade_evict = evict;
-            st.pending_crossfade_finish = attribute_finish;
-            // A non-committing envelope: `logical_gain_db` stays where it was, so a knob
-            // press during the crossfade steps from the live level like any other.
-            st.baseline_committed = false;
-            st.fade_epoch
-        };
-        let join = tokio::spawn(crossfade_task(
-            sink,
-            spec,
-            state_task,
-            changed,
-            epoch,
-            commit,
-            slot_for_task,
-        ));
-        *slot = Some(FadeHandle { abort: join.abort_handle(), join: Some(join) });
-        drop(slot);
-        self.notify_change();
-        Ok(())
+        Duration::try_from_secs_f64(secs).ok()
     }
 
     /// The clamped skip-dip fade duration (`skip_fade_secs` into `[min_slew,
@@ -13203,56 +12885,6 @@ impl HypodjHandler {
         let raw = Duration::try_from_secs_f64(self.fade_cfg.skip_fade_secs)
             .unwrap_or_else(|_| Duration::from_millis(self.fade_cfg.min_slew_ms));
         self.clamp_fade_dur(raw)
-    }
-
-    /// Whether the CURRENT track is safe to WARM behind (near-EOF guard, finding
-    /// 1a). Returns `false` - decline the warm - when the current entry is a live /
-    /// continuous stream (no natural end), has an UNKNOWN duration, or is within
-    /// [`NEAR_EOF_GUARD_SECS`] of its natural EOF (elapsed read from the lockless
-    /// live-media atomic). Only a finite Song with a comfortable margin left warms;
-    /// a decline degrades the skip to today's proven trough loadfile-replace, never
-    /// worse. Conservative on purpose: any doubt (no current, no duration) declines.
-    fn current_can_warm(&self) -> bool {
-        let dur_secs = {
-            let st = self.state.lock().unwrap();
-            // CONSUME makes `current` untrustworthy for this question: `plan_next`
-            // removes the just-finished entry WITHOUT remapping `current`, so by the
-            // time a skip reaches here the index names the SUCCESSOR and we would be
-            // measuring the wrong track's remaining time - happily parking a warm
-            // behind a track with a second left, which is exactly the near-EOF
-            // auto-advance bleed this guard exists to prevent. Declining costs only a
-            // prefetch optimization; trusting a stale index costs audible playback.
-            if st.consume {
-                return false;
-            }
-            let Some(cur) = st.current else { return false };
-            let Some(item) = st.queue.get(cur) else { return false };
-            match &item.entry {
-                // A live/continuous stream never reaches a natural EOF, so appending
-                // behind it can never auto-advance - but it also never buffers fully,
-                // so the warm has nothing to prefetch and no payoff. Decline.
-                QueueEntry::Stream { .. } => return false,
-                // A Song with a KNOWN finite duration can be warmed behind, subject to
-                // the margin check below. Unknown duration -> decline (cannot bound the
-                // EOF distance, so treat as unsafe).
-                QueueEntry::Song(song) => match song.duration_secs {
-                    Some(d) if d > 0 => d as f64,
-                    _ => return false,
-                },
-            }
-        };
-        // Live media position (P1 Tick.time_pos) via the lockless atomic.
-        let elapsed = self.last_elapsed_secs();
-        // The warm sits PARKED behind the current track for the WHOLE dip (from
-        // prefetch_warm until the trough switch_warmed ~ the dip's duration), and mpv
-        // auto-advances into a parked entry at the current's natural EOF (keep-open does
-        // not stop a non-last entry - see MpvPlayer::spawn). So the guard window must
-        // exceed the dip duration, not just a fixed constant: only warm when the current
-        // has MORE than (dip duration + NEAR_EOF_GUARD_SECS margin) left, so it cannot
-        // EOF while a warm is parked. The margin also absorbs the Tick-quantized
-        // staleness of `elapsed` and the switch/network overhead.
-        let guard = self.skip_fade_dur().as_secs_f64() + NEAR_EOF_GUARD_SECS;
-        (dur_secs - elapsed) > guard
     }
 
     /// Build a DELIBERATE (not sub-JND) fade spec from `from_db` to `target`,
@@ -13275,589 +12907,55 @@ impl HypodjHandler {
         FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)
     }
 
-    /// Route a USER Next/Previous. Fades (dip-through-silence) ONLY when actually
-    /// PLAYING with a current track; otherwise (paused / stopped / no-current) it
-    /// falls through to the plain [`Self::play_index`] path unchanged. The
-    /// autonomous EOF advance does NOT come here - it stays gapless.
-    async fn user_skip(&self, idx: usize) -> Result<(), String> {
-        let has_current = self.state.lock().unwrap().current.is_some();
-        if self.reported_play_state() == PlayState::Playing && has_current {
-            self.skip_with_fade(idx, None).await
-        } else {
-            self.play_index(idx).await
+    /// DECLARE the row at `idx` the head and drive the room to it: the call every
+    /// "play this" site makes (play N, playid, next/previous, MPRIS, plan Play /
+    /// PlayNow, radio, autofill, continuation, the EOF advance). The cause says why;
+    /// the engine decides how it sounds.
+    async fn declare_play(&self, idx: usize, cause: Cause) -> Result<(), String> {
+        let declared = self.declare(cause, |st| st.declare_head_at(idx, cause)).await?;
+        match declared {
+            Some(_) => Ok(()),
+            None => Err("Bad song index".into()),
         }
     }
 
-    /// Remove queue entry `pos`. THE PRODUCT RULE: a queue delete is a PLAN edit
-    /// unless it removes the track you are hearing, in which case it is a TRANSPORT
-    /// gesture and takes the transport's startle-safe path - never a hard cut.
-    ///
-    /// Three cases, and the third is the one the safe-sound principles govern:
-    ///
-    /// 1. `pos` is not the loaded entry: a pure queue mutation, no audio event.
-    ///    [`State::evict_qid`] remaps `current`/`pending_skip` over the shrink, so a
-    ///    delete ABOVE the playing row cannot silently repoint playback (the old body
-    ///    remapped `current` but left `pending_skip` stale - a delete during a skip
-    ///    dip then committed the WRONG track).
-    /// 2. `pos` IS the loaded entry but the deck is not playing (paused / stopped):
-    ///    nothing is audible, so there is no transition to smooth. Drop it and stop
-    ///    the deck so the report stays honest rather than holding a vanished entry.
-    /// 3. `pos` IS the loaded entry and it is PLAYING: route it through the exact
-    ///    machinery a user skip already uses. With a successor, that is the skip dip
-    ///    (duck to [`SKIP_DIP_DB`], load the successor at the trough off the prefetched
-    ///    warm, ramp back up) carrying the eviction so queue and deck commit together.
-    ///    With nothing to play next it is a deliberate ramp to silence and then a stop
-    ///    ([`FadeIntent::OutEvicting`]) - the same "never end on an abrupt chord" rule
-    ///    the sleep/wind-down envelope obeys.
-    ///
-    /// There is a case 0 ahead of those three: the row a live skip dip is about to
-    /// LOAD (`pending_skip`). It is not `current`, so classifying on `current` alone
-    /// would plan-edit it out from under the dip and leave the terminal loading a track
-    /// that is no longer queued. It supersedes the dip instead and stays on what is
-    /// playing.
-    ///
-    /// The successor comes from the NON-mutating [`State::peek_next_from`], anchored on
-    /// the row being deleted. Not `plan_next`: that is a real advance which, under
-    /// `consume`, evicts an entry itself - using it as a probe made one `delete` remove
-    /// two rows.
+    /// Remove queue entry `pos` AS A DECLARATION OF THE NEW STATE. A row that is not
+    /// the head is a plain queue edit. Removing the head declares its successor
+    /// ([`State::remove_row`]) - the non-mutating [`State::peek_next_from`] anchored on
+    /// the removed row, never the row itself (repeat over one entry would otherwise
+    /// name it) - and the engine carries the room there exactly as it carries a skip:
+    /// a crossfade, a dip, or with nothing to follow, a fade-out. Removing a head that
+    /// was still ARRIVING keeps the deck on what it is already playing.
     async fn delete_at(&self, pos: usize) {
-        let (is_loaded, is_skip_target, qid) = {
+        let (qid, is_head) = {
             let st = self.state.lock().unwrap();
             match st.queue.get(pos) {
-                Some(item) => {
-                    (st.current == Some(pos), st.pending_skip == Some(pos), QueueId(item.id))
-                }
+                Some(item) => (QueueId(item.id), st.declared.head == Some(QueueId(item.id))),
                 // Out of range: nothing to delete, and MPD answers OK either way.
                 None => return,
             }
         };
-        // CASE 0 - the row a live skip dip is about to LOAD. It is not `current` (the
-        // old track is still the loaded one), so classifying on `current` alone would
-        // send it down the plan-edit path: the dip would survive its target's removal
-        // and its terminal would then load and play an entry the queue no longer has,
-        // committing `current` to whatever slid into the freed slot. That is the
-        // orphaned deck this design promises is unreachable, so it is closed HERE, by
-        // superseding the dip before the entry goes.
-        //
-        // The gesture the user made is "not that one" - so the deck simply STAYS on the
-        // track it is already playing. The dip left the gain ducked at the skip floor,
-        // so the cancel is paired with a deliberate ramp back to the baseline; without
-        // it the delete would leave the room quietly at -18 dB with nothing to explain
-        // why. This is the same cancel-under-one-slot-lock shape `stop_playback` uses.
-        if is_skip_target {
-            // ABANDON, never promote: the row being deleted is the one an in-flight
-            // transition is arriving at, so committing it would land the deck on an
-            // entry that is about to leave the queue.
-            self.settle_crossfade(false).await;
-            let baseline = self.state.lock().unwrap().target_volume;
-            self.fade
-                .cancel_with(|| {
-                    let mut st = self.state.lock().unwrap();
-                    // The skip is abandoned: nothing may still report or commit it.
-                    st.pending_skip = None;
-                    st.set_manual_volume(baseline, self.deck_loaded());
-                })
-                .await;
-            // The target was warmed as a parked mpv playlist entry; it must not survive
-            // to auto-advance behind the still-playing track at its natural EOF.
-            let _ = self.player.drop_warm().await;
-            self.state.lock().unwrap().evict_qid(qid);
-            // Rise back out of the duck the cancelled dip left behind.
-            let dur = self.skip_fade_dur();
-            let target_db = mpv_volume_to_db(baseline as f64);
-            let _ = self
-                .start_fade_spec(FadeRequest {
-                    intent: FadeIntent::Knob { target_db, vol: baseline },
-                    dur,
-                    commit_logical: None,
-                })
-                .await;
-            self.reschedule_continuation_warm().await;
-            return;
-        }
-        if !is_loaded {
-            // Case 1 - a plan edit. No audio event, no fade, no player call.
-            self.state.lock().unwrap().evict_qid(qid);
-            self.reschedule_continuation_warm().await;
-            return;
-        }
-        if self.reported_play_state() != PlayState::Playing {
-            // Case 2 - silent already; a ramp would be theatre. Stop the deck so it
-            // cannot keep holding an entry the queue no longer has.
-            //
-            // The stop goes through the SAME cancel-and-settle as `stop_playback`: the
-            // deck may be reported Paused while a PauseOut ramp is still descending (the
-            // intent is set when that ramp STARTS), and stopping out from under a live
-            // fade would leave it ticking set_volume against a dead deck and its
-            // terminal running on nothing. One slot lock, cancel and settle together.
-            self.settle_crossfade(true).await;
-            self.fade
-                .cancel_with(|| {
-                    let mut st = self.state.lock().unwrap();
-                    let v = st.target_volume;
-                    st.set_manual_volume(v, self.deck_loaded());
-                    // A stop retires the pending-pause intent outright.
-                    st.pending_pause = false;
-                })
-                .await;
-            self.state.lock().unwrap().evict_qid(qid);
-            let _ = self.player.stop().await;
-            self.set_store_playback_remote(false);
-            self.reschedule_continuation_warm().await;
-            return;
-        }
-        // Case 3 - a transport gesture. Ask what would play after this row WITHOUT
-        // advancing: `peek_next_from`, not `plan_next`. plan_next is a real advance -
-        // under `consume` it removes an entry itself, so using it as a probe made a
-        // single `delete` remove TWO entries (and, anchored on `reported_current()`, it
-        // removed the wrong one during a dip). The delete owns the removal; the probe
-        // must only answer the question, and it is anchored on the row being deleted.
-        //
-        // The successor must not BE the entry we are deleting. That is reachable: with
-        // `repeat` on and one entry left, the peek wraps to index 0 - the very row being
-        // removed - and skipping to it would commit a track the terminal then evicts,
-        // leaving the deck on an entry the queue does not have. Compared by QUEUE ID,
-        // never index, so it stays right under any concurrent reindexing.
-        let successor = {
-            let mut st = self.state.lock().unwrap();
-            st.peek_next_from(pos, false)
-                .filter(|&idx| st.queue.get(idx).is_some_and(|it| it.id != qid.0))
-        };
-        match successor {
-            Some(idx) => {
-                let _ = self.skip_with_fade(idx, Some(qid)).await;
-            }
-            None => {
-                // Nothing follows: ramp to silence, then stop and evict together.
-                let dur = self.skip_fade_dur();
-                if self
-                    .start_fade_spec(FadeRequest {
-                        intent: FadeIntent::OutEvicting { qid: qid.0 },
-                        dur,
-                        commit_logical: None,
-                    })
-                    .await
-                    .is_err()
-                {
-                    // A rejected fade must not turn the delete into a no-op: fall back
-                    // to the plain stop path so the gesture still lands.
-                    self.state.lock().unwrap().evict_qid(qid);
-                    let _ = self.player.stop().await;
-                    self.set_store_playback_remote(false);
-                }
-            }
-        }
-        self.reschedule_continuation_warm().await;
-    }
-
-    /// [`Self::play_index`] plus the queue-delete half, in that order: the load
-    /// commits `current` on the target, THEN the evicted entry leaves the queue and
-    /// `evict_qid` remaps `current` over the shrink. Every degrade path out of the
-    /// skip dip routes through here so a rejected/unbuildable fade can never turn a
-    /// delete into a silent no-op - the gesture still lands, just without the ramp.
-    async fn play_index_evicting(&self, idx: usize, evict: Option<QueueId>) -> Result<(), String> {
-        let r = self.play_index(idx).await;
-        if let Some(qid) = evict {
+        if !is_head {
             self.state.lock().unwrap().evict_qid(qid);
             self.notify_change();
+            self.reschedule_continuation_warm().await;
+            return;
         }
-        r
-    }
-
-    /// The skip-fade composition: pre-resolve the target, pre-build the ResumeIn
-    /// half, flip the reported current to the target (`pending_skip`) IMMEDIATELY,
-    /// then install a deliberate dip-to-silence whose [`Terminal::SkipLoad`] loads
-    /// the target from silence and hands off to the ResumeIn follow-on - all
-    /// through the ONE active [`FadeSlot`]. A rejected/unresolvable spec degrades
-    /// to a plain [`Self::play_index`] so a skip never gets stuck.
-    ///
-    /// `evict`, when set, makes this the "remove the currently playing track"
-    /// gesture: the named entry is dropped from the queue at the SAME instant the
-    /// target commits (see [`Terminal::SkipLoad`]), so there is never a window where
-    /// the deck plays an entry the queue has already forgotten.
-    async fn skip_with_fade(&self, idx: usize, evict: Option<QueueId>) -> Result<(), String> {
-        // Disarm any pending continuation warm FIRST (slice 2), before this skip installs
-        // its OWN skip warm: the handler slot must die so the EOF attribution can never
-        // claim a skip warm as the station, and so a Skip warm and a Continuation warm can
-        // never coexist. The skip's own near-EOF decline + drop_warm then degrade it for
-        // free; PrefetchContinuation is refused while pending_skip is set.
-        self.disarm_continuation_warm().await;
-        // (a) Pre-resolve the target's play args (sync). A resolution failure
-        // degrades to the plain path rather than dipping into a dead end.
-        let item = {
-            let st = self.state.lock().unwrap();
-            st.queue.get(idx).cloned()
-        };
-        let Some(item) = item else { return Err("Bad song index".into()) };
-        let play = match self.resolve_play(&item) {
-            Ok(p) => p,
-            Err(_) => return self.play_index_evicting(idx, evict).await,
-        };
-        // The target is about to be current but is not in the window yet, so pin it
-        // against eviction for the length of the dip and kick a light pass in case
-        // its bytes are not cached. Cleared by whichever path makes a track current
-        // (play_index_inner) or by the degrade paths below.
-        if let Some(id) = play.song_id.clone() {
-            self.set_store_skip_pin(Some(id));
-        }
-        // What the trough is about to load: local bytes or the network.
-        self.set_store_playback_remote(!play.local);
-
-        // (a2) CROSSFADE, when the deck can actually overlap two sources and the knob
-        // asks for it. This is the shape the dip below was always approximating: the dip
-        // ducks, swaps and rises, which is one song at a time however short the gap gets,
-        // while a crossfade keeps both audible so the room never has a seam. It is tried
-        // FIRST and falls through on any refusal - a crossfade that cannot start must
-        // never turn a skip into a no-op, and today's dip is a fully proven floor.
-        //
-        // A crossfade needs NONE of the warm-skip machinery below: the incoming deck is a
-        // real deck, opened and buffered on its own while the outgoing one keeps playing,
-        // so there is no trough to hide a load in and nothing parked in the outgoing
-        // deck's playlist. That also makes the near-EOF guard irrelevant here - the hazard
-        // it exists for (mpv auto-advancing into an entry parked behind the current track)
-        // cannot arise when the target is not in that playlist at all.
-        if let Some(xdur) = self.crossfade_skip_dur() {
-            // Any warm a previous gesture parked must go: it belongs to the OUTGOING
-            // deck, which is about to be stopped, and a parked entry there could still
-            // auto-advance during the overlap.
-            let _ = self.player.drop_warm().await;
-            // `false`: a SKIP abandons the outgoing track mid-play, exactly as the dip
-            // does, so it must not be reported as a finish and must not scrobble.
-            if self.start_crossfade(idx, &play, evict, xdur, false).await.is_ok() {
-                self.reschedule_continuation_warm().await;
-                return Ok(());
-            }
-            // The incoming deck refused to load. Nothing audible changed - the outgoing
-            // deck is still at the baseline and still the reported current - so the dip
-            // below starts from exactly the state it expects.
-        }
-
-        // (b) Baseline + the resume target dB.
-        let baseline = self.state.lock().unwrap().target_volume;
-        let resume_db = mpv_volume_to_db(baseline as f64);
-        let dur = self.skip_fade_dur();
-
-        // (d) Pre-build the ResumeIn spec (SKIP_DIP_DB -> baseline), deliberate,
-        // clamp-up: the dip bottoms out at the shallow skip floor, so the follow-on
-        // rises FROM that floor (not full silence) - which is what keeps the skip
-        // short. Built here (from a fixed from_db) so the dip terminal does no
-        // handler-side work under the slot lock. A build failure degrades to the
-        // plain path.
-        let resume_spec =
-            match self.build_deliberate_spec(SKIP_DIP_DB, FadeTarget::Db(resume_db), dur) {
-                Ok(s) => s,
-                Err(_) => return self.play_index_evicting(idx, evict).await,
-            };
-
-        // (c) Report the TARGET immediately during the dip (WITHOUT mutating
-        // `current`): status/MPRIS/currentsong collapse the dip window to the
-        // target at once.
-        self.state.lock().unwrap().pending_skip = Some(idx);
-        self.notify_change();
-
-        // (c2) NEAR-EOF GUARD (finding 1a - the PRIMARY no-bleed defense): a warm
-        // appends the target as a 2nd playlist entry, and mpv AUTO-ADVANCES into it the
-        // instant the CURRENT track hits its natural EOF (keep-open=always does NOT stop
-        // a non-last entry - see MpvPlayer::spawn). So we DECLINE the warm outright
-        // whenever the current track has less than (the dip duration + a margin) left,
-        // or its duration is unknown, or it is a live/continuous stream with no end (see
-        // current_can_warm) - so a warm is NEVER parked in a window where the current
-        // could EOF before the trough switch. There the warm's payoff cannot land
-        // anyway, and declining keeps the skip on today's proven trough loadfile-replace.
-        // On decline we ALSO drop any warm a PRIOR skip parked
-        // (a second skip that lands in the guard window must not leave the first skip's
-        // warm entry auto-advancing behind the current track - finding 3, second-skip).
-        let warm_ok = self.current_can_warm();
-        if warm_ok {
-            // (c3) WARM the target stream in the BACKGROUND during the dip: mpv opens +
-            // demuxes + decodes the appended entry off the audible chain, so the trough
-            // switch (Terminal::SkipLoad -> switch_warmed) lands near-instant instead of
-            // paying the network first-byte cost at the bottom of the dip - collapsing the
-            // moment-of-silence artifact. Purely best-effort and PURE GAIN: the warmed
-            // entry is NOT routed to output (no bleed at the shallow duck), and a warm
-            // failure just degrades switch_warmed to today's trough loadfile - never worse,
-            // never a panic or silence. Errors are ignored here on purpose.
-            let _ = self.player.prefetch_warm(&play.url).await;
-        } else {
-            // Declined: clear any stale warm from an earlier skip so switch_warmed falls
-            // back to loadfile-replace and no parked entry can auto-advance.
-            let _ = self.player.drop_warm().await;
-        }
-
-        // (e) Install the deliberate dip-out to silence -> Terminal::SkipLoad.
-        match self.install_skip_dip(dur, idx, evict, play, resume_spec, baseline).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                tracing::warn!(error = %e, "skip dip rejected; plain play");
-                self.state.lock().unwrap().pending_skip = None;
-                self.play_index_evicting(idx, evict).await
-            }
-        }
-    }
-
-    /// Install the skip dip via the SAME [`FadeSlot::supersede`] body
-    /// [`Self::start_fade_spec`] uses: build a DELIBERATE dip-to-silence from the
-    /// live gain paired with a [`Terminal::SkipLoad`], and (once validated) abort
-    /// the in-flight fade and spawn it under the slot lock. Install-and-return, so
-    /// a second skip can supersede the dip before its terminal loads.
-    async fn install_skip_dip(
-        &self,
-        dur: Duration,
-        idx: usize,
-        evict: Option<QueueId>,
-        play: ResolvedPlay,
-        resume_spec: FadeSpec,
-        resume_vol: u8,
-    ) -> Result<(), FadeError> {
-        let tick = Duration::from_millis(self.fade_cfg.tick_ms);
-        let synth_floor = self.fade_cfg.synth_floor_db;
-        let min_slew = Duration::from_millis(self.fade_cfg.min_slew_ms);
-        let cfg = self.fade_cfg.clone();
-        let state_read = self.state.clone();
-        let state_task = self.state.clone();
-        let changed = self.changed.clone();
-        let sink = self.player.clone();
-        let slot_for_task = self.fade.clone();
-
-        // EVERY fade install supersedes whatever is running, and a running CROSSFADE
-        // cannot simply be superseded: aborting it strands a second audible deck, and
-        // its half-faded pair does not match the `from_db` this fade is about to read.
-        // Settling first makes both true again - one deck, at the baseline the live gain
-        // already claims - so the ordinary supersede below is correct unchanged.
-        self.settle_crossfade(true).await;
-
-        self.fade
-            .supersede(
-                move || {
-                    // Read the live gain AFTER the outgoing fade is aborted+joined
-                    // (validate-before-abort keeps this untouched on rejection).
-                    let from_db = state_read.lock().unwrap().live_gain_db;
-                    // A shallow duck to SKIP_DIP_DB (not full silence) so the dip
-                    // is a few 250ms steps, not ~20 - what keeps a skip snappy.
-                    let target = FadeTarget::Db(SKIP_DIP_DB);
-                    let step_interval = tick.max(min_slew);
-                    let eff_dur =
-                        dur.max(min_deliberate_dur(from_db, target, step_interval, synth_floor));
-                    let bounds = startle_bounds(&cfg, false);
-                    let spec =
-                        FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)?;
-                    let terminal = Terminal::SkipLoad {
-                        idx,
-                        evict,
-                        play,
-                        resume_spec,
-                        resume_vol,
-                        dip_floor_db: SKIP_DIP_DB,
-                    };
-                    Ok((spec, terminal))
-                },
-                move |(spec, terminal)| {
-                    let epoch = {
-                        let mut st = state_task.lock().unwrap();
-                        st.fade_epoch += 1;
-                        st.fading = true;
-                        st.fade_epoch
-                    };
-                    let join = tokio::spawn(fade_task(
-                        sink, spec, state_task, changed, epoch, terminal, slot_for_task,
-                        synth_floor,
-                    ));
-                    let abort = join.abort_handle();
-                    (abort, join)
-                },
-            )
-            .await
-    }
-
-    /// Resolve and start playing the queue item at `idx`. Returns an ACK-style
-    /// error string on failure. A fresh-play gesture (`next`/`play`/`prev`/Eof
-    /// advance) resyncs mpv's gain to the baseline first - see
-    /// [`Self::play_index_inner`].
-    async fn play_index(&self, idx: usize) -> Result<(), String> {
-        // A deliberate gesture re-arms the EOF failure fuse with its full budget (see
-        // [`MAX_CONSECUTIVE_EOF_FAILURES`]) and latches THIS entry as the walk's origin,
-        // so the search that budget pays for can find a playable entry further down while
-        // a search that finds nothing hands the position straight back
-        // ([`Self::arm_eof_fuse_for_gesture`]). The EOF advance itself goes through
-        // `play_index_inner` and must NOT arm at all, because mpv's premature loadfile
-        // Ok makes every failed load look like a successful play from here.
-        self.arm_eof_fuse_for_gesture(idx);
-        self.play_index_inner(idx, true).await
-    }
-
-    /// As [`Self::play_index`] but WITHOUT resyncing mpv's gain: the caller
-    /// (`wake_now` / `restore`) has deliberately forced start-from-silence
-    /// (`live_gain_db = synth_floor`, `player.set_volume(0)`) before the first
-    /// buffer and owns the rise via a following wake ramp. Resyncing here would
-    /// clobber that silence and defeat the ramp.
-    ///
-    /// It is still a fresh-play GESTURE, so a load that LANDS retires any standing
-    /// `pending_pause` - which for a wake means the long-lived nothing-loaded terminal
-    /// ([`Self::halt_failed_advance`], the offline [`Self::restore`]) an alarm can fire
-    /// hours into. [`Self::play_index`] retires it inside the resync branch this path
-    /// deliberately skips, so the retirement lives HERE rather than in
-    /// [`Self::play_index_inner`]: the EOF advance and the drain-edge
-    /// continuation/autofill refills call the inner with the same `false` DIRECTLY and
-    /// are NOT gestures - a PauseOut fade still descending across a track boundary must
-    /// keep its intent until its own [`Terminal::Pause`] lands. Retired only AFTER the
-    /// load lands, so a wake that could not load leaves the held terminal standing.
-    ///
-    /// Being a gesture, it arms the EOF fuse exactly as [`Self::play_index`] does. An
-    /// alarm firing hours into a nothing-loaded terminal is entitled to the same search
-    /// for something playable - and to the same guarantee that a search finding nothing
-    /// hands the saved position back rather than walking it off the end of the queue.
-    async fn play_index_from_silence(&self, idx: usize) -> Result<(), String> {
-        self.arm_eof_fuse_for_gesture(idx);
-        self.play_index_inner(idx, false).await?;
-        let retired = {
-            let mut st = self.state.lock().unwrap();
-            std::mem::replace(&mut st.pending_pause, false)
-        };
-        if retired {
-            // The reported state just moved Paused -> Playing with no transport command
-            // of its own, so wake the `idle` / MPRIS watchers on that edge.
-            self.notify_change();
-        }
-        Ok(())
-    }
-
-    /// Resolve and start playing the queue item at `idx`. When `resync_volume` is
-    /// set, any in-flight fade is cancelled and mpv's gain re-asserted to the
-    /// baseline BEFORE loading, so a fresh-play gesture supersedes a pause/fade in
-    /// progress (see the two failure modes documented at the cancel below).
-    async fn play_index_inner(&self, idx: usize, resync_volume: bool) -> Result<(), String> {
-        let item = {
-            let st = self.state.lock().unwrap();
-            st.queue.get(idx).cloned()
-        };
-        let item = match item {
-            Some(i) => i,
-            None => return Err("Bad song index".into()),
-        };
-        // A library song resolves a Subsonic stream URL and plays under its id
-        // (scrobbled). A raw stream plays its URL verbatim with no id (never
-        // scrobbled). Either way a bad/unreachable URL surfaces as a player
-        // error here and, at worst, an idle/stopped state - never a panic.
-        // Latch the entry's stable identity so every downstream player event
-        // (TimePos/StateChanged/Eof) is attributed to THIS entry even after an
-        // off-spine next/prev/delete repoints the current index.
-        if resync_volume {
-            // A fresh-play gesture supersedes any in-flight fade (e.g. a PauseOut
-            // ramp from a pause-then-next gesture, or a plain fade-out): atomically
-            // cancel it and settle the baseline, THEN re-assert the real mpv gain to
-            // the baseline BEFORE loading. Otherwise a surviving PauseOut fade would
-            // drive the freshly started track down to silence and its
-            // Terminal::Pause would freeze the deck Paused on the new track; and
-            // even an already-completed pause fade leaves mpv's volume at ~0 (it
-            // persists across loadfile), so without this the new track would play
-            // inaudible while getvol/MPRIS report the baseline. Mirrors the stop
-            // path (`stop_playback`).
-            self.settle_crossfade(true).await;
-            self.fade
-                .cancel_with(|| {
-                    let mut st = self.state.lock().unwrap();
-                    let v = st.target_volume;
-                    st.set_manual_volume(v, self.deck_loaded());
-                    // A fresh-play gesture supersedes any pending pause: the deck is
-                    // playing a track now, so the reported state must be Playing, and
-                    // a superseded PauseOut fade must never freeze this new track
-                    // Paused. Explicit and UNGATED - a play is a TRANSPORT gesture, and
-                    // it is precisely how the nothing-loaded terminal is meant to be
-                    // picked up (the deck holds nothing right up until the load below).
-                    st.pending_pause = false;
-                })
-                .await;
-            let baseline = self.state.lock().unwrap().target_volume;
-            let _ = self.player.set_volume(baseline).await;
-        }
-        // Resolve the play args (sync stream_url) then load - the SAME resolution
-        // the skip dip pre-computes, factored into one place.
-        let play = self.resolve_play(&item)?;
-        // A track is becoming current, so no skip target is pending any more: release
-        // the single-slot eviction pin (the new current is protected by the window).
-        self.set_store_skip_pin(None);
-        // Tell the store whether what is now audible comes off the network, so bulk
-        // backfill defers while a thin link is already carrying playback.
-        self.set_store_playback_remote(!play.local);
-        self.player
-            .play_url(play.song_id, Some(play.qid), &play.url, play.local)
-            .await
-            .map_err(|e| e.to_string())?;
-        let trimmed = {
-            let mut st = self.state.lock().unwrap();
-            st.current = Some(idx);
-            // A track is now current: the pending fresh-enqueue gesture is consumed /
-            // superseded by playback, so the anchor must clear (the NowPlaying branch
-            // wins the seed now). This is the universal choke every fresh play, EOF
-            // auto-advance, and PlayNow funnels through - the primary clear that keeps a
-            // stale anchor from overriding recency on a LATER finish (scenario R).
-            st.fresh_enqueue_anchor = None;
-            // ONE track moved forward, so retire one track's worth of history off the
-            // front (task 85xw3mq). Here because this is the same universal choke: every
-            // fresh play, EOF auto-advance and PlayNow passes through it, so the queue is
-            // bounded on every path that grows it, with no second trigger to keep in
-            // sync. Under the SAME lock as the current-commit, so no reader can ever
-            // observe a queue whose `current` has not been shifted over the removal.
-            st.trim_spent()
-        };
-        // The ledger write is OUTSIDE the lock and is itself lock-free and non-async
-        // ([`Self::append_heard`]), so the trim never puts I/O anywhere near the state.
-        for it in &trimmed {
-            if let Some(row) = spent_heard_row(it) {
-                self.append_heard(row);
-            }
-        }
-        self.notify_change();
-        // (Re)arm the LEAD continuation warm behind the freshly-playing entry (slice 2).
-        // This is the funnel EVERY fresh play / EOF auto-advance / PlayNow passes through,
-        // and step 1 DISARMS any prior pending warm - so a manual play/next/prev supersedes
-        // a parked warm here. Declines (arms nothing) unless the new current is a finite
-        // Song that will drain next into an armed, configured continuation station.
-        self.reschedule_continuation_warm().await;
-        Ok(())
-    }
-
-    /// Commit a queue index that mpv ALREADY advanced into, with no load.
-    ///
-    /// The gapless twin of [`Self::play_index_inner`]: byte-for-byte the same state
-    /// commit - the skip pin release, the store remoteness publish, `current`, the
-    /// `fresh_enqueue_anchor` clear, the spent-history trim and its ledger rows, the
-    /// notify, and the re-arm of the next warm - MINUS the `play_url` that is the whole
-    /// point of not being here. mpv never stopped, so loading would restart the track
-    /// that is already audible.
-    ///
-    /// Kept as a sibling rather than a flag on `play_index_inner` because the two differ
-    /// in exactly one statement, and a bool parameter threaded through that function's
-    /// fade-resync logic is how a future edit accidentally loads on the gapless path.
-    async fn commit_landed_advance(&self, idx: usize) {
-        let item = {
-            let st = self.state.lock().unwrap();
-            st.queue.get(idx).cloned()
-        };
-        let Some(item) = item else { return };
-        // A track is becoming current, so no skip target is pending: release the
-        // single-slot eviction pin, exactly as the loading path does.
-        self.set_store_skip_pin(None);
-        // Remoteness is published from the SAME resolution the warm used, so the store
-        // sees the identical verdict it would have on a cold load.
-        if let Ok(play) = self.resolve_play(&item) {
-            self.set_store_playback_remote(!play.local);
-        }
-        let trimmed = {
-            let mut st = self.state.lock().unwrap();
-            st.current = Some(idx);
-            st.pending_pause = false;
-            st.fresh_enqueue_anchor = None;
-            st.trim_spent()
-        };
-        for it in &trimmed {
-            if let Some(row) = spent_heard_row(it) {
-                self.append_heard(row);
-            }
-        }
-        self.notify_change();
-        // Re-arm the warm behind the freshly-current entry, so a run of tracks stays
-        // gapless rather than only the first boundary.
+        // A head removed while nothing plays declares nothing to play: the deck stops.
+        let playing = self.reported_play_state() == PlayState::Playing;
+        let _ = self
+            .declare(Cause::Removed, |st| {
+                let successor = if playing {
+                    st.peek_next_from(pos, false)
+                        .and_then(|i| st.queue.get(i))
+                        .map(|it| QueueId(it.id))
+                        .filter(|q| *q != qid)
+                } else {
+                    None
+                };
+                st.remove_row(qid, successor);
+            })
+            .await;
         self.reschedule_continuation_warm().await;
     }
 
@@ -13990,7 +13088,7 @@ impl HypodjHandler {
         // current track, so disarm any pending continuation warm (cancel timer + drop slot
         // + DropWarm) - it can no longer legitimately auto-advance behind a current that is
         // no longer last. Idempotent across the `plan_enqueue` loop (only the first push
-        // has a warm to drop). A `PlayNow` re-arms cleanly via its follow-on play_index.
+        // has a warm to drop). A `PlayNow` re-arms cleanly via its follow-on declare_play.
         self.disarm_continuation_warm().await;
         id
     }
@@ -14721,7 +13819,7 @@ impl MpdHandler for HypodjHandler {
                         st.repeat,
                         st.single,
                         st.consume,
-                        st.pending_skip.is_some(),
+                        st.head_arriving(),
                     )
                 };
                 let flag = |b: bool| if b { "1" } else { "0" };
@@ -14920,10 +14018,10 @@ impl MpdHandler for HypodjHandler {
             // ── playback ──────────────────────────────────────────────────
             MpdCommand::Play(pos) => {
                 let idx = pos.unwrap_or_else(|| {
-                    self.state.lock().unwrap().current.unwrap_or(0)
+                    self.state.lock().unwrap().current().unwrap_or(0)
                 });
                 // If already have a current and no explicit pos, resume.
-                match self.play_index(idx).await {
+                match self.declare_play(idx, Cause::Gesture).await {
                     Ok(()) => MpdResponse::ok(),
                     Err(e) => ack(ACK_ERROR_NO_EXIST, "play", &e),
                 }
@@ -14940,7 +14038,7 @@ impl MpdHandler for HypodjHandler {
                     None => Some(0),
                 };
                 match idx {
-                    Some(idx) => match self.play_index(idx).await {
+                    Some(idx) => match self.declare_play(idx, Cause::Gesture).await {
                         Ok(()) => MpdResponse::ok(),
                         Err(e) => ack(ACK_ERROR_NO_EXIST, "playid", &e),
                     },
@@ -14994,10 +14092,10 @@ impl MpdHandler for HypodjHandler {
                 self.note_early_skip();
                 // A manual `next` always advances (single governs only auto-advance);
                 // random/repeat/consume are honored via plan_next. The transition
-                // itself is startle-safe: user_skip dips through silence when
+                // itself is startle-safe: declare_play dips through silence when
                 // playing, falling back to a plain load when paused/stopped.
                 match self.plan_next(false) {
-                    Some(idx) => match self.user_skip(idx).await {
+                    Some(idx) => match self.declare_play(idx, Cause::Gesture).await {
                         Ok(()) => MpdResponse::ok(),
                         Err(e) => ack(ACK_ERROR_NO_EXIST, "next", &e),
                     },
@@ -15012,14 +14110,14 @@ impl MpdHandler for HypodjHandler {
                     st.reported_current().and_then(|c| c.checked_sub(1))
                 };
                 match prev {
-                    Some(idx) => match self.user_skip(idx).await {
+                    Some(idx) => match self.declare_play(idx, Cause::Gesture).await {
                         Ok(()) => MpdResponse::ok(),
                         Err(e) => ack(ACK_ERROR_NO_EXIST, "previous", &e),
                     },
                     None => MpdResponse::ok(),
                 }
             }
-            MpdCommand::Seek { secs, .. } => match self.player.seek(secs).await {
+            MpdCommand::Seek { secs, .. } => match self.seek_head(secs).await {
                 Ok(()) => {
                     // A seek moves the playhead: re-arm the LEAD continuation warm from
                     // the new position (the deadline is recomputed off the new remaining).
@@ -15030,6 +14128,9 @@ impl MpdHandler for HypodjHandler {
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
             },
             MpdCommand::SeekCur { secs, relative } => {
+                // Settle FIRST, so a relative seek is computed against the head's own
+                // position rather than the leg an overlap is leaving.
+                self.settle_transitions().await;
                 // A relative seek (`seekcur +/-N`) is computed against the live
                 // lockless position; the player itself only seeks ABSOLUTELY.
                 let target = if relative {
@@ -15037,7 +14138,7 @@ impl MpdHandler for HypodjHandler {
                 } else {
                     secs
                 };
-                match self.player.seek(target).await {
+                match self.seek_head(target).await {
                     Ok(()) => {
                         // Advance the lockless position to where we just seeked, so
                         // rapid successive relative scrubs (Space/Backspace held or
@@ -15052,7 +14153,7 @@ impl MpdHandler for HypodjHandler {
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
                 }
             }
-            MpdCommand::SeekId { secs, .. } => match self.player.seek(secs).await {
+            MpdCommand::SeekId { secs, .. } => match self.seek_head(secs).await {
                 Ok(()) => {
                     self.note_elapsed_ms((secs.max(0.0) * 1000.0) as u64);
                     self.reschedule_continuation_warm().await;
@@ -15159,36 +14260,20 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::Clear => {
-                // Manual wins ATOMICALLY: cancel any fade AND clear the queue +
-                // reset the volume to the baseline under the SAME slot lock (see
-                // SetVol/Stop), so no concurrent `fade` can interleave.
-                self.settle_crossfade(true).await;
-                self.fade
-                    .cancel_with(|| {
-                        let mut st = self.state.lock().unwrap();
+                // An empty queue with no head, DECLARED: the engine fades the playing
+                // track out (a play landing inside that fade crossfades in from its live
+                // level, which is what makes ncmpcpp's `clear; add; play` seamless) and
+                // the status reports stopped at once. A gesture, so a running fade
+                // yields and a pending pause is retired with the queue it was held for.
+                let _ = self
+                    .declare(Cause::Gesture, |st| {
                         st.queue.clear();
-                        st.current = None;
                         st.playlist_version += 1;
-                        let v = st.target_volume;
-                        st.set_manual_volume(v, self.deck_loaded());
-                        // A clear is a TRANSPORT gesture (the queue is gone and the
-                        // deck stops below), so it retires the pending-pause intent
-                        // outright - the gated baseline commit above cannot, and a
-                        // stale intent must never outlive the entry it was held for.
-                        st.pending_pause = false;
+                        st.declare_head(None, Cause::Gesture);
                     })
                     .await;
-                let v = self.state.lock().unwrap().target_volume;
-                let _ = self.player.stop().await;
-                // Nothing is loaded any more: the store stops deferring bulk work.
-                self.set_store_playback_remote(false);
-                // A clear empties the queue: disarm any pending continuation warm so a
-                // parked station cannot auto-advance behind the stopped deck. Slice 2.
+                // A clear empties the queue: no continuation warm survives it.
                 self.disarm_continuation_warm().await;
-                // Re-assert the real mpv gain to the baseline (F4): a cancelled
-                // fade must not leave mpv faded-down under a baseline report.
-                let _ = self.player.set_volume(v).await;
-                self.notify_change();
                 MpdResponse::ok()
             }
             MpdCommand::Delete(spec) => {
@@ -15806,7 +14891,7 @@ impl HypodjHandler {
     /// metadata can never tear and a library song can never inherit a station label.
     pub fn current_item(&self) -> Option<CurrentItem> {
         let st = self.state.lock().unwrap();
-        let idx = st.current?;
+        let idx = st.current()?;
         let it = st.queue.get(idx)?;
         let qid = QueueId(it.id);
         let is_stream = matches!(it.entry, QueueEntry::Stream { .. });
@@ -15874,7 +14959,7 @@ impl HypodjHandler {
         // Mirror the MPD `next` gesture: always advance, honoring
         // random/repeat/consume (single governs only EOF auto-advance).
         if let Some(idx) = self.plan_next(false) {
-            let _ = self.play_index(idx).await;
+            let _ = self.declare_play(idx, Cause::Gesture).await;
         }
     }
 
@@ -15883,10 +14968,10 @@ impl HypodjHandler {
     pub async fn mpris_previous(&self) {
         let prev = {
             let st = self.state.lock().unwrap();
-            st.current.and_then(|c| c.checked_sub(1))
+            st.current().and_then(|c| c.checked_sub(1))
         };
         if let Some(idx) = prev {
-            let _ = self.play_index(idx).await;
+            let _ = self.declare_play(idx, Cause::Gesture).await;
         }
     }
 
@@ -15958,7 +15043,7 @@ impl HypodjHandler {
                     self.state.lock().unwrap().set_manual_volume(landing_vol, self.deck_loaded())
                 })
                 .await;
-            // This defensive cancel_with also SUPERSEDES a live skip dip (its SkipLoad
+            // This defensive cancel_with also SUPERSEDES a live skip dip (its dip
             // never runs), so drop any parked warm target - else the still-playing
             // current track's natural EOF would auto-advance into it (finding 3).
             let _ = self.player.drop_warm().await;
@@ -17495,6 +16580,10 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
 }
 
 #[cfg(test)]
+#[path = "transition_witness.rs"]
+mod transition_witness;
+
+#[cfg(test)]
 mod tests {
 
     #[test]
@@ -17616,13 +16705,13 @@ mod tests {
     async fn move_range_reorders_and_keeps_current_on_the_same_entry() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 5).await;
-        h.state.lock().unwrap().current = Some(1);
+        h.state.lock().unwrap().set_current(Some(1));
         let v0 = h.state.lock().unwrap().playlist_version;
         let r = h.handle(MpdCommand::Move { start: 0, end: Some(2), to: crate::mpd::QueuePos::Abs(3) }).await;
         assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
         assert_eq!(qids(&h), vec![2, 3, 4, 0, 1]);
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, Some(4), "the playing entry (id 1) followed the move");
+        assert_eq!(st.current(), Some(4), "the playing entry (id 1) followed the move");
         assert!(st.playlist_version > v0);
         drop(st);
         let r = h.handle(MpdCommand::Move { start: 3, end: Some(5), to: crate::mpd::QueuePos::Abs(4) }).await;
@@ -17634,10 +16723,10 @@ mod tests {
     async fn moveid_moves_one_entry_and_acks_unknown_ids() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 3).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.handle(MpdCommand::MoveId(0, crate::mpd::QueuePos::Abs(2))).await;
         assert_eq!(qids(&h), vec![1, 2, 0]);
-        assert_eq!(h.state.lock().unwrap().current, Some(2));
+        assert_eq!(h.state.lock().unwrap().current(), Some(2));
         let r = h.handle(MpdCommand::MoveId(99, crate::mpd::QueuePos::Abs(0))).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_NO_EXIST, .. }));
         let r = h.handle(MpdCommand::MoveId(1, crate::mpd::QueuePos::Abs(3))).await;
@@ -17648,7 +16737,7 @@ mod tests {
     async fn shuffle_permutes_only_the_range_and_tracks_current() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 8).await;
-        h.state.lock().unwrap().current = Some(3);
+        h.state.lock().unwrap().set_current(Some(3));
         h.handle(MpdCommand::Shuffle(Some((2, Some(6))))).await;
         let q = qids(&h);
         assert_eq!(&q[..2], &[0, 1]);
@@ -17656,7 +16745,7 @@ mod tests {
         let mut mid = q[2..6].to_vec();
         mid.sort();
         assert_eq!(mid, vec![2, 3, 4, 5], "a permutation of the range");
-        let cur = h.state.lock().unwrap().current.unwrap();
+        let cur = h.state.lock().unwrap().current().unwrap();
         assert_eq!(q[cur], 3, "current still names the entry that was playing");
         h.handle(MpdCommand::Shuffle(None)).await;
         let mut all = qids(&h);
@@ -17688,7 +16777,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 6).await;
         // The playing row is inside the range, so deleting it awaits the player.
-        h.state.lock().unwrap().current = Some(2);
+        h.state.lock().unwrap().set_current(Some(2));
         let del = h.handle(MpdCommand::Delete(Some("0:3".into())));
         let ins = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(0))));
         let (r1, r2) = tokio::join!(del, ins);
@@ -17703,11 +16792,11 @@ mod tests {
     async fn addid_inserts_at_the_requested_position() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 3).await;
-        h.state.lock().unwrap().current = Some(1);
+        h.state.lock().unwrap().set_current(Some(1));
         let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(0)))).await;
         assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
         assert_eq!(qids(&h), vec![3, 0, 1, 2]);
-        assert_eq!(h.state.lock().unwrap().current, Some(2), "current shifted with its entry");
+        assert_eq!(h.state.lock().unwrap().current(), Some(2), "current shifted with its entry");
         let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(9)))).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }));
         assert_eq!(qids(&h).len(), 4, "a bad position adds nothing");
@@ -17721,7 +16810,7 @@ mod tests {
     async fn relative_positions_are_relative_to_the_current_song() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 5).await;
-        h.state.lock().unwrap().current = Some(3);
+        h.state.lock().unwrap().set_current(Some(3));
         // Lift id 0 out: current (id 3) sits at 2, so `+1` lands at 4.
         let r = h.handle(crate::mpd::parse("move 0 +1")).await;
         assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
@@ -17732,7 +16821,7 @@ mod tests {
         // `+0` is right after it.
         h.handle(crate::mpd::parse("moveid 1 +0")).await;
         assert_eq!(qids(&h), vec![2, 0, 3, 1, 4]);
-        assert_eq!(h.state.lock().unwrap().current, Some(2), "current followed its entry");
+        assert_eq!(h.state.lock().unwrap().current(), Some(2), "current followed its entry");
         // Moving the current song relative to itself is an ACK.
         let r = h.handle(crate::mpd::parse("moveid 3 +1")).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }), "{r:?}");
@@ -17745,7 +16834,7 @@ mod tests {
         assert!(matches!(r, MpdResponse::Ack { .. }), "{r:?}");
         assert_eq!(qids(&h), vec![2, 0, 3, 5, 1, 4]);
         // Nothing playing: a relative position ACKs and nothing moves or is added.
-        h.state.lock().unwrap().current = None;
+        h.state.lock().unwrap().set_current(None);
         for cmd in ["move 0 +1".to_string(), "moveid 0 -0".to_string(), format!("addid {NTS} +0")] {
             let r = h.handle(crate::mpd::parse(&cmd)).await;
             assert!(matches!(r, MpdResponse::Ack { .. }), "{cmd}: {r:?}");
@@ -17775,132 +16864,207 @@ mod tests {
         Some((HypodjHandler::new(client, player), events))
     }
 
-    // A skip over a two-deck player takes the CROSSFADE, not the dip - and the whole
-    // difference is what the deck does in between. The dip's promise was "never a hard
-    // cut"; the crossfade's is stronger and is what he actually asked for: the outgoing
-    // track is still audible while the incoming one comes up, so there is no seam at all.
-    #[tokio::test(start_paused = true)]
-    async fn a_skip_on_a_deck_pair_crossfades_instead_of_ducking() {
-        let Some((h, _events)) = handler_with_deck_pair() else { return };
-        assert!(h.player.can_crossfade(), "the pair spawned");
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
-        h.handle(MpdCommand::Next).await;
-        // The target is reported IMMEDIATELY, before a single step has run: the listener
-        // can already hear it arriving, so a status still naming the outgoing track would
-        // be the surface lagging the room.
-        {
-            let st = h.state.lock().unwrap();
-            assert!(st.crossfading, "a crossfade is in flight, not a dip");
-            assert_eq!(st.pending_skip, Some(1), "and it already reports the target");
-            assert_eq!(st.current, Some(0), "while `current` still names what is playing");
-        }
-        h.wait_for_fade().await;
-        let st = h.state.lock().unwrap();
-        assert_eq!(st.current, Some(1), "the target committed");
-        assert!(!st.crossfading, "and the transition is over");
-        assert_eq!(st.pending_skip, None);
+    fn overlapping(h: &HypodjHandler) -> bool {
+        matches!(h.state.lock().unwrap().transit, Some(reconcile::Transit::Overlap(_)))
     }
 
-    // The crossfade must NOT animate the reported volume. Nothing about the room's level
-    // changed - that is the entire point of equal power - so a status that drew a dip
-    // would have the clients render a hole nobody can hear.
+    fn deck_qid(h: &HypodjHandler) -> Option<u64> {
+        h.state.lock().unwrap().deck.map(|l| l.qid.0)
+    }
+
+    /// Two queued rows on a deck pair, the first one playing.
+    async fn pair_playing(
+        n: usize,
+    ) -> Option<(HypodjHandler, tokio::sync::mpsc::Receiver<PlayerEvent>)> {
+        let (h, events) = handler_with_deck_pair()?;
+        for _ in 0..n {
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+        }
+        h.handle(MpdCommand::Play(Some(0))).await;
+        Some((h, events))
+    }
+
+    // A skip over a two-deck player takes the CROSSFADE, not the dip: the outgoing
+    // track is still audible while the incoming one comes up, so there is no seam.
     #[tokio::test(start_paused = true)]
-    async fn a_crossfade_never_moves_the_reported_volume() {
-        let Some((h, _events)) = handler_with_deck_pair() else { return };
+    async fn a_skip_on_a_deck_pair_crossfades_instead_of_ducking() {
+        let Some((h, _ev)) = pair_playing(2).await else { return };
+        assert!(h.player.can_crossfade(), "the pair spawned");
+        h.handle(MpdCommand::Next).await;
+        // The DECLARED head is reported at once; the deck still plays the outgoing row.
+        assert!(overlapping(&h), "a crossfade is in flight, not a dip");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "the head is reported at once");
+        assert_eq!(deck_qid(&h), Some(0), "while the active deck still owns the outgoing row");
+        h.wait_for_fade().await;
+        assert!(!overlapping(&h), "and the transition is over");
+        assert_eq!(deck_qid(&h), Some(1), "the incoming deck was promoted");
+        assert!(h.state.lock().unwrap().deck_committed, "and the ONE commit ran");
+    }
+
+    // Every gesture is the same act, so every gesture sounds the same: play N, playid and
+    // MPRIS next crossfade exactly like `next` (they used to cut).
+    #[tokio::test(start_paused = true)]
+    async fn play_n_playid_and_mpris_next_crossfade_like_next() {
+        let Some((h, _ev)) = pair_playing(4).await else { return };
+        h.handle(MpdCommand::Play(Some(2))).await;
+        assert!(overlapping(&h), "play N while playing crossfades");
+        h.wait_for_fade().await;
+        let id = h.state.lock().unwrap().queue[3].id;
+        h.handle(MpdCommand::PlayId(Some(id))).await;
+        assert!(overlapping(&h), "playid crossfades");
+        h.wait_for_fade().await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.wait_for_fade().await;
+        h.mpris_next().await;
+        assert!(overlapping(&h), "MPRIS next takes the same path as MPD next");
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().current(), Some(1));
+        assert_eq!(deck_qid(&h), Some(1));
+    }
+
+    // THE PROOF CASE, headless: ncmpcpp's "replace the queue and play" is `clear`, `add`
+    // x N, `play 0`. Clear declares no head, so the playing track FADES OUT; the play
+    // lands inside that fade and crossfades the new first track in from the fade's live
+    // level. Nothing in that path knows it is the proof case.
+    #[tokio::test(start_paused = true)]
+    async fn clear_add_play_crossfades_out_of_the_fade_out() {
+        let Some((h, _ev)) = pair_playing(2).await else { return };
+        h.handle(MpdCommand::Clear).await;
+        assert_eq!(h.reported_play_state(), PlayState::Stopped, "clear reports stopped at once");
+        assert_eq!(h.player.state(), PlayState::Playing, "while the old track fades out");
+        tokio::time::sleep(Duration::from_millis(600)).await;
         h.handle(MpdCommand::Add(NTS.to_string())).await;
         h.handle(MpdCommand::Add(NTS.to_string())).await;
         h.handle(MpdCommand::Play(Some(0))).await;
-        let before = h.state.lock().unwrap().reported_volume();
+        assert!(overlapping(&h), "the play crossfades in from the fade-out");
+        let o = match h.state.lock().unwrap().transit {
+            Some(reconcile::Transit::Overlap(o)) => o,
+            other => panic!("expected an overlap, got {other:?}"),
+        };
+        assert!(o.out_db < 0.0, "the outgoing leg starts from its LIVE faded level: {}", o.out_db);
+        h.wait_for_fade().await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current(), Some(0));
+        assert_eq!(st.deck.map(|l| l.qid.0), Some(st.queue[0].id), "the new first track plays");
+    }
 
+    // Clear with nothing following simply fades out and stops.
+    #[tokio::test(start_paused = true)]
+    async fn clear_while_playing_fades_out_then_stops() {
+        let Some((h, _ev)) = pair_playing(2).await else { return };
+        h.handle(MpdCommand::Clear).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Stopped);
+        assert_eq!(h.state.lock().unwrap().deck, None);
+    }
+
+    // The crossfade must NOT animate the reported volume: equal power means the room's
+    // level never changed.
+    #[tokio::test(start_paused = true)]
+    async fn a_crossfade_never_moves_the_reported_volume() {
+        let Some((h, _ev)) = pair_playing(2).await else { return };
+        let before = h.state.lock().unwrap().reported_volume();
         h.handle(MpdCommand::Next).await;
         tokio::time::advance(Duration::from_millis(700)).await;
-        assert_eq!(
-            h.state.lock().unwrap().reported_volume(),
-            before,
-            "mid-crossfade the reported level is unchanged"
-        );
+        assert_eq!(h.state.lock().unwrap().reported_volume(), before, "mid-crossfade");
         h.wait_for_fade().await;
         assert_eq!(h.state.lock().unwrap().reported_volume(), before, "and after it");
     }
 
-    // THE hazard a second deck introduces: a superseded ordinary fade just stops writing,
-    // but a superseded crossfade has left a SECOND DECK PLAYING. A setvol mid-crossfade
-    // must therefore SETTLE the transition (promote the incoming deck) before it takes
-    // the gain - never abort it and strand two audible decks, and never leave the new
-    // fade reading a `from_db` that belongs to a half-faded pair.
+    // A setvol mid-crossfade lands the overlap (promotes the incoming deck) before it
+    // takes the gain - never strands two audible decks.
     #[tokio::test(start_paused = true)]
     async fn a_setvol_during_a_crossfade_settles_it_instead_of_stranding_a_deck() {
-        let Some((h, _events)) = handler_with_deck_pair() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
+        let Some((h, _ev)) = pair_playing(2).await else { return };
         h.handle(MpdCommand::Next).await;
         tokio::time::advance(Duration::from_millis(400)).await;
-        assert!(h.state.lock().unwrap().crossfading, "caught mid-transition");
-
+        assert!(overlapping(&h), "caught mid-transition");
         h.handle(MpdCommand::SetVol(40)).await;
-        {
-            let st = h.state.lock().unwrap();
-            assert!(!st.crossfading, "the crossfade was settled, not merely superseded");
-            assert_eq!(st.current, Some(1), "and settling PROMOTED the incoming track");
-            assert_eq!(st.pending_skip, None, "so nothing is still reported as pending");
-        }
+        assert!(!overlapping(&h), "the crossfade was landed, not merely superseded");
+        assert_eq!(deck_qid(&h), Some(1), "landing PROMOTED the incoming track");
         h.wait_for_fade().await;
-        // Within the glide's documented +/-1 dither window, not exactly 40: setvol
-        // humanizes the landing on purpose (see glide_to_volume). What matters here is
-        // that the gesture LANDED rather than being eaten by the settlement.
         let landed = h.state.lock().unwrap().target_volume;
         assert!((39..=41).contains(&landed), "the setvol still landed: {landed}");
     }
 
-    // A stop mid-crossfade must not silence one deck and leave the other playing into a
-    // room that was just told everything stopped.
+    // A stop mid-crossfade silences BOTH decks.
     #[tokio::test(start_paused = true)]
     async fn a_stop_during_a_crossfade_leaves_no_deck_playing() {
-        let Some((h, _events)) = handler_with_deck_pair() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
+        let Some((h, _ev)) = pair_playing(2).await else { return };
         h.handle(MpdCommand::Next).await;
         tokio::time::advance(Duration::from_millis(400)).await;
         h.stop_playback().await;
-        assert!(!h.state.lock().unwrap().crossfading);
-        assert_eq!(h.player.state(), PlayState::Stopped, "the promoted deck stopped too");
+        assert!(!overlapping(&h));
+        assert!(
+            h.player.deck_states().iter().all(|s| *s == PlayState::Stopped),
+            "no deck left playing: {:?}",
+            h.player.deck_states()
+        );
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "stop holds the declared head");
     }
 
-    // DELETING the track a crossfade is arriving at is the one supersede that must NOT
-    // promote: committing a row that is about to leave the queue lands the deck on an
-    // entry the queue no longer has - the orphaned deck the design promises is
-    // unreachable. The gesture reads "not that one", so the deck stays where it is.
+    // DELETING the row a crossfade is arriving at means "not that one": the head goes
+    // back to the row the deck still plays and the envelope runs BACKWARDS from where it
+    // stands (Reverse) - no promote of a row that left the queue, no step in the gain.
     #[tokio::test(start_paused = true)]
-    async fn deleting_the_crossfade_target_abandons_it_and_keeps_playing_what_it_had() {
-        let Some((h, _events)) = handler_with_deck_pair() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
+    async fn deleting_the_crossfade_target_reverses_back_to_what_was_playing() {
+        let Some((h, _ev)) = pair_playing(2).await else { return };
         h.handle(MpdCommand::Next).await;
         tokio::time::advance(Duration::from_millis(400)).await;
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1));
-
         h.handle(MpdCommand::Delete(Some("1".to_string()))).await;
+        match h.state.lock().unwrap().transit {
+            Some(reconcile::Transit::Overlap(o)) => {
+                assert!(o.reversed, "the same overlap, running back");
+                assert!(o.from_t > 0.5, "from where it stood, mirrored: {}", o.from_t);
+            }
+            other => panic!("expected the reversed overlap, got {other:?}"),
+        }
+        h.wait_for_fade().await;
         let st = h.state.lock().unwrap();
-        assert!(!st.crossfading, "the transition is resolved, not left running");
-        assert_eq!(st.current, Some(0), "the deck kept the track it was already playing");
-        assert_eq!(st.pending_skip, None, "and stopped reporting a target that is gone");
+        assert_eq!(st.current(), Some(0), "the deck kept the track it was already playing");
+        assert_eq!(st.deck.map(|l| l.qid.0), Some(st.queue[0].id));
         assert_eq!(st.queue.len(), 1, "the delete itself landed");
+        drop(st);
+        assert_eq!(
+            h.player.deck_states().iter().filter(|s| **s == PlayState::Playing).count(),
+            1,
+            "exactly one deck still plays"
+        );
     }
 
-    // The OTHER half of "going forward on the music": the natural boundary. Off by
-    // default (a gapless advance is already right for a sequenced record), so this asks
-    // for it explicitly and then checks the transition is owned end to end by the
-    // crossfade - the queue moves because the crossfade committed, not because an EOF
-    // advanced it afterwards.
+    // A THIRD head while two decks overlap finishes the overlap inside the settle bound,
+    // then transitions from the promoted deck - two decks is the bound, never three.
+    #[tokio::test(start_paused = true)]
+    async fn a_third_head_mid_overlap_finishes_then_crossfades_again() {
+        let Some((h, _ev)) = pair_playing(3).await else { return };
+        h.handle(MpdCommand::Next).await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        h.handle(MpdCommand::Play(Some(2))).await;
+        // The old overlap landed on row 1, and a new one is carrying the room to row 2.
+        match h.state.lock().unwrap().transit {
+            Some(reconcile::Transit::Overlap(o)) => {
+                assert_eq!(o.out.qid.0, 1, "the promoted deck is the new outgoing leg");
+                assert_eq!(o.inn.qid.0, 2);
+            }
+            other => panic!("expected a fresh overlap, got {other:?}"),
+        }
+        h.wait_for_fade().await;
+        assert_eq!(deck_qid(&h), Some(2));
+    }
+
+    // `play N` on the row already playing restarts it: a fresh load, crossfaded in from
+    // the top (a declaration with a fresh floor), never a silent no-op.
+    #[tokio::test(start_paused = true)]
+    async fn playing_the_playing_row_restarts_it() {
+        let Some((h, _ev)) = pair_playing(2).await else { return };
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert!(overlapping(&h), "the same row, freshly loaded on the other deck");
+        h.wait_for_fade().await;
+        assert_eq!(deck_qid(&h), Some(0));
+    }
+
+    // The natural boundary: off by default, asked for here. The successor is declared
+    // early as the queue's own motion and the planner crossfades into it, attributed.
     #[tokio::test(start_paused = true)]
     async fn a_track_near_its_end_crossfades_into_the_next_one() {
         let Some((h, _events)) = handler_with_deck_pair() else { return };
@@ -17911,21 +17075,18 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("s-1")).await;
         h.handle(MpdCommand::Play(Some(0))).await;
 
-        // Plenty left: nothing happens, and it must cost nothing to ask.
-        h.maybe_boundary_crossfade(Duration::from_secs(30)).await;
-        assert!(!h.state.lock().unwrap().crossfading, "not near the end yet");
-
-        // Inside the window: the handoff starts.
-        h.maybe_boundary_crossfade(Duration::from_millis(1500)).await;
-        assert!(h.state.lock().unwrap().crossfading, "the boundary crossfade armed");
+        h.on_position(Duration::from_secs(30)).await;
+        assert!(!overlapping(&h), "not near the end yet");
+        h.on_position(Duration::from_millis(1500)).await;
+        match h.state.lock().unwrap().transit {
+            Some(reconcile::Transit::Overlap(o)) => assert!(o.attribute, "a boundary finishes its track"),
+            other => panic!("the boundary crossfade armed: {other:?}"),
+        }
         // Asking again mid-transition must not start a second one.
-        h.maybe_boundary_crossfade(Duration::from_millis(900)).await;
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "still the one handoff");
-
+        h.on_position(Duration::from_millis(900)).await;
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "still the one handoff");
         h.wait_for_fade().await;
-        let st = h.state.lock().unwrap();
-        assert_eq!(st.current, Some(1), "the crossfade IS the advance");
-        assert!(!st.crossfading);
+        assert_eq!(deck_qid(&h), Some(1), "the crossfade IS the advance");
     }
 
     // A record played in its own order keeps its gapless advance. Blending a segue the
@@ -17976,11 +17137,8 @@ mod tests {
         }
         h.handle(MpdCommand::Play(Some(0))).await;
 
-        h.maybe_boundary_crossfade(Duration::from_millis(1500)).await;
-        assert!(
-            !h.state.lock().unwrap().crossfading,
-            "a segue keeps the gapless advance the record was made for"
-        );
+        h.on_position(Duration::from_millis(1500)).await;
+        assert!(!overlapping(&h), "a segue keeps the gapless advance the record was made for");
     }
 
     // The default is OFF, and it has to be: an ordinary track change is already gapless,
@@ -17996,8 +17154,8 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("s-0")).await;
         h.enqueue_song_for_test(playlist_test_song("s-1")).await;
         h.handle(MpdCommand::Play(Some(0))).await;
-        h.maybe_boundary_crossfade(Duration::from_millis(200)).await;
-        assert!(!h.state.lock().unwrap().crossfading);
+        h.on_position(Duration::from_millis(200)).await;
+        assert!(!overlapping(&h));
     }
 
     // With ONE deck nothing changes: no crossfade is attempted and the skip takes the
@@ -18011,10 +17169,15 @@ mod tests {
         h.handle(MpdCommand::Add(NTS.to_string())).await;
         h.handle(MpdCommand::Play(Some(0))).await;
         h.handle(MpdCommand::Next).await;
-        assert!(!h.state.lock().unwrap().crossfading);
+        assert!(!overlapping(&h));
+        assert_eq!(h.state.lock().unwrap().current(), Some(1));
+        assert_eq!(deck_qid(&h), Some(1), "the dip loaded the target at its trough");
         h.wait_for_fade().await;
-        h.wait_for_fade().await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "the dip still lands the skip");
+        assert_eq!(
+            h.state.lock().unwrap().target_volume,
+            100,
+            "and rose back to the baseline"
+        );
     }
 
     // The knob turned off is the same answer as no second deck, and must be, or the
@@ -18149,7 +17312,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("finished")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             assert!(st.last_finished.is_none(), "nothing has finished yet");
         }
         // The track reaches its natural EOF: end of queue -> current becomes None,
@@ -18157,7 +17320,7 @@ mod tests {
         h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
-            assert_eq!(st.current, None, "end of queue stops the deck");
+            assert_eq!(st.current(), None, "end of queue stops the deck");
             assert_eq!(
                 st.last_finished.as_ref().map(|s| &s.id),
                 Some(&SongId("finished".into())),
@@ -18206,7 +17369,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("queued")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0); // the id-less stream is current
+            st.set_current(Some(0)); // the id-less stream is current
             st.last_finished = Some(playlist_test_song("recent"));
         }
         assert_eq!(
@@ -18224,7 +17387,7 @@ mod tests {
         h.enqueue_stream_for_test(NTS).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.last_finished = Some(playlist_test_song("real"));
         }
         h.advance_on_eof(EofSignal::default()).await;
@@ -18246,7 +17409,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         // One real song plays to its natural EOF into an empty tail.
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         // Arm continuation with an absolute stream URL (resolves with NO network).
         h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
@@ -18259,7 +17422,7 @@ mod tests {
             matches!(&st.queue[1].entry, QueueEntry::Stream { url, .. } if url == NTS),
             "the appended tail entry is the configured raw stream"
         );
-        assert_eq!(st.current, Some(1), "current points at the continuation stream (playing, not stopped)");
+        assert_eq!(st.current(), Some(1), "current points at the continuation stream (playing, not stopped)");
         // The just-finished library song is the recency seed; the stream never became one.
         assert_eq!(
             st.last_finished.as_ref().map(|s| &s.id),
@@ -18275,7 +17438,7 @@ mod tests {
     async fn continuation_off_ends_stopped_regression() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         // Station configured but the toggle is OFF (default).
         h.set_continuation_station(Some(NTS.to_string()));
         assert!(!h.state.lock().unwrap().continuation, "continuation defaults OFF");
@@ -18283,7 +17446,7 @@ mod tests {
         h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "disarmed => the deck ends stopped as today");
+        assert_eq!(st.current(), None, "disarmed => the deck ends stopped as today");
         assert_eq!(st.queue.len(), 1, "no continuation stream appended when disarmed");
     }
 
@@ -18293,7 +17456,7 @@ mod tests {
     async fn continuation_armed_but_no_station_stays_inert() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.state.lock().unwrap().continuation = true;
         // No station set (None). Also an empty/whitespace station must be inert.
         h.set_continuation_station(None);
@@ -18301,7 +17464,7 @@ mod tests {
         h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "no station => inert, deck ends stopped");
+        assert_eq!(st.current(), None, "no station => inert, deck ends stopped");
         assert_eq!(st.queue.len(), 1, "nothing appended");
     }
 
@@ -18312,7 +17475,7 @@ mod tests {
     async fn continuation_unresolvable_station_stays_inert() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.state.lock().unwrap().continuation = true;
         // A NAME (not a URL) => a getInternetRadioStations fetch, which fails against
         // the never-called client, so resolution yields None.
@@ -18321,7 +17484,7 @@ mod tests {
         h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "unresolvable station => inert, deck ends stopped");
+        assert_eq!(st.current(), None, "unresolvable station => inert, deck ends stopped");
         assert_eq!(st.queue.len(), 1, "unresolvable station appends nothing");
     }
 
@@ -18332,7 +17495,7 @@ mod tests {
     async fn continuation_stream_does_not_poison_last_finished_or_scrobble() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
 
@@ -18359,7 +17522,7 @@ mod tests {
             "a stream EOF never overwrites last_finished, even under continuation"
         );
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "the continuation stream ends the deck stopped, not re-fired");
+        assert_eq!(st.current(), None, "the continuation stream ends the deck stopped, not re-fired");
         assert_eq!(st.queue.len(), 2, "no SECOND continuation stream appended (one-shot)");
         assert_eq!(st.continuation_active, None, "the active-continuation latch clears on the honest stop");
     }
@@ -18392,7 +17555,7 @@ mod tests {
     async fn continuation_dead_url_stops_honestly_no_refire() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.state.lock().unwrap().continuation = true;
         // An absolute URL resolves with NO network; the NullPlayer's premature Ok
         // models mpv accepting the load before the (here, notionally dead) connect.
@@ -18403,7 +17566,7 @@ mod tests {
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 2, "the continuation stream is appended once");
-            assert_eq!(st.current, Some(1), "and becomes current (loadfile Ok is premature)");
+            assert_eq!(st.current(), Some(1), "and becomes current (loadfile Ok is premature)");
             assert_eq!(
                 st.continuation_active,
                 Some(st.queue[1].id),
@@ -18416,7 +17579,7 @@ mod tests {
         // directly). STILL ARMED, the guard must stop honestly, NOT re-fire.
         h.advance_on_eof(EofSignal::default()).await;
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "a dead continuation stream ends the deck STOPPED (honest)");
+        assert_eq!(st.current(), None, "a dead continuation stream ends the deck STOPPED (honest)");
         assert_eq!(
             st.queue.len(),
             2,
@@ -18436,7 +17599,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("s0")).await;
         h.enqueue_song_for_test(playlist_test_song("s1")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         // Arm continuation AND turn single on: s0 ends, single stops the deck, but s1
         // is still pending - a mode-stop None, not a true drain.
         h.state.lock().unwrap().continuation = true;
@@ -18446,7 +17609,7 @@ mod tests {
         h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "single stops the deck after the current track (its semantics)");
+        assert_eq!(st.current(), None, "single stops the deck after the current track (its semantics)");
         assert_eq!(st.queue.len(), 2, "no continuation stream appended - the pending track is preserved");
         assert!(
             st.queue.iter().all(|it| matches!(it.entry, QueueEntry::Song(_))),
@@ -18497,7 +17660,7 @@ mod tests {
     async fn autofill_album_context_appends_a_whole_album() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         enqueue_album(&h, "A", 3).await;
-        h.state.lock().unwrap().current = Some(2);
+        h.state.lock().unwrap().set_current(Some(2));
         arm_autofill(&h);
         // The similar fetch suggests one track from album B (and one loose track with no
         // album at all, which album mode must skip over rather than choke on).
@@ -18533,7 +17696,7 @@ mod tests {
             "the WHOLE album B lands after album A, in track order"
         );
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, Some(3), "playback continues onto the first track of the new record");
+        assert_eq!(st.current(), Some(3), "playback continues onto the first track of the new record");
     }
 
     // The contrapositive, so the feature cannot be "always albums": a deck of loose
@@ -18546,7 +17709,7 @@ mod tests {
         h.enqueue_song_for_test(album_track("x", "X", 1)).await;
         h.enqueue_song_for_test(album_track("y", "Y", 4)).await;
         h.enqueue_song_for_test(album_track("z", "Z", 2)).await;
-        h.state.lock().unwrap().current = Some(2);
+        h.state.lock().unwrap().set_current(Some(2));
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![album_track("q", "Q", 1), album_track("r", "R", 5)]));
 
@@ -18574,14 +17737,14 @@ mod tests {
     async fn autofill_album_mode_walks_on_to_a_fresh_album() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         enqueue_album(&h, "A", 3).await;
-        h.state.lock().unwrap().current = Some(2);
+        h.state.lock().unwrap().set_current(Some(2));
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![album_track("B-1", "B", 1)]));
         h.push_autofill_album(Ok(vec![album_track("B-1", "B", 1), album_track("B-2", "B", 2)]));
         h.advance_on_eof(EofSignal::default()).await;
 
         // Drain the appended record: B-1 -> B-2, then off the end of B-2.
-        h.state.lock().unwrap().current = Some(4);
+        h.state.lock().unwrap().set_current(Some(4));
         tokio::time::advance(Duration::from_secs(31)).await;
         // Refill 2's similar fetch suggests B again (already served) and then C.
         h.push_autofill_batch(Ok(vec![album_track("B-2", "B", 2), album_track("C-1", "C", 1)]));
@@ -18616,7 +17779,7 @@ mod tests {
     async fn autofill_album_expand_failure_falls_back_to_the_track_walk() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         enqueue_album(&h, "A", 3).await;
-        h.state.lock().unwrap().current = Some(2);
+        h.state.lock().unwrap().set_current(Some(2));
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![album_track("B-1", "B", 1), album_track("C-1", "C", 1)]));
         h.push_autofill_album(Err(())); // B: transport error
@@ -18652,7 +17815,7 @@ mod tests {
     async fn autofill_appends_similar_songs_on_true_drain() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(autofill_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![autofill_song("a1"), autofill_song("a2"), autofill_song("a3")]));
 
@@ -18664,7 +17827,7 @@ mod tests {
             matches!(&st.queue[1].entry, QueueEntry::Song(s) if s.id == SongId("a1".into())),
             "the first appended entry is a real library Song, not a raw stream"
         );
-        assert_eq!(st.current, Some(1), "current points at the first appended song (playing, not stopped)");
+        assert_eq!(st.current(), Some(1), "current points at the first appended song (playing, not stopped)");
         assert_eq!(
             st.last_finished.as_ref().map(|s| &s.id),
             Some(&SongId("seed".into())),
@@ -18687,7 +17850,7 @@ mod tests {
     async fn autofill_re_fires_each_drain_with_fresh_seed() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(autofill_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![autofill_song("a1")]));
         h.push_autofill_batch(Ok(vec![autofill_song("a2")]));
@@ -18695,7 +17858,7 @@ mod tests {
         // Drain 1: seed drains -> a1 appended + playing; the fetch seeded from the seed.
         h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_last_seed(), Some(SongId("seed".into())), "drain 1 seeds from the finished seed");
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "a1 is now current+playing");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "a1 is now current+playing");
 
         // Drain 2: a1 drains -> a2 appended; the fetch seeded from a1 (fresh seed walk),
         // NOT the original seed. Advance past the fuse window first.
@@ -18704,7 +17867,7 @@ mod tests {
         assert_eq!(h.autofill_last_seed(), Some(SongId("a1".into())), "drain 2 seeds from the LAST appended track");
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 3, "a2 is appended (seed, a1, a2)");
-        assert_eq!(st.current, Some(2), "a2 is now current+playing - the music keeps going");
+        assert_eq!(st.current(), Some(2), "a2 is now current+playing - the music keeps going");
     }
 
     // DEDUP: a refill batch that OVERLAPS the recently-seen set has the overlap filtered
@@ -18714,14 +17877,14 @@ mod tests {
     async fn autofill_dedups_recent_and_honest_stops_when_all_seen() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(autofill_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![autofill_song("X")])); // drain 1
         h.push_autofill_batch(Ok(vec![autofill_song("X"), autofill_song("Y")])); // drain 2: X seen, Y new
         h.push_autofill_batch(Ok(vec![autofill_song("X"), autofill_song("Y")])); // drain 3: all seen
 
         h.advance_on_eof(EofSignal::default()).await; // drain 1 -> X appended
-        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.state.lock().unwrap().current(), Some(1));
 
         tokio::time::advance(Duration::from_secs(31)).await;
         h.advance_on_eof(EofSignal::default()).await; // drain 2 -> X filtered (seen), Y appended
@@ -18737,7 +17900,7 @@ mod tests {
         let calls_before = h.autofill_fetch_calls();
         tokio::time::advance(Duration::from_secs(31)).await;
         h.advance_on_eof(EofSignal::default()).await; // drain 3 -> X seen, Y is the seed: all dropped -> honest stop
-        assert_eq!(h.state.lock().unwrap().current, None, "all-already-seen => honest stop, deck stopped");
+        assert_eq!(h.state.lock().unwrap().current(), None, "all-already-seen => honest stop, deck stopped");
         assert_eq!(h.state.lock().unwrap().queue.len(), 3, "nothing appended on the all-seen drain");
         assert_eq!(
             h.autofill_fetch_calls(),
@@ -18753,12 +17916,12 @@ mod tests {
     async fn autofill_no_seed_streams_only_honest_stops_no_fetch() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_stream_for_test(NTS).await; // a raw stream: no library id
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
 
         h.advance_on_eof(EofSignal::default()).await;
 
-        assert_eq!(h.state.lock().unwrap().current, None, "no seed => honest stop");
+        assert_eq!(h.state.lock().unwrap().current(), None, "no seed => honest stop");
         assert_eq!(h.autofill_fetch_calls(), 0, "no fetch attempted without a seed (never seed from a stream)");
     }
 
@@ -18769,13 +17932,13 @@ mod tests {
     async fn autofill_empty_backend_honest_stops() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(autofill_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![])); // backend returns nothing
 
         h.advance_on_eof(EofSignal::default()).await;
 
-        assert_eq!(h.state.lock().unwrap().current, None, "empty backend => honest stop");
+        assert_eq!(h.state.lock().unwrap().current(), None, "empty backend => honest stop");
         assert_eq!(h.state.lock().unwrap().queue.len(), 1, "nothing appended on an empty fetch");
         assert_eq!(h.autofill_fetch_calls(), 1, "exactly one fetch, no retry");
     }
@@ -18786,13 +17949,13 @@ mod tests {
     async fn autofill_fetch_error_honest_stops() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(autofill_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
         h.push_autofill_batch(Err(())); // transport error
 
         h.advance_on_eof(EofSignal::default()).await;
 
-        assert_eq!(h.state.lock().unwrap().current, None, "fetch error => honest stop");
+        assert_eq!(h.state.lock().unwrap().current(), None, "fetch error => honest stop");
         assert_eq!(h.autofill_fetch_calls(), 1, "one fetch, no retry on error");
     }
 
@@ -18803,7 +17966,7 @@ mod tests {
     async fn autofill_fuse_stops_instant_spiral_and_refires_after_interval() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(autofill_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
         h.push_autofill_batch(Ok(vec![autofill_song("a1")]));
         h.push_autofill_batch(Ok(vec![autofill_song("a2")]));
@@ -18811,23 +17974,23 @@ mod tests {
         // Drain 1 (t=0): a1 appended, current -> a1, the fetch time is stamped.
         h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_fetch_calls(), 1, "drain 1 fetched once");
-        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.state.lock().unwrap().current(), Some(1));
 
         // Drain 2 (t=0, no advance): the fuse trips BEFORE any fetch -> honest stop, and
         // the scripted a2 batch is NOT consumed (the fetch never ran).
         h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_fetch_calls(), 1, "the fuse stops BEFORE the fetch - still one fetch total");
-        assert_eq!(h.state.lock().unwrap().current, None, "fuse => honest stop");
+        assert_eq!(h.state.lock().unwrap().current(), None, "fuse => honest stop");
 
         // Advance past the fuse window and re-establish a live drain edge (current at the
         // last entry). Now a drain refires and consumes a2.
         tokio::time::advance(Duration::from_secs(31)).await;
-        h.state.lock().unwrap().current = Some(1); // a1 is the last entry again
+        h.state.lock().unwrap().set_current(Some(1)); // a1 is the last entry again
         h.advance_on_eof(EofSignal::default()).await;
         assert_eq!(h.autofill_fetch_calls(), 2, "past the fuse window, a fresh drain fetches again");
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 3, "a2 is appended after the fuse cleared");
-        assert_eq!(st.current, Some(2));
+        assert_eq!(st.current(), Some(2));
     }
 
     // SINGLE-mode is NOT a true drain: with a track still queued, single stops the deck
@@ -18837,7 +18000,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(autofill_song("s0")).await;
         h.enqueue_song_for_test(autofill_song("s1")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
         h.state.lock().unwrap().single = true;
         h.push_autofill_batch(Ok(vec![autofill_song("x")])); // must NOT be consumed
@@ -18845,7 +18008,7 @@ mod tests {
         h.advance_on_eof(EofSignal::default()).await;
 
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "single stops after the current track (its own semantics)");
+        assert_eq!(st.current(), None, "single stops after the current track (its own semantics)");
         assert_eq!(st.queue.len(), 2, "the pending track is preserved - autofill did not hijack it");
         assert!(
             st.queue.iter().all(|it| matches!(it.entry, QueueEntry::Song(_))),
@@ -18861,7 +18024,7 @@ mod tests {
     async fn autofill_consume_mode_refill_chain_walks_fresh_seeds() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(autofill_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         arm_autofill(&h);
         h.state.lock().unwrap().consume = true;
         h.push_autofill_batch(Ok(vec![autofill_song("a1")]));
@@ -19087,7 +18250,7 @@ mod tests {
         );
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 2, "the batch is appended");
-        assert_eq!(st.current, Some(0), "and nothing was loaded - the deck is untouched");
+        assert_eq!(st.current(), Some(0), "and nothing was loaded - the deck is untouched");
         drop(st);
         assert!(events.try_recv().is_err(), "no load reached the player");
     }
@@ -19149,7 +18312,7 @@ mod tests {
             vec![0, 1, 2],
             "the three pre-existing rows are untouched (never cleared)"
         );
-        assert_eq!(st.current, Some(3), "the pointed-at song is what plays, at the tail");
+        assert_eq!(st.current(), Some(3), "the pointed-at song is what plays, at the tail");
         assert!(st.playlist_version > version_before, "the queue change is observable");
         assert!(st.continuation, "the walk is armed");
         drop(st);
@@ -19186,7 +18349,7 @@ mod tests {
         assert_eq!(pair(&resp, "radio_seed"), Some("Song now"));
         assert_eq!(pair(&resp, "radio_queued"), Some("2"), "only the prefetch was queued");
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, Some(0), "the playing track stays current - no restart");
+        assert_eq!(st.current(), Some(0), "the playing track stays current - no restart");
         assert_eq!(st.queue.len(), 3, "the batch is appended behind it");
         assert!(st.continuation);
         drop(st);
@@ -19216,7 +18379,7 @@ mod tests {
         let resp = h.handle(radio_uri("song/now")).await;
 
         assert_eq!(pair(&resp, "radio_queued"), Some("1"), "only the prefetch was queued");
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "no restart");
+        assert_eq!(h.state.lock().unwrap().current(), Some(0), "no restart");
         assert_eq!(
             h.queue_song_ids(),
             ["now", "p1"].map(|s| SongId(s.into())).to_vec(),
@@ -19237,7 +18400,7 @@ mod tests {
         h.play_for_test(0).await;
         h.handle(MpdCommand::Stop).await;
         assert_eq!(
-            h.state.lock().unwrap().current,
+            h.state.lock().unwrap().current(),
             Some(0),
             "the premise: MPD stop KEEPS the current"
         );
@@ -19249,7 +18412,7 @@ mod tests {
         assert_eq!(h.player.state(), PlayState::Playing, "the deck is AUDIBLE again");
         let status = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&status, "state"), Some("play"), "and it reports what it is doing");
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "on the song it was left on");
+        assert_eq!(h.state.lock().unwrap().current(), Some(0), "on the song it was left on");
         assert_eq!(h.state.lock().unwrap().queue.len(), 2, "with a batch behind it");
     }
 
@@ -19263,13 +18426,13 @@ mod tests {
         for id in ["q0", "q1", "q2"] {
             h.enqueue_song_for_test(autofill_song(id)).await;
         }
-        assert!(h.state.lock().unwrap().current.is_none(), "the premise: nothing ever played");
+        assert!(h.state.lock().unwrap().current().is_none(), "the premise: nothing ever played");
         h.push_autofill_batch(Ok(vec![autofill_song("far1"), autofill_song("far2")]));
 
         h.handle(radio(RadioSeed::Current)).await;
 
         assert_eq!(
-            h.state.lock().unwrap().current,
+            h.state.lock().unwrap().current(),
             Some(0),
             "the user's OWN first row is what plays"
         );
@@ -19302,7 +18465,7 @@ mod tests {
         let resp = h.handle(radio(RadioSeed::Current)).await;
 
         assert_eq!(pair(&resp, "radio_queued"), Some("2"));
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "the batch starts playing");
+        assert_eq!(h.state.lock().unwrap().current(), Some(0), "the batch starts playing");
         assert!(
             !h.state.lock().unwrap().pending_pause,
             "the gesture path RETIRED the standing pause intent"
@@ -19325,13 +18488,13 @@ mod tests {
         // The honest end-of-queue stop: last_finished latched, current cleared, the row
         // still sitting in the queue (consume off).
         h.advance_on_eof(EofSignal::default()).await;
-        assert!(h.state.lock().unwrap().current.is_none(), "the premise: drained");
+        assert!(h.state.lock().unwrap().current().is_none(), "the premise: drained");
         h.push_autofill_batch(Ok(vec![autofill_song("p1")]));
 
         h.handle(radio(RadioSeed::Current)).await;
 
         assert_eq!(
-            h.state.lock().unwrap().current,
+            h.state.lock().unwrap().current(),
             Some(1),
             "the FRESH row plays, not the spent one at the head"
         );
@@ -19417,7 +18580,7 @@ mod tests {
         assert_eq!(h.autofill_fetch_calls(), 0, "a body of music needs no gesture-time prefetch");
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 5, "the album is the whole of what was queued");
-        assert_eq!(st.current, Some(0), "the album's first track plays");
+        assert_eq!(st.current(), Some(0), "the album's first track plays");
         assert!(st.continuation, "the walk is armed behind it all the same");
     }
 
@@ -19490,7 +18653,7 @@ mod tests {
         // S1 ends -> the ordinary advance loads p1. p1 ends -> a true drain fires the walk.
         tokio::time::advance(Duration::from_secs(31)).await;
         h.advance_on_eof(EofSignal::default()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "the prefetched p1 plays next");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "the prefetched p1 plays next");
         tokio::time::advance(Duration::from_secs(31)).await;
         h.advance_on_eof(EofSignal::default()).await;
 
@@ -19501,7 +18664,7 @@ mod tests {
         );
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 3, "the refill appended p2");
-        assert_eq!(st.current, Some(2), "and the music keeps going");
+        assert_eq!(st.current(), Some(2), "and the music keeps going");
     }
 
     // The 30s fuse is a degenerate-INPUT guard, so an explicit gesture resets it (else a
@@ -19548,7 +18711,7 @@ mod tests {
         assert!(h.radio_calls().is_empty(), "arming resolves nothing");
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 1, "the queue is untouched");
-        assert_eq!(st.current, Some(0));
+        assert_eq!(st.current(), Some(0));
         assert!(st.continuation);
         drop(st);
         assert_eq!(*h.continuation_mode.lock().unwrap(), ContinuationMode::Autofill);
@@ -19767,7 +18930,7 @@ mod tests {
         {
             let mut st = h.state.lock().unwrap();
             st.pending_pause = true;
-            assert!(st.current.is_some(), "precondition: an entry is held");
+            assert!(st.current().is_some(), "precondition: an entry is held");
         }
         h.reset_elapsed();
         assert_eq!(
@@ -19967,7 +19130,7 @@ mod tests {
         install_warmed_queue_slot(&h, qid1, 1);
         h.advance_on_eof(landed_eof()).await;
 
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "the advance committed");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "the advance committed");
         assert_eq!(probe.load.load(std::sync::atomic::Ordering::Relaxed), loads_before, "and loaded NOTHING - mpv was already there");
         assert!(
             h.state.lock().unwrap().pending_continuation_warm.is_none()
@@ -19995,7 +19158,7 @@ mod tests {
         install_warmed_queue_slot(&h, 99_999, 1);
         h.advance_on_eof(landed_eof()).await;
 
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "it still advances");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "it still advances");
         assert!(
             probe.load.load(std::sync::atomic::Ordering::Relaxed) > loads_before,
             "but by LOADING - a mismatched warm is never committed blind"
@@ -20060,7 +19223,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20087,7 +19250,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20114,7 +19277,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20142,7 +19305,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("B")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(1); // B is the last, draining track the warm sits behind
+            st.set_current(Some(1)); // B is the last, draining track the warm sits behind
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20174,7 +19337,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("B")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(1); // B is last / draining
+            st.set_current(Some(1)); // B is last / draining
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20238,7 +19401,7 @@ mod tests {
     async fn continuation_warm_disarmed_by_stop() {
         let Some((h, probe, _fire_rx)) = warm_rig() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         install_warmed_slot(&h, 500, NTS);
         h.handle(MpdCommand::Stop).await;
         assert!(h.state.lock().unwrap().pending_continuation_warm.is_none(), "stop disarms the warm");
@@ -20252,7 +19415,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20270,7 +19433,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20397,7 +19560,7 @@ mod tests {
     }
 
     // PLAY-STATE GATE (resume path): after a STOP disarms the warm, playing the final track
-    // again RE-ARMS it - the play_index funnel's reschedule sees a genuinely playing deck once
+    // again RE-ARMS it - the declare_play funnel's reschedule sees a genuinely playing deck once
     // more, so the gapless prefetch is restored without any extra call-site patch.
     #[tokio::test(start_paused = true)]
     async fn play_after_stop_rearms_once_playing_again() {
@@ -20593,7 +19756,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20609,7 +19772,7 @@ mod tests {
             "the appended entry is the warmed station url"
         );
         assert_eq!(st.queue[1].id, 777, "the appended row carries the slot's minted qid");
-        assert_eq!(st.current, Some(1), "current repoints at the already-playing station");
+        assert_eq!(st.current(), Some(1), "current repoints at the already-playing station");
         assert_eq!(st.continuation_active, Some(777), "the slice-1 one-shot latch is set to the station");
         assert!(st.playlist_version > ver_before, "the queue edit bumps playlist_version");
         assert!(st.pending_continuation_warm.is_none(), "the slot is consumed by the commit");
@@ -20623,7 +19786,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             // Continuation toggled OFF (the disarm gesture that dropped the slot): a
             // landed=true with no slot must NOT append, and try_continuation must not fire.
             st.continuation = false;
@@ -20635,7 +19798,7 @@ mod tests {
 
         let st = h.state.lock().unwrap();
         assert_eq!(st.queue.len(), 1, "a landed=true with a disarmed slot appends nothing");
-        assert_eq!(st.current, None, "the deck stops honestly (the orphan is killed)");
+        assert_eq!(st.current(), None, "the deck stops honestly (the orphan is killed)");
         assert_eq!(st.continuation_active, None, "no continuation stream is latched");
     }
 
@@ -20647,7 +19810,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20676,7 +19839,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -20688,7 +19851,7 @@ mod tests {
         // (landed=false). The one-shot guard must stop honestly, NOT re-fire.
         h.advance_on_eof(EofSignal::default()).await;
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "a dead landed station ends the deck STOPPED (honest)");
+        assert_eq!(st.current(), None, "a dead landed station ends the deck STOPPED (honest)");
         assert_eq!(st.queue.len(), 2, "no SECOND continuation appended - the queue does not grow");
         assert_eq!(st.continuation_active, None, "the active-continuation latch clears on the honest stop");
         assert!(st.continuation, "the arming toggle itself is untouched (one-shot is per-stream)");
@@ -20730,7 +19893,7 @@ mod tests {
         assert_hint_matches_seed(&h);
         // NowPlaying-suppressed: a library song current emits no hint, and the helper's
         // "title present implies matching seed" holds vacuously (no title to compare).
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         assert!(h.ambient_hint_pairs().is_empty(), "NowPlaying suppresses the hint");
         assert_hint_matches_seed(&h);
     }
@@ -20741,7 +19904,7 @@ mod tests {
     async fn ambient_hint_just_finished_after_natural_eof() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("finished")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.advance_on_eof(EofSignal::default()).await; // natural end-of-queue EOF, nothing playing after
         let status = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&status, "X-hypodj-hint-kind"), Some("just-finished"));
@@ -20754,7 +19917,7 @@ mod tests {
     async fn ambient_hint_suppressed_while_library_song_current() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_song_for_test(playlist_test_song("now")).await;
-        h.state.lock().unwrap().current = Some(0); // a library Song is current
+        h.state.lock().unwrap().set_current(Some(0)); // a library Song is current
         assert!(h.ambient_hint_pairs().is_empty(), "NowPlaying emits no hint pair");
         let status = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&status, "X-hypodj-hint-kind"), None);
@@ -20799,12 +19962,12 @@ mod tests {
         // A single real song plays, then reaches natural EOF into an empty queue with
         // consume OFF: A LINGERS at pos0 (state stop, current None, last_finished A).
         h.enqueue_song_for_test(playlist_test_song("A")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 1, "A lingers at the queue head (consume off)");
-            assert_eq!(st.current, None, "end of queue stops the deck");
+            assert_eq!(st.current(), None, "end of queue stops the deck");
             assert_eq!(
                 st.last_finished.as_ref().map(|s| &s.id),
                 Some(&SongId("A".into())),
@@ -20892,7 +20055,10 @@ mod tests {
         {
             let mut st = h.state.lock().unwrap();
             st.last_finished = Some(playlist_test_song("A"));
-            st.current = Some(0); // a track is playing
+            // A track is playing: the head names a real row (a head is a queue id now,
+            // so it cannot point past the end of an empty queue).
+            st.queue.push(QueueItem::queued(900, QueueEntry::Song(playlist_test_song("P"))));
+            st.set_current(Some(0));
         }
         h.enqueue_songs(vec![playlist_test_song("D")]).await;
         let st = h.state.lock().unwrap();
@@ -20977,7 +20143,10 @@ mod tests {
         {
             let mut st = h.state.lock().unwrap();
             st.last_finished = Some(playlist_test_song("A"));
-            st.current = Some(0); // a track is playing
+            // A track is playing: the head names a real row (a head is a queue id now,
+            // so it cannot point past the end of an empty queue).
+            st.queue.push(QueueItem::queued(900, QueueEntry::Song(playlist_test_song("P"))));
+            st.set_current(Some(0));
         }
         h.arm_fresh_enqueue_anchor_on_append(7, 1);
         let st = h.state.lock().unwrap();
@@ -21000,12 +20169,12 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         // A single real song plays, then reaches natural EOF: consume off, so A LINGERS.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 1, "A lingers (consume off)");
-            assert_eq!(st.current, None, "deck stopped at end of queue");
+            assert_eq!(st.current(), None, "deck stopped at end of queue");
             assert_eq!(
                 st.last_finished.as_ref().map(|s| &s.id),
                 Some(&SongId("A".into())),
@@ -21050,14 +20219,14 @@ mod tests {
         h.handle(MpdCommand::Play(Some(0))).await;
         {
             let st = h.state.lock().unwrap();
-            assert_eq!(st.current, Some(0), "A is current");
+            assert_eq!(st.current(), Some(0), "A is current");
             assert!(st.fresh_enqueue_anchor.is_none(), "play cleared the anchor");
         }
         // A finishes single: deck stops, current None, both lingering, last_finished A.
         h.advance_on_eof(EofSignal::default()).await;
         {
             let st = h.state.lock().unwrap();
-            assert_eq!(st.current, None, "single stops after A");
+            assert_eq!(st.current(), None, "single stops after A");
             assert_eq!(st.queue.len(), 2, "both lingering (consume off)");
             assert_eq!(
                 st.last_finished.as_ref().map(|s| &s.id),
@@ -21070,14 +20239,14 @@ mod tests {
     }
 
     // The play-time current-commit clears a pending fresh-enqueue anchor: an idle enqueue
-    // arms it, then starting playback (play_index -> play_index_inner) clears it so the
+    // arms it, then starting playback (declare_play -> declare_play) clears it so the
     // NowPlaying branch owns the seed.
     #[tokio::test]
     async fn anchor_cleared_when_track_becomes_current() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.enqueue_songs(vec![playlist_test_song("D")]).await;
         assert!(h.state.lock().unwrap().fresh_enqueue_anchor.is_some(), "idle enqueue armed the anchor");
-        h.play_index(0).await.expect("play the queued song");
+        h.declare_play(0, Cause::Gesture).await.expect("play the queued song");
         assert!(
             h.state.lock().unwrap().fresh_enqueue_anchor.is_none(),
             "the current-commit cleared the anchor"
@@ -21102,7 +20271,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         // A lingering at pos0 after a real EOF.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.advance_on_eof(EofSignal::default()).await;
         // Fresh idle enqueue D arms the anchor at D (pos1).
         h.enqueue_songs(vec![playlist_test_song("D")]).await;
@@ -21173,7 +20342,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         // A lingering at pos0 after a real EOF.
         h.enqueue_song_for_test(playlist_test_song("A")).await;
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         h.advance_on_eof(EofSignal::default()).await;
         // Simulate the append-only action: snapshot the first-appended qid, append the
         // tail, then arm on append. The tail lands at pos1, behind lingering A.
@@ -21225,7 +20394,7 @@ mod tests {
         // trim could take its row, `seed_source` would lose the music the gesture pointed
         // at. The clamp stops the trim exactly at the anchor's index.
         let mut st = spent_queue(80, 70);
-        st.current = Some(70);
+        st.set_current(Some(70));
         st.fresh_enqueue_anchor = Some(5); // qid 5 sits at index 5, deep inside the spent run
         let removed = st.trim_spent();
         assert_eq!(removed.len(), 5, "the trim stops AT the anchor row, never through it");
@@ -21238,22 +20407,22 @@ mod tests {
             st.queue.iter().any(|it| it.id == 5),
             "the anchor row survived a trim that wanted to take 45 rows"
         );
-        assert_eq!(st.current, Some(65), "current followed the removal exactly");
+        assert_eq!(st.current(), Some(65), "current followed the removal exactly");
     }
 
     #[test]
     fn a_trim_keeps_current_playing_and_its_index_consistent() {
         let mut st = spent_queue(120, 100);
-        st.current = Some(100);
+        st.set_current(Some(100));
         let cur_qid = st.queue[100].id;
         let removed = st.trim_spent();
         assert_eq!(removed.len(), 100 - SPENT_KEEP, "everything older than the window goes");
         assert_eq!(
-            st.queue[st.current.unwrap()].id,
+            st.queue[st.current().unwrap()].id,
             cur_qid,
             "current still points at the SAME entry after the shift"
         );
-        assert_eq!(st.current, Some(SPENT_KEEP), "and it sits exactly SPENT_KEEP rows in");
+        assert_eq!(st.current(), Some(SPENT_KEEP), "and it sits exactly SPENT_KEEP rows in");
         assert_eq!(st.queue.len(), 120 - (100 - SPENT_KEEP));
         // `prev` still walks back through the whole kept window.
         assert_eq!(st.queue[..SPENT_KEEP].len(), SPENT_KEEP, "the scrollback is the window");
@@ -21262,10 +20431,10 @@ mod tests {
     #[test]
     fn a_trim_takes_nothing_until_the_window_is_full() {
         let mut st = spent_queue(40, SPENT_KEEP);
-        st.current = Some(SPENT_KEEP);
+        st.set_current(Some(SPENT_KEEP));
         assert!(st.trim_spent().is_empty(), "exactly SPENT_KEEP spent rows is not too many");
         assert_eq!(st.queue.len(), 40);
-        assert_eq!(st.current, Some(SPENT_KEEP), "and nothing moved");
+        assert_eq!(st.current(), Some(SPENT_KEEP), "and nothing moved");
     }
 
     #[test]
@@ -21279,7 +20448,7 @@ mod tests {
         for i in 1..100 {
             st.queue[i].played_at = Some(1_700_000_000 + i as u64);
         }
-        st.current = Some(100);
+        st.set_current(Some(100));
         assert!(
             st.trim_spent().is_empty(),
             "one never-played row at the head refuses the whole trim"
@@ -21296,31 +20465,29 @@ mod tests {
         // Every row including `current` is spent, and the whole queue is longer than the
         // window: the run must still stop AT current.
         let mut st = spent_queue(30, 30);
-        st.current = Some(29);
+        st.set_current(Some(29));
         let removed = st.trim_spent();
         assert_eq!(removed.len(), 29 - SPENT_KEEP);
         assert_eq!(st.queue.len(), 30 - (29 - SPENT_KEEP));
-        assert_eq!(st.current, Some(SPENT_KEEP));
+        assert_eq!(st.current(), Some(SPENT_KEEP));
         assert_eq!(st.queue.last().map(|it| it.id), Some(29), "the playing row is untouched");
     }
 
     #[test]
-    fn repeat_random_and_an_in_flight_skip_each_refuse_the_trim() {
+    fn repeat_and_random_each_refuse_the_trim() {
         // repeat-all wraps to index 0, so trimming the front would silently redefine what
         // it repeats; random draws from the WHOLE queue, so a played row is still a
-        // candidate; and `pending_skip` is an INDEX, so a trim underneath it would
-        // repoint the reported current at the wrong track.
+        // candidate.
         for (label, set) in [
             ("repeat", (|st: &mut State| st.repeat = true) as fn(&mut State)),
             ("random", |st: &mut State| st.random = true),
-            ("pending_skip", |st: &mut State| st.pending_skip = Some(101)),
         ] {
             let mut st = spent_queue(120, 100);
-            st.current = Some(100);
+            st.set_current(Some(100));
             set(&mut st);
             assert!(st.trim_spent().is_empty(), "{label} must refuse the trim");
             assert_eq!(st.queue.len(), 120, "{label} left the queue whole");
-            assert_eq!(st.current, Some(100), "{label} left current where it was");
+            assert_eq!(st.current(), Some(100), "{label} left current where it was");
         }
     }
 
@@ -21328,7 +20495,7 @@ mod tests {
     fn a_stopped_deck_trims_nothing() {
         // No current means nothing has moved forward, so there is no history to retire.
         let mut st = spent_queue(120, 120);
-        st.current = None;
+        st.set_current(None);
         assert!(st.trim_spent().is_empty());
         assert_eq!(st.queue.len(), 120);
     }
@@ -21345,7 +20512,7 @@ mod tests {
             st.queue.push(QueueItem::queued(i, QueueEntry::Song(playlist_test_song(&i.to_string()))));
         }
         st.next_id = 3;
-        st.current = Some(0);
+        st.set_current(Some(0));
         st.queue[0].played_at = Some(1_700_000_000);
         let mut peak = 0usize;
         for step in 0..200u64 {
@@ -21354,8 +20521,8 @@ mod tests {
             st.next_id += 1;
             st.queue.push(QueueItem::queued(id, QueueEntry::Song(playlist_test_song(&id.to_string()))));
             // Advance one row and let it become audible.
-            let next = st.current.unwrap() + 1;
-            st.current = Some(next);
+            let next = st.current().unwrap() + 1;
+            st.set_current(Some(next));
             st.queue[next].played_at = Some(1_700_000_100 + step);
             st.trim_spent();
             peak = peak.max(st.queue.len());
@@ -21367,7 +20534,7 @@ mod tests {
             "the queue must stay bounded across a long session, peaked at {peak}"
         );
         assert!(
-            st.current.unwrap() <= SPENT_KEEP,
+            st.current().unwrap() <= SPENT_KEEP,
             "current never walks off into a huge index either"
         );
         // resume.toml serialises the WHOLE queue on every checkpoint, so bounding the
@@ -21381,7 +20548,7 @@ mod tests {
         // The trim is only defensible if nothing is LOST: the row leaves the queue, the
         // listen does not leave the record. `dj heard all` is where it lands.
         let mut st = spent_queue(120, 100);
-        st.current = Some(100);
+        st.set_current(Some(100));
         let removed = st.trim_spent();
         assert_eq!(removed.len(), 100 - SPENT_KEEP);
         for it in &removed {
@@ -21439,7 +20606,7 @@ mod tests {
     async fn an_endless_walk_trims_the_queue_and_files_what_it_dropped() {
         // END TO END on the path the bug lives on: the EOF auto-advance, which is how an
         // endless radio walk actually moves. Proves the trim is WIRED (it runs inside
-        // play_index_inner, the universal current-commit choke) and that nothing is lost -
+        // declare_play, the universal current-commit choke) and that nothing is lost -
         // every dropped row is in the ledger `dj heard all` reads.
         let Some((h, _events)) = handler_with_null_player() else { return };
         let (ledger, ldir) = ledger_rig("trim-walk");
@@ -21463,9 +20630,9 @@ mod tests {
                 n - dropped,
                 "the queue is bounded by the window, not by the length of the session"
             );
-            assert_eq!(st.current, Some(SPENT_KEEP), "the playing row sits at the window's end");
+            assert_eq!(st.current(), Some(SPENT_KEEP), "the playing row sits at the window's end");
             assert_eq!(
-                st.queue[st.current.unwrap()].id,
+                st.queue[st.current().unwrap()].id,
                 (n - 1) as u64,
                 "and it is still the entry that is actually playing"
             );
@@ -21587,7 +20754,7 @@ mod tests {
         };
         assert!(n > 0, "radio must resolve N>0 real tracks");
         assert_eq!(h.state.lock().unwrap().queue.len() - before, n, "append-only delta");
-        assert!(h.state.lock().unwrap().current.is_none(), "Enqueue never starts playback");
+        assert!(h.state.lock().unwrap().current().is_none(), "Enqueue never starts playback");
         assert_eq!(
             h.state.lock().unwrap().last_finished.as_ref().map(|s| s.id.clone()),
             Some(SongId("A".into())),
@@ -21611,7 +20778,7 @@ mod tests {
             .run_action_outcome(&Action::PlayNow { selector: Selector::Radio, count: 1 }, "test")
             .await;
         assert!(matches!(out2, PlanOutcome::Played { .. }), "PlayNow reports Played");
-        assert!(h2.state.lock().unwrap().current.is_some(), "PlayNow starts playback");
+        assert!(h2.state.lock().unwrap().current().is_some(), "PlayNow starts playback");
         assert!(
             matches!(h2.seed_source(), Some(SeedSource { kind: SeedKind::NowPlaying, .. })),
             "the now-current PlayNow track wins the seed"
@@ -21643,7 +20810,7 @@ mod tests {
         h.enqueue_stream_for_test(NTS).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0); // the id-less stream is current
+            st.set_current(Some(0)); // the id-less stream is current
             st.last_finished = Some(playlist_test_song("real"));
         }
         let pairs = h.ambient_hint_pairs();
@@ -23212,7 +22379,7 @@ mod tests {
     /// carries into [`HypodjHandler::note_playback_progress`].
     fn cur_qid(h: &HypodjHandler) -> Option<QueueId> {
         let st = h.state.lock().unwrap();
-        st.current.and_then(|i| st.queue.get(i)).map(|it| QueueId(it.id))
+        st.current().and_then(|i| st.queue.get(i)).map(|it| QueueId(it.id))
     }
 
     async fn mark_pairs(h: &HypodjHandler, t: crate::heard::MarkTarget) -> Vec<(String, String)> {
@@ -26163,7 +25330,7 @@ mod tests {
         h.enqueue_stream_for_test(NTS).await;
         h.play_for_test(0).await;
         assert_eq!(h.player.state(), PlayState::Playing);
-        h.state.lock().unwrap().current = None;
+        h.state.lock().unwrap().set_current(None);
         assert_eq!(pair(&h.handle(MpdCommand::Status).await, "state"), Some("stop"));
     }
 
@@ -26176,7 +25343,7 @@ mod tests {
         h.play_for_test(0).await;
         assert_eq!(h.player.state(), PlayState::Playing);
         // Drop the current pointer while the raw state is still Playing.
-        h.state.lock().unwrap().current = None;
+        h.state.lock().unwrap().set_current(None);
         let snap = h.resume_snapshot(0.0);
         assert_eq!(snap.play_state, ResumePlayState::Stopped);
         assert_eq!(snap.current, None);
@@ -26265,11 +25432,17 @@ mod tests {
         assert!(h.fade_active().await, "pause installs an in-flight fade");
         pump(20, 2).await;
 
-        // `next` mid-fade must cancel the PauseOut fade and start track B audibly.
+        // `next` mid-fade cancels the PauseOut fade (a gesture takes the gain back, so
+        // the pause never lands) and carries the still-audible deck into track B: on one
+        // deck that is the dip, from wherever the pause fade had got to, rising to the
+        // baseline.
         h.handle(MpdCommand::Next).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.state.lock().unwrap().current(), Some(1));
         assert_eq!(h.player.state(), PlayState::Playing, "next must NOT end Paused");
-        assert!(!h.fade_active().await, "the PauseOut fade must be superseded");
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "the pause intent is retired");
+        h.wait_for_fade().await;
+        assert!(!h.state.lock().unwrap().fading, "and the rise landed");
+        assert_eq!(h.player.state(), PlayState::Playing, "the PauseOut never froze the deck");
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
         assert_eq!(h.state.lock().unwrap().target_volume, 100);
     }
@@ -27208,7 +26381,7 @@ mod tests {
         // Natural EOF advance to the next track: the fade must survive, not be wiped
         // and the gain re-asserted to the baseline.
         h.advance_on_eof(EofSignal::default()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "advanced to next track");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "advanced to next track");
         assert!(h.fade_active().await, "winddown must survive the track boundary");
         assert!(
             h.live_gain_db() <= mid + 1e-6,
@@ -27371,7 +26544,7 @@ mod tests {
         h.enqueue_song_for_test(mk_song("e1")).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.pending_pause = true;
         }
         h.note_elapsed_ms(83_500);
@@ -27801,7 +26974,7 @@ mod tests {
         }
         let set = |cur: Option<usize>, r: bool, rp: bool, si: bool, co: bool| {
             let mut st = h.state.lock().unwrap();
-            st.current = cur;
+            st.set_current(cur);
             st.random = r;
             st.repeat = rp;
             st.single = si;
@@ -27850,7 +27023,7 @@ mod tests {
         }
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(1);
+            st.set_current(Some(1));
             st.consume = true;
         }
         let next = h.plan_next(true);
@@ -28123,597 +27296,202 @@ mod tests {
         assert_eq!(st.queue.len(), 2);
         assert!(st.playlist_version > ver, "version bumped");
         // The playing row slid down one; playback did NOT silently repoint.
-        assert_eq!(st.current, Some(1), "current remapped over the shrink");
+        assert_eq!(st.current(), Some(1), "current remapped over the shrink");
     }
 
-    // Deleting the PLAYING row while a successor exists is the SKIP gesture: it
-    // installs a dip (never a cut), the old track keeps playing audibly through it,
-    // and the eviction lands in the SAME commit as the successor - so the queue and
-    // the deck are never out of step.
-    #[tokio::test(start_paused = true)]
-    async fn delete_playing_row_dips_and_evicts_with_the_successor_commit() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        for _ in 0..2 {
+    /// One deck (the null player), `n` rows, the first playing.
+    async fn single_playing(
+        n: usize,
+    ) -> Option<(HypodjHandler, tokio::sync::mpsc::Receiver<PlayerEvent>)> {
+        let (h, events) = handler_with_null_player()?;
+        for _ in 0..n {
             h.handle(MpdCommand::Add(NTS.to_string())).await;
         }
         h.handle(MpdCommand::Play(Some(0))).await;
+        Some((h, events))
+    }
+
+    // Deleting the PLAYING row is a declaration of the new state: the row leaves the
+    // queue at once and its successor is the head. One deck, so the engine dips into it.
+    #[tokio::test(start_paused = true)]
+    async fn delete_playing_row_declares_the_successor_and_dips_into_it() {
+        let Some((h, _ev)) = single_playing(2).await else { return };
         let successor_qid = h.state.lock().unwrap().queue[1].id;
-
         h.handle(MpdCommand::Delete(Some("0".into()))).await;
-
-        // Mid-dip: NOT a cut. The deck still plays, and - the invariant - the entry
-        // is STILL QUEUED, because the eviction has not committed yet.
-        assert!(h.fade_active().await, "delete of the playing row installs a dip");
-        assert_eq!(h.player.state(), PlayState::Playing, "old track not cut");
-        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "not evicted before the commit");
-
-        // Drive the dip to its terminal: the successor commits and the deleted entry
-        // leaves the queue together, and `current` names the successor by identity.
-        h.wait_for_fade().await;
         let st = h.state.lock().unwrap();
-        assert_eq!(st.queue.len(), 1, "evicted at the commit");
-        assert_eq!(st.queue[0].id, successor_qid, "the successor is what remains");
-        assert_eq!(st.current, Some(0), "current re-derived over the shrink");
-        assert_eq!(st.pending_skip, None);
+        assert_eq!(st.queue.len(), 1, "the row left the queue with the declaration");
+        assert_eq!(st.queue[0].id, successor_qid);
+        assert_eq!(st.current(), Some(0), "the successor is the head");
+        assert_eq!(st.deck.map(|l| l.qid.0), Some(successor_qid), "and is what the deck plays");
         drop(st);
         assert_eq!(h.player.state(), PlayState::Playing);
     }
 
-    // Deleting the playing row when NOTHING follows must not end on an abrupt chord:
-    // it ramps to silence and THEN stops, evicting at the stop. Mid-fade the deck is
-    // still playing and the entry is still queued - all-or-nothing, as above.
+    // Deleting the playing row when NOTHING follows ramps to silence, then stops.
     #[tokio::test(start_paused = true)]
     async fn delete_last_playing_row_fades_to_silence_then_stops() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
+        let Some((h, _ev)) = single_playing(1).await else { return };
         h.handle(MpdCommand::Delete(Some("0".into()))).await;
-
         assert!(h.fade_active().await, "ramps to silence rather than cutting");
         assert_eq!(h.player.state(), PlayState::Playing, "still audible mid-ramp");
-        assert_eq!(h.state.lock().unwrap().queue.len(), 1, "not evicted mid-ramp");
-
+        assert!(h.state.lock().unwrap().queue.is_empty(), "the row is gone at once");
         h.wait_for_fade().await;
         assert_eq!(h.player.state(), PlayState::Stopped, "stops at silence");
-        let st = h.state.lock().unwrap();
-        assert!(st.queue.is_empty(), "evicted at the stop");
-        assert_eq!(st.current, None);
+        assert_eq!(h.state.lock().unwrap().current(), None);
     }
 
-    // Deleting the loaded row while PAUSED needs no ramp (nothing is audible), but it
-    // must still stop the deck: a paused deck holding an entry the queue no longer has
-    // would report a track that cannot be resumed.
+    // Deleting the loaded row while PAUSED needs no ramp, but the deck must not keep
+    // holding an entry the queue no longer has.
     #[tokio::test(start_paused = true)]
     async fn delete_loaded_row_while_paused_stops_the_deck() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
+        let Some((h, _ev)) = single_playing(1).await else { return };
         h.handle(MpdCommand::Pause(Some(true))).await;
-        h.wait_for_fade().await; // the PauseOut ramp lands the real pause
-
+        h.wait_for_fade().await;
         h.handle(MpdCommand::Delete(Some("0".into()))).await;
-
         assert_eq!(h.player.state(), PlayState::Stopped, "deck released");
         let st = h.state.lock().unwrap();
         assert!(st.queue.is_empty());
-        assert_eq!(st.current, None);
+        assert_eq!(st.current(), None);
     }
 
-
-    // REPEAT + one entry left: plan_next wraps to index 0 - the very row being deleted.
-    // Skipping to it would commit a track the terminal then evicts, leaving the deck on
-    // an entry the queue no longer has. It must take the fade-to-silence-and-stop path
-    // instead, and end with an empty queue and a stopped deck.
+    // REPEAT + one entry left: the successor peek wraps onto the row being deleted, which
+    // must not become its own successor.
     #[tokio::test(start_paused = true)]
     async fn delete_last_playing_row_under_repeat_does_not_skip_to_itself() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
+        let Some((h, _ev)) = single_playing(1).await else { return };
         h.handle(MpdCommand::Repeat(true)).await;
-
         h.handle(MpdCommand::Delete(Some("0".into()))).await;
         h.wait_for_fade().await;
-
         assert_eq!(h.player.state(), PlayState::Stopped, "stopped, not looped onto itself");
         let st = h.state.lock().unwrap();
-        assert!(st.queue.is_empty(), "the entry is gone");
-        assert_eq!(st.current, None);
+        assert!(st.queue.is_empty());
+        assert_eq!(st.current(), None);
     }
 
-
-    // REGRESSION (adversarial review, blocker 1): deleting the row a live skip dip is
-    // about to LOAD must supersede the dip, not plan-edit it away underneath. The old
-    // code classified on `current` alone, so this row took the pure-mutation path, the
-    // dip survived, and its terminal loaded and played an entry the queue no longer had
-    // while committing `current` to whatever slid into the freed slot.
-    #[tokio::test(start_paused = true)]
-    async fn delete_of_the_skip_target_mid_dip_supersedes_the_dip() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        for _ in 0..3 {
-            h.handle(MpdCommand::Add(NTS.to_string())).await;
-        }
-        h.handle(MpdCommand::Play(Some(0))).await;
-        let a_qid = h.state.lock().unwrap().queue[0].id;
-        let c_qid = h.state.lock().unwrap().queue[2].id;
-
-        // A user Next installs the dip toward index 1 (B), which is NOT `current`.
-        h.handle(MpdCommand::Next).await;
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "dip targets B");
-
-        // Delete B mid-dip: the skip is abandoned and B leaves the queue.
-        h.handle(MpdCommand::Delete(Some("1".into()))).await;
-        {
-            let st = h.state.lock().unwrap();
-            assert_eq!(st.pending_skip, None, "the abandoned skip reports nothing");
-            assert_eq!(st.queue.len(), 2, "B evicted");
-            assert_eq!(st.queue[0].id, a_qid, "A still queued");
-            assert_eq!(st.queue[1].id, c_qid, "C still queued");
-            // The deck never left the track it was playing.
-            assert_eq!(st.current, Some(0), "stays on A");
-        }
-        // Let every follow-on fade settle, then the deck is still on A, audible, at the
-        // baseline - never ducked at the abandoned dip's floor, never playing B.
-        h.wait_for_fade().await;
-        h.wait_for_fade().await;
-        assert_eq!(h.player.state(), PlayState::Playing, "A still playing");
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "still A, never the deleted B");
-        assert!(
-            h.live_gain_db() > h.fade_cfg.synth_floor_db + 5.0,
-            "risen back out of the dip duck, not left quiet"
-        );
-    }
-
-    // REGRESSION (adversarial review, blocker 2): the SkipLoad terminal must derive the
-    // committed index from the target's QueueId, never from the index captured at
-    // install time. An ordinary delete of an UNRELATED row above the target shrinks the
-    // queue under the live dip; the old `None => idx` arm then committed the pre-shrink
-    // index - the wrong entry, or one past the end (which reports Stopped over audible
-    // playback and drains the queue at the next EOF).
-    #[tokio::test(start_paused = true)]
-    async fn skip_commits_the_target_by_id_when_the_queue_shrinks_under_the_dip() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        for _ in 0..4 {
-            h.handle(MpdCommand::Add(NTS.to_string())).await;
-        }
-        h.handle(MpdCommand::Play(Some(2))).await;
-        let d_qid = h.state.lock().unwrap().queue[3].id;
-
-        // Dip toward D (index 3).
-        h.handle(MpdCommand::Next).await;
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(3), "dip targets D");
-
-        // Delete row 0 - unrelated, not current, not the target. Everything shifts down.
-        h.handle(MpdCommand::Delete(Some("0".into()))).await;
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(2), "target index remapped");
-
-        h.wait_for_fade().await;
-        let st = h.state.lock().unwrap();
-        assert_eq!(st.queue.len(), 3);
-        // D is at index 2 after the shrink; the commit must name D, not the stale 3.
-        assert_eq!(st.current, Some(2), "committed the remapped index");
-        assert_eq!(st.queue[st.current.unwrap()].id, d_qid, "and it really is D");
-    }
-
-    // REGRESSION (adversarial review, finding 3): the successor probe must not ADVANCE.
-    // `plan_next` performs the consume eviction itself, so using it as a probe made one
-    // `delete` under `consume` remove TWO entries.
-    /// A GUARD, not a regression: the old `plan_next` probe happened to remove only one
-    /// entry here too (its consume eviction ate the same row the terminal would have),
-    /// and the review's worse mid-dip variant proved unreachable - under `consume` a
-    /// manual `next` already consumes at `plan_next` time, so a dip toward a LATER index
-    /// never exists to delete underneath. What this pins is that the successor probe
-    /// stays non-mutating, so `peek_next_from` cannot silently become an advance again.
+    // The successor probe must not ADVANCE: under `consume` a delete removes exactly
+    // the row it names.
     #[tokio::test(start_paused = true)]
     async fn delete_under_consume_removes_exactly_one_entry() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        for _ in 0..3 {
-            h.handle(MpdCommand::Add(NTS.to_string())).await;
-        }
-        h.handle(MpdCommand::Play(Some(0))).await;
+        let Some((h, _ev)) = single_playing(3).await else { return };
         h.handle(MpdCommand::Consume(true)).await;
-        let b_qid = h.state.lock().unwrap().queue[1].id;
-        let c_qid = h.state.lock().unwrap().queue[2].id;
-
         h.handle(MpdCommand::Delete(Some("0".into()))).await;
-        h.wait_for_fade().await;
-
-        let st = h.state.lock().unwrap();
-        assert_eq!(st.queue.len(), 2, "exactly one entry removed, not two");
-        assert_eq!(st.queue[0].id, b_qid, "B survived and is the successor");
-        assert_eq!(st.queue[1].id, c_qid, "C untouched");
-        assert_eq!(st.current, Some(0), "playing B");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "one delete, one row");
     }
 
-    // REGRESSION (adversarial review, finding 3A): under `consume` with a single entry,
-    // the old probe removed it at request time and returned None, so the fade-to-stop
-    // ran with `current` left dangling at Some(0) over an empty queue - permanently,
-    // since the terminal's eviction then found nothing to remap.
-    #[tokio::test(start_paused = true)]
-    async fn delete_last_entry_under_consume_leaves_no_dangling_current() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-        h.handle(MpdCommand::Consume(true)).await;
-
-        h.handle(MpdCommand::Delete(Some("0".into()))).await;
-        // Still audible through the ramp, and still queued until the stop commits.
-        assert_eq!(h.player.state(), PlayState::Playing, "ramps rather than cutting");
-        h.wait_for_fade().await;
-
-        assert_eq!(h.player.state(), PlayState::Stopped);
-        let st = h.state.lock().unwrap();
-        assert!(st.queue.is_empty(), "the entry is gone");
-        assert_eq!(st.current, None, "no dangling index over an empty queue");
-    }
-
-    // ── skip-fade (single-mpv dip-through-silence on a USER Next/Previous) ────
-
-    // A user Next while PLAYING dips to silence, loads the target FROM silence in
-    // the SkipLoad terminal, then a follow-on ResumeIn ramps back to the baseline -
-    // all through the ONE fade slot. The target is reported current IMMEDIATELY
-    // (pending_skip), and the OLD track keeps playing audibly through the dip.
+    // A user Next while PLAYING on one deck dips: duck, load the target at the trough,
+    // rise back to the baseline. The head is reported at once.
     #[tokio::test(start_paused = true)]
     async fn user_next_dips_loads_target_then_resumes() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-        assert_eq!(h.player.state(), PlayState::Playing);
-
-        h.handle(MpdCommand::Next).await;
-        // A dip is installed (not an abrupt cut) and mpv still plays the OLD track.
-        assert!(h.fade_active().await, "next installs a dip fade");
-        assert_eq!(h.player.state(), PlayState::Playing, "old track not cut");
-        // status/currentsong report the TARGET (idx 1) immediately via pending_skip,
-        // WITHOUT current having moved yet.
-        assert_eq!(pair(&h.handle(MpdCommand::Status).await, "song"), Some("1"));
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "current not moved yet");
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1));
-
-        // Drive the dip to its SkipLoad terminal: target committed, pending cleared,
-        // a follow-on ResumeIn fade is active, mpv Playing the new track.
+        let Some((h, _ev)) = single_playing(2).await else { return };
+        let (r, ()) = tokio::join!(h.handle(MpdCommand::Next), async {
+            // Past the duck's first deliberate step (min slew), before its trough.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.current(), Some(1), "the target is reported mid-dip");
+            assert_eq!(st.deck.map(|l| l.qid.0), Some(0), "while the old track plays through");
+            assert!(st.live_gain_db < 0.0, "ducking");
+        });
+        assert!(!matches!(r, MpdResponse::Ack { .. }));
+        assert_eq!(deck_qid(&h), Some(1), "loaded at the trough");
         h.wait_for_fade().await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "target committed");
-        assert_eq!(h.state.lock().unwrap().pending_skip, None);
-        assert!(h.fade_active().await, "a follow-on ResumeIn fade is active");
-        assert_eq!(h.player.state(), PlayState::Playing);
+        let st = h.state.lock().unwrap();
+        assert!(!st.fading, "risen back");
+        assert_eq!(st.target_volume, 100);
+    }
 
-        // Drive the follow-on ResumeIn to completion: back at the baseline, audible.
+    // A SECOND skip during the dip re-declares the head; the engine converges on the
+    // LAST declaration (level-triggered), never stopping on the first target.
+    #[tokio::test(start_paused = true)]
+    async fn double_skip_lands_on_the_second_target() {
+        let Some((h, _ev)) = single_playing(3).await else { return };
+        tokio::join!(h.handle(MpdCommand::Next), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.handle(MpdCommand::Next).await;
+        });
         h.wait_for_fade().await;
-        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
-        assert!(h.live_gain_db() > h.fade_cfg.synth_floor_db + 5.0, "ramped back up");
-        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.state.lock().unwrap().current(), Some(2));
+        assert_eq!(deck_qid(&h), Some(2));
     }
 
-    // The warm-skip path is PURE GAIN: a user Next drives dip -> switch_warmed ->
-    // ResumeIn with NO pause/unpause anywhere. The deck stays Playing across the whole
-    // skip and no Paused state edge is ever emitted - the fix warms the target stream,
-    // it never introduces a transport pause (HARD CONSTRAINT 1).
-    #[tokio::test(start_paused = true)]
-    async fn warm_skip_is_pure_gain_never_pauses() {
-        let Some((h, mut events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
-        h.handle(MpdCommand::Next).await;
-        h.wait_for_fade().await; // dip -> switch_warmed lands the target
-        h.wait_for_fade().await; // follow-on ResumeIn back to baseline
-
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "target committed");
-        assert_eq!(h.player.state(), PlayState::Playing, "deck never left Playing");
-
-        // Not a single Paused edge crossed the wire during the skip.
-        while let Ok(ev) = events.try_recv() {
-            if let PlayerEvent::StateChanged(PlayState::Paused, _, _) = ev {
-                panic!("a skip must never pause the deck (pure gain violated)");
-            }
-        }
-    }
-
-    // NEAR-EOF GUARD (finding 1a): the warm is DECLINED whenever appending the target
-    // behind the current track could let mpv auto-advance into it - i.e. when the
-    // current is within NEAR_EOF_GUARD_SECS of its natural end, has an unknown
-    // duration, is a live/continuous stream, or there is no current. Only a finite
-    // Song with a comfortable margin left warms. Direct unit check of the predicate.
-    #[tokio::test(start_paused = true)]
-    async fn near_eof_guard_declines_the_warm() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.enqueue_song_for_test(playlist_test_song("s-0")).await; // idx 0: 200s
-        let mut unknown = playlist_test_song("s-1");
-        unknown.duration_secs = None;
-        h.enqueue_song_for_test(unknown).await; // idx 1: unknown duration
-        h.enqueue_stream_for_test(NTS).await; // idx 2: live stream
-
-        // Mid-track finite song with lots left -> warm OK.
-        h.state.lock().unwrap().current = Some(0);
-        h.reset_elapsed();
-        h.note_elapsed_ms(10_000); // 10s into a 200s track
-        assert!(h.current_can_warm(), "mid-track finite song warms");
-
-        // Within the guard window of the natural end -> decline.
-        h.note_elapsed_ms(199_000); // 1s remaining of 200s
-        assert!(!h.current_can_warm(), "near-EOF declines the warm");
-
-        // Unknown duration -> decline (cannot bound the EOF distance).
-        h.state.lock().unwrap().current = Some(1);
-        h.note_elapsed_ms(1_000);
-        assert!(!h.current_can_warm(), "unknown-duration song declines the warm");
-
-        // Live/continuous stream -> decline (no natural end, nothing to prefetch).
-        h.state.lock().unwrap().current = Some(2);
-        assert!(!h.current_can_warm(), "live stream declines the warm");
-
-        // No current -> decline (conservative).
-        h.state.lock().unwrap().current = None;
-        assert!(!h.current_can_warm(), "no current declines the warm");
-    }
-
-    // SUPERSEDE CLEARS THE WARM (finding 3): a mid-track skip warms the target, then a
-    // PAUSE issued DURING the dip supersedes it - the SkipLoad never runs, so the
-    // parked warm MUST be dropped or the still-playing (now paused) old track's natural
-    // EOF would later auto-advance into the stale target. Observed via the WarmProbe.
-    #[tokio::test(start_paused = true)]
-    async fn pause_during_skip_dip_drops_the_warm() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
-        h.enqueue_song_for_test(playlist_test_song("s-0")).await;
-        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-        assert_eq!(h.player.state(), PlayState::Playing);
-
-        // Next installs a dip and WARMS the target (finite current, fresh elapsed).
-        h.handle(MpdCommand::Next).await;
-        assert!(h.fade_active().await, "next installs a dip fade");
-        assert_eq!(probe.prefetch.load(Relaxed), 1, "a mid-track skip warms the target");
-        let drops_before = probe.drop.load(Relaxed);
-
-        // Pause DURING the dip supersedes the skip; the parked warm must be dropped.
-        h.handle(MpdCommand::Pause(Some(true))).await;
-        assert!(
-            probe.drop.load(Relaxed) > drops_before,
-            "pause-supersede drops the parked warm target"
-        );
-    }
-
-    // SUPERSEDE CLEARS THE WARM, NON-COMMITTING branch (findings 1/1b): a mid-track
-    // skip warms the target, then a WIND-DOWN `fade to <v>` issued DURING the dip
-    // supersedes it. This fade is NON-committing (commit_logical=None) - the exact class
-    // the old code left the warm parked for - so it must ALSO clear pending_skip and drop
-    // the parked warm, or the still-playing old track's natural EOF would auto-advance
-    // into the stale target (audible bleed) and the `warmed` guard would then swallow the
-    // EOF and stall the queue. Observed via the WarmProbe.
-    #[tokio::test(start_paused = true)]
-    async fn winddown_fade_during_skip_dip_drops_the_warm() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
-        h.enqueue_song_for_test(playlist_test_song("s-0")).await;
-        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-        assert_eq!(h.player.state(), PlayState::Playing);
-
-        // Next installs a dip and WARMS the target (finite current, fresh elapsed).
-        h.handle(MpdCommand::Next).await;
-        assert!(h.fade_active().await, "next installs a dip fade");
-        assert_eq!(probe.prefetch.load(Relaxed), 1, "a mid-track skip warms the target");
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "skip target reported");
-        let drops_before = probe.drop.load(Relaxed);
-
-        // A non-committing `fade to 40` DURING the dip supersedes the skip: pending_skip
-        // must revert to `current` and the parked warm must be dropped.
-        h.start_fade(fade_args(FadeKind::To(40), 60)).await.unwrap();
-        assert_eq!(
-            h.state.lock().unwrap().pending_skip,
-            None,
-            "a non-committing wind-down clears the superseded skip"
-        );
-        assert!(
-            probe.drop.load(Relaxed) > drops_before,
-            "wind-down supersede drops the parked warm target"
-        );
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "old track still current");
-    }
-
-    // SUPERSEDE CLEARS THE WARM, wake-ramp branch (finding 1): a scheduled/user wake
-    // `fade in` (also non-committing, ResumeIn/SetBaseline terminal) that supersedes a
-    // live skip dip must clear pending_skip and drop the parked warm just the same.
-    #[tokio::test(start_paused = true)]
-    async fn wake_ramp_during_skip_dip_drops_the_warm() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
-        h.enqueue_song_for_test(playlist_test_song("s-0")).await;
-        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
-        h.handle(MpdCommand::Next).await;
-        assert_eq!(probe.prefetch.load(Relaxed), 1, "a mid-track skip warms the target");
-        let drops_before = probe.drop.load(Relaxed);
-
-        h.start_fade(fade_args(FadeKind::In, 30)).await.unwrap();
-        assert_eq!(
-            h.state.lock().unwrap().pending_skip,
-            None,
-            "a non-committing wake clears the superseded skip"
-        );
-        assert!(
-            probe.drop.load(Relaxed) > drops_before,
-            "wake-ramp supersede drops the parked warm target"
-        );
-    }
-
-    // A rapid SECOND skip during the dip SUPERSEDES the first: the first SkipLoad
-    // terminal is aborted BEFORE it loads, so ONLY the second target is ever loaded.
-    #[tokio::test(start_paused = true)]
-    async fn double_skip_loads_only_second_target() {
-        let Some((h, mut events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
-        h.handle(MpdCommand::Next).await; // dip to idx1
-        pump(20, 1).await; // dip in flight
-        h.handle(MpdCommand::Next).await; // dip to idx2, supersedes the first
-
-        // Drive the (second) dip then its follow-on to completion.
-        h.wait_for_fade().await;
-        h.wait_for_fade().await;
-
-        assert_eq!(h.state.lock().unwrap().current, Some(2), "only the 2nd target");
-        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
-        assert_eq!(h.player.state(), PlayState::Playing);
-
-        // Drain the player events: track 1's queue_id (QueueId(1)) was NEVER loaded
-        // (its SkipLoad was aborted before the load), only 0 (initial) and 2.
-        let mut loaded: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        while let Ok(ev) = events.try_recv() {
-            if let PlayerEvent::StateChanged(PlayState::Playing, _, Some(qid)) = ev {
-                loaded.insert(qid.0);
-            }
-        }
-        assert!(!loaded.contains(&1), "the 1st skip target must never load: {loaded:?}");
-        assert!(loaded.contains(&2), "the 2nd skip target loads: {loaded:?}");
-    }
-
-    // A skip while PAUSED is a plain play (no dip): the deck is not playing, so
-    // there is nothing to dip through - it advances and plays at the baseline.
+    // A skip while PAUSED is a plain load (nothing audible to transition from).
     #[tokio::test(start_paused = true)]
     async fn skip_while_paused_is_plain_play() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
+        let Some((h, _ev)) = single_playing(2).await else { return };
         h.handle(MpdCommand::Pause(Some(true))).await;
         h.wait_for_fade().await;
-        assert_eq!(h.reported_play_state(), PlayState::Paused);
-
         h.handle(MpdCommand::Next).await;
-        // Plain play_index path: current advanced, audible at baseline immediately,
-        // no dip-to-silence and no follow-on skip fade.
-        assert_eq!(h.state.lock().unwrap().current, Some(1));
-        assert_eq!(h.player.state(), PlayState::Playing);
-        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
-        assert!(!h.fade_active().await, "no dip on a paused skip");
-        assert_eq!(h.state.lock().unwrap().pending_skip, None);
+        assert!(!h.fade_active().await || !h.state.lock().unwrap().fading, "no dip");
+        assert_eq!(deck_qid(&h), Some(1));
+        assert_eq!(h.reported_play_state(), PlayState::Playing);
     }
 
-    // An autonomous EOF advance stays GAPLESS: it must NOT skip-fade (no dip, the
-    // envelope/volume is untouched across the track boundary).
+    // An autonomous EOF advance never ducks: the track already ended, so the next one
+    // is a plain load (the planner's Cut from silence).
     #[tokio::test(start_paused = true)]
-    async fn eof_advance_stays_gapless() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
+    async fn eof_advance_stays_a_plain_load() {
+        let Some((h, _ev)) = single_playing(2).await else { return };
         h.advance_on_eof(EofSignal::default()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1));
-        assert!(!h.fade_active().await, "eof advance never dips");
-        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert!(!h.state.lock().unwrap().fading, "no dip on the queue's own motion");
+        assert_eq!(deck_qid(&h), Some(1));
     }
 
-    // A setvol DURING the dip cleanly SUPERSEDES it as a glide: the skip target is
-    // NEVER loaded (the dip's SkipLoad terminal never runs), pending_skip is
-    // cleared SYNCHRONOUSLY at the glide install, the OLD track keeps playing, and
-    // the glide settles at its landing.
+    // A setvol DURING the dip takes the gain, but the declaration stands: the skip
+    // still lands, at the new level.
     #[tokio::test(start_paused = true)]
-    async fn setvol_during_skip_dip_cancels_cleanly() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.state.lock().unwrap().vol_dither_state = 0xABCD_1234_5678_90AB;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
-        h.handle(MpdCommand::Next).await; // dip to idx1
-        pump(20, 1).await;
-        h.handle(MpdCommand::SetVol(30)).await;
-
-        // The glide's install already reconciled the deck: skip target abandoned.
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "target NOT loaded");
-        assert_eq!(h.state.lock().unwrap().pending_skip, None);
-        assert_eq!(h.player.state(), PlayState::Playing, "old track still playing");
-        let committed = h.state.lock().unwrap().target_volume;
-        assert!((29..=31).contains(&committed), "landing in [29,31]: {committed}");
+    async fn setvol_during_skip_dip_still_lands_the_skip() {
+        let Some((h, _ev)) = single_playing(2).await else { return };
+        tokio::join!(h.handle(MpdCommand::Next), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.handle(MpdCommand::SetVol(40)).await;
+        });
         h.wait_for_fade().await;
-        assert!(!h.state.lock().unwrap().fading, "the glide settled");
-        assert_eq!(h.state.lock().unwrap().reported_volume(), committed);
+        h.wait_for_fade().await;
+        assert_eq!(deck_qid(&h), Some(1), "the head was declared, so it lands");
+        let v = h.state.lock().unwrap().target_volume;
+        assert!((39..=41).contains(&v), "and the setvol landed too: {v}");
     }
 
-    // A stop DURING the dip cleanly cancels it: the target is NEVER loaded, the
-    // deck stops, pending_skip is cleared, and the baseline is restored.
+    // A stop DURING the dip holds the declared head and silences the deck.
     #[tokio::test(start_paused = true)]
-    async fn stop_during_skip_dip() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
-        h.handle(MpdCommand::Next).await; // dip to idx1
-        pump(20, 1).await;
-        h.handle(MpdCommand::Stop).await;
-
+    async fn stop_during_skip_dip_holds_the_head_silent() {
+        let Some((h, _ev)) = single_playing(2).await else { return };
+        tokio::join!(h.handle(MpdCommand::Next), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.stop_playback().await;
+        });
         assert_eq!(h.player.state(), PlayState::Stopped);
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "target NOT loaded");
-        assert_eq!(h.state.lock().unwrap().pending_skip, None);
-        assert_eq!(h.state.lock().unwrap().reported_volume(), 100, "baseline restored");
+        assert_eq!(h.reported_play_state(), PlayState::Stopped);
+        assert!(!h.state.lock().unwrap().fading);
     }
 
-    // A natural EOF that lands INSIDE the skip-dip window must NOT auto-advance: the
-    // skip owns the next load. Otherwise advance_on_eof would load an unrelated
-    // track (current+1) that collides with the pending Terminal::SkipLoad, which
-    // still fires and loads the skip target a second time (spurious load + double
-    // load glitch). The skip terminal is the sole authority for the next load.
+    // THE STALE-EOF RULE: the old track ending inside the skip window is not the
+    // queue's motion (the head already moved on), so it advances nothing.
     #[tokio::test(start_paused = true)]
-    async fn eof_during_skip_dip_does_not_double_advance() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
-        h.handle(MpdCommand::Next).await; // dip: current 0, pending_skip Some(1)
-        pump(20, 1).await; // dip in flight
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1));
-
-        // The OLD track (idx0) reaches its natural EOF mid-dip: must be a no-op, NOT
-        // an advance to idx2 (current+1). current + pending_skip stay put.
-        h.advance_on_eof(EofSignal::default()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "eof did not advance mid-skip");
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "skip intent intact");
-
-        // The dip's SkipLoad terminal is still the sole authority for the load: it
-        // commits the target (idx1), never idx2.
+    async fn an_eof_for_a_row_that_is_no_longer_the_head_advances_nothing() {
+        let Some((h, _ev)) = single_playing(3).await else { return };
+        let old = QueueId(h.state.lock().unwrap().queue[0].id);
+        tokio::join!(h.handle(MpdCommand::Next), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.advance_on_eof(EofSignal { queue_id: Some(old), ..EofSignal::default() }).await;
+        });
         h.wait_for_fade().await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "skip target loaded, not eof's idx2");
-        assert_eq!(h.state.lock().unwrap().pending_skip, None);
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "no double advance");
+        assert_eq!(deck_qid(&h), Some(1));
     }
 
-    // A pause DURING the dip supersedes it (SkipLoad never runs, target never
-    // loads), so pending_skip must be cleared: the reported current reverts to the
-    // OLD track mpv is actually paused on, never stuck on the never-loaded target.
+    // A pause during the dip waits for it to land, then pauses the declared head - the
+    // deck and the report never disagree about which track is paused.
     #[tokio::test(start_paused = true)]
-    async fn pause_during_skip_dip_clears_pending_skip() {
-        let Some((h, _events)) = handler_with_null_player() else { return };
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Add(NTS.to_string())).await;
-        h.handle(MpdCommand::Play(Some(0))).await;
-
-        h.handle(MpdCommand::Next).await; // dip: current 0, pending_skip Some(1)
-        pump(20, 1).await;
-        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1));
-
-        h.handle(MpdCommand::Pause(Some(true))).await;
-        // The pause aborted the dip before it loaded the target: reported current
-        // reverts to the still-loaded idx0, not the never-loaded idx1.
-        assert_eq!(h.state.lock().unwrap().pending_skip, None, "skip intent cleared on pause");
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "target NOT loaded");
-        assert_eq!(pair(&h.handle(MpdCommand::Status).await, "song"), Some("0"));
+    async fn pause_during_skip_dip_pauses_the_declared_head() {
+        let Some((h, _ev)) = single_playing(2).await else { return };
+        tokio::join!(h.handle(MpdCommand::Next), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            h.handle(MpdCommand::Pause(Some(true))).await;
+        });
         h.wait_for_fade().await;
         assert_eq!(h.reported_play_state(), PlayState::Paused);
-        // The desync does not survive a resume: still on idx0.
-        assert_eq!(h.state.lock().unwrap().current, Some(0));
-        assert_eq!(h.state.lock().unwrap().pending_skip, None);
+        assert_eq!(h.state.lock().unwrap().current(), Some(1));
+        assert_eq!(deck_qid(&h), Some(1), "paused on the track it reports");
     }
 
     // A MOOD ask primed as `field set <phrase>` registers a lingering pull with
@@ -29142,7 +27920,7 @@ mod tests {
         h.enqueue_song_for_test(seed.clone()).await;
         h.handle(MpdCommand::Play(Some(0))).await;
         h.advance_on_eof(EofSignal::default()).await; // natural end-of-queue EOF
-        assert_eq!(h.state.lock().unwrap().current, None, "deck stopped after EOF");
+        assert_eq!(h.state.lock().unwrap().current(), None, "deck stopped after EOF");
         assert_eq!(
             h.similar_seed_id(),
             Some(seed.id.clone()),
@@ -29234,7 +28012,7 @@ mod tests {
     // (PlayNow) and the strictly append-only enqueue, against a REAL backend. Uses a
     // NullPlayer so nothing plays through the speakers (silent by construction);
     // the SubsonicClient is real so search3/random_songs resolve genuine songs and
-    // play_index resolves a real stream URL. `#[ignore]` (certless/no-network
+    // declare_play resolves a real stream URL. `#[ignore]` (certless/no-network
     // sandbox skips it): run with
     //   HYPODJ_TEST_URL/USER/PASS set, `cargo test -p hypodj-core -- --ignored
     //   live_play_now_enqueues_and_starts`.
@@ -29265,12 +28043,12 @@ mod tests {
         // (0) STRICTLY APPEND-ONLY: enqueue onto a STOPPED, EMPTY deck appends WITHOUT
         // starting playback (the append-only contract the confirm/prompt promise).
         assert!(h.state.lock().unwrap().queue.is_empty());
-        assert!(h.state.lock().unwrap().current.is_none(), "deck starts stopped");
+        assert!(h.state.lock().unwrap().current().is_none(), "deck starts stopped");
         let n0 = h.plan_enqueue(&Selector::Radio, 1).await.expect("append-only enqueue");
         assert!(n0 >= 1, "enqueue appended the resolved song");
         assert!(!h.state.lock().unwrap().queue.is_empty(), "and it was enqueued");
         assert!(
-            h.state.lock().unwrap().current.is_none(),
+            h.state.lock().unwrap().current().is_none(),
             "append-only enqueue NEVER starts playback, even on an empty stopped deck"
         );
 
@@ -29279,13 +28057,13 @@ mod tests {
 
         // (1) STOPPED empty deck: play_now enqueues the song AND starts on it.
         assert!(h.state.lock().unwrap().queue.is_empty());
-        assert!(h.state.lock().unwrap().current.is_none(), "deck starts stopped");
+        assert!(h.state.lock().unwrap().current().is_none(), "deck starts stopped");
         let n = h
             .plan_play_now(&Selector::Query(title.clone()), 1)
             .await
             .expect("play_now");
         assert!(n >= 1, "play_now enqueued the resolved song");
-        assert_eq!(h.state.lock().unwrap().current, Some(0), "playback STARTED on it");
+        assert_eq!(h.state.lock().unwrap().current(), Some(0), "playback STARTED on it");
         assert!(!h.state.lock().unwrap().queue.is_empty(), "and it was enqueued");
 
         // (2) play_now while a track is already playing JUMPS to the new one (never a
@@ -29294,15 +28072,15 @@ mod tests {
         let n = h.plan_play_now(&Selector::Radio, 1).await.expect("play_now radio");
         assert!(n >= 1);
         assert_eq!(
-            h.state.lock().unwrap().current,
+            h.state.lock().unwrap().current(),
             Some(before),
             "jumped to the just-enqueued track at the old tail"
         );
 
         // (3) append-only enqueue onto a NON-empty/live deck does NOT move current.
-        let cur = h.state.lock().unwrap().current;
+        let cur = h.state.lock().unwrap().current();
         h.plan_enqueue(&Selector::Radio, 1).await.expect("enqueue");
-        assert_eq!(h.state.lock().unwrap().current, cur, "append-only never jumps");
+        assert_eq!(h.state.lock().unwrap().current(), cur, "append-only never jumps");
     }
 
     // ── the offline audio store: the READ path ──────────────────────────────
@@ -29531,7 +28309,7 @@ mod tests {
         assert_eq!(keys(&h).len(), 4);
 
         // And the window leads from the CURRENT entry.
-        h.state.lock().unwrap().current = Some(2);
+        h.state.lock().unwrap().set_current(Some(2));
         assert_eq!(keys(&h), vec!["cover/w2", "cover/w3", "cover/w4", "cover/w5"]);
     }
 
@@ -29559,7 +28337,7 @@ mod tests {
         assert_eq!(store.window().len(), 4, "a stream cannot be mirrored");
 
         // The window leads from the CURRENT entry, so an advance moves it along.
-        h.state.lock().unwrap().current = Some(2);
+        h.state.lock().unwrap().set_current(Some(2));
         h.update_store_window();
         assert_eq!(
             store.window().into_iter().map(|i| i.0).collect::<Vec<_>>(),
@@ -29606,14 +28384,14 @@ mod tests {
         h.set_audio_store(store.clone());
         h.enqueue_song_for_test(store_song("s-1", 16)).await;
 
-        // `true` is what a remote load publishes (`!play.local` in play_index_inner
+        // `true` is what a remote load publishes (`!play.local` in declare_play
         // and in the skip dip); each leg below starts from a deck carrying a stream.
         store.set_playback_remote(true);
         h.stop_playback().await;
         assert!(!store.playback_remote(), "the MPD / MPRIS stop empties the deck");
 
         // The currently-playing entry removed out from under playback.
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         store.set_playback_remote(true);
         assert_eq!(h.remove_indices(&[0]).await, 1);
         assert!(!store.playback_remote(), "removing the playing entry stops the deck");
@@ -29628,14 +28406,14 @@ mod tests {
         // mirror is meant to use, and the leg that made the mirror rot.
         store.set_playback_remote(true);
         h.advance_on_eof(EofSignal::default()).await;
-        assert_eq!(h.state.lock().unwrap().current, None, "the queue drained");
+        assert_eq!(h.state.lock().unwrap().current(), None, "the queue drained");
         assert!(!store.playback_remote(), "a drained queue defers nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn a_landed_continuation_station_publishes_a_remote_deck() {
-        // The landed handoff never passes through play_index_inner (mpv already
+        // The landed handoff never passes through declare_play (mpv already
         // advanced into the warmed station), so the deck's remoteness is published in
         // that arm or nowhere - and a radio stream is exactly the thin-link case bulk
         // backfill is supposed to stay out of.
@@ -29646,7 +28424,7 @@ mod tests {
         h.enqueue_song_for_test(store_song("s-local", 16)).await;
         {
             let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
+            st.set_current(Some(0));
             st.continuation = true;
         }
         h.set_continuation_station(Some(NTS.to_string()));
@@ -29656,7 +28434,7 @@ mod tests {
 
         h.advance_on_eof(EofSignal { continuation_landed: true, ..EofSignal::default() }).await;
 
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "the station is current");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "the station is current");
         assert!(store.playback_remote(), "and the deck is on the network again");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -30222,6 +29000,7 @@ mod tests {
             errored: true,
             was_local: true,
             continuation_landed: false,
+            queue_id: None,
         })
         .await;
 
@@ -30250,6 +29029,7 @@ mod tests {
             errored: false,
             was_local: true,
             continuation_landed: false,
+            queue_id: None,
         })
         .await;
         assert!(store.lookup(&cached.id).is_some(), "a natural local end is never suspect");
@@ -30261,6 +29041,7 @@ mod tests {
             errored: true,
             was_local: false,
             continuation_landed: false,
+            queue_id: None,
         })
         .await;
         assert!(store.lookup(&cached.id).is_some(), "a remote failure never de-offers stored bytes");
@@ -30271,6 +29052,7 @@ mod tests {
             errored: true,
             was_local: true,
             continuation_landed: false,
+            queue_id: None,
         })
         .await;
         assert!(store.lookup(&cached.id).is_some());
@@ -30278,7 +29060,7 @@ mod tests {
     }
 
     // THE RACE THE DESIGN CLOSED: the mark keys off the EVENT's song id, never a
-    // re-read of `st.current` - which is repointed after the play_url await, so an
+    // re-read of `st.current()` - which is repointed after the play_url await, so an
     // interleaved play would otherwise de-offer a perfectly good, different file.
     #[tokio::test]
     async fn the_suspect_mark_follows_the_event_not_the_current_entry() {
@@ -30293,13 +29075,14 @@ mod tests {
         h.enqueue_song_for_test(finished.clone()).await;
         h.enqueue_song_for_test(now_playing.clone()).await;
         // An interleaved play already repointed current onto the OTHER song.
-        h.state.lock().unwrap().current = Some(1);
+        h.state.lock().unwrap().set_current(Some(1));
 
         h.advance_on_eof(EofSignal {
             song: Some(finished.id.clone()),
             errored: true,
             was_local: true,
             continuation_landed: false,
+            queue_id: None,
         })
         .await;
 
@@ -30308,11 +29091,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A skip dip owns the next load, so advance_on_eof early-returns - but the FACT
-    // that local bytes failed is true either way, so the mark must already have been
-    // applied before that return.
+    // A STALE end (the head already moved on) advances nothing - but the FACT that
+    // local bytes failed is true either way, so the mark must already have been applied
+    // before that return.
     #[tokio::test]
-    async fn a_pending_skip_does_not_swallow_the_suspect_mark() {
+    async fn a_stale_eof_does_not_swallow_the_suspect_mark() {
         let Some((h, _rx)) = handler_with_null_player() else { return };
         let dir = store_tmpdir("suspect-skip");
         let store = open_store(&dir);
@@ -30320,13 +29103,15 @@ mod tests {
         commit_into(&store, &cached);
         h.set_audio_store(store.clone());
         h.enqueue_song_for_test(cached.clone()).await;
-        h.state.lock().unwrap().pending_skip = Some(0);
+        let ended = QueueId(h.state.lock().unwrap().queue[0].id);
+        h.state.lock().unwrap().hold_head(Some(QueueId(9_999)));
 
         h.advance_on_eof(EofSignal {
             song: Some(cached.id.clone()),
             errored: true,
             was_local: true,
             continuation_landed: false,
+            queue_id: Some(ended),
         })
         .await;
         assert_eq!(store.lookup(&cached.id), None, "marked despite the early return");
@@ -30393,7 +29178,7 @@ mod tests {
         }
         // The current entry IS playable from local bytes, so the saved Playing state
         // is honored (this is the everyday offline start).
-        assert_eq!(h.state.lock().unwrap().current, Some(0));
+        assert_eq!(h.state.lock().unwrap().current(), Some(0));
         assert_eq!(h.reported_play_state(), PlayState::Playing, "a cached current wakes normally");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -30412,7 +29197,7 @@ mod tests {
         h.restore(&s).await.expect("restore succeeds");
 
         assert_eq!(h.state.lock().unwrap().queue.len(), 2, "still no shrinking");
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "and the saved position survives");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "and the saved position survives");
         // PAUSED specifically, not merely "not Playing": Stopped would be a lie about a
         // deck that still holds a position, and it is what the checkpoint persists.
         assert_eq!(
@@ -30471,7 +29256,7 @@ mod tests {
         );
         {
             let st = h.state.lock().unwrap();
-            assert_eq!(st.current, Some(SPENT_KEEP), "the playing row sits at the window's end");
+            assert_eq!(st.current(), Some(SPENT_KEEP), "the playing row sits at the window's end");
             assert_eq!(st.queue.len(), ids.len() - (cur - SPENT_KEEP));
         }
 
@@ -30485,8 +29270,8 @@ mod tests {
                 let id = st.next_id;
                 st.next_id += 1;
                 st.queue.push(QueueItem::queued(id, QueueEntry::Song(playlist_test_song(&id.to_string()))));
-                let next = st.current.unwrap() + 1;
-                st.current = Some(next);
+                let next = st.current().unwrap() + 1;
+                st.set_current(Some(next));
                 st.queue[next].played_at = Some(1_700_000_100 + step);
                 st.trim_spent();
                 peak = peak.max(st.queue.len());
@@ -30637,27 +29422,27 @@ mod tests {
         for i in 0..8 {
             h.enqueue_song_for_test(playlist_test_song(&format!("f-{i}"))).await;
         }
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         let failed = || EofSignal { errored: true, ..EofSignal::default() };
 
         // One dead track is still skipped past, and so is a second: the fuse only ever
         // fires on a RUN, so the everyday online case is untouched.
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "a single failed load still advances");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "a single failed load still advances");
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(2), "and so does a second");
+        assert_eq!(h.state.lock().unwrap().current(), Some(2), "and so does a second");
         // A track that PLAYED clears the run, so the budget starts over.
         h.advance_on_eof(EofSignal::default()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(3), "a natural EOF advances normally");
+        assert_eq!(h.state.lock().unwrap().current(), Some(3), "a natural EOF advances normally");
         h.advance_on_eof(failed()).await;
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(5), "the natural EOF reset the run");
+        assert_eq!(h.state.lock().unwrap().current(), Some(5), "the natural EOF reset the run");
 
         // The THIRD consecutive failure stops the walk dead.
         h.advance_on_eof(failed()).await;
         {
             let st = h.state.lock().unwrap();
-            assert_eq!(st.current, Some(5), "held AT the entry that failed, never walked past it");
+            assert_eq!(st.current(), Some(5), "held AT the entry that failed, never walked past it");
             assert_eq!(st.queue.len(), 8, "and the queue is untouched");
         }
         assert_eq!(
@@ -30668,7 +29453,7 @@ mod tests {
         // And it stays put: more failures cannot restart the grind.
         h.advance_on_eof(failed()).await;
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(5), "still held, never ground to None");
+        assert_eq!(h.state.lock().unwrap().current(), Some(5), "still held, never ground to None");
 
         // THE POINT: what the checkpoint loop would now write still carries the session.
         let snap = h.resume_snapshot(12.5);
@@ -30677,9 +29462,9 @@ mod tests {
         assert_eq!(snap.queue.len(), 8, "and the whole queue");
 
         // A fresh-play GESTURE is the user saying try again: the fuse re-arms in full.
-        h.play_index(0).await.expect("play");
+        h.declare_play(0, Cause::Gesture).await.expect("play");
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "the gesture re-armed the walk");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "the gesture re-armed the walk");
     }
 
     /// THE ORDINARY ONLINE FAILURE, which is NOT a failed load: mpv's `EndReason::Error`
@@ -30699,7 +29484,7 @@ mod tests {
         for i in 0..12 {
             h.enqueue_song_for_test(playlist_test_song(&format!("d-{i}"))).await;
         }
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         let failed = || EofSignal { errored: true, ..EofSignal::default() };
 
         // Six errored ends, each on a track that actually PLAYED first (the director
@@ -30709,7 +29494,7 @@ mod tests {
             h.note_playback_progress(cur_qid(&h));
             h.advance_on_eof(failed()).await;
             assert_eq!(
-                h.state.lock().unwrap().current,
+                h.state.lock().unwrap().current(),
                 Some(expected),
                 "a track that played and then dropped costs exactly one skip-past"
             );
@@ -30724,10 +29509,10 @@ mod tests {
         h.note_playback_progress(cur_qid(&h));
         h.advance_on_eof(failed()).await;
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(8), "two silent failures still walk");
+        assert_eq!(h.state.lock().unwrap().current(), Some(8), "two silent failures still walk");
         h.advance_on_eof(failed()).await;
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, Some(8), "the third silent failure holds the position");
+        assert_eq!(st.current(), Some(8), "the third silent failure holds the position");
         assert!(st.pending_pause, "and the deck reports Paused");
     }
 
@@ -30747,7 +29532,7 @@ mod tests {
         for i in 0..6 {
             h.enqueue_song_for_test(playlist_test_song(&format!("r-{i}"))).await;
         }
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         let failed = || EofSignal { errored: true, ..EofSignal::default() };
         for _ in 0..3 {
             h.advance_on_eof(failed()).await;
@@ -30758,7 +29543,7 @@ mod tests {
         let _ = h.player.stop().await;
         h.state.lock().unwrap().pending_pause = true;
         assert_eq!(h.reported_play_state(), PlayState::Paused, "the halt reports Paused");
-        assert_eq!(h.state.lock().unwrap().current, Some(2), "holding the failed entry");
+        assert_eq!(h.state.lock().unwrap().current(), Some(2), "holding the failed entry");
 
         // ONE resume gesture.
         h.set_pause(Some(false)).await.expect("resume");
@@ -30767,7 +29552,7 @@ mod tests {
             PlayState::Playing,
             "the held entry was LOADED - not merely un-intended into a silent Stopped"
         );
-        assert_eq!(h.state.lock().unwrap().current, Some(2), "and it is the SAME entry");
+        assert_eq!(h.state.lock().unwrap().current(), Some(2), "and it is the SAME entry");
 
         // And the deck behaves like an ordinary loaded one from there: a pause reports
         // Paused over a track that is really loaded, never the phantom toggle pair.
@@ -30799,18 +29584,18 @@ mod tests {
     /// publishes live, so the terminal that stands at the end is the REAL shape (a raw
     /// Stopped player under a standing `pending_pause`), not one poked into the state.
     async fn halt_terminal_at(h: &HypodjHandler, start: usize) -> Option<usize> {
-        h.state.lock().unwrap().current = Some(start);
+        h.state.lock().unwrap().set_current(Some(start));
         cascade_failed_loads(h).await;
         assert_eq!(h.reported_play_state(), PlayState::Paused, "the halt reports Paused");
         assert_eq!(h.player.state(), PlayState::Stopped, "over a player holding nothing");
-        h.state.lock().unwrap().current
+        h.state.lock().unwrap().current()
     }
 
     /// THE DRAIN BY ANOTHER ROUTE - the gap c70beed named and left open, reproduced in
     /// the order it was observed live.
     ///
     /// Every resume gesture funnels into [`HypodjHandler::resume_by_loading_current`],
-    /// which calls `play_index`, which re-armed the fuse with a FULL budget. So offline,
+    /// which calls `declare_play`, which re-armed the fuse with a FULL budget. So offline,
     /// at the halt terminal, each press of play bought three more failed loads: the walk
     /// went pause@3 -> pause@5 -> pause@7 and then off the end of the queue into
     /// `current: None` + Stopped, where the drain LEGITIMATELY retires the intent - and
@@ -30839,7 +29624,7 @@ mod tests {
         for _ in 0..3 {
             h.set_pause(Some(false)).await.expect("resume gesture");
             cascade_failed_loads(&h).await;
-            held_after_each_gesture.push(h.state.lock().unwrap().current);
+            held_after_each_gesture.push(h.state.lock().unwrap().current());
         }
         assert_eq!(
             held_after_each_gesture,
@@ -30888,13 +29673,13 @@ mod tests {
         let s = offline_resume_state(&["q-0", "q-1", "q-2", "q-3", "q-4", "q-5"], Some(2));
         h.restore(&s).await.expect("restore succeeds");
         assert_eq!(h.reported_play_state(), PlayState::Paused);
-        assert_eq!(h.state.lock().unwrap().current, Some(2), "holding the saved position");
+        assert_eq!(h.state.lock().unwrap().current(), Some(2), "holding the saved position");
 
         // The user presses play while the server is still away.
         h.set_pause(Some(false)).await.expect("resume gesture");
         cascade_failed_loads(&h).await;
         assert_eq!(
-            h.state.lock().unwrap().current,
+            h.state.lock().unwrap().current(),
             Some(2),
             "the search found nothing, so it hands the SAME entry back - never a walk \
              down the queue"
@@ -30927,14 +29712,14 @@ mod tests {
         let s = offline_resume_state(&["p-0", "p-1", "p-2", "p-3", "p-4"], Some(2));
         h.restore(&s).await.expect("restore succeeds");
         assert_eq!(h.reported_play_state(), PlayState::Paused, "the offline terminal stands");
-        assert_eq!(h.state.lock().unwrap().current, Some(2), "on the saved position");
+        assert_eq!(h.state.lock().unwrap().current(), Some(2), "on the saved position");
 
         // Press play. Entry 2 cannot open, so the walk steps to entry 3 - which does.
         h.set_pause(Some(false)).await.expect("resume gesture");
         let _ = h.player.stop().await;
         h.advance_on_eof(EofSignal { errored: true, ..EofSignal::default() }).await;
         assert_eq!(
-            h.state.lock().unwrap().current,
+            h.state.lock().unwrap().current(),
             Some(3),
             "the search reached the next entry the store CAN serve"
         );
@@ -30973,7 +29758,7 @@ mod tests {
             "consume ate nothing: not one entry of the queue the walk stepped over"
         );
         assert_eq!(
-            h.state.lock().unwrap().current,
+            h.state.lock().unwrap().current(),
             Some(1),
             "so the position the gesture started from is still there to hand back"
         );
@@ -30992,7 +29777,7 @@ mod tests {
     }
 
     /// THE ALARM AT THE TERMINAL, on a queue too SHORT for the fuse to save it. A wake
-    /// plays through `play_index_from_silence`, so it must arm the same way `play_index`
+    /// plays through `declare_play` (from silence), so it must arm the same way `declare_play`
     /// does - otherwise the walk it starts belongs to no gesture, and with only two
     /// entries left to try it falls off the END of the queue before a third failure could
     /// ever trip the fuse. That drain arm legitimately retires the intent and drops
@@ -31010,14 +29795,14 @@ mod tests {
         // Nothing cached, the server away, the saved position one from the end.
         let s = offline_resume_state(&["w-0", "w-1", "w-2"], Some(1));
         h.restore(&s).await.expect("restore succeeds");
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "holding the saved position");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "holding the saved position");
 
         // Hours later the alarm fires into it, and the server is STILL away.
         h.wake_now(None, 0).await.expect("the alarm plays");
         cascade_failed_loads(&h).await;
 
         assert_eq!(
-            h.state.lock().unwrap().current,
+            h.state.lock().unwrap().current(),
             Some(1),
             "the walk ran off the end of a 3-entry queue and still handed the position back"
         );
@@ -31047,17 +29832,17 @@ mod tests {
         // answered) and audio starts flowing.
         h.set_pause(Some(false)).await.expect("resume gesture");
         assert_eq!(h.reported_play_state(), PlayState::Playing, "one attempt was all it needed");
-        assert_eq!(h.state.lock().unwrap().current, Some(3), "on the entry that was held");
+        assert_eq!(h.state.lock().unwrap().current(), Some(3), "on the entry that was held");
         h.note_playback_progress(cur_qid(&h)); // the director's identity-matched TimePos
 
         // Full budget back: two dead tracks are skipped past exactly as they always were.
         let failed = || EofSignal { errored: true, ..EofSignal::default() };
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(4), "a single failed load still advances");
+        assert_eq!(h.state.lock().unwrap().current(), Some(4), "a single failed load still advances");
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(5), "and so does a second");
+        assert_eq!(h.state.lock().unwrap().current(), Some(5), "and so does a second");
         h.advance_on_eof(failed()).await;
-        assert_eq!(h.state.lock().unwrap().current, Some(5), "the third is still the systemic one");
+        assert_eq!(h.state.lock().unwrap().current(), Some(5), "the third is still the systemic one");
         assert!(h.state.lock().unwrap().pending_pause, "and it halts, as it always did");
     }
 
@@ -31095,7 +29880,7 @@ mod tests {
         // The load that failed published its own honest stop, so the player holds
         // NOTHING. (A NullPlayer's own loads all succeed, so the stop is explicit here.)
         let _ = h.player.stop().await;
-        h.state.lock().unwrap().current = Some(1);
+        h.state.lock().unwrap().set_current(Some(1));
         h.halt_failed_advance();
         assert_eq!(h.reported_play_state(), PlayState::Paused, "the halt reports Paused");
 
@@ -31106,7 +29891,7 @@ mod tests {
             PlayState::Paused,
             "and its terminal must not retire a terminal it knows nothing about"
         );
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "still holding the failed entry");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "still holding the failed entry");
         assert_eq!(
             h.resume_snapshot(12.0).play_state,
             ResumePlayState::Paused,
@@ -31162,7 +29947,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("g-0")).await;
         // A deck holding an entry whose PLAYER holds nothing, and (unlike the halt
         // terminal) with no pending-pause intent standing: reported Stopped.
-        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().set_current(Some(0));
         assert_eq!(h.reported_play_state(), PlayState::Stopped);
 
         h.set_pause(Some(false)).await.expect("resume gesture");
@@ -31178,7 +29963,7 @@ mod tests {
     /// finally picks the held entry up. Making the nothing-loaded terminal survive every
     /// volume commit means it can still be standing hours later, when a scheduled ALARM
     /// (`Action::Wake` -> [`HypodjHandler::wake_now`]) fires into it. Wake plays through
-    /// `play_index_from_silence`, which skips the resync branch where a fresh play
+    /// `declare_play` (from silence), which skips the resync branch where a fresh play
     /// retires the intent - so the deck genuinely PLAYED while `status` and MPRIS both
     /// said Paused, the checkpoint persisted a paused session over a playing track, and
     /// every recovery gesture was hijacked: seeing Paused, a knob-up / PlayPause routes
@@ -31198,7 +29983,7 @@ mod tests {
         // could not load, and the player holds nothing.
         h.note_playback_progress(cur_qid(&h));
         let _ = h.player.stop().await;
-        h.state.lock().unwrap().current = Some(1);
+        h.state.lock().unwrap().set_current(Some(1));
         h.halt_failed_advance();
         assert_eq!(h.reported_play_state(), PlayState::Paused, "the terminal stands");
 
@@ -31225,7 +30010,7 @@ mod tests {
     }
 
     /// The retirement above is scoped to the GESTURE wrapper, never to
-    /// `play_index_inner` itself: the natural EOF advance rides the same
+    /// `declare_play` itself: the natural EOF advance rides the same
     /// no-volume-resync load, and a PauseOut fade still descending when a track ends
     /// must keep its intent ACROSS the boundary so its own `Terminal::Pause` freezes the
     /// track that inherited it. Retiring there would flap the reported state
@@ -31243,7 +30028,7 @@ mod tests {
 
         // The track ends mid-descent and the advance loads the next one WITHOUT a
         // volume resync (so the ramp survives the handoff).
-        h.play_index_inner(1, false).await.expect("the EOF advance loads");
+        h.declare_play(1, Cause::Natural).await.expect("the EOF advance loads");
         assert_eq!(
             h.reported_play_state(),
             PlayState::Paused,
@@ -31271,14 +30056,14 @@ mod tests {
         h.advance_on_eof(EofSignal::default()).await;
         assert!(!h.fade_active().await, "the drain retired the pause fade");
         let st = h.state.lock().unwrap();
-        assert_eq!(st.current, None, "end of queue stops the deck");
+        assert_eq!(st.current(), None, "end of queue stops the deck");
         assert!(!st.fading, "no dead envelope drives the reported volume");
         assert_eq!(st.reported_volume(), baseline, "getvol reads the baseline");
         assert_eq!(st.queue.len(), 1, "no continuation was appended behind the pause");
     }
 
     /// The skip-pin SLOT must be leak-proof under CONCURRENCY - two connections issuing
-    /// `next`, or the window between the pin and `pending_skip` being written. With the
+    /// `next`, or the window between the pin and the declared head being written. With the
     /// slot swap and the protected-set edit taken under SEPARATE lock acquisitions, one
     /// caller's `protect(X)` can land after another's `unprotect(X)` and strand X in the
     /// protected set forever, starving eviction of victims - the exact leak the single
@@ -31417,7 +30202,7 @@ mod tests {
         );
 
         // Play it for real. loadfile's Ok is premature; the failure arrives as an event.
-        h.play_index(0).await.expect("play_index returns Ok (loadfile is premature)");
+        h.declare_play(0, Cause::Gesture).await.expect("play_index returns Ok (loadfile is premature)");
 
         // WHY A WALL CLOCK, uniquely here: the event being waited for is produced by a
         // REAL libmpv core on its OWN thread, out of its demuxer's verdict on the bytes -
@@ -31438,7 +30223,7 @@ mod tests {
                     Some(PlayerEvent::Eof { song: ended, errored, was_local, continuation_landed, .. })
                         if ended.as_ref() == Some(&song.id) =>
                     {
-                        return Some(EofSignal { song: ended, errored, was_local, continuation_landed });
+                        return Some(EofSignal { song: ended, errored, was_local, continuation_landed, queue_id: None });
                     }
                     Some(other) => {
                         if seen.len() < 16 {
@@ -31649,7 +30434,7 @@ mod tests {
 
         assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
         assert_eq!(rows(&h), before);
-        assert_eq!(h.state.lock().unwrap().current, Some(0));
+        assert_eq!(h.state.lock().unwrap().current(), Some(0));
         assert_eq!(qid_at(&h, 0), playing_qid, "the same row is current, by id");
         assert_eq!(h.reported_play_state(), PlayState::Playing);
         // The playhead really went back: the actor saw a seek into the saved
@@ -31863,11 +30648,11 @@ mod tests {
             )
             .await;
         assert_eq!(out, PlanOutcome::Jumped(1));
-        assert_eq!(h.state.lock().unwrap().current, Some(2));
+        assert_eq!(h.state.lock().unwrap().current(), Some(2));
         drain_events(&h, &mut events).await;
 
         assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
-        assert_eq!(h.state.lock().unwrap().current, Some(0));
+        assert_eq!(h.state.lock().unwrap().current(), Some(0));
         assert_eq!(qid_at(&h, 0), home);
         assert_eq!(h.reported_play_state(), PlayState::Playing);
         let evs = drain_events(&h, &mut events).await;
@@ -31904,7 +30689,7 @@ mod tests {
         assert_eq!(h2.reported_play_state(), PlayState::Stopped);
         assert!(matches!(h2.handle(MpdCommand::Undo(None)).await, MpdResponse::Pairs(_)));
         assert_eq!(h2.reported_play_state(), PlayState::Playing, "the stop was retracted");
-        assert_eq!(h2.state.lock().unwrap().current, Some(0));
+        assert_eq!(h2.state.lock().unwrap().current(), Some(0));
     }
 
 
@@ -32095,7 +30880,7 @@ mod tests {
         );
         let evs = drain_events(&h, &mut events).await;
         assert!(evs.is_empty(), "it reloaded the track he was listening to: {evs:?}");
-        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.state.lock().unwrap().current(), Some(1));
         assert_eq!(h.last_elapsed_ms.load(Ordering::Relaxed), 30_000, "the playhead never moved");
         // Nothing moved, so nothing sits on the ring offering to put back a world he
         // never left.
@@ -32386,7 +31171,7 @@ mod tests {
         );
         h.play_for_test(1).await;
         assert!(matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
-        assert_eq!(h.state.lock().unwrap().current, Some(1), "playback stayed where he put it");
+        assert_eq!(h.state.lock().unwrap().current(), Some(1), "playback stayed where he put it");
         assert_eq!(rows(&h).len(), 3);
 
         // (d) the transport moved: he paused between the act and the retraction.

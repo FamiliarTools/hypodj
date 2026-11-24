@@ -389,28 +389,36 @@ const CROSSFADE_MIN_TICK: Duration = Duration::from_millis(5);
 /// is not yet audible and at `t = 1` the outgoing is gone, and each leg reaches its
 /// end continuously - so neither end is a click even though neither is slewed.
 pub fn crossfade_gains(t01: f64, baseline_db: f64) -> (f64, f64) {
+    crossfade_pair(t01, baseline_db, baseline_db)
+}
+
+/// [`crossfade_gains`] with a separate reference per leg: the outgoing leg rides down
+/// from `out_db`, the incoming rises to `in_db`. Equal references are the ordinary
+/// crossfade; a lower `out_db` is a crossfade that begins inside a fade-out (the
+/// outgoing leg continues from the level it had already reached, never jumps back up).
+pub fn crossfade_pair(t01: f64, out_db: f64, in_db: f64) -> (f64, f64) {
     let t = t01.clamp(0.0, 1.0);
     // The ends are snapped, not computed. `cos(PI/2)` is 6.1e-17 rather than 0 in
     // binary floating point, which renders as -324 dB: inaudible, but it is not the
     // silence the contract promises, and "the outgoing is gone" is a claim the caller
     // gets to rely on rather than round off.
     if t <= 0.0 {
-        return (baseline_db, f64::NEG_INFINITY);
+        return (out_db, f64::NEG_INFINITY);
     }
     if t >= 1.0 {
-        return (f64::NEG_INFINITY, baseline_db);
+        return (f64::NEG_INFINITY, in_db);
     }
     let theta = t * std::f64::consts::FRAC_PI_2;
     // 20*log10 of the linear leg. A leg of exactly 0 maps to -inf, which the sink
     // renders as mpv volume 0 - true silence, and the correct value at each end.
-    let db = |lin: f64| {
+    let db = |reference: f64, lin: f64| {
         if lin <= 0.0 {
             f64::NEG_INFINITY
         } else {
-            baseline_db + 20.0 * lin.log10()
+            reference + 20.0 * lin.log10()
         }
     };
-    (db(theta.cos()), db(theta.sin()))
+    (db(out_db, theta.cos()), db(in_db, theta.sin()))
 }
 
 /// One scheduled crossfade step: be at balance `t01` at offset `at` from the start.
@@ -431,9 +439,11 @@ struct XStep {
 #[derive(Clone, Debug)]
 pub struct CrossfadeSpec {
     steps: Vec<XStep>,
-    /// The level both legs are measured against - the deck's committed baseline, and
-    /// the constant the perceived loudness holds at throughout.
-    baseline_db: f64,
+    /// The outgoing leg's reference level (where it stands at balance 0).
+    out_db: f64,
+    /// The incoming leg's reference level - where it lands, and the constant the
+    /// perceived loudness converges on.
+    in_db: f64,
 }
 
 impl CrossfadeSpec {
@@ -445,20 +455,35 @@ impl CrossfadeSpec {
     /// UP to [`CROSSFADE_MIN_TICK`] and the step count is capped like every other
     /// schedule here.
     pub fn new(baseline_db: f64, dur: Duration, tick: Duration) -> Result<CrossfadeSpec, FadeError> {
-        if !baseline_db.is_finite() {
+        Self::between(baseline_db, baseline_db, 0.0, dur, tick)
+    }
+
+    /// The general schedule: from balance `from_t01` to 1, with per-leg references
+    /// (see [`crossfade_pair`]). `dur` is the length of the WHOLE 0-to-1 transition, so
+    /// a schedule resumed from a live position keeps the same speed and runs only the
+    /// remaining `(1 - from_t01) * dur`. This is what lets the engine re-aim an overlap
+    /// (reverse it, or finish it inside a bound) without a step in either gain.
+    pub fn between(
+        out_db: f64,
+        in_db: f64,
+        from_t01: f64,
+        dur: Duration,
+        tick: Duration,
+    ) -> Result<CrossfadeSpec, FadeError> {
+        if !out_db.is_finite() || !in_db.is_finite() || !from_t01.is_finite() {
             return Err(FadeError::NonFinite);
         }
+        let from = from_t01.clamp(0.0, 1.0);
         let t_eff = tick.max(CROSSFADE_MIN_TICK);
-        let n = ((dur.as_secs_f64() / t_eff.as_secs_f64()).ceil() as u64)
-            .max(1)
-            .min(MAX_SCHEDULE_STEPS);
+        let span = dur.as_secs_f64() * (1.0 - from);
+        let n = ((span / t_eff.as_secs_f64()).ceil() as u64).max(1).min(MAX_SCHEDULE_STEPS);
         let steps = (1..=n)
             .map(|k| XStep {
                 at: t_eff.saturating_mul(k as u32),
-                t01: (k as f64) / (n as f64),
+                t01: from + (1.0 - from) * (k as f64) / (n as f64),
             })
             .collect();
-        Ok(CrossfadeSpec { steps, baseline_db })
+        Ok(CrossfadeSpec { steps, out_db, in_db })
     }
 
     pub fn step_count(&self) -> usize {
@@ -470,7 +495,7 @@ impl CrossfadeSpec {
     /// its true starting gain before it is unpaused, instead of letting it be briefly
     /// audible at whatever the deck happened to hold.
     pub fn opening_pair(&self) -> (f64, f64) {
-        crossfade_gains(0.0, self.baseline_db)
+        crossfade_pair(0.0, self.out_db, self.in_db)
     }
 }
 
@@ -501,18 +526,18 @@ pub async fn run_crossfade<S: CrossfadeSink, C: Clock>(
 ) -> FadeOutcome {
     let steps = &spec.steps;
     if steps.is_empty() {
-        report(FadeProgress { gain_db: spec.baseline_db, done: true });
+        report(FadeProgress { gain_db: spec.in_db, done: true });
         return FadeOutcome::Completed;
     }
     let t0 = clock.now();
     let n = steps.len();
     for (i, step) in steps.iter().enumerate() {
         clock.sleep_until(t0 + step.at).await;
-        let (out_db, in_db) = crossfade_gains(step.t01, spec.baseline_db);
+        let (out_db, in_db) = crossfade_pair(step.t01, spec.out_db, spec.in_db);
         if let Err(e) = sink.set_pair_db(out_db, in_db).await {
             return FadeOutcome::SinkError(e);
         }
-        report(FadeProgress { gain_db: spec.baseline_db, done: i + 1 == n });
+        report(FadeProgress { gain_db: spec.in_db, done: i + 1 == n });
     }
     FadeOutcome::Completed
 }

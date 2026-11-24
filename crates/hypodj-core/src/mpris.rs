@@ -13,9 +13,8 @@
 //! ## Boundary
 //!
 //! This stays behind the existing player/handler actor boundary. It holds:
-//!   - a [`PlayerHandle`] for the stateless transport controls (play/pause/stop/
-//!     seek/volume) - the SAME handle the MPD server drives;
-//!   - an `Arc<HypodjHandler>` for queue-aware controls (next/previous) and to
+//!   - an `Arc<HypodjHandler>` for every transport control (play/pause/stop/seek/
+//!     volume/next/previous), the same entry points the MPD server drives, and to
 //!     read the current queue item;
 //!   - an `Arc<SubsonicClient>` only to BUILD the `mpris:artUrl` getCoverArt URL
 //!     (auth baked in like the stream URL); it never fetches bytes here.
@@ -35,13 +34,12 @@ use mpris_server::{
 
 use crate::handler::{CurrentItem, HypodjHandler};
 use crate::model::{QueueEntry, Song};
-use crate::player::{PlayState, PlayerHandle, StreamMeta};
+use crate::player::{PlayState, StreamMeta};
 use crate::subsonic::SubsonicClient;
 
-/// The MPRIS implementation object served on the bus. Cheap to hold: three Arc/
-/// handle clones.
+/// The MPRIS implementation object served on the bus. Cheap to hold: two Arc
+/// clones. Every transport act goes through the handler, never the player directly.
 pub struct HypodjMpris {
-    player: PlayerHandle,
     handler: Arc<HypodjHandler>,
     client: Arc<SubsonicClient>,
     /// Command to spawn on MPRIS `Raise()` (e.g. a terminal + ncmpcpp). `None`
@@ -263,13 +261,11 @@ fn song_metadata(m: &mut Metadata, song: &Song, client: &SubsonicClient) {
 /// headless, no `DBUS_SESSION_BUS_ADDRESS`), `Server::new` errors and we bubble
 /// it up so the daemon can log-and-skip (never fatal).
 pub async fn serve(
-    player: PlayerHandle,
     handler: Arc<HypodjHandler>,
     client: Arc<SubsonicClient>,
     raise_command: Option<Vec<String>>,
 ) -> mpris_server::zbus::Result<Server<HypodjMpris>> {
     let imp = HypodjMpris {
-        player,
         handler,
         client,
         raise_command,
@@ -399,17 +395,17 @@ impl PlayerInterface for HypodjMpris {
         // position here, so treat the offset as a best-effort absolute nudge from
         // zero when negative-clamped. Absolute positioning is SetPosition.
         let secs = (offset.as_micros() as f64) / 1_000_000.0;
-        let p = self.player.clone();
+        let h = self.handler.clone();
         self.dispatch(async move {
-            let _ = p.seek(secs.max(0.0)).await;
+            let _ = h.seek_head(secs.max(0.0)).await;
         });
         Ok(())
     }
     async fn set_position(&self, _track_id: TrackId, position: Time) -> fdo::Result<()> {
         let secs = (position.as_micros() as f64) / 1_000_000.0;
-        let p = self.player.clone();
+        let h = self.handler.clone();
         self.dispatch(async move {
-            let _ = p.seek(secs.max(0.0)).await;
+            let _ = h.seek_head(secs.max(0.0)).await;
         });
         Ok(())
     }
