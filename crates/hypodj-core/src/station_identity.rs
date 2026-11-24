@@ -22,8 +22,53 @@
 //! The catalogue is STATIC content, so the caller caches it long-TTL and the match
 //! itself ([`match_nts_mixtape`]) is a PURE function over the fetched JSON + the URL,
 //! unit-tested offline against a captured fixture.
+//!
+//! # Tier order (task r7ql64x P5)
+//!
+//! Every tier is a pure matcher here; the handler runs them off the playback spine and
+//! MERGES the results field by field - a higher tier's name or image wins, a lower tier
+//! only fills a field the higher ones left empty ([`merge`]):
+//!
+//! 1. CONFIG - a `[[stream]]` entry ([`match_config_stream`]): exact url, else the
+//!    longest url prefix at a path boundary, else exact host. The user's own word, so
+//!    it outranks everything, and it costs no network. A name AND a logo here short-
+//!    circuit every remote tier.
+//! 2. NTS - the live channel (`/api/v2/live`, re-resolved per show) or the mixtapes
+//!    catalogue. Curated per-show name and art.
+//! 3. NAVIDROME SAVED STATION - the `name` of the `getInternetRadioStations` row whose
+//!    `streamUrl` equals the playing url ([`match_saved_station`]), list cached 60s.
+//! 4. FAVICON - `https://<homePageUrl host>/favicon.ico` of that same saved station
+//!    ([`favicon_url`]), image only, and only adopted after one bounded fetch through
+//!    the remote cover path actually returned image bytes (which also warms the cover
+//!    cache, so `albumart` serves it without a second fetch).
+//!
+//! The ICY `icy-name` sits BELOW all of these at read time (`currentsong` overwrites
+//! `Name` with a resolved identity name).
+//!
+//! # Honest gaps (task r7ql64x P6)
+//!
+//! - Matching is by url string. A station reached through a redirecting or tokenised
+//!   url (a `?sid=` session parameter, a playlist `.pls` that resolves elsewhere) only
+//!   matches a config `url` written as a prefix of it, or a `host` entry.
+//! - The Navidrome tier needs the stream to be QUEUED by its exact saved `streamUrl`;
+//!   the same station added by a different url form is not recognised.
+//! - The favicon is whatever `/favicon.ico` the homepage host serves: often 16 to 48
+//!   px, sometimes absent, never the `<link rel=icon>` a page declares (parsing HTML is
+//!   not cheap or bounded). Subsonic stations have no artwork field at all, so a
+//!   station with no homepage and no config logo stays art-less.
+//! - A config `logo` file is read when a client asks for art, not at load; a missing
+//!   or oversized (> 2 MiB) file degrades to "no art" with nothing logged per request.
+//! - NTS live rotation trusts `end_timestamp`; CloudFront can serve the previous show
+//!   for a few minutes past a boundary (bounded retries cover it, not instantly).
+//! - Resolution runs once per stream track-start. A `[[stream]]` edit or a renamed
+//!   saved station shows on the next start, not mid-play.
+
+use std::path::PathBuf;
 
 use serde::Deserialize;
+
+use crate::config::{StreamConfig, StreamLogo};
+use crate::model::Station;
 
 /// The NTS mixtapes catalogue endpoint (no auth). Static content; the caller fetches
 /// it once behind a long-TTL cache and re-matches subsequent stream URLs against it.
@@ -45,6 +90,12 @@ pub enum StationIdentitySource {
     /// The show currently on an NTS LIVE channel, from `/api/v2/live` (task r7ql64x P4).
     /// Rotates per show, so the caller re-resolves at the show's `end_timestamp`.
     NtsLive,
+    /// A `[[stream]]` config entry (task r7ql64x P5, the highest tier).
+    Config,
+    /// The name of a matching Navidrome saved internet-radio station.
+    SavedStation,
+    /// Only a favicon of a saved station's homepage.
+    Favicon,
 }
 
 /// A resolved station/show identity for a raw stream: a display `name` and a cover
@@ -60,6 +111,9 @@ pub struct StationIdentity {
     /// `picture_large`), fetched by the existing bounded remote-cover path. `None` when
     /// the provider matched but carried no image.
     pub image_url: Option<String>,
+    /// A LOCAL logo file declared by a `[[stream]]` entry, already path-validated. It
+    /// outranks `image_url` when both are set (only the config tier sets it).
+    pub image_file: Option<PathBuf>,
     /// Which provider resolved this identity (provenance; see [`StationIdentitySource`]).
     pub source: StationIdentitySource,
 }
@@ -118,6 +172,7 @@ pub fn match_nts_mixtape(catalogue_json: &str, url: &str) -> Option<StationIdent
     Some(StationIdentity {
         name: m.title.clone().filter(|t| !t.trim().is_empty()),
         image_url,
+        image_file: None,
         source: StationIdentitySource::NtsMixtape,
     })
 }
@@ -205,7 +260,100 @@ pub fn match_nts_live(live_json: &str, channel: &str) -> Option<(StationIdentity
         .as_deref()
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .map(|d| d.timestamp());
-    Some((StationIdentity { name, image_url, source: StationIdentitySource::NtsLive }, end))
+    Some((StationIdentity { name, image_url, image_file: None, source: StationIdentitySource::NtsLive }, end))
+}
+
+impl StationIdentity {
+    /// Does this identity carry any image (a url or a local file)?
+    pub fn has_image(&self) -> bool {
+        self.image_url.is_some() || self.image_file.is_some()
+    }
+}
+
+/// Merge two tiers: `hi` wins every field it has, `lo` fills the gaps. The image is
+/// taken as a UNIT (url and file together) so a lower tier never pairs its url with a
+/// higher tier's file. Provenance follows the tier that supplied the name, else the
+/// image.
+pub fn merge(hi: Option<StationIdentity>, lo: Option<StationIdentity>) -> Option<StationIdentity> {
+    match (hi, lo) {
+        (None, lo) => lo,
+        (hi, None) => hi,
+        (Some(hi), Some(lo)) => {
+            let source = if hi.name.is_some() || lo.name.is_none() { hi.source.clone() } else { lo.source.clone() };
+            let (image_url, image_file) =
+                if hi.has_image() { (hi.image_url, hi.image_file) } else { (lo.image_url, lo.image_file) };
+            Some(StationIdentity { name: hi.name.or(lo.name), image_url, image_file, source })
+        }
+    }
+}
+
+/// The host of a url (scheme, userinfo and port stripped), lowercased.
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = normalize_url(url);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    let host = host.split(':').next()?.trim();
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Tier 1: the `[[stream]]` entry for `url`. Exact url first, then the LONGEST url
+/// prefix that ends at a path boundary (`/`, `?`, `#`), then exact host. PURE.
+pub fn match_config_stream<'a>(streams: &'a [StreamConfig], url: &str) -> Option<&'a StreamConfig> {
+    let want = normalize_url(url);
+    let url_of = |e: &'a StreamConfig| e.url.as_deref().map(normalize_url).filter(|u| !u.is_empty());
+    if let Some(e) = streams.iter().find(|e| url_of(e) == Some(want)) {
+        return Some(e);
+    }
+    let prefix = streams
+        .iter()
+        .filter_map(|e| url_of(e).map(|u| (e, u)))
+        .filter(|(_, u)| {
+            want.strip_prefix(u)
+                .is_some_and(|rest| rest.starts_with(['/', '?', '#']) || u.ends_with('/'))
+        })
+        .max_by_key(|(_, u)| u.len());
+    if let Some((e, _)) = prefix {
+        return Some(e);
+    }
+    let host = url_host(url)?;
+    streams.iter().find(|e| {
+        e.host
+            .as_deref()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .is_some_and(|h| !h.is_empty() && h == host)
+    })
+}
+
+/// The identity a matched `[[stream]]` entry yields, or `None` when it carries
+/// neither a usable name nor a usable logo.
+pub fn config_identity(entry: &StreamConfig) -> Option<StationIdentity> {
+    let name = entry.name.clone().filter(|n| !n.trim().is_empty());
+    let (image_url, image_file) = match entry.parsed_logo() {
+        Some(StreamLogo::Url(u)) => (Some(u), None),
+        Some(StreamLogo::File(p)) => (None, Some(p)),
+        None => (None, None),
+    };
+    if name.is_none() && image_url.is_none() && image_file.is_none() {
+        return None;
+    }
+    Some(StationIdentity { name, image_url, image_file, source: StationIdentitySource::Config })
+}
+
+/// Tier 3: the saved station whose `streamUrl` equals `url` (scheme- and
+/// trailing-slash-insensitive). PURE.
+pub fn match_saved_station<'a>(stations: &'a [Station], url: &str) -> Option<&'a Station> {
+    let want = normalize_url(url);
+    stations.iter().find(|s| normalize_url(&s.stream_url) == want)
+}
+
+/// Tier 4: the conventional favicon url of a station homepage, always https (the
+/// remote cover path is https-only). `None` for a missing or hostless homepage.
+pub fn favicon_url(home_page_url: Option<&str>) -> Option<String> {
+    let home = home_page_url?.trim();
+    if home.is_empty() {
+        return None;
+    }
+    Some(format!("https://{}/favicon.ico", url_host(home)?))
 }
 
 /// Normalize a stream URL for equality: strip an `http(s)://` scheme and a trailing
@@ -329,6 +477,80 @@ mod tests {
         assert!(match_nts_mixtape(NTS_FIXTURE, "https://example.com/some-other-stream").is_none());
         // A garbage catalogue is a clean miss, never a panic.
         assert!(match_nts_mixtape("not json", "https://stream-mixtape-geo.ntslive.net/mixtape5").is_none());
+    }
+
+    fn sc(url: Option<&str>, host: Option<&str>, name: &str) -> StreamConfig {
+        StreamConfig {
+            url: url.map(String::from),
+            host: host.map(String::from),
+            name: Some(name.to_string()),
+            logo: None,
+        }
+    }
+
+    #[test]
+    fn config_tier_prefers_exact_then_longest_prefix_then_host() {
+        let streams = vec![
+            sc(None, Some("radio.example"), "by host"),
+            sc(Some("https://radio.example/"), None, "short prefix"),
+            sc(Some("https://radio.example/live"), None, "long prefix"),
+            sc(Some("http://radio.example/live/hi.mp3"), None, "exact"),
+        ];
+        let name = |u: &str| match_config_stream(&streams, u).and_then(|e| e.name.clone());
+        assert_eq!(name("https://radio.example/live/hi.mp3").as_deref(), Some("exact"), "scheme-insensitive exact");
+        assert_eq!(name("https://radio.example/live/lo.aac").as_deref(), Some("long prefix"));
+        assert_eq!(name("https://radio.example/live?sid=3").as_deref(), Some("long prefix"));
+        assert_eq!(name("https://radio.example/other").as_deref(), Some("short prefix"));
+        // `/live` must not prefix-match `/livestream`: a path boundary is required.
+        assert_eq!(name("https://radio.example/livestream").as_deref(), Some("short prefix"));
+        assert_eq!(name("https://user@RADIO.example:8000/x").as_deref(), Some("by host"));
+        assert_eq!(name("https://other.example/live"), None);
+    }
+
+    #[test]
+    fn config_identity_carries_name_and_logo_kind() {
+        let mut e = sc(Some("https://a/x"), None, "A");
+        e.logo = Some("/srv/a.png".into());
+        let id = config_identity(&e).unwrap();
+        assert_eq!(id.image_file, Some(PathBuf::from("/srv/a.png")));
+        assert_eq!(id.image_url, None);
+        e.logo = Some("/srv/../a.png".into());
+        assert!(!config_identity(&e).unwrap().has_image(), "an invalid path is no image");
+        e.name = None;
+        assert!(config_identity(&e).is_none());
+    }
+
+    #[test]
+    fn merge_lets_higher_tiers_win_and_lower_fill_gaps() {
+        let cfg = StationIdentity { name: None, image_url: None, image_file: Some("/l.png".into()), source: StationIdentitySource::Config };
+        let nav = StationIdentity { name: Some("Saved".into()), image_url: Some("https://f/favicon.ico".into()), image_file: None, source: StationIdentitySource::SavedStation };
+        let m = merge(Some(cfg.clone()), Some(nav.clone())).unwrap();
+        assert_eq!(m.name.as_deref(), Some("Saved"));
+        assert_eq!(m.image_file, Some(PathBuf::from("/l.png")));
+        assert_eq!(m.image_url, None, "the image is a unit: no lower url beside a higher file");
+        assert_eq!(m.source, StationIdentitySource::SavedStation, "provenance follows the name");
+        assert_eq!(merge(None, Some(nav.clone())), Some(nav.clone()));
+        assert_eq!(merge(Some(cfg.clone()), None), Some(cfg));
+    }
+
+    #[test]
+    fn saved_station_and_favicon_tiers() {
+        let st = |url: &str, home: Option<&str>| Station {
+            id: crate::model::StationId("1".into()),
+            name: "Radar".into(),
+            stream_url: url.into(),
+            home_page_url: home.map(String::from),
+        };
+        let list = vec![st("https://radio.example/stream", Some("http://www.radio.example/about"))];
+        let hit = match_saved_station(&list, "http://radio.example/stream/").unwrap();
+        assert_eq!(hit.name, "Radar");
+        assert!(match_saved_station(&list, "https://radio.example/stream2").is_none());
+        assert_eq!(
+            favicon_url(hit.home_page_url.as_deref()).as_deref(),
+            Some("https://www.radio.example/favicon.ico")
+        );
+        assert_eq!(favicon_url(None), None);
+        assert_eq!(favicon_url(Some("  ")), None);
     }
 
     #[test]

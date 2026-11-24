@@ -34,7 +34,7 @@ use tokio::time::Instant;
 
 use crate::cache::TtlLru;
 use crate::clock::TokioClock;
-use crate::config::{ContinuationMode, FadeConfig};
+use crate::config::{ContinuationMode, FadeConfig, StreamConfig};
 use crate::executor::PendingPlan;
 use crate::fade::{
     min_deliberate_dur, run_crossfade, run_fade, CrossfadeSpec, Curve, FadeError, FadeOutcome,
@@ -2966,6 +2966,15 @@ pub struct HypodjHandler {
     /// [`NTS_CATALOGUE_CACHE_KEY`] so repeated stream track-starts re-match against the
     /// cached document instead of re-fetching. A miss is a natural refetch.
     nts_catalogue_cache: TtlLru<String, String>,
+    /// The `[[stream]]` config entries (task r7ql64x P5), the highest station-identity
+    /// tier. Set once at startup; read under a short std lock, cloned out, never held
+    /// across an await. Also the ALLOWLIST of local files the cover path may read.
+    stream_configs: Mutex<Vec<StreamConfig>>,
+    /// The Navidrome saved-station list for the station-identity name tier, cached 60s
+    /// so a burst of stream starts costs one `getInternetRadioStations`. Deliberately a
+    /// separate cache from the uncached `searchall` / `station` paths: a 60s-stale NAME
+    /// is harmless, while a stale list there would break `add station/<name>`.
+    saved_stations_cache: TtlLru<String, Vec<Station>>,
     /// Recognized (artist, title) -> the confident library counterpart, or `None` for a
     /// cached NEGATIVE. Caching the misses is what bounds the unattended cost: the auto
     /// cadence re-identifying an unmatchable long mix searches once an hour, not once
@@ -3702,6 +3711,8 @@ impl HypodjHandler {
             // The NTS mixtapes catalogue is static; cache it for an hour so repeated
             // stream track-starts re-match without re-fetching.
             nts_catalogue_cache: TtlLru::new(4, Duration::from_secs(3600)),
+            stream_configs: Mutex::new(Vec::new()),
+            saved_stations_cache: TtlLru::new(1, Duration::from_secs(60)),
             library_match_cache: TtlLru::new(64, Duration::from_secs(3600)),
             plan_pending: Arc::new(Mutex::new(Vec::new())),
             journal: Journal::new(),
@@ -6426,6 +6437,12 @@ impl HypodjHandler {
             if st.station_identity_gen != gen {
                 return;
             }
+            tracing::debug!(
+                source = ?identity.source,
+                named = identity.name.is_some(),
+                image = identity.has_image(),
+                "station identity resolved"
+            );
             st.station_identity = Some((queue_id, identity));
         }
         self.notify_change();
@@ -6454,45 +6471,107 @@ impl HypodjHandler {
         });
     }
 
-    /// The off-spine STATION-IDENTITY resolution body (task lq54isr). Currently ONE
-    /// provider: the NTS mixtapes catalogue. Host-prefilters to an NTS URL (so an
-    /// arbitrary stream never triggers a network call), fetches the catalogue cache-first
-    /// (static content, long TTL) with NO std lock held across the await, matches the URL
-    /// by string equality, and stores the identity via [`Self::set_station_identity`]
-    /// (generation-gated). Any error / miss leaves the slot untouched (no identity is an
-    /// honest outcome). No leaked task: the fetch is bounded by the client's 4s timeout
-    /// and lives entirely inside this future.
+    /// The off-spine STATION-IDENTITY resolution body (tasks lq54isr, r7ql64x). Runs
+    /// the tiers in the order [`crate::station_identity`] documents and MERGES them
+    /// field by field: CONFIG (`[[stream]]`, no network; a name AND a logo there end the
+    /// resolve), then NTS (live channel or mixtapes catalogue), then the Navidrome saved
+    /// station NAME, then that station's homepage FAVICON (image only, adopted only once
+    /// a bounded fetch returned image bytes). Every network step is bounded by its
+    /// client's timeout, lives inside this future, and holds no std lock across an
+    /// await; every write goes through the generation-gated
+    /// [`Self::set_station_identity`]. Any miss or error leaves the tier empty - no
+    /// identity is an honest outcome.
     async fn resolve_station_identity(&self, gen: u64, qid: QueueId, url: String) {
-        // An NTS LIVE channel rotates per show: its own provider (task r7ql64x P4).
+        let cfg = {
+            let streams = self.stream_configs.lock().unwrap();
+            crate::station_identity::match_config_stream(&streams, &url)
+                .and_then(crate::station_identity::config_identity)
+        };
+        if let Some(id) = &cfg {
+            self.set_station_identity(gen, qid, id.clone());
+            if id.name.is_some() && id.has_image() {
+                return;
+            }
+        }
+        // An NTS LIVE channel rotates per show: its own provider (task r7ql64x P4),
+        // which loops for the life of the entry, so it is the last tier for that url.
         if let Some(channel) = nts_live_channel(&url) {
-            self.resolve_nts_live(gen, qid, channel).await;
+            self.resolve_nts_live(gen, qid, channel, cfg).await;
             return;
         }
-        // Only NTS URLs are worth a catalogue fetch.
-        if !is_nts_stream_url(&url) {
+        let nts = if is_nts_stream_url(&url) { self.nts_mixtape_identity(&url).await } else { None };
+        let mut merged = crate::station_identity::merge(cfg, nts);
+        if merged.as_ref().is_some_and(|m| m.name.is_some() && m.has_image()) {
+            self.set_station_identity(gen, qid, merged.expect("checked"));
             return;
         }
-        // Cache-first: the catalogue is static, so a hit skips the network entirely.
+        // Tier 3 and 4: the Navidrome saved station for this exact url.
+        if let Some(station) = self.saved_station_for(&url).await {
+            let saved = StationIdentity {
+                name: Some(station.name.clone()).filter(|n| !n.trim().is_empty() && *n != station.stream_url),
+                image_url: None,
+                image_file: None,
+                source: crate::station_identity::StationIdentitySource::SavedStation,
+            };
+            merged = crate::station_identity::merge(merged, Some(saved).filter(|s| s.name.is_some()));
+            if !merged.as_ref().is_some_and(|m| m.has_image()) {
+                if let Some(fav) = crate::station_identity::favicon_url(station.home_page_url.as_deref()) {
+                    // One bounded fetch through the remote cover guards; it also warms
+                    // the cover cache under the key `albumart` will ask for.
+                    let key = format!("remote/{fav}");
+                    if self.cover_bytes(&key, || self.fetch_remote_cover(&fav)).await.is_some() {
+                        let icon = StationIdentity {
+                            name: None,
+                            image_url: Some(fav),
+                            image_file: None,
+                            source: crate::station_identity::StationIdentitySource::Favicon,
+                        };
+                        merged = crate::station_identity::merge(merged, Some(icon));
+                    }
+                }
+            }
+        }
+        if let Some(id) = merged {
+            self.set_station_identity(gen, qid, id);
+        }
+    }
+
+    /// The NTS mixtapes tier: the catalogue cache-first (static, long TTL), validated
+    /// before caching, matched by string equality.
+    async fn nts_mixtape_identity(&self, url: &str) -> Option<StationIdentity> {
         let catalogue = match self.nts_catalogue_cache.get(&NTS_CATALOGUE_CACHE_KEY.to_string()) {
             Some(json) => json,
             None => {
                 let resp = match self.station_identity_http.get(NTS_MIXTAPES_URL).send().await {
                     Ok(r) if r.status().is_success() => r,
-                    _ => return,
+                    _ => return None,
                 };
                 // PARSE-VALIDATE before caching: a captive portal or CDN error page can
                 // answer 200, and caching it would poison NTS resolution for the TTL.
                 let json = match resp.text().await {
                     Ok(t) if is_valid_nts_catalogue(&t) => t,
-                    _ => return,
+                    _ => return None,
                 };
                 self.nts_catalogue_cache.put(NTS_CATALOGUE_CACHE_KEY.to_string(), json.clone());
                 json
             }
         };
-        if let Some(identity) = match_nts_mixtape(&catalogue, &url) {
-            self.set_station_identity(gen, qid, identity);
-        }
+        match_nts_mixtape(&catalogue, url)
+    }
+
+    /// The Navidrome saved station whose `streamUrl` equals `url`, from a 60s-cached
+    /// `getInternetRadioStations` list. A fetch failure is a miss and is not cached.
+    async fn saved_station_for(&self, url: &str) -> Option<Station> {
+        const KEY: &str = "stations";
+        let list = match self.saved_stations_cache.get(&KEY.to_string()) {
+            Some(l) => l,
+            None => {
+                let l = self.client.get_internet_radio_stations().await.ok()?;
+                self.saved_stations_cache.put(KEY.to_string(), l.clone());
+                l
+            }
+        };
+        crate::station_identity::match_saved_station(&list, url).cloned()
     }
 
     /// The NTS LIVE provider (task r7ql64x P4): resolve the show now on `channel` from
@@ -6504,7 +6583,7 @@ impl HypodjHandler {
     /// The endpoint sits behind CloudFront and can lag a boundary by minutes, so a body
     /// whose show has already ended is retried a bounded number of times, a minute apart.
     /// `tokio::time::sleep`, so a paused test clock drives it.
-    async fn resolve_nts_live(&self, gen: u64, qid: QueueId, channel: &str) {
+    async fn resolve_nts_live(&self, gen: u64, qid: QueueId, channel: &str, cfg: Option<StationIdentity>) {
         const BOUNDARY_SLACK_SECS: i64 = 20;
         const STALE_RETRY_SECS: u64 = 60;
         const STALE_RETRIES: u32 = 15;
@@ -6526,7 +6605,9 @@ impl HypodjHandler {
                 _ => return,
             };
             let Some((identity, end)) = match_nts_live(&body, channel) else { return };
-            self.set_station_identity(gen, qid, identity);
+            // A `[[stream]]` entry still outranks the rotating show, field by field.
+            let merged = crate::station_identity::merge(cfg.clone(), Some(identity)).expect("lo is Some");
+            self.set_station_identity(gen, qid, merged);
             let Some(end) = end else { return };
             let now = crate::store::now_unix() as i64;
             let wait = if end + BOUNDARY_SLACK_SECS > now {
@@ -9406,6 +9487,12 @@ impl HypodjHandler {
     /// toggle; `interval_secs` is the re-identify cadence, floor-clamped again here
     /// (defense in depth over the config-load clamp) so no path can hammer Shazam. A
     /// toggle-off takes effect at the next reschedule / fire and never arms again.
+    /// Install the `[[stream]]` config entries (task r7ql64x P5). Called once at
+    /// startup with the already-normalized list from [`crate::config::Config`].
+    pub fn set_stream_configs(&self, streams: Vec<StreamConfig>) {
+        *self.stream_configs.lock().unwrap() = streams;
+    }
+
     pub fn set_recognize_config(&self, auto: bool, interval_secs: u64) {
         self.recognize_auto.store(auto, Ordering::Relaxed);
         self.recognize_interval_secs.store(
@@ -14150,6 +14237,9 @@ const LIBRARY_MATCH_BUDGET: Duration = Duration::from_secs(6);
 pub(crate) enum StreamCoverSource {
     /// A remote image URL, fetched through the bounded `fetch_remote_cover` path.
     Remote(String),
+    /// A LOCAL logo file from a `[[stream]]` entry (task r7ql64x P5), read through the
+    /// bounded, allowlisted `read_logo_file` path.
+    File(std::path::PathBuf),
     /// A LIBRARY cover id, fetched through the first-party `client.cover_art` path and
     /// cached under the SAME `cover/{id}` key the library `albumart` path uses, so a
     /// cover already fetched for a library browse costs nothing here.
@@ -14163,8 +14253,13 @@ pub(crate) enum StreamCoverSource {
 fn stream_cover_source(st: &State, qid: QueueId) -> Option<StreamCoverSource> {
     st.station_identity
         .as_ref()
-        .and_then(|(q, i)| (*q == qid).then(|| i.image_url.clone()).flatten())
-        .map(StreamCoverSource::Remote)
+        .filter(|(q, _)| *q == qid)
+        .and_then(|(_, i)| {
+            i.image_file
+                .clone()
+                .map(StreamCoverSource::File)
+                .or_else(|| i.image_url.clone().map(StreamCoverSource::Remote))
+        })
         .or_else(|| {
             // Through the provenance gate, like every other reader: a match whose
             // subject has moved on must not keep serving its album art either.
@@ -14791,6 +14886,7 @@ impl MpdHandler for HypodjHandler {
                             }
                             let cover = stream_cover_source(&st, cur_qid).map(|src| match src {
                                 StreamCoverSource::Remote(u) => u,
+                                StreamCoverSource::File(p) => format!("file://{}", p.display()),
                                 StreamCoverSource::Library { song_id, .. } => {
                                     format!("song/{}", song_id.0)
                                 }
@@ -15744,6 +15840,7 @@ impl HypodjHandler {
         let cover_url = if is_stream {
             stream_cover_source(&st, qid).and_then(|src| match src {
                 StreamCoverSource::Remote(u) => Some(u),
+                StreamCoverSource::File(p) => Some(format!("file://{}", p.display())),
                 StreamCoverSource::Library { cover_id, .. } => {
                     self.client.cover_art_url(&cover_id).ok().map(|u| u.to_string())
                 }
@@ -16307,6 +16404,10 @@ impl HypodjHandler {
                     None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
                 }
             }
+            StreamCoverSource::File(path) => match self.read_logo_file(&path).await {
+                Some(b) => b,
+                None => return ack(ACK_ERROR_NO_EXIST, "albumart", "No file exists"),
+            },
             StreamCoverSource::Remote(cover_url) => {
                 let cache_key = format!("remote/{cover_url}");
                 match self
@@ -16320,6 +16421,43 @@ impl HypodjHandler {
             }
         };
         self.binary_tail(&bytes, offset)
+    }
+
+    /// The ONE local-file read in the otherwise remote-only cover serving (task r7ql64x
+    /// P5). Three gates, all of which must pass: the path is declared as a `logo` by a
+    /// CURRENT `[[stream]]` entry (an allowlist - nothing a client sends can name a
+    /// file, the path only ever comes from state the config wrote), it re-passes the
+    /// lexical [`crate::config::validate_logo_path`] check, and it is a regular file of
+    /// at most 2 MiB (checked on the metadata, then capped again on the bytes read, so a
+    /// file growing between the two cannot widen it). The read is `tokio::fs`, so the
+    /// blocking syscalls run on the blocking pool, and the bytes live in the memory
+    /// cover cache only (key `file/<path>`), never the disk cover store.
+    async fn read_logo_file(&self, path: &std::path::Path) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        const MAX_LOGO_BYTES: u64 = 2 * 1024 * 1024;
+        let declared = self.stream_configs.lock().unwrap().iter().any(|e| {
+            matches!(e.parsed_logo(), Some(crate::config::StreamLogo::File(p)) if p == path)
+        });
+        let raw = path.to_str()?;
+        if !declared || crate::config::validate_logo_path(raw).as_deref() != Some(path) {
+            return None;
+        }
+        let key = format!("file/{raw}");
+        if let Some(b) = self.cover_cache.get(&key) {
+            return Some(b);
+        }
+        let meta = tokio::fs::metadata(path).await.ok()?;
+        if !meta.is_file() || meta.len() > MAX_LOGO_BYTES {
+            return None;
+        }
+        let file = tokio::fs::File::open(path).await.ok()?;
+        let mut buf = Vec::new();
+        file.take(MAX_LOGO_BYTES + 1).read_to_end(&mut buf).await.ok()?;
+        if buf.is_empty() || buf.len() as u64 > MAX_LOGO_BYTES {
+            return None;
+        }
+        self.cover_cache.put(key, buf.clone());
+        Some(buf)
     }
 
     /// Bounded, defensive remote cover fetch (task kmrhj8m). https-only (plus http
@@ -22655,8 +22793,48 @@ mod tests {
         StationIdentity {
             name: Some("4 To The Floor".to_string()),
             image_url: Some("https://media.ntslive.co.uk/resize/400x400/ftf.jpeg".to_string()),
+            image_file: None,
             source: StationIdentitySource::NtsMixtape,
         }
+    }
+
+    // The `[[stream]]` CONFIG tier (task r7ql64x P5): a name plus a local logo resolves
+    // with no network at all, names the stream in currentsong, advertises the file as
+    // X-CoverArt, and the logo bytes are served only for the DECLARED path.
+    #[tokio::test]
+    async fn config_tier_names_the_stream_and_serves_only_its_declared_logo() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let dir = std::env::temp_dir().join(format!("hypodj-logo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let logo = dir.join("logo.png");
+        std::fs::write(&logo, b"\x89PNG fake").unwrap();
+        let other = dir.join("other.png");
+        std::fs::write(&other, b"not declared").unwrap();
+        let url = "https://radio.example/live";
+        h.set_stream_configs(vec![StreamConfig {
+            url: Some("https://radio.example/".into()),
+            host: None,
+            name: Some("My Radio".into()),
+            logo: Some(logo.display().to_string()),
+        }]);
+        let qid = h.enqueue_stream_for_test(url).await;
+        h.play_for_test(0).await;
+        let gen = h.state.lock().unwrap().station_identity_gen;
+        h.resolve_station_identity(gen, QueueId(qid), url.to_string()).await;
+
+        let cur = match h.handle(MpdCommand::CurrentSong).await {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(cur.iter().any(|(k, v)| k == "Name" && v == "My Radio"), "{cur:?}");
+        let want = format!("file://{}", logo.display());
+        assert!(cur.iter().any(|(k, v)| k == "X-CoverArt" && *v == want), "{cur:?}");
+
+        assert_eq!(h.read_logo_file(&logo).await.as_deref(), Some(&b"\x89PNG fake"[..]));
+        assert_eq!(h.read_logo_file(&other).await, None, "an undeclared file is never read");
+        let traversal = dir.join("..").join(dir.file_name().unwrap()).join("logo.png");
+        assert_eq!(h.read_logo_file(&traversal).await, None, "a traversal spelling is refused");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A resolved station identity names the stream in currentsong (Name) and surfaces its

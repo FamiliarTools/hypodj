@@ -49,6 +49,94 @@ pub struct Config {
     /// dir it simply never opens and `mark` behaves exactly as it did without it.
     #[serde(default)]
     pub tape: TapeConfig,
+    /// `[[stream]]` entries: the user's own name and logo for a raw internet-radio
+    /// stream, the HIGHEST-priority station-identity tier (see
+    /// [`crate::station_identity`] for the full tier order). Optional; none declared
+    /// means the tier is simply empty.
+    #[serde(default, rename = "stream")]
+    pub streams: Vec<StreamConfig>,
+}
+
+/// One `[[stream]]` entry: how to NAME and DRAW a raw stream the outside catalogues
+/// cannot (or name badly). Matched against the playing url by `url` (exact, else the
+/// longest url prefix at a path boundary) or, failing that, by `host` (exact host
+/// equality). An entry with neither selector, or with neither `name` nor `logo`,
+/// matches nothing and is dropped at load.
+///
+/// `logo` is either an `https://` image url (fetched through the bounded remote cover
+/// path) or an ABSOLUTE local file path. A local path is the only file the cover
+/// serving will ever read off disk, so it is validated here once: absolute, no `..`
+/// component, a raster image extension. A logo that fails validation is dropped with a
+/// warning and the entry keeps its name.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct StreamConfig {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub logo: Option<String>,
+}
+
+/// What a validated `logo` value is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamLogo {
+    /// A remote image url (https, or http loopback for tests).
+    Url(String),
+    /// A local image file, validated by [`validate_logo_path`].
+    File(PathBuf),
+}
+
+/// The image extensions a local logo may carry: the raster formats an MPD art client
+/// and the GNOME MPRIS widget can both decode. An allowlist, so a config typo can never
+/// turn the cover path into a reader of an arbitrary file.
+pub const LOGO_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+/// Validate a local logo path: absolute, free of `..` (and `.`) components, ending in
+/// an allowed image extension. Pure and lexical (no filesystem access), so the read
+/// path can re-run it as a cheap second gate.
+pub fn validate_logo_path(raw: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let p = PathBuf::from(raw.trim());
+    if !p.is_absolute() {
+        return None;
+    }
+    if p.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
+        return None;
+    }
+    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+    LOGO_EXTENSIONS.contains(&ext.as_str()).then_some(p)
+}
+
+impl StreamConfig {
+    /// Classify `logo`: an `http(s)://` value is a url, anything else must pass
+    /// [`validate_logo_path`]. `None` for an absent or invalid logo.
+    pub fn parsed_logo(&self) -> Option<StreamLogo> {
+        let raw = self.logo.as_deref()?.trim();
+        if raw.starts_with("https://") || raw.starts_with("http://") {
+            return Some(StreamLogo::Url(raw.to_string()));
+        }
+        validate_logo_path(raw).map(StreamLogo::File)
+    }
+
+    fn normalize_list(list: &mut Vec<StreamConfig>) {
+        let blank = |s: &Option<String>| s.as_deref().map_or(true, |v| v.trim().is_empty());
+        for e in list.iter_mut() {
+            if !blank(&e.logo) && e.parsed_logo().is_none() {
+                tracing::warn!("[[stream]] logo is neither an http(s) url nor a valid absolute image path; ignoring it");
+                e.logo = None;
+            }
+        }
+        list.retain(|e| {
+            let keep = !(blank(&e.url) && blank(&e.host)) && !(blank(&e.name) && blank(&e.logo));
+            if !keep {
+                tracing::warn!("[[stream]] entry needs a url or host and a name or logo; ignoring it");
+            }
+            keep
+        });
+    }
 }
 
 /// `[tape]` config for THE TAPE ([`crate::tape`]): the rolling cache of retroactively
@@ -1072,6 +1160,7 @@ impl Config {
         cfg.store.normalize();
         cfg.heard.normalize();
         cfg.tape.normalize();
+        StreamConfig::normalize_list(&mut cfg.streams);
         Ok(cfg)
     }
 
@@ -1089,6 +1178,7 @@ impl Config {
         cfg.store.normalize();
         cfg.heard.normalize();
         cfg.tape.normalize();
+        StreamConfig::normalize_list(&mut cfg.streams);
         Ok(cfg)
     }
 }
@@ -1096,6 +1186,55 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_entries_parse_and_bad_ones_are_dropped() {
+        let cfg = Config::from_str(
+            r#"
+[server]
+url = "https://x"
+username = "u"
+password = "p"
+
+[[stream]]
+url = "https://a.example/live"
+name = "A"
+logo = "/srv/logos/a.png"
+
+[[stream]]
+host = "b.example"
+logo = "https://b.example/logo.png"
+
+[[stream]]
+host = "c.example"
+name = "C"
+logo = "/etc/../etc/shadow.png"
+
+[[stream]]
+name = "no selector"
+
+[[stream]]
+url = "https://d.example/"
+logo = "relative/d.png"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.streams.len(), 3, "{:?}", cfg.streams);
+        assert_eq!(cfg.streams[0].parsed_logo(), Some(StreamLogo::File("/srv/logos/a.png".into())));
+        assert_eq!(cfg.streams[1].parsed_logo(), Some(StreamLogo::Url("https://b.example/logo.png".into())));
+        assert_eq!(cfg.streams[2].logo, None, "a traversal logo is dropped, the name kept");
+        assert_eq!(cfg.streams[2].name.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn logo_paths_are_validated_lexically() {
+        assert!(validate_logo_path("/srv/logos/a.PNG").is_some());
+        assert!(validate_logo_path("/srv/logos/a.jpeg").is_some());
+        assert!(validate_logo_path("srv/a.png").is_none(), "relative");
+        assert!(validate_logo_path("/srv/../etc/a.png").is_none(), "parent dir");
+        assert!(validate_logo_path("/etc/shadow").is_none(), "no extension");
+        assert!(validate_logo_path("/etc/passwd.txt").is_none(), "not an image");
+    }
 
     #[test]
     fn parses_and_defaults_bind_to_the_standard_mpd_port() {
