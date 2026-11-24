@@ -200,6 +200,11 @@ struct State {
     xf_failed_rev: Option<u64>,
     /// The declaration rev that failed at the bottom of the ladder: nothing retries it.
     abandoned_rev: Option<u64>,
+    /// The declaration rev whose head the engine is loading onto a STOPPED deck right
+    /// now (a natural advance after a track ended, a play from stop). The deck reads
+    /// Stopped until the load lands, but the room was declared playing: status reports
+    /// what was declared, not the gap between two tracks.
+    loading_rev: Option<u64>,
     /// The user-facing baseline volume (0..=100): what a manual `setvol` sets and
     /// what a completed `fade out` restores to. During a fade this stays put; the
     /// LIVE level rides in `live_gain_db`.
@@ -1341,6 +1346,7 @@ impl Default for State {
             quiesce_epoch: None,
             xf_failed_rev: None,
             abandoned_rev: None,
+            loading_rev: None,
             target_volume: 100,
             // 100 -> 0 dB (see mpv_volume_to_db); the two start in sync.
             live_gain_db: 0.0,
@@ -1559,10 +1565,14 @@ impl State {
     }
 
     /// Whether the declared head is still ARRIVING: the active deck plays some OTHER
-    /// row. The lockless playhead then belongs to the track being left, so it is not
-    /// reported against the head.
+    /// row, or the engine is loading the head onto an empty deck (a natural advance
+    /// after its track ended). The lockless playhead then belongs to the track being
+    /// left, so it is not reported against the head. An empty deck that is NOT loading
+    /// (a restored session held paused) keeps its saved playhead.
     fn head_arriving(&self) -> bool {
-        self.deck.is_some_and(|l| Some(l.qid) != self.head_qid())
+        let head = self.head_qid();
+        let loading = self.loading_rev == Some(self.declared.rev);
+        head.is_some() && self.deck.map(|l| l.qid) != head && (self.deck.is_some() || loading)
     }
 
     /// Whether the engine has a transition in flight (an overlap or a dip). The
@@ -8810,11 +8820,14 @@ impl HypodjHandler {
     /// One source of truth shared by `status`, the MPRIS surface, and the resume
     /// checkpoint - so they can never disagree about the play state.
     pub fn reported_play_state(&self) -> PlayState {
-        let (has_current, pending) = {
+        let (has_current, pending, loading) = {
             let st = self.state.lock().unwrap();
             (
                 st.current().and_then(|i| st.queue.get(i)).is_some(),
                 st.pending_pause,
+                st.loading_rev.is_some_and(|r| {
+                    r == st.declared.rev && st.declared.intent == reconcile::Intent::Play
+                }),
             )
         };
         if !has_current {
@@ -8823,7 +8836,11 @@ impl HypodjHandler {
         if pending {
             return PlayState::Paused;
         }
-        effective_play_state(self.player.state(), has_current)
+        let raw = self.player.state();
+        if raw == PlayState::Stopped && loading {
+            return PlayState::Playing;
+        }
+        effective_play_state(raw, has_current)
     }
 
     /// The clamped pause/resume fade duration (float-second `pause_fade_secs` into
@@ -8855,6 +8872,13 @@ impl HypodjHandler {
     /// level. Both notify on the transition so the MPRIS PropertiesChanged loop (and
     /// MPD `idle`) refresh - the fix for a desktop widget that would otherwise never
     /// see the Paused edge (it never went through `notify_change`).
+    /// Seek the HEAD. The player seeks its active deck, which through an overlap is the
+    /// leg being left, so the transition settles to one committed deck first.
+    pub(crate) async fn seek_head(&self, secs: f64) -> Result<(), PlayerError> {
+        self.settle_transitions().await;
+        self.player.seek(secs).await
+    }
+
     pub async fn set_pause(&self, want: Option<bool>) -> Result<(), PlayerError> {
         // Decide from the EFFECTIVE (pending-pause-aware) state, not the raw mpv
         // state: during a pause-out fade mpv is still raw-Playing but the intent is
@@ -13991,7 +14015,7 @@ impl MpdHandler for HypodjHandler {
                     None => MpdResponse::ok(),
                 }
             }
-            MpdCommand::Seek { secs, .. } => match self.player.seek(secs).await {
+            MpdCommand::Seek { secs, .. } => match self.seek_head(secs).await {
                 Ok(()) => {
                     // A seek moves the playhead: re-arm the LEAD continuation warm from
                     // the new position (the deadline is recomputed off the new remaining).
@@ -14002,6 +14026,9 @@ impl MpdHandler for HypodjHandler {
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
             },
             MpdCommand::SeekCur { secs, relative } => {
+                // Settle FIRST, so a relative seek is computed against the head's own
+                // position rather than the leg an overlap is leaving.
+                self.settle_transitions().await;
                 // A relative seek (`seekcur +/-N`) is computed against the live
                 // lockless position; the player itself only seeks ABSOLUTELY.
                 let target = if relative {
@@ -14009,7 +14036,7 @@ impl MpdHandler for HypodjHandler {
                 } else {
                     secs
                 };
-                match self.player.seek(target).await {
+                match self.seek_head(target).await {
                     Ok(()) => {
                         // Advance the lockless position to where we just seeked, so
                         // rapid successive relative scrubs (Space/Backspace held or
@@ -14024,7 +14051,7 @@ impl MpdHandler for HypodjHandler {
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
                 }
             }
-            MpdCommand::SeekId { secs, .. } => match self.player.seek(secs).await {
+            MpdCommand::SeekId { secs, .. } => match self.seek_head(secs).await {
                 Ok(()) => {
                     self.note_elapsed_ms((secs.max(0.0) * 1000.0) as u64);
                     self.reschedule_continuation_warm().await;

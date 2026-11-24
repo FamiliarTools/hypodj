@@ -193,7 +193,6 @@ async fn main() -> anyhow::Result<()> {
     // we log and skip - never fatal, and the MPD serve loop is unaffected.
     if cfg.mpris.enable {
         match hypodj_core::mpris::serve(
-            player.clone(),
             handler.clone(),
             client.clone(),
             cfg.mpris.raise_command.clone(),

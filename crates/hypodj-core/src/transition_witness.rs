@@ -795,6 +795,20 @@ async fn adv_settled(r: &Rig, label: &str) -> (Vec<Option<String>>, Option<Strin
     (srcs, head, vols)
 }
 
+/// Wait for an engine fade (a clear's fade-out, a pause's fade to silence) to land.
+/// Those are one-legged ramps to silence, held to the startle-safe slew (3 dB per
+/// 250 ms tick, so about five seconds from the baseline), longer than the fixed
+/// settle window `adv_settled` samples at. Bounded: a fade that never lands fails.
+async fn adv_fade_landed(r: &Rig, label: &str) {
+    for _ in 0..60 {
+        if !r.h.state.lock().unwrap().fading {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("{label}: the engine fade never landed within 15s");
+}
+
 fn adv_run(f: impl FnOnce(u16) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>) {
     let port = serve_tones();
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
@@ -864,6 +878,7 @@ fn adv_clear_during_xf() {
         r.h.handle(MpdCommand::Next).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         r.h.handle(MpdCommand::Clear).await;
+        adv_fade_landed(&r, "clear-during-xf").await;
         let (srcs, _, _) = adv_settled(&r, "clear-during-xf").await;
         assert_eq!(audible_count(&srcs), 0, "nothing audible after clear");
     }));
@@ -878,6 +893,7 @@ fn adv_pause_during_xf() {
         r.h.handle(MpdCommand::Next).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         r.h.handle(MpdCommand::Pause(Some(true))).await;
+        adv_fade_landed(&r, "pause-during-xf").await;
         let (srcs, _, _) = adv_settled(&r, "pause-during-xf").await;
         assert_eq!(audible_count(&srcs), 0, "nothing audible after pause");
         r.h.handle(MpdCommand::Pause(Some(false))).await;
@@ -1034,11 +1050,13 @@ fn adv_scenarios() {
             r.play(0).await;
             r.h.handle(MpdCommand::Next).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
-            r.h.handle(MpdCommand::SeekCur { secs: 4.0, relative: false }).await;
+            // 2.0 rather than 4.0: the 8 s tone must not reach its own end inside
+            // assert_live's 3.2 s window, which would sample across a track change.
+            r.h.handle(MpdCommand::SeekCur { secs: 2.0, relative: false }).await;
             snap(&r.h, "sxf-after-seek").await;
             tokio::time::sleep(Duration::from_millis(500)).await;
             let s = snap(&r.h, "sxf-seek+500ms").await;
-            assert!(el(&s) >= 3.5, "seek during xf: elapsed {} 500ms after seekcur 4.0", el(&s));
+            assert!(el(&s) >= 2.3, "seek during xf: elapsed {} 500ms after seekcur 2.0", el(&s));
             assert_live(&r.h, "seek-during-xf").await;
         }
         if run("stop-during-xf") {
@@ -1067,6 +1085,9 @@ fn adv_scenarios() {
             tokio::time::sleep(Duration::from_millis(500)).await;
             snap(&r.h, "pxf-500").await;
             tokio::time::sleep(Duration::from_millis(2000)).await;
+            // The playhead honestly moves while the pause ramps down (startle-safe slew,
+            // about five seconds from the baseline); "frozen" is asserted once it landed.
+            adv_fade_landed(&r, "pause-during-xf").await;
             let a = snap(&r.h, "pxf-a").await;
             tokio::time::sleep(Duration::from_millis(800)).await;
             let b = snap(&r.h, "pxf-b").await;
@@ -1227,6 +1248,9 @@ fn adv_scenarios() {
             r.play(0).await;
             r.h.handle(MpdCommand::Clear).await;
             r.h.handle(MpdCommand::Play(None)).await;
+            // The clear's fade-out is held to the startle-safe slew (about 5 s from the
+            // baseline, see clear-end); silence is asserted once it landed.
+            adv_fade_landed(&r, "clear-then-stop").await;
             tokio::time::sleep(Duration::from_millis(3000)).await;
             let s = snap(&r.h, "cts").await;
             assert_eq!(s.get("state").map(String::as_str), Some("stop"));

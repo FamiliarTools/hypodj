@@ -501,10 +501,23 @@ impl HypodjHandler {
         self.engine.run.lock().await
     }
 
-    /// Wait for any pass in progress to finish (a dip landing, a load completing) and
-    /// run one more. Transport gestures that take the gain (pause) call this first so
+    /// Bring the room to ONE deck playing the declared head, committed. Transport
+    /// gestures that act on "the" deck (pause, seek, an undo's reload) call this first so
     /// they act on the room as declared, never on a transition half done.
+    ///
+    /// A pass alone is not enough: the planner rightly treats an overlap carrying the
+    /// room to the head as `AwaitOverlap` and returns, but every transport primitive
+    /// addresses the ACTIVE deck, which through a forward overlap is still the OUTGOING
+    /// leg. A pause or seek issued then lands on the track being left (lost when it
+    /// stops) while the incoming leg plays on, and the head's deferred commit, running
+    /// later, would retire the pause intent raised after it. So an overlap in flight is
+    /// finished here within the bounded settle, under the run lock, and the pass that
+    /// follows commits the head before the gesture runs.
     pub(crate) async fn settle_transitions(&self) {
+        {
+            let _pass = self.engine.run.lock().await;
+            self.finish_overlap(SETTLE).await;
+        }
         let _ = self.reconcile().await;
     }
 
@@ -641,12 +654,14 @@ impl HypodjHandler {
     /// the caller to surface.
     async fn load(&self, play: &ResolvedPlay, rev: u64) -> Result<(), String> {
         self.set_store_playback_remote(!play.local);
+        self.state.lock().unwrap().loading_rev = Some(rev);
         let loaded = self
             .player
             .play_url(&KEY, play.song_id.clone(), Some(play.qid), &play.url, play.local)
             .await
             .map_err(|e| e.to_string());
         let mut st = self.state.lock().unwrap();
+        st.loading_rev = None;
         match loaded {
             Ok(()) => {
                 st.deck = Some(Leg { qid: play.qid, rev });
@@ -797,6 +812,12 @@ impl HypodjHandler {
             st.fade_epoch
         };
         *slot = Some(self.spawn_overlap(spec, r, epoch));
+        drop(slot);
+        // The leg coming back never stopped, so it emits no Playing edge of its own: name
+        // it, or the director stays latched on the leg being abandoned and drops every
+        // tick of the head. The returning leg is the active deck exactly when this run
+        // is reversed.
+        let _ = self.player.reannounce(&KEY, r.reversed).await;
     }
 
     /// Finish the running overlap within `within` (scaled by what is left of it), land

@@ -302,6 +302,13 @@ enum PlayerCommand {
     EmitCrossfadedEof {
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
+    /// Re-publish this deck's `StateChanged(Playing)` for the entry it carries, when it
+    /// is playing. A REVERSED overlap hands the head back to a deck that never stopped,
+    /// so it emits no edge of its own; without this the director stays latched on the
+    /// abandoned incoming leg and drops every tick of the real head (elapsed froze).
+    Reannounce {
+        reply: oneshot::Sender<Result<(), PlayerError>>,
+    },
     /// Drop a parked (warmed) continuation entry WITHOUT switching to it:
     /// `playlist-clear` (removes the appended entry, KEEPS the current playing entry)
     /// and restore `keep-open=no` so the current track's own natural EOF once again
@@ -618,6 +625,17 @@ impl PlayerHandle {
         }
         self.active.fetch_add(1, Ordering::AcqRel);
         Self::request_on(&outgoing, PlayerCommand::Stop).await
+    }
+
+    /// Re-publish the Playing edge of one deck of the pair (`active`: the deck owning the
+    /// identity, else the spare). Engine-only: a reversed overlap names which leg is the
+    /// head again, so the director re-latches the row the room is actually playing.
+    pub(crate) async fn reannounce(&self, _key: &HeadKey, active: bool) -> Result<(), PlayerError> {
+        let deck = if active { Some(self.deck().clone()) } else { self.spare().cloned() };
+        match deck {
+            Some(d) => Self::request_on(&d, |reply| PlayerCommand::Reannounce { reply }).await,
+            None => Ok(()),
+        }
     }
 
     /// Abandon a crossfade WITHOUT promoting: stop the incoming deck and leave the
@@ -1012,6 +1030,19 @@ impl NullPlayer {
                         let _ = evt_tx
                             .send(PlayerEvent::StateChanged(PlayState::Playing, song, queue_id))
                             .await;
+                    }
+                    PlayerCommand::Reannounce { reply } => {
+                        let playing = *state_tx.borrow() == PlayState::Playing;
+                        let _ = reply.send(Ok(()));
+                        if playing && current_qid.is_some() {
+                            let _ = evt_tx
+                                .send(PlayerEvent::StateChanged(
+                                    PlayState::Playing,
+                                    current.clone(),
+                                    current_qid,
+                                ))
+                                .await;
+                        }
                     }
                     PlayerCommand::EmitCrossfadedEof { reply } => {
                         // Same shape as the mpv arm: report the entry this deck was
@@ -1900,6 +1931,17 @@ fn handle_cmd(
                 }
             }
             let _ = reply.send(res);
+        }
+        PlayerCommand::Reannounce { reply } => {
+            // Reply BEFORE the (bounded) event send, as every load arm does.
+            let _ = reply.send(Ok(()));
+            if *playing && holds_entry(current, current_qid) {
+                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
+                    PlayState::Playing,
+                    current.clone(),
+                    *current_qid,
+                ));
+            }
         }
         PlayerCommand::EmitCrossfadedEof { reply } => {
             // The crossfade is promoting the other deck, so THIS deck's entry is
