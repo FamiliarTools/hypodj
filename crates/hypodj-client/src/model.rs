@@ -95,6 +95,11 @@ pub struct NowPlaying {
     /// full pass with an authoritative pin set - a row of zeros would read as "the
     /// mirror is empty", which is a different claim from "nobody has looked yet".
     pub store: Option<String>,
+    /// The music server's reachability as the daemon last observed it, from the
+    /// `X-Server` status pair (`online`, `unreachable`, `no-network`, `error`,
+    /// `unknown`). `None` from a daemon that does not report it. See
+    /// [`server_words`] for how it reads.
+    pub server: Option<String>,
     /// How many times the SERVER records this user playing the current track, from the
     /// daemon's non-standard `X-Plays` pair on `currentsong`.
     ///
@@ -388,11 +393,26 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         hint: AmbientHint::parse(status),
         continuation: parse_continuation(status),
         store: find(status, "X-Store").map(str::to_string),
+        server: find(status, "X-Server").map(str::to_string),
         // Absent pair -> None, never a fabricated zero: the daemon emits these only
         // when the server actually has a record.
         plays: find(current, "X-Plays").and_then(|v| v.parse().ok()),
         last_played_days: find(current, "X-LastPlayed").and_then(|v| v.parse().ok()),
         modes: PlaybackModes::parse(status),
+    }
+}
+
+/// The daemon's `X-Server` word as a listener reads it, plus whether it is a
+/// problem (drawn louder). Short on purpose: it has to fit beside the tab row on an
+/// 80-column terminal. An unrecognised word is shown as-is rather than hidden.
+pub fn server_words(label: &str) -> (String, bool) {
+    match label {
+        "online" => ("server online".to_string(), false),
+        "unreachable" => ("server unreachable".to_string(), true),
+        "no-network" => ("no network".to_string(), true),
+        "error" => ("server error".to_string(), true),
+        "unknown" => ("checking server".to_string(), false),
+        other => (format!("server {other}"), true),
     }
 }
 
@@ -668,6 +688,16 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn server_reachability_is_parsed_and_worded() {
+        let np = now_playing(&p(&[("X-Server", "no-network")]), &[]);
+        assert_eq!(np.server.as_deref(), Some("no-network"));
+        assert_eq!(server_words("online"), ("server online".to_string(), false));
+        assert_eq!(server_words("unreachable").0, "server unreachable");
+        assert!(server_words("no-network").1);
+        assert_eq!(now_playing(&[], &[]).server, None);
     }
 
     #[test]

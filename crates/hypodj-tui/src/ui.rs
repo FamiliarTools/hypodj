@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use hypodj_client::model::{
-    store_badge, store_badge_short, FieldState, HintKind, NowPlaying,
+    server_words, store_badge, store_badge_short, FieldState, HintKind, NowPlaying,
 };
 
 use crate::keymap;
@@ -80,7 +80,7 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     ])
     .split(f.area());
 
-    render_tabs(f, chunks[1], state.screen);
+    render_tabs(f, chunks[1], state.screen, state.now.server.as_deref());
     let list_area = chunks[2];
     match state.screen {
         Screen::Queue => render_queue(f, list_area, state),
@@ -752,8 +752,11 @@ fn hit_style() -> Style {
     Style::default().underline().bold()
 }
 
-/// A one-line tab strip: the active screen is REVERSED, the rest dim.
-fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen) {
+/// A one-line tab strip: the active screen is REVERSED, the rest dim. The music
+/// server's reachability rides the right end in words ("server online", "server
+/// unreachable", "no network"), because it decides what every other pane can do and
+/// was otherwise said nowhere: online, blackholed and unroutable drew the same frame.
+fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen, server: Option<&str>) {
     let labels = [
         (Screen::Queue, "[F1]Queue"),
         (Screen::Albums, "[F2]Albums"),
@@ -774,6 +777,17 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen) {
             Style::default().quiet()
         };
         spans.push(Span::styled(*label, style));
+    }
+    if let Some((words, bad)) = server.map(server_words) {
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let room = (area.width as usize).saturating_sub(used);
+        // Two cells of air at least, and never truncated into a half-word: a clipped
+        // "server unrea" is worse than the tab row alone.
+        if room >= words.chars().count() + 2 {
+            spans.push(Span::raw(" ".repeat(room - words.chars().count())));
+            let style = if bad { Style::default().bold() } else { Style::default().quiet() };
+            spans.push(Span::styled(words, style));
+        }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1139,14 +1153,20 @@ fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
             Span::styled(format!("{lead}  "), Style::default().quiet()),
             Span::styled(it.title.clone(), Style::default().bold()),
         ]));
-        match it.artist.as_deref() {
-            Some(a) if previous_artist != Some(a) => {
-                lines.push(Line::from(Span::styled(
-                    format!("      {a}"),
-                    Style::default().quiet(),
-                )));
-            }
-            _ => {}
+        // Availability in words (decision b), from the daemon's per-row `X-Offline`.
+        // It rides the artist sub-line so a long title can never clip it away.
+        let avail = it.details.iter().find(|(k, _)| k == "X-Offline").map(|(_, v)| {
+            if v == "1" { "on disk" } else { "stream only" }
+        });
+        let artist = it.artist.as_deref().filter(|a| previous_artist != Some(*a));
+        let sub = match (artist, avail) {
+            (Some(a), Some(w)) => Some(format!("      {a} · {w}")),
+            (Some(a), None) => Some(format!("      {a}")),
+            (None, Some(w)) => Some(format!("      {w}")),
+            (None, None) => None,
+        };
+        if let Some(sub) = sub {
+            lines.push(Line::from(Span::styled(sub, Style::default().quiet())));
         }
         previous_artist = it.artist.as_deref();
         lines.push(Line::from(""));
@@ -3461,9 +3481,23 @@ fn render_browse(
             if r.is_dir {
                 spans.push(Span::raw("/"));
             }
+            if let Some(words) = availability_words(browse, r) {
+                spans.push(Span::styled(format!("  {words}"), Style::default().quiet()));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
+    // LOADING is a state, not an empty list: the Albums root can take seconds when
+    // the server is slow or gone, and an empty pane meanwhile reads "no albums".
+    if browse.rows.is_empty() && !browse.loaded && markers {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "loading albums...",
+            Style::default().quiet(),
+        )))
+        .block(block);
+        f.render_widget(p, area);
+        return;
+    }
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().reverse());
@@ -3476,6 +3510,21 @@ fn render_browse(
         ls.select(Some(browse.selected));
     }
     f.render_stateful_widget(list, area, &mut ls);
+}
+
+/// An album dir row's availability in words (decision b): "on disk", "2 of 5 on
+/// disk" or "stream only". `None` for anything that is not an album row, or when
+/// the store did not answer - unknown is never drawn as "stream only".
+fn availability_words(browse: &Browse, r: &crate::state::BrowseRow) -> Option<String> {
+    if !browse.held_known || !r.is_dir || !r.uri.starts_with("album/") {
+        return None;
+    }
+    let held = browse.held.get(&r.uri).copied().unwrap_or(0);
+    Some(match r.song_count {
+        _ if held == 0 => "stream only".to_string(),
+        Some(n) if n > held => format!("{held} of {n} on disk"),
+        _ => "on disk".to_string(),
+    })
 }
 
 /// The DJ View pane (right of Queue on Screen::Dj): the Claude Code intelligence

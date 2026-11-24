@@ -33,6 +33,7 @@ pub mod nl;
 pub mod plan;
 pub mod plan_store;
 pub mod player;
+pub mod reach;
 pub mod recognize;
 pub mod resume;
 pub mod scrobble;

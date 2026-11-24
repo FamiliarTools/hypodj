@@ -207,7 +207,7 @@ def mpd(cmd, timeout=10):
         return dict(pairs)
 
 
-def start_daemon(bins, run, store):
+def start_daemon(bins, run, store, queue_ahead=None):
     home, xdg, state = run / "home", run / "xdg", run / "state"
     for d in (home, xdg, state):
         d.mkdir(parents=True, exist_ok=True)
@@ -234,7 +234,7 @@ state_dir = "{state}"
 [store]
 enable = true
 dir = "{store}"
-""")
+""" + (f"queue_ahead = {queue_ahead}\n" if queue_ahead is not None else ""))
     env = {"HOME": str(home), "XDG_RUNTIME_DIR": str(xdg), "HYPODJ_AUDIO": "null",
            "RUST_LOG": "info", "PATH": os.environ["PATH"]}
     proc = subprocess.Popen([str(bins / "hypodj"), str(cfg)], env=env, cwd=run,
@@ -398,7 +398,7 @@ def run_journey(bins, spec, state, work, seed, outroot):
     outdir.mkdir(parents=True)
     start = spec.get("start", "{state}").replace("{state}", state)
     set_net(start, work)
-    daemon = start_daemon(bins, run, store)
+    daemon = start_daemon(bins, run, store, spec.get("store_queue_ahead"))
     try:
         script = outdir / "script.pump"
         script.write_text(render_script(spec, state, work))

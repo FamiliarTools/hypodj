@@ -773,7 +773,7 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
                 }
             }
         }
-        RespKind::Browse { target, rows, path, title, restore_sel } => {
+        RespKind::Browse { target, rows, path, title, restore_sel, held } => {
             // browse_for(Find) returns the drill ONLY while `drilling`, which is the
             // staleness gate: a drill response that lands after the user already
             // backed out is dropped here rather than left as stale rows waiting to
@@ -785,6 +785,8 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             }
             if let Some(b) = state.browse_for(target) {
                 b.apply(rows, path, title);
+                b.held_known = held.is_some();
+                b.held = held.unwrap_or_default();
                 if let Some(sel) = restore_sel {
                     if !b.rows.is_empty() {
                         b.selected = sel.min(b.rows.len() - 1);

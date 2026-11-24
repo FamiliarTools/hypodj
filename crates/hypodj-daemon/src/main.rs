@@ -137,6 +137,23 @@ async fn main() -> anyhow::Result<()> {
     // MPD dispatch does not have. Weak so it can never keep the handler alive (the same
     // posture the store's server-back hook takes below).
     handler.set_self_ref(Arc::downgrade(&handler));
+    // SERVER REACHABILITY on `status` (`X-Server`): seeded by the greet just made,
+    // then kept current by a bounded heartbeat ping so a server that drops mid-song
+    // is named within seconds, and one that returns is noticed without a restart.
+    {
+        use hypodj_core::reach::{self, Reach, ServerReach};
+        let now = tokio::time::Instant::now();
+        let slot = Arc::new(ServerReach::new(now));
+        if server_online {
+            slot.record(Reach::Online, now);
+        }
+        handler.set_server_reach(slot.clone());
+        let probe_client = client.clone();
+        tokio::spawn(reach::run(slot, hypodj_core::clock::TokioClock, move || {
+            let c = probe_client.clone();
+            async move { c.probe_reach().await }
+        }));
+    }
 
     // The background scrobbler (feature 1) shares the SAME client. The director
     // spine feeds it every player event alongside the inline queue-advance.
