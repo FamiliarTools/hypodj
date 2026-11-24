@@ -2292,21 +2292,25 @@ pub(crate) struct DeckProbe {
 // ── the sample-accurate gain line ───────────────────────────────────────────
 
 /// mpv's own `audio-buffer`, set explicitly so the gain lead below is a stated
-/// number rather than an inherited default.
-const AUDIO_BUFFER_SECS: f64 = 0.2;
+/// number rather than an inherited default. The smallest that never underran on the
+/// listen rig's 4096-frame (85 ms) quantum under a loaded machine (measured: 0.075
+/// and 0.06 dropped audio constantly, 0.1 and up never did); every gain change waits
+/// behind it, so smaller is more responsive.
+const AUDIO_BUFFER_SECS: f64 = 0.1;
 
 /// How far AHEAD of the playback position a gain change is anchored, in stream
-/// seconds: past everything mpv has already decoded (its audio buffer plus a couple
-/// of sound-server quanta, measured at ~0.43 s on a 4096-frame graph), so a new
-/// ramp never rewrites audio the filter has already scaled. It is also the latency
+/// seconds: past everything mpv has already decoded (its audio buffer plus up to one
+/// sound-server quantum: a step sent to the filter was heard 102-178 ms later at a
+/// 0.1 s buffer on a 4096-frame graph), so a new ramp never rewrites audio the
+/// filter has already scaled. It is also the latency
 /// between a commanded level and the room hearing it, which every terminal that
 /// follows a fade (freeze, stop, load at the trough) waits out - see
 /// [`GAIN_SETTLE`].
-const GAIN_LEAD_SECS: f64 = AUDIO_BUFFER_SECS + 0.3;
+const GAIN_LEAD_SECS: f64 = AUDIO_BUFFER_SECS + 0.09;
 
 /// [`GAIN_LEAD_SECS`] as a wait: the time from the last commanded gain to it being
 /// what plays.
-pub(crate) const GAIN_SETTLE: Duration = Duration::from_millis(550);
+pub(crate) const GAIN_SETTLE: Duration = Duration::from_millis(240);
 
 /// An isolated level change (no ramp in flight) still lands as a ramp this long,
 /// never as a step: a step in gain is a click.

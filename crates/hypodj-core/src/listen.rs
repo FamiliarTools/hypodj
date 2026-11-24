@@ -51,6 +51,13 @@ pub(crate) const EQUAL_GAIN_DIP_DB: f64 = 3.0;
 pub(crate) const GAP_FLOOR_DB: f64 = -40.0;
 pub(crate) const LOUDNESS_TOL_LU: f64 = 1.0;
 pub(crate) const STARTLE_FLOOR_MS: f64 = 250.0;
+/// Longest a deliberate stop (pause, stop, clear) may take to START being heard after
+/// the command: the responsiveness bound. On the rig's 4096-frame quantum the floor
+/// is mpv's 0.1 s audio buffer plus up to one quantum (measured 102-178 ms); the
+/// gain line anchors at 0.19 s, so the onset lands near 200 ms.
+pub(crate) const ONSET_BOUND_MS: f64 = 250.0;
+/// A fade-out at most this long is a quick transport stop the onset bound applies to.
+pub(crate) const QUICK_FADE_MS: f64 = 1000.0;
 pub(crate) const TAIL_FLOOR_DB: f64 = -60.0;
 /// The reference must be a real signal, or the run is not a measurement.
 const REF_MIN_DBFS: f64 = -70.0;
@@ -231,13 +238,15 @@ pub(crate) struct AudioRow {
     pub loud_step_lu: f64,
     pub m_min_rel_lu: f64,
     pub fade_ms: f64,
+    /// Command to the first 10 ms window 1 dB below the reference (fade-outs).
+    pub onset_ms: f64,
     pub rebright_db: f64,
     pub tail_db: f64,
     pub verdict: &'static str,
     pub reasons: Vec<String>,
 }
 
-pub(crate) const AUDIO_HEADER: &str = "cause\texpect\tverdict\tref_dbfs\tmax_dip_db\tmax_over_db\tgap_ms\tclicks\tpre_clicks\tm_pre_lufs\tm_post_lufs\tloud_step_lu\tm_min_rel_lu\tfade_ms\trebright_db\ttail_db\treasons";
+pub(crate) const AUDIO_HEADER: &str = "cause\texpect\tverdict\tref_dbfs\tmax_dip_db\tmax_over_db\tgap_ms\tclicks\tpre_clicks\tm_pre_lufs\tm_post_lufs\tloud_step_lu\tm_min_rel_lu\tfade_ms\tonset_ms\trebright_db\ttail_db\treasons";
 
 fn f1(v: f64) -> String {
     if v.is_finite() { format!("{v:.1}") } else { "-".into() }
@@ -251,7 +260,7 @@ impl AudioRow {
 
     pub(crate) fn tsv(&self) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.cause,
             self.expect.name(),
             self.verdict,
@@ -266,6 +275,7 @@ impl AudioRow {
             f1(self.loud_step_lu),
             f1(self.m_min_rel_lu),
             f1(self.fade_ms),
+            f1(self.onset_ms),
             f1(self.rebright_db),
             f1(self.tail_db),
             if self.reasons.is_empty() { "-".to_string() } else { self.reasons.join("; ") }
@@ -348,6 +358,7 @@ pub(crate) fn analyse(cause: &str, expect: Expect, w: &Wav, win: &Window) -> (Au
         loud_step_lu: m_post - m_pre,
         m_min_rel_lu: after(&c.t, &c.m_rel, MOMENTARY_MS).into_iter().fold(0.0, f64::min),
         fade_ms: f64::NAN,
+        onset_ms: f64::NAN,
         rebright_db: f64::NAN,
         tail_db: f64::NAN,
         verdict: "PASS",
@@ -403,6 +414,13 @@ pub(crate) fn analyse(cause: &str, expect: Expect, w: &Wav, win: &Window) -> (Au
                     let t_leave = coarse.iter().find(|(_, v)| *v < -JND_DB).map(|p| p.0 - RMS_MS).unwrap_or(t_land).min(t_land);
                     // Credit back one window so a genuine fade is not under-read.
                     row.fade_ms = t_land - t_leave + GAP_WIN_MS;
+                    row.onset_ms = pts.iter().find(|(_, v)| *v < -JND_DB).map(|p| p.0 - GAP_WIN_MS).unwrap_or(f64::NAN);
+                    // The bound is on a quick transport stop (pause, stop). A slow
+                    // leave (clear's 5 s) starts as promptly but takes longer to fall
+                    // the first dB, which is its shape, not latency.
+                    if row.fade_ms <= QUICK_FADE_MS && !(row.onset_ms <= ONSET_BOUND_MS) {
+                        row.fail(format!("fade starts {:.0} ms after the command (> {ONSET_BOUND_MS} ms)", row.onset_ms));
+                    }
                     let mut run_min = f64::INFINITY;
                     let mut rb: f64 = 0.0;
                     for (_, v) in &coarse {
