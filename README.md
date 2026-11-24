@@ -143,6 +143,29 @@ back_secs = 300       # how much past a press asks for
 max_secs = 1200       # hard span cap per dump
 ```
 
+### Naming a raw stream
+
+A raw internet-radio stream often arrives with no name and no art. hypodj resolves
+one off the playback path, merging tiers field by field (a higher tier wins, a
+lower one only fills a gap): your own `[[stream]]` entries, then NTS (live channel
+or mixtape catalogue), then the name of the matching Navidrome saved station, then
+that station's homepage `/favicon.ico`. ICY `icy-name` sits below all of them.
+
+```toml
+[[stream]]
+url = "https://radio.example/live"   # exact, else longest prefix at a path boundary
+name = "My Radio"
+logo = "/srv/logos/my-radio.png"     # absolute png/jpg/webp/gif, or an https url
+
+[[stream]]
+host = "stream.other.example"        # any url on this host
+name = "Other"
+```
+
+A local `logo` is the only file the cover path ever reads, and only while a
+`[[stream]]` entry declares it (2 MiB cap). Honest gaps are listed in
+`crates/hypodj-core/src/station_identity.rs`.
+
 ## Install and run (Nix)
 
 ```

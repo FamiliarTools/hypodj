@@ -126,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     // stream names itself; ICY still wins when present, and the backoff + single-flight
     // keep the Shazam endpoint safe. The plan-timer wheel it arms on is wired below.
     handler.set_recognize_config(cfg.recognize.auto, cfg.recognize.interval_secs);
+    handler.set_stream_configs(cfg.streams.clone());
     // The handler's own Arc, WEAKLY: the `mark` gesture's no-ICY branch spawns a
     // one-shot recognition, and `tokio::spawn` needs an owned 'static handle the &self
     // MPD dispatch does not have. Weak so it can never keep the handler alive (the same
