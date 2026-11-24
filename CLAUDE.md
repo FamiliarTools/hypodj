@@ -27,6 +27,10 @@ usage - this file is only what you need to work in the repo.
 - `crates/hypodj-mcp` - the `dj-mcp` stdio MCP server: the agent's whole reach
   into hypodj. Depends on `hypodj-client` + `hypodj-dsl` and must NEVER depend on
   `hypodj-core`, which hard-links libmpv.
+- `crates/hypodj-search` - `dj-search-provider`, the GNOME Shell
+  `org.gnome.Shell.SearchProvider2` service (zbus over `hypodj-client`). Same rule
+  as `dj-mcp`: never depends on `hypodj-core`. Test it in a private
+  `dbus-run-session`, never the real session bus.
 
 Build or test one crate with `-p <crate>`.
 

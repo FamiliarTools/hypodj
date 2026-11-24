@@ -9,4 +9,9 @@ final: prev: {
   hypodj = final.callPackage ./package.nix {
     cargoVersion = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
   };
+  # The clients (dj, dj-gui, dj-mcp, dj-search-provider), so the module's
+  # searchProvider option has a default package without the user wiring one.
+  hypodj-clients = final.callPackage ./clients.nix {
+    cargoVersion = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
+  };
 }

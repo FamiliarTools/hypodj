@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=HypoDJ
+GenericName=Music Player
+Comment=hypodj jukebox
+Exec=dj-gui
+Terminal=true
+Icon=audio-x-generic
+Categories=Audio;AudioVideo;Player;
+Keywords=music;dj;hypodj;next;pause;

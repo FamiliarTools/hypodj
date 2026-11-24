@@ -1540,4 +1540,181 @@ mod tests {
 
         teardown(&workers);
     }
+
+    /// "go to album" then "go to artist" end to end, the way a human drives it: keys
+    /// into handle_key, dispatch onto the REAL worker against a fake MPD deck, inbounds
+    /// folded through apply_inbound. The pass criterion is the deck's own log (it was
+    /// asked for `lsinfo "album/7"` then `lsinfo "artist/3"`) plus the drill the user
+    /// sees; the frames are dumped to a temp file as the headless witness.
+    #[test]
+    fn go_to_album_then_go_to_artist_navigates_through_the_real_worker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        const SONG: &str = "Title: Everest\nArtist: Klangstof\nAlbum: Seed\n\
+            X-AlbumUri: album/7\nX-ArtistUri: artist/3\nTime: 241\n";
+
+        fn reply(cmd: &str) -> String {
+            match cmd {
+                "status" => "volume: 50\nstate: play\nsong: 0\nplaylist: 3\nplaylistlength: 1\nOK\n".into(),
+                "currentsong" => format!("file: song/everest\n{SONG}OK\n"),
+                "playlistinfo" => format!("file: song/everest\n{SONG}Pos: 0\nId: 0\nOK\n"),
+                "idle" => "changed: player\nOK\n".into(),
+                "lsinfo \"album/7\"" => format!(
+                    "file: song/everest\n{SONG}file: song/close\nTitle: Close To Me\n\
+                     Artist: Klangstof\nAlbum: Seed\nX-AlbumUri: album/7\nX-ArtistUri: artist/3\nOK\n"
+                ),
+                "lsinfo \"artist/3\"" => "directory: album/7\nAlbum: Seed\nX-SongCount: 2\n\
+                    directory: album/8\nAlbum: Close Encounters\nX-SongCount: 9\nOK\n"
+                    .into(),
+                _ => "OK\n".into(),
+            }
+        }
+
+        fn serve_one(stream: TcpStream, log: Arc<Mutex<Vec<String>>>) {
+            let mut reader = BufReader::new(stream.try_clone().expect("clone fake conn"));
+            let mut stream = stream;
+            stream.write_all(b"OK MPD 0.24.0\n").expect("greet");
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let cmd = line.trim_end().to_string();
+                if cmd == "idle" {
+                    std::thread::sleep(Duration::from_millis(50));
+                } else {
+                    log.lock().expect("log").push(cmd.clone());
+                }
+                if stream.write_all(reply(&cmd).as_bytes()).is_err() {
+                    return;
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake bind");
+        let port = listener.local_addr().expect("fake addr").port();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let accept_log = log.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let log = accept_log.clone();
+                std::thread::spawn(move || serve_one(stream, log));
+            }
+        });
+
+        let workers = worker::spawn("127.0.0.1", port).expect("fake daemon accepts");
+        let mut state = TuiState::new();
+        let render_text = |state: &TuiState| -> String {
+            use ratatui::backend::TestBackend;
+            use ratatui::Terminal;
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("test backend");
+            terminal.draw(|f| ui::render(f, state)).expect("draw");
+            let buf = terminal.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut story = String::new();
+        let mut snap = |stage: &str, state: &TuiState| {
+            story.push_str(&format!(
+                "=== {stage} === screen={:?} drilling={} drill_path={:?} status={:?}\n{}\n",
+                state.screen,
+                state.find.drilling,
+                state.find.drill.path,
+                state.status_msg,
+                render_text(state)
+            ));
+        };
+        let drain_until = |state: &mut TuiState, done: &dyn Fn(&TuiState) -> bool, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done(state) {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                if let Ok(msg) = workers.inbound_rx.recv_timeout(Duration::from_millis(200)) {
+                    apply_inbound(&workers.req_tx, state, msg);
+                }
+            }
+            while let Ok(msg) = workers.inbound_rx.try_recv() {
+                apply_inbound(&workers.req_tx, state, msg);
+            }
+        };
+        let press = |state: &mut TuiState, c: char| {
+            let intents: Vec<Intent> =
+                state.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)).into_iter().collect();
+            dispatch(
+                &workers.req_tx,
+                &workers.cc_tx,
+                &workers.find_tx,
+                &workers.info_tx,
+                &workers.more_tx,
+                state,
+                coalesce_intents(intents),
+            );
+        };
+
+        request_refresh(&workers.req_tx, &mut state);
+        drain_until(
+            &mut state,
+            &|s| s.queue.first().is_some_and(|it| it.artist_uri.is_some()),
+            "the queue with its artist uri",
+        );
+        snap("queue", &state);
+
+        // Queue row -> menu -> go to album.
+        press(&mut state, 'o');
+        snap("menu on queue row", &state);
+        press(&mut state, 'b');
+        drain_until(
+            &mut state,
+            &|s| s.find.drilling && !s.find.drill_loading && s.find.drill.rows.len() == 2,
+            "the album drill",
+        );
+        snap("after go to album", &state);
+        assert_eq!(state.screen, Screen::Find);
+        assert_eq!(state.find.drill.path, "album/7");
+        assert_eq!(
+            state.find.drill.rows[0].artist_uri.as_deref(),
+            Some("artist/3"),
+            "a drilled song row keeps its artist uri"
+        );
+
+        // Drilled song row -> menu -> go to artist: a real jump now, not a search.
+        press(&mut state, 'o');
+        let label = state
+            .menu
+            .as_ref()
+            .and_then(|m| m.rows.iter().find(|r| r.item == crate::menu::MenuItem::GoToArtist))
+            .map(|r| r.label.clone());
+        assert_eq!(label.as_deref(), Some("go to artist"), "jump, not (search)");
+        snap("menu on drilled song row", &state);
+        press(&mut state, 't');
+        drain_until(
+            &mut state,
+            &|s| s.find.drilling && !s.find.drill_loading && s.find.drill.path == "artist/3"
+                && s.find.drill.rows.len() == 2,
+            "the artist drill",
+        );
+        snap("after go to artist", &state);
+        assert_eq!(state.status_msg.as_deref(), Some("showing Klangstof"), "names the artist");
+        let frame = render_text(&state);
+        assert!(frame.contains("Close Encounters"), "the artist's albums are on screen");
+
+        let asked = log.lock().expect("log").clone();
+        let pos = |c: &str| asked.iter().position(|x| x == c);
+        let (al, ar) = (pos("lsinfo \"album/7\""), pos("lsinfo \"artist/3\""));
+        assert!(al.is_some() && ar.is_some() && al < ar, "deck was asked album then artist: {asked:?}");
+        assert!(!asked.iter().any(|c| c.starts_with("search")), "no name search: {asked:?}");
+
+        let witness = std::env::temp_dir().join("hypodj-tui-goto-story.txt");
+        std::fs::write(&witness, &story).expect("storyboard write");
+        println!("goto storyboard: {}", witness.display());
+        teardown(&workers);
+    }
 }

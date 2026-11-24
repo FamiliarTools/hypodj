@@ -1,0 +1,20 @@
+[package]
+name = "hypodj-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dj-search-provider"
+path = "src/main.rs"
+
+# The GNOME Shell search provider: an org.gnome.Shell.SearchProvider2 D-Bus service
+# that answers Activities search over the MPD socket. A CLIENT like dj-mcp - it must
+# never depend on hypodj-core (which hard-links libmpv); everything it needs is the
+# shared blocking client plus zbus. zbus 4.4 on tokio is the instance hypodj-core
+# already resolves, so the lock gains no new D-Bus stack.
+[dependencies]
+hypodj-client = { path = "../hypodj-client" }
+zbus = { version = "4.4", default-features = false, features = ["tokio"] }
+tokio = { workspace = true }

@@ -16,7 +16,7 @@ MPD client ──MPD text/TCP──▶ hypodj daemon ──OpenSubsonic REST─�
                              libmpv audio                          server)
 ```
 
-![HypoDJ (dj-gui) in the DJ View - the Queue beside the natural-language Claude Code DJ, with the now-playing card, up-next preview, and a live level meter](Screenshots/dj-view.png)
+![HypoDJ (dj-gui) in the DJ View - the Queue beside the DJ pane after an echoed, confirmed "play something calmer", with the now-playing card and cover art, the field line, up-next preview, the album-tinted level meter and the undo pill](Screenshots/dj-view.png)
 
 *HypoDJ (`dj-gui`), the DJ View: the queue beside the natural-language DJ, with the now-playing card, up-next, and a live level meter.*
 
@@ -72,6 +72,16 @@ the endless radio from whatever is playing (`dj radio random` from cold, `dj rad
 off` to stop). `dj mark` is the press; `dj heard` reads the ledger back with each
 marked row's tape segment beside it, and `dj heard keep <n>` / `dj heard drop <n>`
 pin and release one.
+
+### GNOME Activities search (`dj-search-provider`)
+
+An `org.gnome.Shell.SearchProvider2` D-Bus service. Type `next song`, `pause`,
+`louder`, `vol 30` or an artist/album name into Activities: transport rows run on
+the spot, a library hit is enqueued and played (an artist starts its radio), and
+`dj <anything>` offers "Ask the DJ", which opens `dj <phrase>` in a terminal so
+the plan is still echoed and confirmed before it arms. Enable it with
+`services.hypodj.searchProvider.enable = true;` (it is started by D-Bus on the
+first search and exits when idle; `HYPODJ_TERMINAL` picks the terminal).
 
 Any stock MPD client (ncmpcpp, mpc) also works unchanged against the daemon.
 
@@ -136,7 +146,7 @@ nix run github:FamiliarTools/hypodj#dj-gui   # HypoDJ, the TUI
 ```
 
 The flake ships `packages.hypodj` (the daemon, libmpv wrapped),
-`packages.hypodj-clients` (`dj` + `dj-gui`), and one shared `services.hypodj`
+`packages.hypodj-clients` (`dj`, `dj-gui`, `dj-mcp`, `dj-search-provider`), and one shared `services.hypodj`
 module for both NixOS and Home-Manager:
 
 ```nix
@@ -171,5 +181,6 @@ finds it).
 | `crates/hypodj-client` | Shared client lib (MPD connection, `nl` handshake, routing) |
 | `crates/hypodj-cli` | `dj` |
 | `crates/hypodj-tui` | `dj-gui` (product name HypoDJ) |
+| `crates/hypodj-search` | `dj-search-provider`, the GNOME Shell search provider |
 
 Building, testing, and deploying are covered in [CLAUDE.md](CLAUDE.md).
