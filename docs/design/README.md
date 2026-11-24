@@ -4,6 +4,7 @@ Living documents: architecture, system specs, technical exploration. Updated as
 understanding evolves, unlike the dated snapshots in `../research/`.
 
 - [hypodj offline store: final design](offline-audio-store.md) - the on-disk audio store: validity model, commit protocol, reconciler, eviction.
+- [A question gets an answer](questions.md) - why questions route to the daemon before any translator, and the offline album view.
 - [The offline store's user-facing surface](offline-store-user-surface.md) - what the badge and `dj store` may say, and the width constraint that governs it.
 - [Attention and detail: the hint and info system](attention-and-detail.md) - dwell-driven cover peek and the `i` detail card; depth as a derived value, not an event.
 - [Implementation plan: the hint and info system](attention-and-detail-plan.md) - the nine sequenced steps, each independently shippable, with the observation that proves each one landed.

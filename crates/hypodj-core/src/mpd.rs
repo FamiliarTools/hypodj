@@ -518,6 +518,10 @@ pub enum StoreCmd {
     Resume,
     /// Kick a full pass now instead of waiting out the interval.
     Now,
+    /// What is playable OFFLINE right now, grouped by album, read from the mirror's
+    /// own sidecars. Read-only. Answers "what can I play offline" with the albums a
+    /// person browses by, where `Show` only counts songs and bytes.
+    Albums,
     /// Set the user's own cache size, or clear it back to the configured cap with
     /// `None`. The payload is BYTES: human spellings like `24G` are parsed by the
     /// client, so the protocol carries one unambiguous integer and two clients can
@@ -539,6 +543,7 @@ fn parse_store(args: &[String], line: &str) -> MpdCommand {
         Some("pause") if args.len() == 1 => MpdCommand::Store(StoreCmd::Pause),
         Some("resume") if args.len() == 1 => MpdCommand::Store(StoreCmd::Resume),
         Some("now") if args.len() == 1 => MpdCommand::Store(StoreCmd::Now),
+        Some("albums") if args.len() == 1 => MpdCommand::Store(StoreCmd::Albums),
         // Bare `store limit` is a READ, and the read is `Show` - which already carries
         // the limit and its source. Routing it here rather than minting a second
         // reporting path is what keeps one answer to "how big is the cache".
@@ -1891,6 +1896,8 @@ mod parse_tests {
             // Case-insensitive like every other subcommand word here.
             ("store PAUSE", StoreCmd::Pause),
             ("store FRONTIER", StoreCmd::Frontier),
+            // What plays offline, by album - a read-only view.
+            ("store albums", StoreCmd::Albums),
         ] {
             assert!(
                 matches!(parse(line), MpdCommand::Store(got) if got == want),

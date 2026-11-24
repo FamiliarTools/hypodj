@@ -9,7 +9,7 @@ use hypodj_client::spoken::{reply_shapes, Act, State};
 use hypodj_core::handler::{
     effect_set_volume, PlanOutcome, ACK_NL_INVALID, ACK_NL_NO_TOKEN, ACK_NL_STALE, ACK_NO_PLAN,
     ACK_TRANSLATOR_TASK, ACK_WAKE_DURATION, ACK_WAKE_TIME, EFFECT_FADING, EFFECT_NOTHING,
-    EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_JDID, PAIR_NL_ANSWER, PAIR_PLAN_ID,
+    EFFECT_PAUSED, EFFECT_STOPPED, EFFECT_WAKING, PAIR_JDID, PAIR_NL_ANSWER, PAIR_OFFLINE_ALBUM, PAIR_OFFLINE_ALBUM_URI, PAIR_PLAN_ID,
     PAIR_RESULT, PAIR_SLEEP, PAIR_SLEEP_REMAINING, PAIR_WAKE, PAIR_WAKE_REMAINING,
 };
 use hypodj_core::nl::NlError;
@@ -169,6 +169,8 @@ fn the_catalog_speaks_the_handlers_sentences() {
         PAIR_WAKE_REMAINING,
         PAIR_WAKE,
         PAIR_NL_ANSWER,
+        PAIR_OFFLINE_ALBUM,
+        PAIR_OFFLINE_ALBUM_URI,
         PAIR_JDID,
         hypodj_dsl::WINDDOWN_KEY,
         hypodj_dsl::WINDDOWN_WHEN_KEY,

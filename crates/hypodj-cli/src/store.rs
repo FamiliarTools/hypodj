@@ -35,8 +35,10 @@ usage:
   djc store now            run a full reconcile pass now instead of waiting
   djc store pause          suspend bulk mirroring for this daemon process
   djc store resume         resume it (and kick a pass)
+  djc store albums         what plays offline right now, by album (no server needed)
+  djc store play <words>   play the held album whose name matches <words>
 
-pause/resume/now/limit are ACTIONS and are words only; the two views are read-only.
+pause/resume/now/limit are ACTIONS and are words only; the views are read-only.
 Sizes are binary (24G is 24 GiB) and are clamped up to 64 MiB, never rejected.";
 
 /// Run the `store` gesture. `words` are the argv tokens AFTER the leading `store`.
@@ -45,6 +47,11 @@ Sizes are binary (24G is 24 GiB) and are clamped up to 64 MiB, never rejected.";
 /// returns `Ok(false)` (which the caller maps to a non-zero exit) rather than quietly
 /// showing the default view, which would let a typo pass as an answer.
 pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
+    match words.split_first() {
+        Some((w, [])) if w == "albums" => return albums(conn),
+        Some((w, rest)) if w == "play" && !rest.is_empty() => return play(conn, &rest.join(" ")),
+        _ => {}
+    }
     let Some(line) = verb_line(words) else {
         eprintln!("{USAGE}");
         return Ok(false);
@@ -159,6 +166,119 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
     Ok(true)
 }
 
+/// One held album as the daemon listed it: the worded row and its `album/<id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldAlbum {
+    pub line: String,
+    pub uri: Option<String>,
+}
+
+/// Zip the daemon's `OfflineAlbum` rows with the `OfflineAlbumUri` that follows
+/// each. Pure, so the pairing is testable without a socket.
+pub fn held_albums(pairs: &[(String, String)]) -> Vec<HeldAlbum> {
+    let mut out: Vec<HeldAlbum> = Vec::new();
+    for (k, v) in pairs {
+        match k.as_str() {
+            "OfflineAlbum" => out.push(HeldAlbum { line: v.clone(), uri: None }),
+            "OfflineAlbumUri" if v != "-" => {
+                if let Some(last) = out.last_mut() {
+                    last.uri = Some(v.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The held albums a phrase names: every row containing all of its words,
+/// case-blind. A row that matches the phrase EXACTLY (ignoring the song count)
+/// wins alone, so a short album name is never ambiguous with a longer one.
+pub fn match_albums<'a>(albums: &'a [HeldAlbum], phrase: &str) -> Vec<&'a HeldAlbum> {
+    let want: Vec<String> = phrase.split_whitespace().map(str::to_lowercase).collect();
+    let hits: Vec<&HeldAlbum> = albums
+        .iter()
+        .filter(|a| {
+            let l = a.line.to_lowercase();
+            want.iter().all(|w| l.contains(w.as_str()))
+        })
+        .collect();
+    let p = phrase.trim().to_lowercase();
+    let exact: Vec<&HeldAlbum> = hits
+        .iter()
+        .copied()
+        .filter(|a| {
+            let l = a.line.to_lowercase();
+            let name = l.rsplit_once(" (").map_or(l.as_str(), |(n, _)| n);
+            name == p || name.rsplit_once(" - ").is_some_and(|(_, album)| album == p)
+        })
+        .collect();
+    if exact.len() == 1 { exact } else { hits }
+}
+
+/// `djc store albums`: what plays offline right now, grouped by album, plus how to
+/// play one. Read from the daemon's mirror alone, so it answers with the server
+/// unreachable - the moment the question is asked.
+fn albums(conn: &mut MpdConn) -> Result<bool, MpdError> {
+    let pairs = match conn.command("store albums") {
+        Ok(p) => p,
+        Err(MpdError::Ack(msg)) => {
+            println!("could not read the offline albums: {msg}");
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some((_, head)) = pairs.iter().find(|(k, _)| k == "OfflineSummary") {
+        println!("{head}");
+    }
+    print_held(&held_albums(&pairs));
+    Ok(true)
+}
+
+/// The rows and, when there are any, the one line that says how to play one.
+pub fn print_held(albums: &[HeldAlbum]) {
+    for a in albums {
+        println!("  {}", a.line);
+    }
+    if albums.iter().any(|a| a.uri.is_some()) {
+        println!("play one: djc store play <album name>");
+    }
+}
+
+/// `djc store play <words>`: add the held album the words name and start it. The
+/// daemon's `add album/<id>` falls back to the songs the mirror holds when the
+/// server cannot be reached, so this works offline - which is its point.
+fn play(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
+    let all = held_albums(&conn.command("store albums")?);
+    let hits = match_albums(&all, phrase);
+    let target = match hits.as_slice() {
+        [] => {
+            println!("no offline album matches \"{phrase}\" - djc store albums lists them");
+            return Ok(false);
+        }
+        [one] => *one,
+        many => {
+            println!("\"{phrase}\" matches {} offline albums - say more:", many.len());
+            for a in many {
+                println!("  {}", a.line);
+            }
+            return Ok(false);
+        }
+    };
+    let Some(uri) = target.uri.as_deref() else {
+        println!("{} has no album id, so it cannot be played as an album", target.line);
+        return Ok(false);
+    };
+    let added = conn.command(&format!("addid {uri}"))?;
+    let Some(id) = added.iter().find(|(k, _)| k == "Id").map(|(_, v)| v.clone()) else {
+        println!("the daemon did not say where it queued {}", target.line);
+        return Ok(false);
+    };
+    conn.command(&format!("playid {id}"))?;
+    println!("playing {}", target.line);
+    Ok(true)
+}
+
 /// Map the argv tail to the ONE daemon verb line, or None when it names no view.
 ///
 /// Pure, so the whole argv surface is testable without a socket.
@@ -216,6 +336,41 @@ fn human(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn p(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn held_albums_zip_each_row_with_its_uri() {
+        let pairs = p(&[
+            ("OfflineSummary", "2 albums play offline (4 songs)"),
+            ("OfflineAlbum", "Fixture Band - Held Harbour (3 songs)"),
+            ("OfflineAlbumUri", "album/a1"),
+            ("OfflineAlbum", "Loose (1 song)"),
+            ("OfflineAlbumUri", "-"),
+        ]);
+        let got = held_albums(&pairs);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].uri.as_deref(), Some("album/a1"));
+        assert_eq!(got[1].uri, None);
+    }
+
+    #[test]
+    fn a_phrase_picks_the_album_and_an_exact_name_beats_a_longer_one() {
+        let rows = |ls: &[&str]| -> Vec<HeldAlbum> {
+            ls.iter().map(|l| HeldAlbum { line: l.to_string(), uri: Some("album/x".into()) }).collect()
+        };
+        let a = rows(&["Fixture Band - Held Harbour (3 songs)", "Other - Summit (2 songs)"]);
+        assert_eq!(match_albums(&a, "harbour").len(), 1);
+        assert_eq!(match_albums(&a, "HELD harbour")[0].line, a[0].line);
+        assert!(match_albums(&a, "jazz").is_empty());
+        let b = rows(&["X - Blue (2 songs)", "X - Blue Train (5 songs)"]);
+        assert_eq!(match_albums(&b, "blue").len(), 1, "exact album name wins");
+        assert_eq!(match_albums(&b, "blue")[0].line, "X - Blue (2 songs)");
+        assert_eq!(match_albums(&b, "x").len(), 2, "a vague phrase stays ambiguous");
+    }
+
     use super::*;
 
     fn v(items: &[&str]) -> Vec<String> {

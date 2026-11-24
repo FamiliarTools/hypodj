@@ -107,6 +107,9 @@ pub enum NlQuery {
     Favorites,
     /// "is this favorited?" / "is the current song starred?": yes/no for current.
     IsCurrentFavorited,
+    /// "what's offline?" / "what can I play offline?" / "what is downloaded?": the
+    /// albums the offline mirror holds right now, the same rows as `store albums`.
+    Offline,
     /// "cancel the sleep timer" / "cancel wind down": disarm that feature through
     /// the same path as `sleep off` / `winddown off`. Answered immediately like a
     /// question (no plan, no token): it can only take away a pending timer, never

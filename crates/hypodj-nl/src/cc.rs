@@ -279,6 +279,38 @@ pub fn parse_envelope(envelope: &str) -> Result<RawPlan, String> {
     Err("claude envelope had no structured_output or result".to_string())
 }
 
+/// The ONE line that says why a `claude` call failed.
+///
+/// `claude -p --output-format json` reports a failed run in the stdout ENVELOPE
+/// (`is_error`, `subtype`, `errors`, `result`) and exits 1 with stderr EMPTY - a
+/// budget cap, a turn cap, a usage limit all arrive that way. Reading only stderr
+/// threw the reason away and left "claude exited with exit status: 1", which no
+/// one can act on. The envelope comes first, stderr second, the bare status last.
+pub fn failure_reason(stdout: &str, stderr: &str, status: &str) -> String {
+    let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        let errors: Vec<String> = v
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).map(one_line).collect())
+            .unwrap_or_default();
+        if !errors.is_empty() {
+            return errors.join("; ");
+        }
+        if let Some(r) = v.get("result").and_then(|r| r.as_str()).filter(|r| !r.trim().is_empty()) {
+            return one_line(r);
+        }
+        if let Some(sub) = v.get("subtype").and_then(|r| r.as_str()) {
+            return format!("claude stopped: {sub}");
+        }
+    }
+    let err = one_line(stderr);
+    if !err.is_empty() {
+        return format!("claude failed: {err}");
+    }
+    format!("claude exited with {status}")
+}
+
 /// Wall-clock ceiling for one `claude` call. A stalled child (network hang, an
 /// expired-auth prompt blocking on stdin) must NEVER hang the client; past this we
 /// kill it and degrade gracefully to the daemon path. Generous vs the usual
@@ -375,13 +407,11 @@ pub fn run_claude(
     let stdout = out_h.join().unwrap_or_default();
     let stderr = err_h.join().unwrap_or_default();
     if !status.success() {
-        let err = String::from_utf8_lossy(&stderr);
-        let err = err.trim();
-        return Err(if err.is_empty() {
-            format!("claude exited with {status}")
-        } else {
-            format!("claude failed: {err}")
-        });
+        return Err(failure_reason(
+            &String::from_utf8_lossy(&stdout),
+            &String::from_utf8_lossy(&stderr),
+            &status.to_string(),
+        ));
     }
     parse_envelope(&String::from_utf8_lossy(&stdout))
 }
@@ -390,6 +420,21 @@ pub fn run_claude(
 mod tests {
     use super::*;
     use hypodj_core::plan::{Action, FadeIntentIr};
+
+    #[test]
+    fn a_failed_run_names_the_envelope_reason_not_the_exit_status() {
+        // The real shape `claude` printed for a budget stop: exit 1, stderr empty,
+        // the reason only in the stdout envelope.
+        let env = r#"{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":null,"errors":["Reached maximum budget ($0.0001)"]}"#;
+        assert_eq!(failure_reason(env, "", "exit status: 1"), "Reached maximum budget ($0.0001)");
+        let env = r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#;
+        assert_eq!(failure_reason(env, "", "exit status: 1"), "claude stopped: error_max_turns");
+        let env = r#"{"is_error":true,"result":"Claude AI usage limit\nreached"}"#;
+        assert_eq!(failure_reason(env, "", "exit status: 1"), "Claude AI usage limit reached");
+        // No envelope: stderr, on one line; nothing at all: the status.
+        assert_eq!(failure_reason("", "bad\n flag", "exit status: 2"), "claude failed: bad flag");
+        assert_eq!(failure_reason("", "", "exit status: 1"), "claude exited with exit status: 1");
+    }
 
     #[test]
     fn prompt_carries_instruction_context_and_request() {

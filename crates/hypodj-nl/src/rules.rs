@@ -45,7 +45,9 @@ impl Translator for RulesTranslator {
     }
 
     fn query(&self, utterance: &str) -> Option<NlQuery> {
-        query_rules(utterance).or_else(|| cancel_rules(utterance))
+        query_rules(utterance)
+            .or_else(|| offline_rules(utterance))
+            .or_else(|| cancel_rules(utterance))
     }
 }
 
@@ -94,6 +96,35 @@ pub fn query_rules(utterance: &str) -> Option<NlQuery> {
         return Some(NlQuery::Favorites);
     }
     None
+}
+
+/// A word that names the offline mirror: what is held on disk and plays without
+/// the server.
+fn is_offline_word(w: &str) -> bool {
+    matches!(
+        w,
+        "offline" | "downloaded" | "downloads" | "download" | "cached" | "mirrored" | "on-disk"
+    )
+}
+
+/// The READ-side question about the offline mirror: "what's offline (available)?",
+/// "what can I play offline?", "what is downloaded?", "show offline albums", a bare
+/// "offline". An offline word plus a question or listing opener - so an imperative
+/// ("download this album") never matches and stays on the action path.
+pub fn offline_rules(utterance: &str) -> Option<NlQuery> {
+    let w = words(utterance);
+    let wv: Vec<&str> = w.iter().map(String::as_str).collect();
+    if !wv.iter().any(|t| is_offline_word(t)) {
+        return None;
+    }
+    let first = *wv.first()?;
+    let asks = matches!(
+        first,
+        "what" | "what's" | "whats" | "which" | "list" | "show" | "is" | "are" | "do" | "does"
+            | "anything" | "any" | "how" | "can" | "where"
+    );
+    let bare = wv.len() <= 2 && (is_offline_word(first) || first == "my");
+    (asks || bare).then_some(NlQuery::Offline)
 }
 
 /// A feature-cancel ask ("cancel the sleep timer", "turn off the wind-down"):

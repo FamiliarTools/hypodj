@@ -77,6 +77,56 @@ impl Translator for HybridTranslator {
     }
 }
 
+/// Is this utterance a READ-side QUESTION the daemon answers directly (favorites,
+/// the offline mirror, a feature cancel)? The ONE question grammar, shared by every
+/// client that translates on its own side: a question must reach the daemon's `nl`
+/// (which answers it from live state, no plan, nothing to confirm) BEFORE any
+/// client-side translator, because a translator only emits actions - handed a
+/// question it can only say "do nothing" or invent one.
+pub fn is_question(utterance: &str) -> bool {
+    use hypodj_core::nl::Translator;
+    RulesTranslator.query(utterance).is_some()
+}
+
+/// Is this plan "do nothing"? A translator's way of saying it did not understand,
+/// which a client must report as a miss - never offer for confirmation.
+pub fn is_noop(raw: &hypodj_core::plan::RawPlan) -> bool {
+    matches!(raw.action, hypodj_core::plan::Action::Noop)
+}
+
+#[cfg(test)]
+mod question_tests {
+    use super::*;
+    use hypodj_core::nl::NlQuery;
+
+    #[test]
+    fn offline_questions_are_questions_and_imperatives_are_not() {
+        for u in [
+            "whats offline available",
+            "what's offline?",
+            "what is offline",
+            "what can I play offline",
+            "what is downloaded",
+            "which albums are downloaded?",
+            "show offline albums",
+            "list downloads",
+            "offline",
+            "offline albums",
+            "is anything cached",
+        ] {
+            assert_eq!(rules::offline_rules(u), Some(NlQuery::Offline), "{u}");
+            assert!(is_question(u), "{u}");
+        }
+        for u in ["download this album", "play something", "fade out", "play offline jazz"] {
+            assert_eq!(rules::offline_rules(u), None, "{u}");
+        }
+        // The existing questions still route as questions.
+        assert!(is_question("what is favorited"));
+        assert!(is_question("cancel the sleep timer"));
+        assert!(!is_question("play some jazz"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

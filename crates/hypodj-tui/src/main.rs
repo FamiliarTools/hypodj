@@ -426,6 +426,14 @@ fn dispatch(
             Intent::LoadPlaylist(name) => {
                 let _ = tx.send(Req::Load(name));
             }
+            // A QUESTION is the daemon's to answer (from live state, nothing to
+            // confirm); Claude only emits actions, so it would turn "what's offline"
+            // into "do nothing". The one question grammar decides.
+            #[cfg(feature = "cc")]
+            Intent::Cc(phrase) if hypodj_nl::is_question(&phrase) => {
+                state.dj_phase = None;
+                let _ = tx.send(Req::Nl(phrase));
+            }
             Intent::Cc(phrase) => {
                 // Send on the DEDICATED CC channel with the small context the render
                 // thread already holds (queue length + is-playing).

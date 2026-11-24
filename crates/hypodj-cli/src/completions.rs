@@ -23,9 +23,14 @@ pub const CLI_VERBS: &[VerbSpec] = &[
     VerbSpec {
         word: "store",
         args: &[
-            "status", "show", "frontier", "pause", "resume", "now", "limit",
+            "status", "show", "frontier", "pause", "resume", "now", "limit", "albums", "play",
         ],
         help: "offline store status and control",
+    },
+    VerbSpec {
+        word: "nl",
+        args: &[],
+        help: "the rest of the line as natural language",
     },
     VerbSpec {
         word: "journal",
