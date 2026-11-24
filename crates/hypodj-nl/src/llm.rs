@@ -331,10 +331,24 @@ pub fn parse_llm_output(json: &str) -> Result<RawPlan, String> {
 mod backend {
     use hypodj_core::nl::{NlContext, NlError, NlHit, NlSource, Translator};
 
+    /// One chat message: `role` is `system`, `user` or `assistant`.
+    #[derive(Clone, Debug)]
+    pub struct ChatTurn {
+        pub role: &'static str,
+        pub content: String,
+    }
+
     /// A local constrained-decode backend. Constrains generation against a GBNF
-    /// and returns the raw JSON string the grammar produced.
+    /// and returns the raw JSON string the grammar produced for the assistant
+    /// turn that follows `chat`.
     pub trait LlmBackend: Send + Sync {
-        fn generate(&self, prompt: &str, gbnf: &str) -> Result<String, String>;
+        fn generate(&self, chat: &[ChatTurn], gbnf: &str) -> Result<String, String>;
+
+        /// Evaluate `chat` ahead of any ask so a caching backend can reuse the
+        /// state for every later ask sharing its prefix; others ignore it.
+        fn prefill(&self, _chat: &[ChatTurn]) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     /// The model translator: build a prompt, constrained-decode against the
@@ -355,12 +369,25 @@ mod backend {
             self.backend.generate(&Self::prompt(utterance, ctx), self.gbnf)
         }
 
+        /// Evaluate the fixed instructions once, before the first ask, so a
+        /// caching backend answers every later ask from the warm prefix.
+        pub fn warm(&self, ctx: &NlContext) {
+            let _ = self.backend.prefill(&Self::prompt("", ctx));
+        }
+
+        /// Parse an already-decoded plan for `utterance` (every refusal folds to
+        /// NotUnderstood).
+        pub fn translate_decoded(&self, _utterance: &str, out: &str) -> Result<NlHit, NlError> {
+            let raw = super::parse_llm_output(out).map_err(|_| NlError::NotUnderstood)?;
+            Ok(NlHit { plans: vec![raw], source: NlSource::Llm, session: None })
+        }
+
         /// The instruction a small local model decodes under. The grammar already
         /// fixes the SHAPE, so this carries only the MEANING: durations are in
         /// seconds, and worked examples anchor the mapping a 0.5B model will not
         /// infer from a schema alone.
-        fn prompt(utterance: &str, ctx: &NlContext) -> String {
-            format!(
+        fn prompt(utterance: &str, ctx: &NlContext) -> Vec<ChatTurn> {
+            vec![ChatTurn { role: "user", content: format!(
                 "You translate a music player request into one JSON plan.\n\
                  All times are in SECONDS (1 minute = 60). \"in N minutes\" delays the \
                  action (when after_secs); \"over N minutes\" is the fade length (secs). \
@@ -385,21 +412,20 @@ mod backend {
                 ctx.queue_len,
                 if ctx.current.is_some() { "" } else { "NOT " },
                 utterance,
-            )
+            ) }]
         }
     }
 
     impl<B: LlmBackend> Translator for LlmTranslator<B> {
         fn translate(&self, utterance: &str, ctx: &NlContext) -> Result<NlHit, NlError> {
             let out = self.decode(utterance, ctx).map_err(|_| NlError::NotUnderstood)?;
-            let raw = super::parse_llm_output(&out).map_err(|_| NlError::NotUnderstood)?;
-            Ok(NlHit { plans: vec![raw], source: NlSource::Llm, session: None })
+            self.translate_decoded(utterance, &out)
         }
     }
 }
 
 #[cfg(feature = "llm")]
-pub use backend::{LlmBackend, LlmTranslator};
+pub use backend::{ChatTurn, LlmBackend, LlmTranslator};
 
 #[cfg(test)]
 mod tests {

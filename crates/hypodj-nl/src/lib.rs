@@ -29,7 +29,7 @@ pub use llm::{parse_llm_output, LlmActionKind, LlmRawPlan, LlmWhen};
 pub use rules::RulesTranslator;
 
 #[cfg(feature = "llm")]
-pub use llm::{LlmBackend, LlmTranslator};
+pub use llm::{ChatTurn, LlmBackend, LlmTranslator};
 
 use hypodj_core::nl::{NlContext, NlError, NlHit, Translator};
 
@@ -927,56 +927,165 @@ mod tests {
         assert!(bad.is_empty(), "{} golden row(s) drifted:\n{}", bad.len(), bad.join("\n"));
     }
 
-    /// REAL-INFERENCE smoke for the local model path (5znoe5i, 01m85qw): golden
-    /// asks on the model surface, decoded by the actual llama backend against the
-    /// GBNF and compared with the rules translation. Every answer must be a plan
-    /// (the grammar admits nothing else); the agreement rate is printed, not
-    /// asserted, because it measures the model rather than the code. Ignored
-    /// (needs a GGUF on disk and the llama.cpp build); run with
-    /// `HYPODJ_NL_MODEL=/path/model.gguf cargo test -p hypodj-nl --features
-    /// llm-llama -- --ignored --nocapture llm_real_inference_smoke`.
+    /// The held-out paraphrase set (`tests/heldout.tsv`): `(utterance, expected)`
+    /// rows, `expected` a plan-DSL echo or `NOOP`.
+    fn heldout_rows() -> Vec<(String, String)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/heldout.tsv");
+        std::fs::read_to_string(path)
+            .expect("heldout.tsv")
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let (u, w) = l.split_once('\t').expect("utterance<TAB>expected");
+                (u.to_string(), w.to_string())
+            })
+            .collect()
+    }
+
+    /// Every held-out row is a rules MISS (so only the model ever sees it), and
+    /// every expected echo re-parses as a real `plan add` line.
+    #[test]
+    fn heldout_rows_are_rules_misses() {
+        use hypodj_core::mpd::{parse, MpdCommand, PlanCmd};
+        let c = ctx(Some("song-42"), 5);
+        let rows = heldout_rows();
+        assert!(rows.len() >= 25, "held-out set shrank to {}", rows.len());
+        let mut bad = Vec::new();
+        for (u, want) in rows {
+            if tr(&u, &c).err() != Some(NlError::NotUnderstood) {
+                bad.push(format!("rules do not miss {u:?}: {:?}", tr(&u, &c)));
+            }
+            if want != "NOOP" && !matches!(parse(&format!("plan add {want}")), MpdCommand::Plan(PlanCmd::Add(_))) {
+                bad.push(format!("expected echo does not parse: {want}"));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// One plan rendered for comparison: rules' `Similar(current)` and the model's
+    /// id-free `SimilarToCurrent` are the same ask (the daemon fills the seed), and
+    /// a query's case is irrelevant to the library search.
+    #[cfg(feature = "llm-llama")]
+    fn eval_render(p: &RawPlan, c: &NlContext) -> String {
+        let mut p = p.clone();
+        if let Action::Enqueue { selector, .. } | Action::PlayNow { selector, .. } = &mut p.action {
+            if matches!(selector, Selector::Similar(id) if Some(&*id) == c.current.as_ref()) {
+                *selector = Selector::SimilarToCurrent;
+            }
+        }
+        render_dsl(&p).unwrap_or_else(|| format!("{p:?}")).to_lowercase()
+    }
+
+    /// REAL-INFERENCE eval for the local model path: every golden.tsv row and every
+    /// held-out paraphrase, decoded by the actual llama backend under the GBNF.
+    /// A golden row AGREES when the model plan renders like the rules plan, or when
+    /// the rules refuse (any ERR) and the model answers noop or is refused itself
+    /// (grounding / parse). A held-out row agrees with its expected echo, NOOP
+    /// matching a noop or a refusal. "Expressible" golden rows are those whose rules
+    /// answer is a refusal or one plan the model surface can build at all (no
+    /// mode / wake / wind-down / curate / favorites / calmer). Printed, not
+    /// asserted: it measures the model. Ignored (needs a GGUF and the llama.cpp
+    /// build); run with `HYPODJ_NL_MODEL=/path/model.gguf cargo test -p hypodj-nl
+    /// --features llm-llama -- --ignored --nocapture llm_eval`.
     #[cfg(feature = "llm-llama")]
     #[test]
     #[ignore = "needs a local GGUF model (HYPODJ_NL_MODEL) and the llama.cpp build"]
-    fn llm_real_inference_smoke() {
+    fn llm_eval() {
         let model = std::env::var_os("HYPODJ_NL_MODEL").expect("set HYPODJ_NL_MODEL to a GGUF path");
         let t = LlmTranslator::new(llama::LlamaBackend::open(&model).expect("model file exists"));
         let c = ctx(Some("song-42"), 5);
-        let asks = [
-            "fade out",
-            "fade in",
-            "fade out over 20 minutes",
-            "fade out in 20 minutes",
-            "fade the 3rd track",
-            "stop",
-            "pause",
-            "stop after this album",
-            "stop after this track",
-            "pause in 10 minutes",
-            "more like this",
-            "stop in a bit",
-            "do a barrel roll",
-        ];
-        let mut agree = 0;
-        for u in asks {
+        let t0 = std::time::Instant::now();
+        t.warm(&c);
+        println!("warm {} ms", t0.elapsed().as_millis());
+        let mut ms = Vec::new();
+        let ask = |u: &str| -> (Option<RawPlan>, String, u128) {
             let started = std::time::Instant::now();
-            let raw = t.decode(u, &c).unwrap_or_else(|e| panic!("decode {u:?}: {e}"));
-            println!("    raw:   {raw}");
-            let hit = t.translate(u, &c).expect("the grammar admits only plans");
-            assert_eq!(hit.source, NlSource::Llm);
-            assert_eq!(hit.plans.len(), 1);
-            let p = &hit.plans[0];
-            let llm = render_dsl(p).unwrap_or_else(|| format!("{p:?}"));
-            let rules = golden_render(u, &c);
-            let same = llm == rules;
-            agree += usize::from(same);
+            let raw = t.decode(u, &c).unwrap_or_else(|e| format!("decode error: {e}"));
+            let took = started.elapsed().as_millis();
+            let plan = t.translate_decoded(u, &raw).ok().map(|h| h.plans.into_iter().next().expect("one plan"));
+            (plan, raw, took)
+        };
+        let refused = |p: &Option<RawPlan>| p.as_ref().is_none_or(|p| matches!(p.action, Action::Noop));
+        let on_surface = |p: &RawPlan| {
+            !matches!(p.trigger, RawTrigger::WallClock { .. } | RawTrigger::Daily { .. })
+                && match &p.action {
+                    Action::Fade(FadeIntentIr::Out { .. } | FadeIntentIr::In { .. }) => true,
+                    Action::Stop | Action::Pause | Action::SetVolume(_) | Action::Noop => true,
+                    Action::Enqueue { selector, .. } | Action::PlayNow { selector, .. } => matches!(
+                        selector,
+                        Selector::Query(_) | Selector::Genre(_) | Selector::Radio | Selector::Similar(_)
+                    ),
+                    Action::Remove { sel } | Action::Play { sel } | Action::Move { sel, .. } => {
+                        !matches!(sel, hypodj_core::plan::QueueSelector::Upcoming(_))
+                    }
+                    Action::Clear { .. } => true,
+                    _ => false,
+                }
+        };
+
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden.tsv")).unwrap();
+        let (mut g_all, mut g_ok, mut x_all, mut x_ok) = (0, 0, 0, 0);
+        for line in src.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
+            let u = line.split_once('\t').map_or(line, |(u, _)| u);
+            let rules = tr(u, &c);
+            let expressible = match &rules {
+                Err(_) => true,
+                Ok(ps) => ps.len() == 1 && on_surface(&ps[0]),
+            };
+            let (llm, raw, took) = ask(u);
+            ms.push(took);
+            let same = match &rules {
+                Err(_) => refused(&llm),
+                Ok(ps) => {
+                    ps.len() == 1 && llm.as_ref().is_some_and(|p| eval_render(p, &c) == eval_render(&ps[0], &c))
+                }
+            };
+            g_all += 1;
+            g_ok += usize::from(same);
+            x_all += usize::from(expressible);
+            x_ok += usize::from(same && expressible);
+            let rules_s = match &rules {
+                Ok(ps) => ps.iter().map(|p| eval_render(p, &c)).collect::<Vec<_>>().join(" ; "),
+                Err(e) => format!("ERR {e:?}"),
+            };
+            let llm_s = llm.as_ref().map_or("REFUSED".into(), |p| eval_render(p, &c));
             println!(
-                "{} {u:?} ({} ms)\n    llm:   {llm}\n    rules: {rules}",
+                "{}{} {u:?} ({} ms)\n    raw:   {raw}\n    llm:   {llm_s}\n    rules: {rules_s}",
                 if same { "AGREE" } else { "DIFF " },
-                started.elapsed().as_millis()
+                if expressible { "" } else { " [off-surface]" },
+                took
             );
         }
-        println!("agreement {agree}/{}", asks.len());
+
+        let (mut h_all, mut h_ok, mut neg_all, mut neg_ok) = (0, 0, 0, 0);
+        for (u, want) in heldout_rows() {
+            let (llm, raw, took) = ask(&u);
+            ms.push(took);
+            let same = if want == "NOOP" {
+                neg_all += 1;
+                neg_ok += usize::from(refused(&llm));
+                refused(&llm)
+            } else {
+                llm.as_ref().is_some_and(|p| eval_render(p, &c) == want.to_lowercase())
+            };
+            h_all += 1;
+            h_ok += usize::from(same);
+            let llm_s = llm.as_ref().map_or("REFUSED".into(), |p| eval_render(p, &c));
+            println!(
+                "{} held-out {u:?} ({} ms)\n    raw:   {raw}\n    llm:   {llm_s}\n    want:  {want}",
+                if same { "AGREE" } else { "DIFF " },
+                took
+            );
+        }
+        ms.sort_unstable();
+        println!("golden agreement {g_ok}/{g_all}; expressible golden {x_ok}/{x_all}");
+        println!("held-out agreement {h_ok}/{h_all} (of which NOOP rows {neg_ok}/{neg_all})");
+        println!(
+            "per-ask decode latency ms: median {} p90 {} max {}",
+            ms[ms.len() / 2],
+            ms[ms.len() * 9 / 10],
+            ms[ms.len() - 1]
+        );
     }
 
     // Sleep and wind-down name the daemon's single-instance FEATURES, so the hit
