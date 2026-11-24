@@ -1,4 +1,4 @@
-//! `dj heard` - the human artifact over the daemon's append-only heard ledger.
+//! `djc heard` - the human artifact over the daemon's append-only heard ledger.
 //!
 //! The always-on half (ICY titles, and a recognition on the streams that announce
 //! nothing) writes rows nobody is expected to open. THIS is the surface that is meant
@@ -22,12 +22,12 @@ use hypodj_client::mpd::{MpdConn, MpdError};
 
 const USAGE: &str = "\
 usage:
-  dj heard                 the last session: marks first, unowned only, deduped
-  dj heard all             every row, owned included, no cap (redirect it to a file)
-  dj heard marks           every mark you pressed, across the retained sessions
-  dj heard limit <n>       the last session, capped at n unowned rows
-  dj heard keep <n>        pin tape segment n so the sweep never evicts it
-  dj heard drop <n>        release that pin again
+  djc heard                the last session: marks first, unowned only, deduped
+  djc heard all            every row, owned included, no cap (redirect it to a file)
+  djc heard marks          every mark you pressed, across the retained sessions
+  djc heard limit <n>      the last session, capped at n unowned rows
+  djc heard keep <n>       pin tape segment n so the sweep never evicts it
+  djc heard drop <n>       release that pin again
 
 Flag spellings work too (--all, --marks, --limit n); keep/drop are ACTIONS, not views,
 so they are words only. The first line is always the COVERAGE line: it prints its own
@@ -76,7 +76,7 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
 /// Both spellings of every view are accepted - the subcommand WORD (which is what the
 /// daemon's own grammar uses, and what `:heard all` types in the TUI) and the flag,
 /// which is what a hand reaches for at a shell. Anything else is a usage error, never a
-/// silent fallback to the default view: `dj heard marsk` must not quietly print
+/// silent fallback to the default view: `djc heard marsk` must not quietly print
 /// something else and let the typo pass as an answer.
 ///
 /// Pure, so the whole argv surface is testable without a socket.
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn the_tape_pins_are_word_only_and_carry_the_rendered_index() {
         // `mark` keeps audio, the tape is a rolling cache under a byte budget, and this
-        // is the ONLY way a segment survives the sweep. Without these arms `dj heard
+        // is the ONLY way a segment survives the sweep. Without these arms `djc heard
         // keep 3` printed the usage and exited non-zero on a gesture the daemon fully
         // supports.
         assert_eq!(line(&["keep", "3"]), Some("heard keep 3".to_string()));

@@ -69,9 +69,9 @@ impl Provider {
 fn activate(host: &str, port: u16, hit: Hit) {
     match hit {
         Hit::Ask(phrase) => {
-            // Echo-before-arm: `dj <phrase>` prints the plan and asks y/N in the
+            // Echo-before-arm: `djc <phrase>` prints the plan and asks y/N in the
             // terminal. Nothing is ever armed from the search box itself.
-            let mut argv = vec![sibling("dj")];
+            let mut argv = vec![sibling("djc")];
             argv.extend(phrase.split_whitespace().map(str::to_string));
             open_terminal(&argv);
         }

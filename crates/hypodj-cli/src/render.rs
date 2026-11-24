@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn card_carries_the_offline_store_line_playing_or_stopped() {
-        // "How do I know the backfill is running?" has to be answerable from `dj status`,
+        // "How do I know the backfill is running?" has to be answerable from `djc status`,
         // because `store` is not in the `commands` advertisement and nothing else in the
         // toolchain surfaces it. Both branches of the card render it - a stopped deck is
         // exactly when a multi-day mirror is most likely to be filling.

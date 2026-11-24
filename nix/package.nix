@@ -70,6 +70,9 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "MPD-speaking OpenSubsonic client daemon (the DJ underneath)";
     mainProgram = "hypodj";
-    license = with lib.licenses; [ mit asl20 ];
+    # FSL-1.1-MIT is source-available (free = false in nixpkgs) until each
+    # release converts to MIT after two years; consumers need allowUnfree or a
+    # predicate. The flake's own pkgs allow exactly these two packages.
+    license = lib.licenses.fsl11Mit;
   };
 }
