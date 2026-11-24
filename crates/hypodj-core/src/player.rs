@@ -1231,6 +1231,11 @@ pub enum AudioOut {
     /// The real default device. Only reachable by explicitly asking for it;
     /// nothing in the test path constructs this.
     Device,
+    /// `ao=pipewire` pinned to ONE named PipeWire remote, with no fallback driver. The
+    /// transition listen harness points this at a private PipeWire whose only sink is
+    /// a null sink it records, so two decks are summed exactly as the real graph sums
+    /// them without a speaker anywhere. A remote that does not exist fails closed.
+    Pipewire(String),
 }
 
 /// The real, libmpv-backed player actor. Lives behind the SAME [`PlayerHandle`]
@@ -1359,6 +1364,10 @@ impl MpvPlayer {
                     init.set_property("oac", "pcm_s16le")?;
                 }
                 AudioOut::Device => {}
+                AudioOut::Pipewire(remote) => {
+                    init.set_property("ao", "pipewire")?;
+                    init.set_property("pipewire-remote", remote.as_str())?;
+                }
             }
             Ok(())
         })

@@ -16671,6 +16671,10 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
 mod transition_witness;
 
 #[cfg(test)]
+#[path = "listen.rs"]
+mod listen;
+
+#[cfg(test)]
 mod tests {
 
     #[test]
