@@ -35,6 +35,14 @@ use std::io::{BufRead, BufReader, Write};
 const SAMPLE_MS: u64 = 10;
 const PRE_MS: u64 = 400;
 const POST_MS: u64 = 3500;
+/// `clear` fades out over the configured clear fade (5 s by default, deliberately
+/// long), plus the audio path's lead: its window has to hold the whole fade.
+const CLEAR_POST_MS: u64 = 6500;
+
+/// How long after the trigger a cause is recorded and judged.
+fn post_ms(cause: &str) -> u64 {
+    if cause == "clear" { CLEAR_POST_MS } else { POST_MS }
+}
 /// A source counts as AUDIBLE above this mpv softvol (cubic: 2 is about -102 dB, i.e.
 /// anything the fade driver did not deliberately park at zero).
 const AUDIBLE_VOL: f64 = 0.5;
@@ -483,6 +491,10 @@ impl Rig {
         let scrobbler = Arc::new(crate::scrobble::Scrobbler::new(client.clone()));
         let runtime =
             crate::director::run(TokioClock, h.clone(), scrobbler, client, events);
+        // As the daemon does: the timers are what arm the gapless warm of the next row
+        // ahead of a natural EOF. Without them every EOF here was a cold load, a gap
+        // the daemon never plays.
+        h.set_plan_timers(runtime.timers.clone());
         for s in songs {
             h.enqueue_song_for_test(song(s)).await;
         }
@@ -508,13 +520,20 @@ impl Rig {
     where
         F: std::future::Future<Output = ()>,
     {
+        self.record_for(trigger, POST_MS).await
+    }
+
+    async fn record_for<F>(&self, trigger: F, post: u64) -> Vec<Sample>
+    where
+        F: std::future::Future<Output = ()>,
+    {
         let t0 = tokio::time::Instant::now();
         let mut out = Vec::new();
         while t0.elapsed() < Duration::from_millis(PRE_MS) {
             out.push(self.sample(t0).await);
             tokio::time::sleep(Duration::from_millis(SAMPLE_MS)).await;
         }
-        let end = t0 + Duration::from_millis(PRE_MS + POST_MS);
+        let end = t0 + Duration::from_millis(PRE_MS + post);
         if let Some(l) = &self.listen {
             l.mark(std::time::Instant::now());
         }
@@ -578,6 +597,9 @@ pub(crate) const CAUSES: &[&str] = &[
     "previous",
     "eof-other-album",
     "eof-same-album",
+    // A natural EOF on the deck a crossfade just landed on: its gain arrived by the
+    // engine's ramp, and the gapless advance must carry it into the next file.
+    "eof-after-crossfade",
     "play-n-while-playing",
     "playid",
     "delete-playing-row",
@@ -616,6 +638,14 @@ async fn run_cause(port: u16, cause: &str, lx: Option<Arc<Listen>>) -> Vec<Row> 
         "eof-same-album" => {
             let r = Rig::with(port, lx.clone(), &["P", "Q"]).await;
             r.h.handle(MpdCommand::Play(Some(0))).await;
+            vec![row(&r.record_until_head_moves(Duration::from_secs(8)).await)]
+        }
+        "eof-after-crossfade" => {
+            let r = Rig::with(port, lx.clone(), &["A", "X", "Y"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            // Let the overlap land on X (3 s) before its natural end.
+            tokio::time::sleep(Duration::from_millis(2100)).await;
             vec![row(&r.record_until_head_moves(Duration::from_secs(8)).await)]
         }
         "play-n-while-playing" => {
@@ -709,7 +739,7 @@ async fn run_cause(port: u16, cause: &str, lx: Option<Arc<Listen>>) -> Vec<Row> 
         "clear" => {
             let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
             r.play(0).await;
-            vec![row(&r.record(async { r.h.handle(MpdCommand::Clear).await; }).await)]
+            vec![row(&r.record_for(async { r.h.handle(MpdCommand::Clear).await; }, CLEAR_POST_MS).await)]
         }
         other => panic!("unknown witness cause {other}"),
     }
@@ -863,10 +893,10 @@ fn transition_listen_record() {
         assert_eq!(triggers.len(), rows.len(), "{cause}: one trigger per witness row");
         for (row, at) in rows.iter().zip(triggers) {
             let trigger = (at.saturating_duration_since(first).as_secs_f64() * listen::FS as f64) as usize;
-            let win = listen::Window { trigger, pre_ms: PRE_MS as f64, post_ms: POST_MS as f64, f_max };
+            let win = listen::Window { trigger, pre_ms: PRE_MS as f64, post_ms: post_ms(&row.cause) as f64, f_max };
             let (a, curve) = listen::analyse(&row.cause, expect_of(&row.cause), &wav, &win);
             std::fs::write(dir.join(format!("{}.curve.tsv", row.cause)), listen::curve_tsv(&curve)).expect("curve");
-            std::fs::write(dir.join(format!("{}.png", row.cause)), listen::plot_png(&curve, PRE_MS as f64, POST_MS as f64)).expect("png");
+            std::fs::write(dir.join(format!("{}.png", row.cause)), listen::plot_png(&curve, PRE_MS as f64, post_ms(&row.cause) as f64)).expect("png");
             let line = format!("{}\t{}\t{}", a.tsv(), row.shape, row.overlap_ms);
             eprintln!("listen {line}");
             text.push_str(&line);
@@ -978,9 +1008,9 @@ async fn adv_settled(r: &Rig, label: &str) -> (Vec<Option<String>>, Option<Strin
 }
 
 /// Wait for an engine fade (a clear's fade-out, a pause's fade to silence) to land.
-/// Those are one-legged ramps to silence, held to the startle-safe slew (3 dB per
-/// 250 ms tick, so about five seconds from the baseline), longer than the fixed
-/// settle window `adv_settled` samples at. Bounded: a fade that never lands fails.
+/// Those are one-legged ramps to silence (a clear's runs its configured five seconds,
+/// plus the audio path's lead), longer than the fixed settle window `adv_settled`
+/// samples at. Bounded: a fade that never lands fails.
 async fn adv_fade_landed(r: &Rig, label: &str) {
     for _ in 0..60 {
         if !r.h.state.lock().unwrap().fading {
@@ -1405,12 +1435,14 @@ fn adv_scenarios() {
             r.h.handle(MpdCommand::Clear).await;
             tokio::time::sleep(Duration::from_millis(500)).await;
             r.h.handle(MpdCommand::Stop).await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // The stop takes over the clear's slow fade with its own short one (the
+            // pause length plus the audio path's lead), never a cut.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
             let (pr, _) = r.h.player.witness_probe().await;
             assert!(pr.iter().all(|p| src_of(p).is_none()), "explicit stop after clear left audio: {pr:?}");
         }
         if run("stop-fade-audible") {
-            // a plain stop while playing: MPD stops at once
+            // a plain stop while playing: reported stopped at once, the deck fades out
             let r = Rig::new(port, &["A", "B"]).await;
             r.play(0).await;
             r.h.handle(MpdCommand::Stop).await;

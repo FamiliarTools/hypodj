@@ -33,6 +33,11 @@ use crate::event::QueueId;
 use crate::model::SongId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Margin added to mpv's `audio-buffer` before a drained stop: the sound server's
+/// own quantum sits behind mpv's buffer.
+const STOP_DRAIN_MARGIN_SECS: f64 = 0.15;
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -288,6 +293,10 @@ enum PlayerCommand {
         /// a later [`PlayerEvent::Eof`] can report `was_local` without anyone re-reading
         /// mutable handler state (see the event's doc).
         local: bool,
+        /// Where to start, seconds into the file: a per-file `start=` option on the
+        /// load itself, so the first buffer is already at that position (no audible
+        /// seek after the fact). `None` starts from the top.
+        start: Option<f64>,
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
     /// Emit this deck's entry's [`PlayerEvent::Eof`] with `crossfaded: true`, then
@@ -387,6 +396,13 @@ enum PlayerCommand {
     Pause(oneshot::Sender<Result<(), PlayerError>>),
     Resume(oneshot::Sender<Result<(), PlayerError>>),
     Stop(oneshot::Sender<Result<(), PlayerError>>),
+    /// Stop only once what is already buffered has played out. Replies at once (the
+    /// caller never waits on the drain), then holds the actor for the output latency
+    /// before stopping, so any command sent after it (a re-arm of this deck) still
+    /// runs after the stop. For a deck whose gain was just taken to zero: mpv applies
+    /// a volume change ahead of its output buffer, so a plain stop cuts the last
+    /// buffered stretch of the fade, still audible, and that cut is a click.
+    StopDrained(oneshot::Sender<Result<(), PlayerError>>),
     Seek {
         secs: f64,
         reply: oneshot::Sender<Result<(), PlayerError>>,
@@ -527,9 +543,19 @@ pub struct PlayerHandle {
     /// Index into `decks` of the deck that currently owns the queue's identity.
     /// Flipped ONLY by [`crossfade_commit`](Self::crossfade_commit).
     active: Arc<AtomicUsize>,
+    /// How long after a commanded gain it is actually what plays (see
+    /// [`GAIN_SETTLE`]): zero for a deck with no audio path (the null player).
+    settle: Duration,
 }
 
 impl PlayerHandle {
+    /// The time from a commanded gain to the room hearing it. A fade's terminal (a
+    /// freeze, a stop, a load at the trough) waits this out after its last step, so
+    /// it never cuts audio that is still sounding at an earlier gain.
+    pub fn gain_settle(&self) -> Duration {
+        self.settle
+    }
+
     /// The deck every ordinary command addresses.
     fn deck(&self) -> &DeckLink {
         // `active` is only ever written with an index this handle produced from
@@ -580,6 +606,7 @@ impl PlayerHandle {
         queue_id: Option<QueueId>,
         url: &str,
         local: bool,
+        start: Option<f64>,
     ) -> Result<(), PlayerError> {
         let Some(spare) = self.spare().cloned() else {
             return Err(PlayerError::Backend("no second deck to crossfade with".into()));
@@ -590,6 +617,7 @@ impl PlayerHandle {
             queue_id,
             url: url.to_string(),
             local,
+            start,
             reply,
         })
         .await
@@ -624,7 +652,8 @@ impl PlayerHandle {
                     .await;
         }
         self.active.fetch_add(1, Ordering::AcqRel);
-        Self::request_on(&outgoing, PlayerCommand::Stop).await
+        // Drained: the outgoing leg's last gains are still in its output buffer.
+        Self::request_on(&outgoing, PlayerCommand::StopDrained).await
     }
 
     /// Re-publish the Playing edge of one deck of the pair (`active`: the deck owning the
@@ -650,17 +679,27 @@ impl PlayerHandle {
         Self::request_on(&spare, PlayerCommand::Stop).await
     }
 
+    /// Retire the spare deck after a REVERSED overlap landed: its gain is already zero,
+    /// so it stops once its buffered tail has drained (see `StopDrained`).
+    pub(crate) async fn crossfade_retire(&self, _key: &HeadKey) -> Result<(), PlayerError> {
+        let Some(spare) = self.spare().cloned() else {
+            return Ok(());
+        };
+        Self::request_on(&spare, PlayerCommand::StopDrained).await
+    }
+
     /// A one-deck handle: no crossfade, every command to the one actor.
     fn single(cmd_tx: mpsc::Sender<PlayerCommand>, state_rx: watch::Receiver<PlayState>) -> Self {
         PlayerHandle {
             decks: Arc::new(vec![DeckLink { cmd_tx, state_rx, waker: None }]),
             active: Arc::new(AtomicUsize::new(0)),
+            settle: Duration::ZERO,
         }
     }
 
     /// A two-deck handle. Deck 0 starts active; the pair alternates from there.
     fn pair(links: Vec<DeckLink>) -> Self {
-        PlayerHandle { decks: Arc::new(links), active: Arc::new(AtomicUsize::new(0)) }
+        PlayerHandle { decks: Arc::new(links), active: Arc::new(AtomicUsize::new(0)), settle: Duration::ZERO }
     }
 
     async fn request_on<F>(deck: &DeckLink, make: F) -> Result<(), PlayerError>
@@ -728,6 +767,7 @@ impl PlayerHandle {
             queue_id,
             url: url.to_string(),
             local,
+            start: None,
             reply,
         })
         .await
@@ -1004,7 +1044,7 @@ impl NullPlayer {
             let mut current_local = false;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    PlayerCommand::PlayUrl { song, queue_id, url: _, local, reply } => {
+                    PlayerCommand::PlayUrl { song, queue_id, url: _, local, start: _, reply } => {
                         #[cfg(test)]
                         if let Some(p) = probe.as_ref() {
                             p.load.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1127,7 +1167,7 @@ impl NullPlayer {
                                 .await;
                         }
                     }
-                    PlayerCommand::Stop(reply) => {
+                    PlayerCommand::Stop(reply) | PlayerCommand::StopDrained(reply) => {
                         current = None;
                         current_qid = None;
                         current_local = false;
@@ -1316,7 +1356,9 @@ impl MpvPlayer {
         // The template sender is dropped here so the receiver closes when the last
         // ACTOR goes, not merely when this function returns.
         drop(evt_tx);
-        (PlayerHandle::pair(links), evt_rx)
+        let mut handle = PlayerHandle::pair(links);
+        handle.settle = GAIN_SETTLE;
+        (handle, evt_rx)
     }
 
     fn build_mpv(out: &AudioOut) -> Result<libmpv2::Mpv, libmpv2::Error> {
@@ -1573,9 +1615,10 @@ fn mpv_actor(
     // so `let _`, never `?`. The `@viz:` label binds the node we read metadata from
     // (`af-metadata/viz`); labelling the chain or asetnsamples yields a dead node.
     // No asetnsamples: mpv coalesces af-metadata dispatch to ~20 Hz regardless.
-    if let Err(e) = mpv.set_property("af", "@viz:astats=metadata=1:reset=1") {
-        tracing::warn!(error = %e, "viz astats filter unavailable; playback continues without the HUD level meter");
-    }
+    // The gain filter rides the same chain (see [`GainLine`]).
+    let _ = mpv.set_property("audio-buffer", AUDIO_BUFFER_SECS);
+    let mut gain = GainLine::new();
+    gain.install(&mpv);
 
     // Observe time-pos so we can push TimePos events (drives scrobble + UI).
     let ectx = mpv.event_context_mut();
@@ -1615,7 +1658,7 @@ fn mpv_actor(
         // 1. Drain any pending commands without blocking.
         match cmd_rx.try_recv() {
             Ok(cmd) => {
-                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, &mut current_local, &mut cur_vol, &mut playing, &mut warm, cmd) {
+                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, &mut current_local, &mut cur_vol, &mut playing, &mut warm, &mut gain, cmd) {
                     // Stop requested with shutdown intent is not modeled;
                     // channel close is the only exit. Continue.
                 }
@@ -1625,6 +1668,7 @@ fn mpv_actor(
             Err(mpsc::error::TryRecvError::Empty) => {}
         }
 
+        gain.tick(&mpv, playing);
         // 2. Pump mpv events with a short timeout so we stay responsive to
         //    commands. wait_event MUST be drained each wakeup.
         let ectx = mpv.event_context_mut();
@@ -1753,6 +1797,8 @@ fn mpv_actor(
                             let finishing_local = std::mem::replace(&mut current_local, warm_local);
                             current = warm_song;
                             current_qid = Some(station_qid);
+                            // The new file runs on a fresh timeline.
+                            gain.rebase(&mpv, true);
                             // playing stays true: mpv never stopped across the gapless
                             // advance. The Eof rides the guaranteed blocking_send.
                             // `errored: false` ALWAYS: this arm is reached only on a
@@ -1890,17 +1936,26 @@ fn handle_cmd(
     // CONTINUATION entry (PrefetchContinuation). Cleared / re-latched here so the
     // EndFile arm picks the right path.
     warm: &mut WarmKind,
+    gain: &mut GainLine,
     cmd: PlayerCommand,
 ) -> bool {
     match cmd {
-        PlayerCommand::PlayUrl { song, queue_id, url, local, reply } => {
+        PlayerCommand::PlayUrl { song, queue_id, url, local, start, reply } => {
             // A fresh play REPLACES the current entry; also drop any leftover warmed
             // entry (playlist-clear keeps only the current) so a stale prefetch can
             // never auto-advance behind this track, and restore keep-open=no (a prior
             // warm may have flipped it to always) so this track's natural EOF advances.
             // All best-effort in the chain.
-            let res = mpv
-                .command("loadfile", &[&quote(&url), "replace"])
+            // mpv >= 0.38 syntax: `loadfile <url> <flags> <index> <options>`.
+            if gain.enabled {
+                gain.before_load(mpv);
+            }
+            let start_opt = start.filter(|s| s.is_finite() && *s > 0.0).map(|s| format!("start={s:.3}"));
+            let loaded = match &start_opt {
+                Some(opt) => mpv.command("loadfile", &[&quote(&url), "replace", "-1", opt]),
+                None => mpv.command("loadfile", &[&quote(&url), "replace"]),
+            };
+            let res = loaded
                 .and_then(|_| mpv.command("playlist-clear", &[]))
                 .and_then(|_| mpv.set_property("keep-open", "no"))
                 .and_then(|_| mpv.set_property("pause", false))
@@ -2057,6 +2112,17 @@ fn handle_cmd(
             }
             let _ = reply.send(res);
         }
+        PlayerCommand::StopDrained(reply) => {
+            let _ = reply.send(Ok(()));
+            // The output latency, read from mpv rather than assumed: its own audio
+            // buffer, plus a margin for the sound server's quantum behind it.
+            let buffer = mpv.get_property::<f64>("audio-buffer").unwrap_or(0.2);
+            let drain = Duration::try_from_secs_f64(buffer.clamp(0.0, 2.0) + STOP_DRAIN_MARGIN_SECS)
+                .unwrap_or(Duration::from_millis(400));
+            std::thread::sleep(drain);
+            let (tx, _rx) = oneshot::channel();
+            return handle_cmd(mpv, state_tx, evt_tx, current, current_qid, current_local, cur_vol, playing, warm, gain, PlayerCommand::Stop(tx));
+        }
         PlayerCommand::Stop(reply) => {
             let res = mpv
                 .command("stop", &[])
@@ -2084,6 +2150,9 @@ fn handle_cmd(
             let res = mpv
                 .command("seek", &[&secs.to_string(), "absolute"])
                 .map_err(|e| PlayerError::Backend(e.to_string()));
+            if gain.enabled {
+                gain.rebase(mpv, *playing);
+            }
             if res.is_ok() {
                 let _ = evt_tx.blocking_send(PlayerEvent::TimePos {
                     pos: secs,
@@ -2091,6 +2160,16 @@ fn handle_cmd(
                 });
             }
             let _ = reply.send(res);
+        }
+        PlayerCommand::SetVolume { vol, reply } if gain.enabled => {
+            gain.set_vol(mpv, vol as f64, *playing);
+            *cur_vol = vol as f64;
+            let _ = reply.send(Ok(()));
+        }
+        PlayerCommand::SetVolumeF64 { vol, reply } if gain.enabled => {
+            gain.set_vol(mpv, vol, *playing);
+            *cur_vol = vol;
+            let _ = reply.send(Ok(()));
         }
         PlayerCommand::SetVolume { vol, reply } => {
             let res = mpv
@@ -2192,7 +2271,7 @@ fn handle_cmd(
         PlayerCommand::WitnessProbe(reply) => {
             let path: Option<String> = mpv.get_property::<String>("path").ok();
             let core_idle: bool = mpv.get_property("core-idle").unwrap_or(true);
-            let volume: f64 = mpv.get_property("volume").unwrap_or(0.0);
+            let volume: f64 = if gain.enabled { *cur_vol } else { mpv.get_property("volume").unwrap_or(0.0) };
             let _ = reply.send(DeckProbe { path, core_idle, volume });
         }
     }
@@ -2208,6 +2287,321 @@ pub(crate) struct DeckProbe {
     pub path: Option<String>,
     pub core_idle: bool,
     pub volume: f64,
+}
+
+// ── the sample-accurate gain line ───────────────────────────────────────────
+
+/// mpv's own `audio-buffer`, set explicitly so the gain lead below is a stated
+/// number rather than an inherited default.
+const AUDIO_BUFFER_SECS: f64 = 0.2;
+
+/// How far AHEAD of the playback position a gain change is anchored, in stream
+/// seconds: past everything mpv has already decoded (its audio buffer plus a couple
+/// of sound-server quanta, measured at ~0.43 s on a 4096-frame graph), so a new
+/// ramp never rewrites audio the filter has already scaled. It is also the latency
+/// between a commanded level and the room hearing it, which every terminal that
+/// follows a fade (freeze, stop, load at the trough) waits out - see
+/// [`GAIN_SETTLE`].
+const GAIN_LEAD_SECS: f64 = AUDIO_BUFFER_SECS + 0.3;
+
+/// [`GAIN_LEAD_SECS`] as a wait: the time from the last commanded gain to it being
+/// what plays.
+pub(crate) const GAIN_SETTLE: Duration = Duration::from_millis(550);
+
+/// An isolated level change (no ramp in flight) still lands as a ramp this long,
+/// never as a step: a step in gain is a click.
+const GAIN_MIN_RAMP_SECS: f64 = 0.02;
+
+/// A knot this long after the previous one is a new gesture, not the next tick of
+/// the same ramp: hold the old level until just before it.
+const GAIN_GAP_SECS: f64 = 0.1;
+
+/// How far (dB) a knot may sit off the line through its neighbours and still be
+/// merged away (see [`GainLine::set_vol`]).
+const GAIN_MERGE_DB: f64 = 0.05;
+
+/// The dB a zero gain is drawn toward inside a ramp (the end itself is exact 0).
+const GAIN_SILENCE_DB: f64 = -120.0;
+
+/// Within this many seconds of the file's end, the filter's option string is kept
+/// in step with the live level: mpv rebuilds the filter chain for the next file of a
+/// gapless advance FROM that string (measured), so it must carry the level there.
+const GAIN_EOF_SYNC_SECS: f64 = 1.5;
+
+/// Rewriting the option string rebuilds the filter (measured seamless, but a rebuild
+/// per 25 ms tick is a storm nothing needs): near the end it is rewritten at most this
+/// often, which bounds the staleness a fade can carry across a boundary.
+const GAIN_OPT_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A filter instance that started this close to its stream's t = 0 is a rebuild
+/// for a NEW file (a gapless advance), not one of ours mid-file.
+const GAIN_NEW_FILE_SECS: f64 = 0.5;
+
+/// The deck's gain, applied INSIDE the audio path by a labelled lavfi `volume`
+/// filter evaluated per 64-sample frame against the stream time `t`, instead of
+/// mpv's `volume` property.
+///
+/// WHY: mpv applies its softvol once per output chunk, and a chunk is a whole
+/// sound-server quantum (85 ms on a 4096-frame graph, measured: a 0.5 s pause fade
+/// arrived as 7-10 dB stairs 85 ms apart, each one a click). No tick rate can beat
+/// that. Here the commanded levels become knots of a piecewise linear-in-dB line
+/// over stream time, so the gain moves every 1.3 ms whatever the quantum is, and the
+/// fade above keeps speaking plain levels at its own ticks.
+///
+/// Outside the knots: just before the first one (audio decoded ahead of the lead)
+/// the line holds its STARTING level; well before it (a backward seek, a new file)
+/// and after the last one it holds the LATEST commanded level. A filter rebuilt
+/// from the option string for a new file always starts at the level the option
+/// last recorded.
+struct GainLine {
+    /// Whether the filter exists; without it the deck falls back to softvol.
+    enabled: bool,
+    /// (stream t, dB) knots, strictly increasing in t.
+    knots: Vec<(f64, f64)>,
+    /// The latest commanded level, dB (`-inf` = silence).
+    level_db: f64,
+    /// The expression the running filter instance evaluates.
+    live_expr: String,
+    /// The level a rebuild from the option string starts a new file at.
+    opt_level_db: f64,
+    opt_written: Option<std::time::Instant>,
+    /// Wall instant of the last knot: consecutive ticks of one ramp are spaced by
+    /// the time between the commands, not by the playhead's jitter, so an
+    /// equal-dB-per-tick fade stays collinear and collapses to two knots.
+    last_at: Option<std::time::Instant>,
+}
+
+fn gain_lin(db: f64) -> f64 {
+    if db.is_finite() { 10f64.powf(db / 20.0) } else { 0.0 }
+}
+
+fn vol_to_gain_db(vol: f64) -> f64 {
+    if vol <= 0.0 { f64::NEG_INFINITY } else { 60.0 * (vol.min(100.0) / 100.0).log10() }
+}
+
+fn gain_filter_string(expr: &str) -> String {
+    format!("@gain:lavfi=[asetnsamples=n=64:p=0,volume=volume='{expr}':eval=frame:precision=float]")
+}
+
+fn same_db(a: f64, b: f64) -> bool {
+    (a.is_infinite() && b.is_infinite()) || (a - b).abs() < 0.05
+}
+
+impl GainLine {
+    fn new() -> Self {
+        GainLine {
+            enabled: false,
+            knots: Vec::new(),
+            level_db: 0.0,
+            live_expr: Self::const_expr(0.0),
+            opt_level_db: 0.0,
+            opt_written: None,
+            last_at: None,
+        }
+    }
+
+    fn const_expr(db: f64) -> String {
+        format!("{:.9}", gain_lin(db))
+    }
+
+    /// The expression for the current knots, in this file's timeline.
+    fn expr(&self) -> String {
+        let last = Self::const_expr(self.level_db);
+        if self.knots.len() < 2 {
+            return last;
+        }
+        let seg = |a: (f64, f64), b: (f64, f64)| {
+            let da = if a.1.is_finite() { a.1 } else { GAIN_SILENCE_DB };
+            let db = if b.1.is_finite() { b.1 } else { GAIN_SILENCE_DB };
+            format!(
+                "pow(10,({da:.4}+({:.4})*(t-{:.4})/{:.4})/20)",
+                db - da,
+                a.0,
+                (b.0 - a.0).max(1e-6)
+            )
+        };
+        let mut e = last.clone();
+        for w in self.knots.windows(2).rev() {
+            e = format!("if(lt(t,{:.4}),{},{e})", w[1].0, seg(w[0], w[1]));
+        }
+        let t0 = self.knots[0].0;
+        let first = Self::const_expr(self.knots[0].1);
+        format!(
+            "if(isnan(t),{first},if(lt(t,{:.4}),{last},if(lt(t,{t0:.4}),{first},{e})))",
+            t0 - GAIN_LEAD_SECS - 0.25
+        )
+    }
+
+    /// The option string's expression: a rebuild that starts at the top of a stream
+    /// (the next file of a gapless advance) holds the latest level; a rebuild mid-file
+    /// runs the live line.
+    fn option_expr(&self) -> String {
+        format!(
+            // `t - n*64/sample_rate` is the stream time this filter INSTANCE started
+            // at (64-sample frames from asetnsamples). `nb_consumed_samples` and
+            // `nb_samples` evaluate to NaN in this build (measured), `n` does not.
+            "if(lt(t-n*64/sample_rate,{GAIN_NEW_FILE_SECS}),{},{})",
+            Self::const_expr(self.level_db),
+            self.expr()
+        )
+    }
+
+    /// Install the filter (plus the viz tap) on a fresh core; the softvol is then
+    /// parked at unity.
+    fn install(&mut self, mpv: &libmpv2::Mpv) {
+        let viz = "@viz:astats=metadata=1:reset=1";
+        let g = gain_filter_string(&Self::const_expr(self.level_db));
+        if mpv.set_property("af", format!("{viz},{g}").as_str()).is_ok() {
+            self.enabled = true;
+        } else if mpv.set_property("af", g.as_str()).is_ok() {
+            tracing::warn!("viz astats filter unavailable; playback continues without the HUD level meter");
+            self.enabled = true;
+        } else {
+            tracing::warn!("gain filter unavailable; volume falls back to mpv softvol (stepped per output chunk)");
+            if let Err(e) = mpv.set_property("af", viz) {
+                tracing::warn!(error = %e, "viz astats filter unavailable; playback continues without the HUD level meter");
+            }
+        }
+        if self.enabled {
+            let _ = mpv.set_property("volume", 100.0f64);
+        }
+    }
+
+    /// Rewrite the option string (the filter is rebuilt from it at once).
+    fn write_option(&mut self, mpv: &libmpv2::Mpv) {
+        let expr = self.option_expr();
+
+        let viz = "@viz:astats=metadata=1:reset=1";
+        let g = gain_filter_string(&expr);
+        let ok = mpv.set_property("af", format!("{viz},{g}").as_str()).is_ok()
+            || mpv.set_property("af", g.as_str()).is_ok();
+        if ok {
+            self.opt_level_db = self.level_db;
+            self.opt_written = Some(std::time::Instant::now());
+            self.live_expr = expr;
+        } else {
+            tracing::warn!("gain filter option rewrite refused; a rebuilt filter may start at a stale level");
+        }
+    }
+
+    fn send(&mut self, mpv: &libmpv2::Mpv, flowing: bool) {
+        if !flowing {
+            // Nothing is decoding (idle, paused): the option string IS what the
+            // next audio meets, and a rebuild costs nothing audible.
+            if !same_db(self.opt_level_db, self.level_db) || self.knots.len() >= 2 || self.opt_written.is_none() {
+                self.write_option(mpv);
+            }
+            return;
+        }
+        let expr = self.expr();
+        if expr == self.live_expr {
+            return;
+        }
+        // The lavfi graph holds two filters and only `volume` takes the command, so
+        // mpv reports an error even when it applied: not a failure signal.
+        let _ = mpv.command("af-command", &["gain", "volume", &quote(&expr)]);
+        self.live_expr = expr;
+    }
+
+    /// Command a new level. A flowing deck ramps to it along stream time; a deck
+    /// that is not decoding takes it at once (nothing audible to smooth).
+    fn set_vol(&mut self, mpv: &libmpv2::Mpv, vol: f64, flowing: bool) {
+        let db = vol_to_gain_db(vol);
+        let pts: Option<f64> = if flowing { mpv.get_property("audio-pts").ok() } else { None };
+        match pts.filter(|p| p.is_finite()) {
+            None => {
+                self.knots.clear();
+                self.last_at = None;
+                self.level_db = db;
+            }
+            Some(pos) => {
+                // Drop knots that are wholly behind the playhead, keeping the one the
+                // current segment starts from.
+                while self.knots.len() >= 2 && self.knots[1].0 <= pos - 0.05 {
+                    self.knots.remove(0);
+                }
+                let now = std::time::Instant::now();
+                let anchor = pos + GAIN_LEAD_SECS;
+                let since = self.last_at.map(|t| now.duration_since(t).as_secs_f64());
+                let at = match (self.knots.last().copied(), since) {
+                    // The next tick of a ramp in flight: spaced by wall time.
+                    (Some((tl, _)), Some(dt)) if dt <= GAIN_GAP_SECS && tl + dt >= anchor - GAIN_GAP_SECS => {
+                        tl + dt.max(0.001)
+                    }
+                    // A new gesture: hold the current line until just before the anchor.
+                    (Some((tl, dl)), _) => {
+                        let at = anchor.max(tl + GAIN_MIN_RAMP_SECS + 0.001);
+                        self.knots.push((at - GAIN_MIN_RAMP_SECS, dl));
+                        at
+                    }
+                    (None, _) => {
+                        self.knots.push((anchor - GAIN_MIN_RAMP_SECS, self.level_db));
+                        anchor
+                    }
+                };
+                self.last_at = Some(now);
+                self.knots.push((at, db));
+                // Near-collinear runs (an equal-dB-per-tick fade, its ticks jittered by
+                // a few ms) collapse to their ends, so the expression stays a handful of
+                // segments. The middle knot goes when it sits within GAIN_MERGE_DB of the
+                // straight line through its neighbours: smoothing the jitter, not the shape.
+                let n = self.knots.len();
+                if n >= 3 {
+                    let (a, b, c) = (self.knots[n - 3], self.knots[n - 2], self.knots[n - 1]);
+                    if a.1.is_finite() && b.1.is_finite() && c.1.is_finite() && c.0 > a.0 {
+                        let on_line = a.1 + (c.1 - a.1) * (b.0 - a.0) / (c.0 - a.0);
+                        if (b.1 - on_line).abs() <= GAIN_MERGE_DB {
+                            self.knots.remove(n - 2);
+                        }
+                    }
+                }
+                self.level_db = db;
+            }
+        }
+        self.send(mpv, flowing);
+    }
+
+    /// From the actor loop (every <= 100 ms): collapse a line whose ramp has fully
+    /// played into its constant, and near the file's end keep the option string a
+    /// gapless rebuild starts from in step with the level, rate-limited.
+    fn tick(&mut self, mpv: &libmpv2::Mpv, flowing: bool) {
+        if !self.enabled || !flowing {
+            return;
+        }
+        let pos: Option<f64> = mpv.get_property("audio-pts").ok().filter(|p: &f64| p.is_finite());
+        let Some(pos) = pos else { return };
+        if self.knots.last().is_some_and(|k| pos > k.0 + 0.1) {
+            self.knots.clear();
+            self.last_at = None;
+            self.send(mpv, flowing);
+        }
+        let dur: f64 = mpv.get_property("duration").unwrap_or(f64::INFINITY);
+        // The rebuild happens when the DECODER reaches the end, a lead ahead of `pos`.
+        let near_end = dur.is_finite() && dur - pos < GAIN_EOF_SYNC_SECS + GAIN_LEAD_SECS;
+        let due = self.opt_written.is_none_or(|w| w.elapsed() >= GAIN_OPT_MIN_INTERVAL);
+        if near_end && due && !same_db(self.opt_level_db, self.level_db) {
+            self.write_option(mpv);
+        }
+    }
+
+    /// The stream timeline restarted (a new file, a seek): the knots belong to the
+    /// old one. Hold the latest level.
+    fn rebase(&mut self, mpv: &libmpv2::Mpv, flowing: bool) {
+        self.knots.clear();
+        self.last_at = None;
+        self.live_expr.clear();
+        self.send(mpv, flowing);
+    }
+
+    /// Before a load: the new file's chain is built from the option string, so it
+    /// must hold exactly the latest level.
+    fn before_load(&mut self, mpv: &libmpv2::Mpv) {
+        self.knots.clear();
+        self.last_at = None;
+        if !same_db(self.opt_level_db, self.level_db) || self.opt_written.is_none() {
+            self.write_option(mpv);
+        }
+    }
 }
 
 /// mpv's `command`/`loadfile` treats spaces as argument separators, so a URL
@@ -3197,7 +3591,7 @@ mod tests {
             // Arm deck B silent and walk the envelope by hand, checking the overlap at
             // the midpoint rather than trusting the driver to have happened.
             player
-                .crossfade_arm(crate::handler::reconcile::test_key(), None, Some(QueueId(2)), b.to_str().unwrap(), true)
+                .crossfade_arm(crate::handler::reconcile::test_key(), None, Some(QueueId(2)), b.to_str().unwrap(), true, None)
                 .await
                 .expect("deck B arms");
             for k in 0..=20 {

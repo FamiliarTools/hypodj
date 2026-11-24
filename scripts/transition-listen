@@ -136,5 +136,6 @@ cd "$repo"
   ${RUSTC_WRAPPER:+RUSTC_WRAPPER="$RUSTC_WRAPPER"} \
   HYPODJ_LISTEN_DIR="$out" \
   HYPODJ_WITNESS_ONLY="${HYPODJ_WITNESS_ONLY:-}" \
+  HYPODJ_LISTEN_STRICT="${HYPODJ_LISTEN_STRICT:-}" \
   CARGO_BUILD_JOBS=2 \
   nix develop "$repo" --command cargo test -j2 -p hypodj-core -- --ignored transition_listen_record --nocapture --test-threads=1

@@ -410,11 +410,19 @@ pub(crate) fn analyse(cause: &str, expect: Expect, w: &Wav, win: &Window) -> (Au
                         run_min = run_min.min(*v);
                     }
                     row.rebright_db = rb;
-                    row.tail_db = pts
-                        .iter()
-                        .filter(|(t, _)| *t > t_land + 200.0)
-                        .map(|p| p.1)
-                        .fold(f64::NEG_INFINITY, f64::max);
+                    // The tail is read after the fade reaches the silence floor, not after
+                    // it crosses the gap floor: a long dB-linear fade (clear's 5 s) is
+                    // still descending, monotonically, between the two, and that is the
+                    // fade, not audio after it.
+                    let t_silent = pts.iter().find(|(t, v)| *t >= t_land && *v < TAIL_FLOOR_DB).map(|p| p.0);
+                    row.tail_db = match t_silent {
+                        Some(ts) => pts
+                            .iter()
+                            .filter(|(t, _)| *t > ts + 200.0)
+                            .map(|p| p.1)
+                            .fold(f64::NEG_INFINITY, f64::max),
+                        None => pts.last().map(|p| p.1).unwrap_or(f64::INFINITY),
+                    };
                     if row.fade_ms < STARTLE_FLOOR_MS {
                         row.fail(format!("fade {:.0} ms (< {STARTLE_FLOOR_MS} ms startle floor)", row.fade_ms));
                     }

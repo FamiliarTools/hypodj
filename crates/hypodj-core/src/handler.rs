@@ -196,6 +196,15 @@ struct State {
     /// The fade epoch of an in-flight one-legged fade-out the engine installed (clear,
     /// remove-last). Live only while that epoch is still the running fade.
     quiesce_epoch: Option<u64>,
+    /// The fade epoch of a `stop`'s own short fade-out. While that fade is the live
+    /// one the deck still sounds, but the room was told stop, so the reported state
+    /// is Stopped (a `fade out`, which also leaves under a Stop intent, is a slow
+    /// wind-down and keeps reporting Playing).
+    stop_epoch: Option<u64>,
+    /// Where the NEXT crossfade into this row starts, seconds into the file (an undo
+    /// putting a track back at its playhead). Consumed by the engine's arm; the
+    /// declarer clears it once its declaration returns.
+    head_start: Option<(QueueId, f64)>,
     /// The declaration rev whose crossfade arm failed: the ladder continues below it.
     xf_failed_rev: Option<u64>,
     /// The declaration rev that failed at the bottom of the ladder: nothing retries it.
@@ -1344,6 +1353,8 @@ impl Default for State {
             deck_committed: false,
             transit: None,
             quiesce_epoch: None,
+            stop_epoch: None,
+            head_start: None,
             xf_failed_rev: None,
             abandoned_rev: None,
             loading_rev: None,
@@ -8792,6 +8803,16 @@ impl HypodjHandler {
     /// [`FadeError`] (the slot is left empty). The terminal action lives in the
     /// spawned wrapper task, keeping [`run_fade`] pure.
     pub async fn start_fade_spec(&self, req: FadeRequest) -> Result<(), FadeError> {
+        // A `stop` still fading out is a stop already given: no later fade (a setvol
+        // glide, a pause) may supersede it and leave the deck playing. Land it first.
+        let stopping = {
+            let st = self.state.lock().unwrap();
+            st.fading && st.stop_epoch == Some(st.fade_epoch)
+        };
+        if stopping {
+            let _pass = self.engine_pass().await;
+            self.halt_decks().await;
+        }
         let tick = Duration::from_millis(self.fade_cfg.tick_ms);
         let ceiling = self.fade_cfg.wake_ceiling_db;
         let synth_floor = self.fade_cfg.synth_floor_db;
@@ -8842,13 +8863,7 @@ impl HypodjHandler {
                     // step under the 3 dB cap, so FadeSpec::new never rejects it as
                     // StepTooLarge and it is never a hard cut.
                     let eff_dur = if clamp_dur_up {
-                        // Use the SAME per-step interval FadeSpec::new will use
-                        // (tick.max(min_slew)); passing bare min_slew when
-                        // tick > min_slew under-counts the steps and the clamp
-                        // fails to prevent the StepTooLarge rejection.
-                        let min_slew = Duration::from_millis(cfg.min_slew_ms);
-                        let step_interval = tick.max(min_slew);
-                        dur.max(min_deliberate_dur(from_db, target, step_interval, synth_floor))
+                        dur.max(min_deliberate_dur(from_db, target, synth_floor))
                     } else {
                         dur
                     };
@@ -8995,7 +9010,7 @@ impl HypodjHandler {
     /// One source of truth shared by `status`, the MPRIS surface, and the resume
     /// checkpoint - so they can never disagree about the play state.
     pub fn reported_play_state(&self) -> PlayState {
-        let (has_current, pending, loading) = {
+        let (has_current, pending, loading, stopping) = {
             let st = self.state.lock().unwrap();
             (
                 st.current().and_then(|i| st.queue.get(i)).is_some(),
@@ -9003,6 +9018,7 @@ impl HypodjHandler {
                 st.loading_rev.is_some_and(|r| {
                     r == st.declared.rev && st.declared.intent == reconcile::Intent::Play
                 }),
+                st.fading && st.stop_epoch == Some(st.fade_epoch),
             )
         };
         if !has_current {
@@ -9011,6 +9027,10 @@ impl HypodjHandler {
         if pending {
             return PlayState::Paused;
         }
+        if stopping {
+            // A stop fading out: the deck still sounds, but the room was told stop.
+            return PlayState::Stopped;
+        }
         let raw = self.player.state();
         if raw == PlayState::Stopped && loading {
             return PlayState::Playing;
@@ -9018,9 +9038,16 @@ impl HypodjHandler {
         effective_play_state(raw, has_current)
     }
 
+    /// The clamped clear fade-out duration (`clear_fade_secs` into `[min_slew, max_dur]`).
+    pub(crate) fn clear_fade_dur(&self) -> Duration {
+        let raw = Duration::try_from_secs_f64(self.fade_cfg.clear_fade_secs)
+            .unwrap_or_else(|_| Duration::from_millis(self.fade_cfg.min_slew_ms));
+        self.clamp_fade_dur(raw)
+    }
+
     /// The clamped pause/resume fade duration (float-second `pause_fade_secs` into
     /// `[min_slew, max_dur]`). Saturating parse: a pathological float never panics.
-    fn pause_fade_dur(&self) -> Duration {
+    pub(crate) fn pause_fade_dur(&self) -> Duration {
         let raw = Duration::try_from_secs_f64(self.fade_cfg.pause_fade_secs)
             .unwrap_or_else(|_| Duration::from_millis(self.fade_cfg.min_slew_ms));
         self.clamp_fade_dur(raw)
@@ -9396,11 +9423,38 @@ impl HypodjHandler {
             let mut st = self.state.lock().unwrap();
             let head = st.head_qid();
             st.hold_head(head);
+            // A stop retires a standing pause intent outright.
+            st.pending_pause = false;
+            // A slower fade already carrying the deck away (a clear's, a `fade out`)
+            // is not this stop: un-mark it, so the engine plans the stop's own short
+            // fade from the live gain instead of leaving the slow one to run.
+            if st.stop_epoch != Some(st.fade_epoch) {
+                st.quiesce_epoch = None;
+            }
         }
-        // Serialized with any pass in progress (a load landing after this stop would
-        // otherwise play into it), then every deck stops: the stop's transport
-        // semantics (baseline, no pending pause, no warm) apply even over a deck that
-        // already held nothing.
+        // A playing deck is FADED to the stop (the engine plans it: an overlap lands
+        // first, then one short slewed fade whose terminal stops and restores the
+        // baseline). Never a cut from full level.
+        let _ = self.reconcile().await;
+        let leaving = {
+            let st = self.state.lock().unwrap();
+            st.declared.intent == reconcile::Intent::Stop
+                && st.fading
+                && st.quiesce_epoch == Some(st.fade_epoch)
+        };
+        if leaving {
+            {
+                let mut st = self.state.lock().unwrap();
+                st.stop_epoch = Some(st.fade_epoch);
+            }
+            self.notify_change();
+            return;
+        }
+        // Nothing to fade (paused, silent, or the fade could not be built): every deck
+        // stops now. Serialized with any pass in progress (a load landing after this
+        // stop would otherwise play into it); the stop's transport semantics
+        // (baseline, no pending pause, no warm) apply even over a deck that already
+        // held nothing.
         let _pass = self.engine_pass().await;
         self.halt_decks().await;
     }
@@ -11553,6 +11607,28 @@ impl HypodjHandler {
         match (snap.state, snap.current) {
             (PlayState::Playing, Some(idx)) => {
                 let elapsed = snap.elapsed_ms as f64 / 1000.0;
+                // Something else is playing and the player can overlap: CROSSFADE back
+                // to the restored row at its playhead, exactly as a skip would. The
+                // room's level never leaves the baseline, so there is no rise to own
+                // and nothing to seek under it - the incoming deck loads AT the
+                // snapshot position. A silence-and-rise here would be a hole in the
+                // music the undo itself dug.
+                let overlap = self.player.state() == PlayState::Playing
+                    && self.player.can_crossfade()
+                    && self.crossfade_skip_dur().is_some_and(|d| !d.is_zero());
+                if overlap {
+                    let qid = self.state.lock().unwrap().queue.get(idx).map(|it| QueueId(it.id));
+                    if let Some(q) = qid {
+                        self.state.lock().unwrap().head_start = Some((q, elapsed));
+                    }
+                    let r = self.declare_play(idx, Cause::Gesture).await;
+                    self.state.lock().unwrap().head_start = None;
+                    r?;
+                    self.note_elapsed_ms(snap.elapsed_ms);
+                    self.notify_change();
+                    self.reschedule_continuation_warm().await;
+                    return Ok(());
+                }
                 let target_db = mpv_volume_to_db(vol as f64);
                 let dur = self.clamp_fade_dur(Duration::from_secs(self.fade_cfg.restart_fade_secs));
                 // The ramp starts sub-audible, so seek back by the LEAD - the wall time
@@ -12987,9 +13063,7 @@ impl HypodjHandler {
     ) -> Result<FadeSpec, FadeError> {
         let tick = Duration::from_millis(self.fade_cfg.tick_ms);
         let synth_floor = self.fade_cfg.synth_floor_db;
-        let min_slew = Duration::from_millis(self.fade_cfg.min_slew_ms);
-        let step_interval = tick.max(min_slew);
-        let eff_dur = dur.max(min_deliberate_dur(from_db, target, step_interval, synth_floor));
+        let eff_dur = dur.max(min_deliberate_dur(from_db, target, synth_floor));
         let bounds = startle_bounds(&self.fade_cfg, false);
         FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)
     }
@@ -17086,6 +17160,9 @@ mod tests {
         tokio::time::advance(Duration::from_millis(400)).await;
         h.stop_playback().await;
         assert!(!overlapping(&h));
+        assert_eq!(h.reported_play_state(), PlayState::Stopped, "reported stopped at once");
+        // The one deck left fades out (never a cut), then stops.
+        h.wait_for_fade().await;
         assert!(
             h.player.deck_states().iter().all(|s| *s == PlayState::Stopped),
             "no deck left playing: {:?}",
@@ -21435,14 +21512,10 @@ mod tests {
 
     #[test]
     fn skip_dip_is_far_shorter_than_a_full_silence_dip() {
-        // A skip ducks to SKIP_DIP_DB, not the -60 dB synth floor. At the startle-
-        // safe 250ms minimum step interval, a deliberate fade costs one step per
-        // 3 dB, so the cost scales with the dB span: the shallow duck is a handful
-        // of steps (~1.5s) versus ~20 steps (~5s) all the way to silence. This is
-        // exactly why the skip now feels snappy.
-        let step = std::time::Duration::from_millis(250);
-        let shallow = min_deliberate_dur(0.0, FadeTarget::Db(SKIP_DIP_DB), step, -60.0);
-        let full = min_deliberate_dur(0.0, FadeTarget::Silence, step, -60.0);
+        // A skip ducks to SKIP_DIP_DB, not the -60 dB synth floor: the deliberate
+        // floor cost scales with the dB span, so the shallow duck is cheaper.
+        let shallow = min_deliberate_dur(0.0, FadeTarget::Db(SKIP_DIP_DB), -60.0);
+        let full = min_deliberate_dur(0.0, FadeTarget::Silence, -60.0);
         assert!(
             shallow <= std::time::Duration::from_millis(1600),
             "shallow skip dip stays snappy, got {shallow:?}"
@@ -25795,7 +25868,10 @@ mod tests {
         assert!(h.live_gain_db() < 0.0, "fade lowered the live gain");
 
         h.handle(MpdCommand::Stop).await;
-        assert!(!h.fade_active().await, "stop cancels the fade");
+        assert_eq!(h.reported_play_state(), PlayState::Stopped, "reported stopped at once");
+        // The stop supersedes the slow fade with its own short one, from the live gain.
+        h.wait_for_fade().await;
+        assert!(!h.state.lock().unwrap().fading, "the stop's fade landed");
         assert_eq!(h.player.state(), PlayState::Stopped);
         // Reported volume is back at the baseline, not the faded-down level.
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
@@ -26386,7 +26462,7 @@ mod tests {
         // gain is well above silence and the deck is STILL raw-Playing (fade THEN
         // pause), so a resume here is the in-flight-abort case, not the settled case.
         h.set_pause(Some(true)).await.unwrap();
-        pump(250, 7).await;
+        pump(50, 5).await;
         assert!(h.fade_active().await, "pause fade in flight");
         assert_eq!(h.player.state(), PlayState::Playing, "not frozen yet: still ramping");
         let mid = h.live_gain_db();
@@ -27579,6 +27655,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             h.stop_playback().await;
         });
+        assert_eq!(h.reported_play_state(), PlayState::Stopped);
+        h.wait_for_fade().await;
         assert_eq!(h.player.state(), PlayState::Stopped);
         assert_eq!(h.reported_play_state(), PlayState::Stopped);
         assert!(!h.state.lock().unwrap().fading);
