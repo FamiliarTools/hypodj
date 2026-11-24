@@ -70,8 +70,8 @@ use crate::player::{
     StreamMeta,
 };
 use crate::station_identity::{
-    is_nts_stream_url, match_nts_mixtape, StationIdentity, NTS_CATALOGUE_CACHE_KEY,
-    NTS_MIXTAPES_URL,
+    is_nts_stream_url, is_valid_nts_catalogue, match_nts_live, match_nts_mixtape, nts_live_channel,
+    StationIdentity, NTS_CATALOGUE_CACHE_KEY, NTS_LIVE_URL, NTS_MIXTAPES_URL,
 };
 use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
@@ -6393,7 +6393,12 @@ impl HypodjHandler {
     /// honest outcome). No leaked task: the fetch is bounded by the client's 4s timeout
     /// and lives entirely inside this future.
     async fn resolve_station_identity(&self, gen: u64, qid: QueueId, url: String) {
-        // Only NTS URLs are worth a catalogue fetch (P4 adds more providers here).
+        // An NTS LIVE channel rotates per show: its own provider (task r7ql64x P4).
+        if let Some(channel) = nts_live_channel(&url) {
+            self.resolve_nts_live(gen, qid, channel).await;
+            return;
+        }
+        // Only NTS URLs are worth a catalogue fetch.
         if !is_nts_stream_url(&url) {
             return;
         }
@@ -6405,8 +6410,10 @@ impl HypodjHandler {
                     Ok(r) if r.status().is_success() => r,
                     _ => return,
                 };
+                // PARSE-VALIDATE before caching: a captive portal or CDN error page can
+                // answer 200, and caching it would poison NTS resolution for the TTL.
                 let json = match resp.text().await {
-                    Ok(t) if !t.trim().is_empty() => t,
+                    Ok(t) if is_valid_nts_catalogue(&t) => t,
                     _ => return,
                 };
                 self.nts_catalogue_cache.put(NTS_CATALOGUE_CACHE_KEY.to_string(), json.clone());
@@ -6415,6 +6422,54 @@ impl HypodjHandler {
         };
         if let Some(identity) = match_nts_mixtape(&catalogue, &url) {
             self.set_station_identity(gen, qid, identity);
+        }
+    }
+
+    /// The NTS LIVE provider (task r7ql64x P4): resolve the show now on `channel` from
+    /// `/api/v2/live`, then sleep to the show's `end_timestamp` and re-resolve, so the
+    /// name and cover follow the rotation while the stream keeps playing. EVENT-DRIVEN,
+    /// not polled: one fetch per show boundary. The loop ends the moment this resolve is
+    /// superseded (a newer track-start bumped the generation) or `qid` is no longer the
+    /// current entry, and on any fetch/parse failure (no identity is an honest outcome).
+    /// The endpoint sits behind CloudFront and can lag a boundary by minutes, so a body
+    /// whose show has already ended is retried a bounded number of times, a minute apart.
+    /// `tokio::time::sleep`, so a paused test clock drives it.
+    async fn resolve_nts_live(&self, gen: u64, qid: QueueId, channel: &str) {
+        const BOUNDARY_SLACK_SECS: i64 = 20;
+        const STALE_RETRY_SECS: u64 = 60;
+        const STALE_RETRIES: u32 = 15;
+        let mut stale = 0u32;
+        loop {
+            let still_ours = {
+                let st = self.state.lock().unwrap();
+                st.station_identity_gen == gen
+                    && st.current.and_then(|i| st.queue.get(i)).map(|it| it.id) == Some(qid.0)
+            };
+            if !still_ours {
+                return;
+            }
+            let body = match self.station_identity_http.get(NTS_LIVE_URL).send().await {
+                Ok(r) if r.status().is_success() => match r.text().await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                },
+                _ => return,
+            };
+            let Some((identity, end)) = match_nts_live(&body, channel) else { return };
+            self.set_station_identity(gen, qid, identity);
+            let Some(end) = end else { return };
+            let now = crate::store::now_unix() as i64;
+            let wait = if end + BOUNDARY_SLACK_SECS > now {
+                stale = 0;
+                (end + BOUNDARY_SLACK_SECS - now) as u64
+            } else {
+                stale += 1;
+                if stale > STALE_RETRIES {
+                    return;
+                }
+                STALE_RETRY_SECS
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         }
     }
 
