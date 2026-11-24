@@ -148,7 +148,9 @@ pub fn not_understood_hint() -> String {
     s.push_str("  - sleep / winddown\n");
     s.push_str("  - stop after this track / stop after this album\n");
     s.push_str("  - wake me at a time with a selector (e.g. wake me at 7 with jazz)\n");
-    s.push_str("Or use a control verb: play, pause, stop, next, prev, vol <0-100>, clear, queue, now.");
+    s.push_str("Or use a control verb: play, pause, stop, next, prev, vol <0-100>, clear, queue, now.\n");
+    // The READ side, so a question that missed still lands on something that answers.
+    s.push_str("Or ask: what's offline, what is favorited - or read: store, store albums, heard, queue.");
     s
 }
 

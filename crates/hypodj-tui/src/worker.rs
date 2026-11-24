@@ -341,6 +341,13 @@ fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, host: &str, port: u16, stop
             // Drop the "thinking..." spinner.
             let _ = tx.send(Inbound::CcProgress(String::new()));
             match settled {
+                // "Do nothing" means not understood: say so with what WOULD work,
+                // never offer it for confirmation.
+                Ok(raw) if hypodj_nl::is_noop(&raw) => {
+                    for l in hypodj_client::nl::not_understood_hint().lines() {
+                        let _ = tx.send(Inbound::CcLine(l.to_string()));
+                    }
+                }
                 Ok(raw) => match hypodj_nl::render_dsl(&raw) {
                     Some(dsl) => {
                         let steps = vec![hypodj_nl::describe_plan(&raw)];

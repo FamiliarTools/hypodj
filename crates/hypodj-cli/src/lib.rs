@@ -61,6 +61,8 @@ USAGE:
   djc store frontier      the whole ranked order, best to worst, with why
   djc store now | pause | resume
                           reconcile now / suspend bulk mirroring / resume it
+  djc store albums        what plays offline right now, by album
+  djc store play <name>   play a held album (works with the server unreachable)
   djc journal             what the daemon did, newest first - each line is the
                            daemon's OWN words for what happened, not a guess
   djc undo                retract the newest thing that can still be retracted
@@ -300,7 +302,7 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         return Ok(());
     }
 
-    let action = route::route(&parsed.words);
+    let action = explicit_nl(&parsed.words).unwrap_or_else(|| route::route(&parsed.words));
     if let Action::Help = action {
         print!("{HELP}");
         println!("\n{}", nl::not_understood_hint());
@@ -401,6 +403,16 @@ fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
     Ok(())
 }
 
+/// `djc nl <phrase>`: the phrase, explicitly as natural language. Without this the
+/// word `nl` itself rode along into the translator ("nl what is offline"), which no
+/// grammar reads as a question.
+fn explicit_nl(words: &[String]) -> Option<Action> {
+    match words.split_first() {
+        Some((w, rest)) if w == "nl" && !rest.is_empty() => Some(Action::Nl(rest.join(" "))),
+        _ => None,
+    }
+}
+
 /// Run one command line and print the card - plus, first, whatever the verb ANSWERED.
 /// Most MPD verbs answer with a bare OK and the card is the whole feedback, but `mark`
 /// returns `mark_result`, the one sentence a human reads. Dropping it would make
@@ -443,7 +455,10 @@ fn nl_handshake(
     {
         // Pin `rules` skips the Claude Code side door so probes share one translator
         // path with the TUI. Auto / claude keep today's try-CC-then-daemon behavior.
-        if pin.prefer_claude() && hypodj_nl::cc::cc_available() {
+        // A QUESTION goes straight to the daemon, which answers it from live state.
+        // Claude only emits actions, so handed "what's offline" it can only say
+        // "do nothing" (or fail) - the daemon's question grammar must come first.
+        if pin.prefer_claude() && !hypodj_nl::is_question(phrase) && hypodj_nl::cc::cc_available() {
             match cc_nl_handshake(conn, phrase)? {
                 true => return Ok(()),
                 // The CC call failed (spawn/parse/no-DSL); fall through to the daemon.
@@ -466,6 +481,11 @@ fn nl_handshake(
     // A READ-side question is answered immediately (no plan, nothing to confirm).
     if let Some(line) = render::render_command("nl", &pairs, stdout_ansi()) {
         println!("{line}");
+        // A list of held albums is only useful if you can play one.
+        let held = store::held_albums(&pairs);
+        if held.iter().any(|a| a.uri.is_some()) {
+            println!("play one: djc store play <album name>");
+        }
         return Ok(());
     }
     let token = match nl::token_from_pairs(&pairs) {
@@ -546,11 +566,13 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
     let _ = std::io::stderr().flush();
 
     let raw = match result {
+        // "Do nothing" is Claude saying it did not understand. Never offer it for
+        // confirmation: hand the phrase to the daemon, whose rules may know it and
+        // whose miss names what WOULD work.
+        Ok(raw) if hypodj_nl::is_noop(&raw) => return Ok(false),
         Ok(raw) => raw,
         Err(e) => {
-            eprintln!(
-                "Claude Code could not translate that ({e}); trying the built-in translator."
-            );
+            eprintln!("Claude Code could not translate that: {e}. Trying the built-in translator.");
             return Ok(false);
         }
     };
@@ -600,6 +622,14 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leading_nl_marks_the_rest_as_natural_language() {
+        let w = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(explicit_nl(&w("nl what is offline")), Some(Action::Nl("what is offline".into())));
+        assert_eq!(explicit_nl(&w("nl")), None);
+        assert_eq!(explicit_nl(&w("what is offline")), None);
+    }
 
     #[test]
     fn rename_notice_shows_only_in_the_rename_release() {

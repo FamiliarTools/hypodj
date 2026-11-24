@@ -217,7 +217,16 @@ fn noted(pairs: &[(String, String)], act: Option<Act>) -> Option<Spoken> {
         return Some(Spoken::new(State::Note, vec!["no wake alarm armed".into()]));
     }
     if let Some((_, answer)) = pairs.iter().find(|(k, _)| k == "nl_answer") {
-        return Some(Spoken::new(State::Live, vec![answer.clone()]));
+        // A list answer (what plays offline) carries its rows after the headline;
+        // they belong to the answer, so both surfaces show them under it.
+        let mut lines = vec![answer.clone()];
+        lines.extend(
+            pairs
+                .iter()
+                .filter(|(k, _)| k == "OfflineAlbum")
+                .map(|(_, v)| format!("  {v}")),
+        );
+        return Some(Spoken::new(State::Live, lines));
     }
     if act == Some(Act::Undo) {
         if let Some((_, did)) = pairs.iter().find(|(k, _)| k == "jdid") {
@@ -492,6 +501,18 @@ pub fn reply_shapes() -> Vec<ReplyShape> {
         None,
         State::Live,
         &["yes, \"Blue\" is a favorite"],
+    ));
+    out.push(shape(
+        "nl answer with offline albums",
+        pairs(&[
+            ("nl_answer", "1 album plays offline (3 songs)"),
+            ("OfflineAlbum", "Fixture Band - Held Harbour (3 songs)"),
+            ("OfflineAlbumUri", "album/al-1"),
+        ]),
+        None,
+        None,
+        State::Live,
+        &["1 album plays offline (3 songs)", "  Fixture Band - Held Harbour (3 songs)"],
     ));
     // Status. The handler sends the seconds, or the word none.
     out.push(shape(

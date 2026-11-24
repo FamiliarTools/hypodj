@@ -2342,6 +2342,15 @@ pub const PAIR_ORIGIN: &str = "origin";
 pub const PAIR_WHEN: &str = "when";
 pub const PAIR_NEXT_FIRE: &str = "next_fire";
 pub const PAIR_NL_ANSWER: &str = "nl_answer";
+/// One held album's worded row in `store albums` / the offline answer.
+pub const PAIR_OFFLINE_ALBUM: &str = "OfflineAlbum";
+/// The `album/<id>` (or `-`) that follows each [`PAIR_OFFLINE_ALBUM`].
+pub const PAIR_OFFLINE_ALBUM_URI: &str = "OfflineAlbumUri";
+
+/// How long a best-effort server read waits when there is an offline answer to fall
+/// back on (`nl` grounding, an `album/<id>` add the mirror holds). Well under the
+/// clients' 5s read timeout.
+const NL_GROUNDING_BUDGET: Duration = Duration::from_millis(1500);
 pub const PAIR_JDID: &str = "jdid";
 
 pub use hypodj_dsl::{
@@ -6006,7 +6015,11 @@ impl HypodjHandler {
         let mut ctx = self.nl_context();
         // The library artist index (cached; best effort - a failed fetch leaves
         // only the queue credits to resolve "no <artist>" against).
-        if let Ok(a) = self.cached_artists().await {
+        // BOUNDED: offline, the artist fetch waits out the metadata connect timeout
+        // (5s), which is exactly the client's read timeout - so every phrase offline
+        // ended in "djc: io error: Resource temporarily unavailable". Grounding is
+        // best effort; a phrase must never wait on it longer than a beat.
+        if let Ok(Ok(a)) = tokio::time::timeout(NL_GROUNDING_BUDGET, self.cached_artists()).await {
             ctx.library_artists = a.into_iter().map(|(_, n)| n).collect();
         }
         // Run the (possibly model-backed) translate OFF the reactor: Rules is
@@ -6019,6 +6032,12 @@ impl HypodjHandler {
             // Loud ACK with the SPECIFIC reason (NotUnderstood / Ambiguous /
             // Unresolvable / NotAvailable), never a generic fail.
             Err(e) => return ack(ACK_ERROR_UNKNOWN, "nl", &e.to_string()),
+            // A translator that answered "do nothing" did not understand. Offering
+            // "do nothing - confirm? [y/N]" asks the human to approve an absence;
+            // say plainly it was not understood so the client shows what WOULD work.
+            Ok(h) if !h.plans.is_empty() && h.plans.iter().all(|p| matches!(p.action, Action::Noop)) => {
+                return ack(ACK_ERROR_UNKNOWN, "nl", &NlError::NotUnderstood.to_string());
+            }
             Ok(h) => h,
         };
         // Stamp origin (adapter, NEVER the model) and DRY-RUN validate every plan
@@ -6112,6 +6131,9 @@ impl HypodjHandler {
                 let answer = if cancelled { format!("{name} cancelled") } else { format!("no {name} armed") };
                 return MpdResponse::pairs().pair("nl_answer", answer).build();
             }
+            // A question about the mirror is answered from the mirror alone: no
+            // server call, so it answers exactly when it matters most - offline.
+            NlQuery::Offline => return self.store_albums_response(true).await,
             NlQuery::Favorites => true,
             NlQuery::IsCurrentFavorited => false,
         };
@@ -7733,6 +7755,75 @@ impl HypodjHandler {
         MpdResponse::Pairs(p)
     }
 
+    /// `store albums`, and the answer to "what can I play offline?".
+    ///
+    /// WHAT PLAYS OFFLINE, BY ALBUM. The badge counts songs and bytes, which answers
+    /// "how full is it" but not the question a person offline actually asks - "what
+    /// can I put on". Read from the sidecars every held song already carries, so it
+    /// needs no server and is exactly as true as the mirror itself. The sidecar reads
+    /// are plain `std::fs` and run in `spawn_blocking`, never on the spine.
+    ///
+    /// One row per album (`OfflineAlbum`, already worded) followed by its uri
+    /// (`OfflineAlbumUri`, `album/<id>`, or `-` when the server gave the song no
+    /// album id) so a client can play the row it shows without a second lookup. The
+    /// rows are the SAME whether asked as a verb or as a question; `as_answer` only
+    /// adds the `nl_answer` headline so an NL client renders it as an answer.
+    async fn store_albums_response(&self, as_answer: bool) -> MpdResponse {
+        let head_key = if as_answer { PAIR_NL_ANSWER } else { "OfflineSummary" };
+        let Some(store) = self.audio_store() else {
+            return MpdResponse::pairs()
+                .pair(head_key, "nothing plays offline - this daemon keeps no offline copies (store off)")
+                .build();
+        };
+        let albums = tokio::task::spawn_blocking(move || offline_albums(&store))
+            .await
+            .unwrap_or_default();
+        let songs: usize = albums.iter().map(|a| a.songs).sum();
+        let head = if albums.is_empty() {
+            "nothing is downloaded for offline play yet".to_string()
+        } else {
+            format!(
+                "{} {} {} offline ({songs} {})",
+                albums.len(),
+                if albums.len() == 1 { "album" } else { "albums" },
+                if albums.len() == 1 { "plays" } else { "play" },
+                if songs == 1 { "song" } else { "songs" },
+            )
+        };
+        let mut b = MpdResponse::pairs().pair(head_key, head);
+        for a in &albums {
+            b = b
+                .pair(PAIR_OFFLINE_ALBUM, a.line())
+                .pair(PAIR_OFFLINE_ALBUM_URI, a.uri.clone().unwrap_or_else(|| "-".to_string()));
+        }
+        b.build()
+    }
+
+    /// The held songs of one album, in play order, for an `album/<id>` add the
+    /// server could not answer. `None` when the store holds none of it.
+    async fn offline_album_songs(&self, album: &AlbumId) -> Option<Vec<Song>> {
+        let store = self.audio_store()?;
+        let want = album.clone();
+        let mut songs = tokio::task::spawn_blocking(move || {
+            store
+                .entries()
+                .into_iter()
+                .filter_map(|e| store.read_sidecar(&e.id).map(|sc| sc.song))
+                .filter(|s| s.album_id.as_ref() == Some(&want))
+                .collect::<Vec<Song>>()
+        })
+        .await
+        .ok()?;
+        if songs.is_empty() {
+            return None;
+        }
+        songs.sort_by(|a, b| {
+            (a.disc.unwrap_or(0), a.track.unwrap_or(0), &a.title)
+                .cmp(&(b.disc.unwrap_or(0), b.track.unwrap_or(0), &b.title))
+        });
+        Some(songs)
+    }
+
     /// `store` / `store frontier` / `store pause` / `store resume` / `store now`.
     ///
     /// SYNC and cheap by contract: it answers from the status a pass already
@@ -7765,7 +7856,8 @@ impl HypodjHandler {
                         .build();
                 }
             }
-            StoreCmd::Show | StoreCmd::Frontier => {}
+            // Albums is dispatched to `store_albums_response` before reaching here.
+            StoreCmd::Show | StoreCmd::Frontier | StoreCmd::Albums => {}
         }
         let st = store.status();
         let mut b = MpdResponse::pairs()
@@ -13058,11 +13150,25 @@ impl HypodjHandler {
         // change, not a per-song wake burst, and a client cannot observe a
         // half-added album. Returns the FIRST assigned id (MPD addid semantics).
         if let Some(id) = uri.strip_prefix("album/") {
-            let songs = self
-                .client
-                .album_songs(&AlbumId(id.to_string()))
-                .await
-                .map_err(|e| e.to_string())?;
+            let album = AlbumId(id.to_string());
+            // OFFLINE, the album is whatever of it the mirror holds: the server
+            // cannot list it, but every held song carries its album id in its
+            // sidecar. The server stays authoritative when it answers; when the
+            // mirror holds some of the album the server only gets a short budget,
+            // because an unreachable server costs the full metadata connect timeout
+            // (5s) - the clients' own read timeout - and the add would die with it.
+            let held = self.offline_album_songs(&album).await;
+            let online = match &held {
+                Some(_) => tokio::time::timeout(NL_GROUNDING_BUDGET, self.client.album_songs(&album))
+                    .await
+                    .unwrap_or_else(|_| Err(SubsonicError::Request("server too slow".into()))),
+                None => self.client.album_songs(&album).await,
+            };
+            let songs = match (online, held) {
+                (Ok(s), _) => s,
+                (Err(_), Some(held)) => held,
+                (Err(e), None) => return Err(e.to_string()),
+            };
             if songs.is_empty() {
                 return Err(format!("no such album: {uri}"));
             }
@@ -13813,6 +13919,73 @@ fn continuation_mode_name(mode: ContinuationMode) -> &'static str {
     }
 }
 
+/// One album as the offline view shows it: who, what, and how many of its songs
+/// the mirror holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineAlbum {
+    artist: Option<String>,
+    album: String,
+    /// `album/<id>` when the server gave the songs an album id - what a client
+    /// hands back to `add` to play it.
+    uri: Option<String>,
+    songs: usize,
+}
+
+impl OfflineAlbum {
+    /// The one human line for the row: "Artist - Album (N songs)".
+    fn line(&self) -> String {
+        let n = if self.songs == 1 { "1 song".to_string() } else { format!("{} songs", self.songs) };
+        match &self.artist {
+            Some(a) => format!("{a} - {} ({n})", self.album),
+            None => format!("{} ({n})", self.album),
+        }
+    }
+}
+
+/// Read every held song's sidecar and group them by album. A song whose sidecar is
+/// unreadable is skipped: it cannot be named, and the reconciler will repair it.
+fn offline_albums(store: &crate::store::AudioStore) -> Vec<OfflineAlbum> {
+    let songs = store
+        .entries()
+        .into_iter()
+        .filter_map(|e| store.read_sidecar(&e.id).map(|sc| sc.song))
+        .collect();
+    group_offline_albums(songs)
+}
+
+/// Group songs into albums, keyed by album id when the server gave one and by
+/// (artist, album name) otherwise, sorted by artist then album, case-blind.
+/// A song with no album at all is gathered under "(no album)" so it is still
+/// counted: it plays offline too.
+fn group_offline_albums(songs: Vec<Song>) -> Vec<OfflineAlbum> {
+    let mut by_key: HashMap<String, OfflineAlbum> = HashMap::new();
+    for s in songs {
+        let album = s.album.clone().unwrap_or_else(|| "(no album)".to_string());
+        let artist = s.artist.clone();
+        let key = match &s.album_id {
+            Some(id) => format!("id:{}", id.0),
+            None => format!("name:{}\u{1f}{}", artist.as_deref().unwrap_or(""), album),
+        };
+        by_key
+            .entry(key)
+            .and_modify(|a| a.songs += 1)
+            .or_insert(OfflineAlbum {
+                artist,
+                album,
+                uri: s.album_id.as_ref().map(|id| format!("album/{}", id.0)),
+                songs: 1,
+            });
+    }
+    let mut v: Vec<OfflineAlbum> = by_key.into_values().collect();
+    v.sort_by(|a, b| {
+        let k = |x: &OfflineAlbum| {
+            (x.artist.as_deref().unwrap_or("").to_lowercase(), x.album.to_lowercase())
+        };
+        k(a).cmp(&k(b))
+    });
+    v
+}
+
 /// The `radio status` spelling of a [`ContinuationMode`]. Deliberately NOT the config
 /// words: inside the `radio` verb "radio" would name the whole feature rather than the
 /// mechanism, so the two mechanisms are reported as what they DO - a library `walk` or a
@@ -14172,6 +14345,9 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Mark(target) => self.mark(target).await,
             MpdCommand::Heard(q) => self.heard(q).await,
 
+            // The album view reads sidecars off disk, so it is the one async store
+            // form; every other one answers from the published status.
+            MpdCommand::Store(crate::mpd::StoreCmd::Albums) => self.store_albums_response(false).await,
             MpdCommand::Store(cmd) => self.handle_store(cmd),
             MpdCommand::Info(uri) => self.handle_info(&uri).await,
             MpdCommand::InfoMore(uri) => self.handle_info_more(&uri).await,
