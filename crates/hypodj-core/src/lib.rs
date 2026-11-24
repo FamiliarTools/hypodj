@@ -37,6 +37,7 @@ pub mod recognize;
 pub mod resume;
 pub mod scrobble;
 pub mod station_identity;
+pub mod station_meta;
 pub mod store;
 pub mod subsonic;
 pub mod tape;

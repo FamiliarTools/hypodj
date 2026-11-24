@@ -1007,6 +1007,7 @@ fn recognize_hit_row(
         album: track.album.clone().or_else(|| library.and_then(|m| m.album.clone())),
         year: library.and_then(|m| m.year),
         isrc: track.isrc.clone(),
+        genre: track.genre.clone(),
         shazam_offset_ms: offset_secs.map(|o| (o * 1000.0) as i64),
         ..crate::heard::HeardRow::now("heard")
     }
@@ -3111,6 +3112,10 @@ pub struct HypodjHandler {
     /// newest one. Separate from the handle because reading is a different capability
     /// from writing (and the read runs in `spawn_blocking`, never on any hot path).
     heard_dir: Mutex<Option<PathBuf>>,
+    /// Station metadata hypodj learns for itself (ICY genre/description, heard
+    /// artists/genres), searched by `searchall` (task wxpnbso). In-memory until the
+    /// daemon registers a persistent store.
+    station_meta: Mutex<crate::station_meta::StationMetaStore>,
     /// The render-time dedupe window, seconds (`[heard].dedupe_window_secs`). Read
     /// locklessly when a `heard` request is built.
     heard_dedupe_window_secs: AtomicU64,
@@ -3712,6 +3717,7 @@ impl HypodjHandler {
             tape_seq: AtomicU64::new(0),
             self_ref: OnceLock::new(),
             heard_dir: Mutex::new(None),
+            station_meta: Mutex::new(crate::station_meta::StationMetaStore::in_memory()),
             heard_dedupe_window_secs: AtomicU64::new(
                 crate::config::DEFAULT_HEARD_DEDUPE_WINDOW_SECS,
             ),
@@ -9456,6 +9462,25 @@ impl HypodjHandler {
             .store(dedupe_window_secs, Ordering::Relaxed);
     }
 
+    /// Register the persistent station-metadata store, plumbed once at daemon startup.
+    pub fn set_station_meta(&self, store: crate::station_meta::StationMetaStore) {
+        *self.station_meta.lock().unwrap() = store;
+    }
+
+    /// Record a station's ICY self-description against the stream url of `qid`. ON THE
+    /// DIRECTOR SPINE: one short state lock for the url, then a memory move and a
+    /// lock-free send (the store's writer does the file I/O).
+    pub(crate) fn note_station_icy(&self, qid: QueueId, genre: Option<&str>, description: Option<&str>) {
+        if genre.is_none() && description.is_none() {
+            return;
+        }
+        let url = stream_url_for(&self.state.lock().unwrap(), qid);
+        if let Some(url) = url {
+            let store = self.station_meta.lock().unwrap().clone();
+            store.note_icy(&url, genre, description);
+        }
+    }
+
     /// Enqueue one ledger row, or do nothing when no ledger is registered.
     ///
     /// THE SPINE CONTRACT lives here: this is a SYNC `&self` method whose entire body is
@@ -9464,6 +9489,15 @@ impl HypodjHandler {
     /// `set_stream_meta` (which the director spine invokes synchronously) safe by
     /// construction rather than by care.
     pub(crate) fn append_heard(&self, row: crate::heard::HeardRow) {
+        // Every heard TRACK row on a stream teaches the station-metadata cache what the
+        // station plays (task wxpnbso). Reached from the spine via the ICY path, so this
+        // is a memory move and a channel send only.
+        if row.ev == "heard" && row.kind.as_deref() == Some("track") {
+            if let Some(url) = row.url.as_deref() {
+                let store = self.station_meta.lock().unwrap().clone();
+                store.note_heard(url, row.artist.as_deref(), row.genre.as_deref());
+            }
+        }
         let ledger = self.heard_ledger.lock().unwrap().clone();
         if let Some(l) = ledger {
             l.append(row);
@@ -16232,7 +16266,14 @@ impl HypodjHandler {
         // not ACK because the internet-radio endpoint hiccuped.
         let query_lower = query.to_lowercase();
         let stations: Option<Vec<Station>> = match self.client.get_internet_radio_stations().await {
-            Ok(all) => Some(all.into_iter().filter(|s| station_matches(s, &query_lower)).collect()),
+            Ok(all) => {
+                let meta = self.station_meta.lock().unwrap().clone().snapshot();
+                Some(
+                    all.into_iter()
+                        .filter(|s| station_matches(s, &query_lower, meta.get(&s.stream_url)))
+                        .collect(),
+                )
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "searchall: station list unavailable; omitting the station kind");
                 None
@@ -16827,8 +16868,43 @@ fn search_all_pairs(
 /// are not named "radio". Additive, never a mode switch: search3 still runs on the same
 /// query, so an artist, album or song literally called "Stations" is not lost, and the
 /// station block sits between albums and songs exactly as for any other query.
-fn station_matches(s: &Station, query_lower: &str) -> bool {
-    is_station_kind_token(query_lower) || s.name.to_lowercase().contains(query_lower)
+///
+/// LEARNED METADATA (task wxpnbso, part B): `meta` is what hypodj learned about this
+/// station itself ([`crate::station_meta`]) - ICY genre/description and the artists and
+/// genres it was heard playing - so `house` finds a station that played house and
+/// `eclectic` finds KFJC. A query shorter than 3 characters never searches it (two
+/// letters would match half of every heard list).
+///
+/// SCOPED HOST TOKEN: the host is already RENDERED as the row trailer, so it is matched
+/// too - but only as a whole-word PREFIX of one host label other than the TLD, and only
+/// for a single 3+ character word (`somafm`, `nts`, `kfjc`). `http`, `ntslive.net` or
+/// `com` still match nothing, which is the guard that kept url matching out.
+///
+/// PURE: the caller passes the snapshot, so the whole rule is unit-testable.
+fn station_matches(s: &Station, query_lower: &str, meta: Option<&crate::station_meta::StationMeta>) -> bool {
+    if is_station_kind_token(query_lower) || s.name.to_lowercase().contains(query_lower) {
+        return true;
+    }
+    let q = query_lower.trim();
+    if q.chars().count() < 3 {
+        return false;
+    }
+    if meta.is_some_and(|m| m.matches(q)) {
+        return true;
+    }
+    host_token_matches(&s.stream_url, q)
+}
+
+/// Does a single-word query prefix one non-TLD label of the stream host?
+fn host_token_matches(url: &str, q: &str) -> bool {
+    if !q.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return false;
+    }
+    let Some(host) = stream_host(url) else { return false };
+    let host = host.to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let n = labels.len().saturating_sub(1).max(1);
+    labels[..n.min(labels.len())].iter().any(|l| l.starts_with(q))
 }
 
 /// Is this (lowercased) query the station KIND token rather than a text query?
@@ -25434,17 +25510,48 @@ mod tests {
 
     // ── stations as the FOURTH searchall result kind ───────────────────────────
 
+    fn station_matches_bare(s: &Station, q: &str) -> bool {
+        station_matches(s, q, None)
+    }
+
+    #[test]
+    fn station_matches_learned_metadata_and_host_token() {
+        use crate::station_meta::{record_heard, record_icy, StationMetaMap};
+        let kfjc = st("2", "KFJC 89.7 FM", "http://netcast.kfjc.org/kfjc-320k-aac");
+        let nts = st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5");
+        let soma = st("4", "Groove Salad", "https://ice2.somafm.com/groovesalad-128-mp3");
+        let mut m = StationMetaMap::new();
+        record_icy(&mut m, &kfjc.stream_url, Some("Eclectic"), Some("Freeform college radio"));
+        record_heard(&mut m, &nts.stream_url, Some("Floorplan"), Some("House"));
+        let km = m.get(&kfjc.stream_url);
+        let nm = m.get(&nts.stream_url);
+        assert!(station_matches(&kfjc, "radio", km), "icy-description");
+        assert!(station_matches(&kfjc, "eclectic", km), "icy-genre");
+        assert!(station_matches(&nts, "house", nm), "a heard genre");
+        assert!(station_matches(&nts, "floorplan", nm), "a heard artist");
+        assert!(!station_matches(&nts, "radio", nm));
+        assert!(!station_matches(&nts, "house", None), "no learned meta, no match");
+        assert!(!station_matches(&nts, "ho", nm), "short queries never search learned text");
+        // Scoped host token: a whole-label prefix, never the TLD or a dotted/scheme query.
+        assert!(station_matches(&soma, "somafm", None));
+        assert!(station_matches(&nts, "ntslive", None));
+        assert!(!station_matches(&soma, "com", None));
+        assert!(!station_matches(&soma, "http", None));
+        assert!(!station_matches(&soma, "somafm.com", None));
+        assert!(!station_matches(&soma, "fm", None));
+    }
+
     #[test]
     fn station_matches_is_name_substring_never_url() {
         let s = st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5");
         // Substring, case-insensitive: FIND is loose where station_for_name is exact.
-        assert!(station_matches(&s, "nts"));
-        assert!(station_matches(&s, "floor"));
-        assert!(station_matches(&s, "4 to the floor"));
-        assert!(!station_matches(&s, "kfjc"));
+        assert!(station_matches_bare(&s, "nts"));
+        assert!(station_matches_bare(&s, "floor"));
+        assert!(station_matches_bare(&s, "4 to the floor"));
+        assert!(!station_matches_bare(&s, "kfjc"));
         // The URL is NEVER searched: `searchall http` must not return every station.
-        assert!(!station_matches(&s, "http"));
-        assert!(!station_matches(&s, "ntslive.net"));
+        assert!(!station_matches_bare(&s, "http"));
+        assert!(!station_matches_bare(&s, "ntslive.net"));
     }
 
     #[test]
@@ -25456,11 +25563,11 @@ mod tests {
             st("3", "The Lot Radio - NYC", "https://www.lvpr.tv/?v=x"),
         ];
         for q in ["stations", "station", " stations "] {
-            assert!(all.iter().all(|s| station_matches(s, q)), "{q:?} lists the whole set");
+            assert!(all.iter().all(|s| station_matches_bare(s, q)), "{q:?} lists the whole set");
         }
         // Only the WHOLE token: a longer query is an ordinary name substring again.
-        assert!(!station_matches(&all[0], "stations nyc"));
-        assert!(!station_matches(&all[0], "stat"));
+        assert!(!station_matches_bare(&all[0], "stations nyc"));
+        assert!(!station_matches_bare(&all[0], "stat"));
     }
 
     #[test]
