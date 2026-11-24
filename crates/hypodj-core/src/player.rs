@@ -1412,6 +1412,23 @@ fn is_active_load_failure(e: &libmpv2::Error) -> bool {
     }
 }
 
+/// A human reading of an [`is_active_load_failure`] error. libmpv renders the code
+/// as a bare `Raw(-13)`, which reads like a demuxer or option problem; it is far more
+/// often the SOURCE: a saved station whose host no longer resolves (RNE Radio 3's old
+/// flumotion host is NXDOMAIN) surfaces as exactly that `-13`.
+fn load_failure_cause(e: &libmpv2::Error) -> &'static str {
+    use libmpv2::{Error, mpv_error};
+    match e {
+        Error::Raw(mpv_error::LoadingFailed) | Error::Loadfile { .. } => {
+            "the source could not be opened: DNS failure, unreachable host, refused connection or an HTTP error"
+        }
+        Error::Raw(mpv_error::NothingToPlay) => "the source opened but held nothing playable",
+        Error::Raw(mpv_error::UnknownFormat) => "the source opened but its format is not recognised",
+        Error::Raw(mpv_error::Unsupported) => "the source opened but is not supported",
+        _ => "unclassified mpv error",
+    }
+}
+
 /// Does the actor currently HOLD an entry - i.e. is there something loaded that a
 /// pause could freeze and a resume could un-freeze?
 ///
@@ -1823,7 +1840,7 @@ fn mpv_actor(
                 // premature that failure never becomes an EndFile(Error). So the Eof it
                 // emits carries `errored: true` - the offline store's suspect signal.
                 if matches!(warm, WarmKind::None) && current_qid.is_some() && is_active_load_failure(&e) {
-                    tracing::warn!(error = %e, "mpv load/open failed for the active entry; stopping honestly");
+                    tracing::warn!(error = %e, cause = load_failure_cause(&e), "mpv load/open failed for the active entry; stopping honestly");
                     emit_honest_stop(
                         &state_tx,
                         &evt_tx,
