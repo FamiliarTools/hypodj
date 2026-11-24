@@ -1,0 +1,35 @@
+# Held-out paraphrases the RULES reject (every row must translate to ERR
+# NotUnderstood under the rules, pinned by `heldout_rows_are_rules_misses`), with
+# what a human would arm: a plan-DSL echo, or NOOP when the right answer is to
+# refuse. Only the local model ever sees these, so this is its real test set.
+# Scored by `llm_eval` (ignored; needs HYPODJ_NL_MODEL). Same fixed test context
+# as golden.tsv.
+fade it out gently over a quarter hour	trigger immediate action fade out 900 once
+give the music a long ten minute fade-out	trigger immediate action fade out 600 once
+slowly bring the music in	trigger immediate action fade in 30 once
+kill it after this one	trigger after action stop once
+turn the music off in five minutes	trigger in 300 action stop once
+shut it off in 45 minutes	trigger in 2700 action stop once
+hold the music once this album ends	trigger album action pause once
+pause when this song is done	trigger after action pause once
+make it louder, like 70	trigger immediate action setvol 70 once
+bring the volume down to 20	trigger immediate action setvol 20 once
+throw some jazz on the queue	trigger immediate action enqueue genre jazz 5 once
+put on radiohead	trigger immediate action playnow query radiohead 1 once
+I want to hear more stuff like this song	trigger immediate action enqueue similar_current 5 once
+get rid of the second song	trigger immediate action remove pos 2 once
+jump to track 4	trigger immediate action play pos 4 once
+wipe the whole queue	trigger immediate action clear all once
+empty everything after this song	trigger immediate action clear after once
+take the last 2 songs off the queue	trigger immediate action remove last 2 once
+quieten things down in a while	NOOP
+cut the music at some point	NOOP
+dim it eventually	NOOP
+what's the weather like	NOOP
+tell me a joke	NOOP
+order a pizza	NOOP
+who sang this	NOOP
+how long is this song	NOOP
+call mom	NOOP
+turn off the lights	NOOP
+make it sound better	NOOP

@@ -1236,3 +1236,43 @@ fn resolve_next_local(ctx: &NlContext, h: u32, m: u32) -> Option<chrono::DateTim
     };
     Some(dt.with_timezone(&Utc))
 }
+
+/// Every quantity `utterance` SAYS, for the model-output grounding check
+/// ([`crate::llm::grounded`]): `(values, spans)`. `values` holds each bare
+/// number, written ("70", "2nd", "1.5") or spoken ("ten", "a", "half", "second"
+/// as an ordinal); `spans` holds each duration in seconds: a spoken one only WITH
+/// its unit ("five minutes", "an hour and a half", "a quarter of an hour" - never
+/// the "a" of "in a bit"), a written number in any unit. Over-collecting is harmless (a model number that matches a stray
+/// "a" is still a number the human could have meant); under-collecting refuses a
+/// good plan, which only costs a rules-style NotUnderstood.
+pub(crate) fn spoken_quantities(utterance: &str) -> (Vec<f64>, Vec<f64>) {
+    let ws = words(utterance);
+    let toks: Vec<&str> = ws.iter().map(String::as_str).collect();
+    let (mut values, mut spans) = (Vec::new(), Vec::new());
+    for (i, t) in toks.iter().enumerate() {
+        let bare = t.trim_end_matches('%');
+        if let Ok(v) = bare.parse::<f64>() {
+            values.push(v);
+            // "20 minutes" is 1200 s only; a bare "20" may be any unit; "2 days"
+            // is no span hypodj can arm.
+            match toks.get(i + 1) {
+                Some(u) if unit_secs(u).is_some() => spans.push(v * unit_secs(u).unwrap_or(1.0)),
+                Some(u) if is_unsupported_time_unit(u) => {}
+                _ => spans.extend([v, v * 60.0, v * 3600.0]),
+            }
+        }
+        if let Some(n) = parse_ordinal(t) {
+            values.push(n as f64);
+        }
+        if *t == "quarter" && toks[i + 1..].iter().take(3).any(|w| unit_secs(w) == Some(3600.0)) {
+            spans.push(900.0);
+        }
+        if let Some((v, _)) = word_qty(&toks, i) {
+            values.push(v);
+        }
+        if let Some((secs, _)) = word_dur(&toks, i) {
+            spans.push(secs);
+        }
+    }
+    (values, spans)
+}

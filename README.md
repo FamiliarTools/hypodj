@@ -200,6 +200,14 @@ should own the speakers. Then point any client at `mpd.bind`
 (default `127.0.0.1:6600`, the standard MPD port, so a bare `ncmpcpp` or `mpc`
 finds it).
 
+The natural-language front-end is rules-only in both packages. A daemon built
+with the `hypodj-nl` feature `llm-llama` also asks a local model, only for what
+the rules do not understand, when `HYPODJ_NL_MODEL` names a GGUF file. The
+default model is Qwen2.5-1.5B-Instruct Q4_K_M (Apache-2.0, ~1.1 GB, ~2 GB
+resident): `nix build .#nl-model` fetches it, pinned by hash. Every model plan is
+refused unless its words and numbers appear in the request, and is echoed before
+it arms, like any other.
+
 ## Layout
 
 | Crate | What |

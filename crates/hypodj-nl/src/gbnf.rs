@@ -24,15 +24,18 @@ pub fn schema_json() -> String {
 /// turns into a [`hypodj_core::plan::RawPlan`]: each action lists exactly the
 /// scalars its `TryFrom` arm requires, so "set_volume without level" or "move
 /// without dest" is not merely rejected afterwards, it cannot be decoded at all.
-/// Numbers are bounded (a u8 volume, at most 4-digit slots, 5-digit seconds),
+/// Numbers are bounded (a u8 volume, at most 4-digit slots, a 4-digit span in a
+/// closed unit the parser converts, so the model never does the arithmetic),
 /// strings are length-capped and free of JSON escapes, there is no whitespace to
-/// pad, and every plan ends `"once":true` like the rules path. Queue edits take no
+/// pad, and every plan ends `"once":true` like the rules path. A delay is the bare
+/// `"in"` key and a fade length the `"over"` key, so the choice between the two
+/// readings is one token that mirrors the preposition the request used. Queue edits take no
 /// `queue_position` trigger because that would reuse the selector's `slot` key.
 /// Hand-written rather than a json-schema-to-grammar port so it stays auditable;
 /// the tests below decode a sentence from every alternative.
 pub const GBNF: &str = r##"root ::= "{" plan ",\"once\":true}"
 plan ::= fade | halt | vol | content | qedit | mv | clr | noop
-fade ::= "\"type\":" ( "\"fade_out\"" | "\"fade_in\"" ) ( ",\"secs\":" num )? when?
+fade ::= "\"type\":" ( "\"fade_out\"" | "\"fade_in\"" ) ( ",\"over\":" num ",\"over_unit\":" unit )? when?
 halt ::= "\"type\":" ( "\"stop\"" | "\"pause\"" ) when?
 vol ::= "\"type\":\"set_volume\",\"level\":" level when?
 content ::= "\"type\":" ( "\"enqueue\"" | "\"play_now\"" ) "," csel ( ",\"count\":" int )? when?
@@ -44,10 +47,11 @@ dest ::= "\"dest\":\"position\",\"dest_slot\":" int | "\"dest\":\"relative\",\"d
 clr ::= "\"type\":\"clear\",\"scope\":" ( "\"all\"" | "\"after_current\"" | "\"range\"," range )
 range ::= "\"range_start\":" int ",\"range_end\":" int
 noop ::= "\"type\":\"noop\""
-when ::= ",\"when\":" ( "\"after_current\"" | "\"album_boundary\"" | "\"after_secs\",\"when_secs\":" num | "\"time_remaining\",\"when_secs\":" num | "\"queue_position\",\"slot\":" int )
+when ::= ",\"in\":" num ",\"in_unit\":" unit | ",\"when\":" ( "\"after_current\"" | "\"album_boundary\"" | "\"time_remaining\",\"left\":" num ",\"left_unit\":" unit | "\"queue_position\",\"slot\":" int )
+unit ::= "\"s\"" | "\"min\"" | "\"h\""
 level ::= "100" | [1-9]? [0-9]
 int ::= [0-9]{1,4}
-num ::= [0-9]{1,5} ( "." [0-9]{1,2} )?
+num ::= [0-9]{1,4} ( "." [0-9]{1,2} )?
 string ::= "\"" char{1,64} "\""
 char ::= [^"\\\x00-\x1F]
 "##;
@@ -127,13 +131,13 @@ mod tests {
             "",
             r#","when":"after_current""#,
             r#","when":"album_boundary""#,
-            r#","when":"after_secs","when_secs":99999.99"#,
-            r#","when":"time_remaining","when_secs":0"#,
+            r#","in":9999.99,"in_unit":"h""#,
+            r#","when":"time_remaining","left":0,"left_unit":"s""#,
             r#","when":"queue_position","slot":9999"#,
         ];
         let timed = [
             r#""type":"fade_out""#,
-            r#""type":"fade_in","secs":1200"#,
+            r#""type":"fade_in","over":20,"over_unit":"min""#,
             r#""type":"stop""#,
             r#""type":"pause""#,
             r#""type":"set_volume","level":100"#,

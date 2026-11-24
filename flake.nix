@@ -55,6 +55,14 @@
         # The client bins (djc + dj + dj-gui) - libmpv-free, so a separate, lighter
         # derivation that a workstation can install without pulling mpv.
         packages.hypodj-clients = pkgs.callPackage ./nix/clients.nix { inherit buildInfo cargoVersion; };
+        # The default local NL model for an `llm-llama` daemon (HYPODJ_NL_MODEL):
+        # Qwen2.5-1.5B-Instruct Q4_K_M, the official Qwen GGUF, Apache-2.0, ~1.1 GB.
+        # A fixed-output fetch, so the file is only downloaded when this is built.
+        packages.nl-model = pkgs.fetchurl {
+          name = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
+          url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf";
+          hash = "sha256-ahouttFWIr88loVyBjUbqX4a8Www16dO44lw5DTpQH4=";
+        };
         packages.default = self.packages.${system}.hypodj;
 
         apps.hypodj = {
