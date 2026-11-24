@@ -14,6 +14,7 @@ mod art;
 mod find;
 mod keymap;
 mod menu;
+mod pump;
 mod sigil;
 mod state;
 mod ui;
@@ -55,6 +56,14 @@ fn main() {
     // --version/--help short-circuit before the terminal is taken over. Enriched
     // display version: base semver + commits-since-tag + git short hash on source
     // builds (bare semver otherwise).
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("--pump") {
+        if let Err(e) = pump::run(&argv[1..]) {
+            eprintln!("dj-gui --pump: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-V" | "--version" => {
@@ -69,7 +78,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "dj-gui - hypodj interactive TUI\n\nUSAGE:\n  dj-gui            launch the jukebox TUI\n\nOPTIONS:\n  -h, --help    this help\n  -V, --version print version and exit\n\nENV:\n  HYPODJ_NL_TRANSLATOR  auto|rules|claude (pin NL path; probes use rules)"
+                    "dj-gui - hypodj interactive TUI\n\nUSAGE:\n  dj-gui            launch the jukebox TUI\n  dj-gui --pump <script> <outdir> [world-file]\n                    headless journey driver (see pump.rs)\n\nOPTIONS:\n  -h, --help    this help\n  -V, --version print version and exit\n\nENV:\n  HYPODJ_NL_TRANSLATOR  auto|rules|claude (pin NL path; probes use rules)"
                 );
                 return;
             }

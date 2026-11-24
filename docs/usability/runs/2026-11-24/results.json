@@ -1,0 +1,456 @@
+[
+ {
+  "journey": "connected",
+  "goal": "Find out whether the music server is reachable right now.",
+  "state": "online",
+  "results": [
+   {
+    "check": "screen says the server is reachable",
+    "step": 2,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['connected', 'online', 'server ok', 'reachable'] on screen",
+     "80x24: none of ['connected', 'online', 'server ok', 'reachable'] on screen"
+    ],
+    "severity": "S0"
+   },
+   {
+    "check": "daemon itself answers (the UI talks to a live daemon)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "steps 0 within budget 1",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "connected",
+  "goal": "Find out whether the music server is reachable right now.",
+  "state": "blocked",
+  "results": [
+   {
+    "check": "screen says the server is NOT reachable",
+    "step": 2,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['unreachable', 'no network', 'server down', 'cannot reach', 'not reachable'] on screen",
+     "80x24: none of ['unreachable', 'no network', 'server down', 'cannot reach', 'not reachable'] on screen"
+    ],
+    "severity": "S0"
+   },
+   {
+    "check": "daemon itself answers (the UI talks to a live daemon)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "steps 0 within budget 1",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "connected",
+  "goal": "Find out whether the music server is reachable right now.",
+  "state": "no_network",
+  "results": [
+   {
+    "check": "screen says the server is NOT reachable",
+    "step": 2,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['unreachable', 'no network', 'server down', 'cannot reach', 'not reachable'] on screen",
+     "80x24: none of ['unreachable', 'no network', 'server down', 'cannot reach', 'not reachable'] on screen"
+    ],
+    "severity": "S0"
+   },
+   {
+    "check": "daemon itself answers (the UI talks to a live daemon)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "steps 0 within budget 1",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "offline-album",
+  "goal": "Browse your albums and play one that is downloaded to this machine.",
+  "state": "online",
+  "results": [
+   {
+    "check": "album list states availability in words (on disk / stream only)",
+    "step": 3,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['on disk', 'downloaded', '(held)', 'stream only', 'not on disk'] on screen",
+     "80x24: none of ['on disk', 'downloaded', '(held)', 'stream only', 'not on disk'] on screen"
+    ],
+    "severity": "S1"
+   },
+   {
+    "check": "the held album is playing (daemon truth)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "the screen names what is playing",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 3 within budget 6",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "offline-album",
+  "goal": "Browse your albums and play one that is downloaded to this machine.",
+  "state": "blocked",
+  "results": [
+   {
+    "check": "album list states availability in words (on disk / stream only)",
+    "step": 3,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['on disk', 'downloaded', '(held)', 'stream only', 'not on disk'] on screen",
+     "80x24: none of ['on disk', 'downloaded', '(held)', 'stream only', 'not on disk'] on screen"
+    ],
+    "severity": "S1"
+   },
+   {
+    "check": "the held album is playing (daemon truth)",
+    "step": 6,
+    "pass": false,
+    "notes": [
+     "truth 'status.state == play' failed (status.state='stop')",
+     "truth 'currentsong.Album == Held Harbour' failed (currentsong.Album=None)"
+    ],
+    "severity": "S1"
+   },
+   {
+    "check": "the screen names what is playing",
+    "step": 6,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['Held Harbour', 'Low Tide'] on screen",
+     "80x24: none of ['Held Harbour', 'Low Tide'] on screen"
+    ],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 3 within budget 6",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "offline-album",
+  "goal": "Browse your albums and play one that is downloaded to this machine.",
+  "state": "no_network",
+  "results": [
+   {
+    "check": "album list states availability in words (on disk / stream only)",
+    "step": 3,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['on disk', 'downloaded', '(held)', 'stream only', 'not on disk'] on screen",
+     "80x24: none of ['on disk', 'downloaded', '(held)', 'stream only', 'not on disk'] on screen"
+    ],
+    "severity": "S1"
+   },
+   {
+    "check": "the held album is playing (daemon truth)",
+    "step": 6,
+    "pass": false,
+    "notes": [
+     "truth 'status.state == play' failed (status.state='stop')",
+     "truth 'currentsong.Album == Held Harbour' failed (currentsong.Album=None)"
+    ],
+    "severity": "S1"
+   },
+   {
+    "check": "the screen names what is playing",
+    "step": 6,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['Held Harbour', 'Low Tide'] on screen",
+     "80x24: none of ['Held Harbour', 'Low Tide'] on screen"
+    ],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 3 within budget 6",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "drop-mid-song",
+  "goal": "You are listening to a song streamed from the server when the server drops. Understand what happened and what still plays.",
+  "state": "online",
+  "results": [
+   {
+    "check": "setup: a streamed (not held) song was playing before the drop",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "control: no false alarm while online",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "screen transport word matches the daemon (no stale 'playing')",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "when a song that was never fetched is due: transport word matches the daemon",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 4 within budget 4",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "drop-mid-song",
+  "goal": "You are listening to a song streamed from the server when the server drops. Understand what happened and what still plays.",
+  "state": "blocked",
+  "results": [
+   {
+    "check": "setup: a streamed (not held) song was playing before the drop",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "within 10s the screen says the server is gone",
+    "step": 9,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['unreachable', 'no network', 'server down', 'connection lost', 'lost the server', 'cannot reach'] on screen",
+     "80x24: none of ['unreachable', 'no network', 'server down', 'connection lost', 'lost the server', 'cannot reach'] on screen"
+    ],
+    "severity": "S0"
+   },
+   {
+    "check": "screen transport word matches the daemon (no stale 'playing')",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "Up Next states availability in words while the server is gone (decision b)",
+    "step": 11,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['on disk', 'stream only', 'not on disk', 'downloaded'] on screen",
+     "80x24: none of ['on disk', 'stream only', 'not on disk', 'downloaded'] on screen"
+    ],
+    "severity": "S1"
+   },
+   {
+    "check": "when a song that was never fetched is due: still playing, or the screen says why not",
+    "step": 15,
+    "pass": true,
+    "na": true,
+    "severity": "S1",
+    "notes": [
+     "n/a: precondition false (status.state='play')"
+    ]
+   },
+   {
+    "check": "when a song that was never fetched is due: transport word matches the daemon",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 4 within budget 4",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "drop-mid-song",
+  "goal": "You are listening to a song streamed from the server when the server drops. Understand what happened and what still plays.",
+  "state": "no_network",
+  "results": [
+   {
+    "check": "setup: a streamed (not held) song was playing before the drop",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "within 10s the screen says the server is gone",
+    "step": 9,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['unreachable', 'no network', 'server down', 'connection lost', 'lost the server', 'cannot reach'] on screen",
+     "80x24: none of ['unreachable', 'no network', 'server down', 'connection lost', 'lost the server', 'cannot reach'] on screen"
+    ],
+    "severity": "S0"
+   },
+   {
+    "check": "screen transport word matches the daemon (no stale 'playing')",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "Up Next states availability in words while the server is gone (decision b)",
+    "step": 11,
+    "pass": false,
+    "notes": [
+     "129x40: none of ['on disk', 'stream only', 'not on disk', 'downloaded'] on screen",
+     "80x24: none of ['on disk', 'stream only', 'not on disk', 'downloaded'] on screen"
+    ],
+    "severity": "S1"
+   },
+   {
+    "check": "when a song that was never fetched is due: still playing, or the screen says why not",
+    "step": 15,
+    "pass": true,
+    "na": true,
+    "severity": "S1",
+    "notes": [
+     "n/a: precondition false (status.state='play')"
+    ]
+   },
+   {
+    "check": "when a song that was never fetched is due: transport word matches the daemon",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 4 within budget 4",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ }
+]

@@ -1,0 +1,29 @@
+id = "connected"
+goal = "Find out whether the music server is reachable right now."
+# Connectivity timeline: the state holds from before the daemon starts to the end.
+start = "{state}"
+states = ["online", "blocked", "no_network"]
+min_steps = 0          # the answer should be on the first screen, no key needed
+step_budget = 1        # 2x min, floored at one key (e.g. opening a status view)
+script = [
+  "wait 3",
+  "snap first-look",
+]
+
+[[check]]
+name = "screen says the server is reachable"
+when = ["online"]
+severity = "S0"
+screen_require_any = ["connected", "online", "server ok", "reachable"]
+screen_forbid = ["unreachable", "no network", "disconnected"]
+
+[[check]]
+name = "screen says the server is NOT reachable"
+when = ["blocked", "no_network"]
+severity = "S0"
+screen_require_any = ["unreachable", "no network", "server down", "cannot reach", "not reachable"]
+screen_forbid = ["connected"]
+
+[[check]]
+name = "daemon itself answers (the UI talks to a live daemon)"
+truth = ["status.state exists"]

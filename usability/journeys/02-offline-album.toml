@@ -1,0 +1,31 @@
+id = "offline-album"
+goal = "Browse your albums and play one that is downloaded to this machine."
+start = "{state}"
+states = ["online", "blocked", "no_network"]
+# Min path: open Albums, move to the held album, play it.
+min_steps = 3
+step_budget = 6
+script = [
+  "key F2",
+  "wait 6",
+  "key j",
+  "key Enter",
+  "wait 4",
+  "snap playing",
+]
+
+[[check]]
+name = "album list states availability in words (on disk / stream only)"
+at = 3
+severity = "S1"
+screen_require_any = ["on disk", "downloaded", "(held)", "stream only", "not on disk"]
+
+[[check]]
+name = "the held album is playing (daemon truth)"
+severity = "S1"
+truth = ["status.state == play", "currentsong.Album == Held Harbour"]
+
+[[check]]
+name = "the screen names what is playing"
+severity = "S0"
+screen_require_any = ["Held Harbour", "Low Tide"]

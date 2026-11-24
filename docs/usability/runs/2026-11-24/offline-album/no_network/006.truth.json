@@ -1,0 +1,1 @@
+{"world":"no_network","truth_ms":1,"status":{"ok":true,"pairs":[["volume","100"],["repeat","0"],["random","0"],["single","0"],["consume","0"],["playlist","0"],["playlistlength","0"],["state","stop"]]},"currentsong":{"ok":true,"pairs":[]},"store":{"ok":true,"pairs":[["X-StorePaused","0"],["X-Store","starting"]]},"daemon_connectivity":"not exposed by any daemon verb"}
