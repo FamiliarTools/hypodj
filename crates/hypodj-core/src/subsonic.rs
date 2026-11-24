@@ -78,21 +78,75 @@ fn build_metadata_http_client() -> Result<reqwest::Client, SubsonicError> {
         .map_err(|e| SubsonicError::Init(format!("bounded metadata http client: {e}")))
 }
 
+/// Query parameters that carry Subsonic credentials: `u` (user), `t`
+/// (md5(password + salt), a replayable token), `s` (salt), `p` (plain or `enc:`
+/// password) and `apiKey`. Each value is replaced by [`REDACTED`].
+const SECRET_QUERY_KEYS: [&str; 5] = ["u", "t", "s", "p", "apiKey"];
+const REDACTED: &str = "REDACTED";
+
+/// Strip credential VALUES from any URL query embedded in `text`.
+///
+/// Every request this module makes bakes auth into the query, and `reqwest`'s
+/// error Display embeds the full request URL ("error sending request for url
+/// (...?u=..&t=..&s=..)"). So any error string that crosses out of this file -
+/// into an MPD ACK, a log line, the journal, an `nl` reply, a store/scrobble
+/// failure - would carry a replayable token. This is the one boundary filter:
+/// [`SubsonicError`]'s Display and Debug both run through it, so no construction
+/// site can forget it. A key matches only right after `?` or `&`, so ordinary
+/// prose ("s=" inside a word) is untouched; the value ends at `&`, `#`, a quote,
+/// a closing bracket or whitespace.
+pub fn redact_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(['?', '&']) {
+        out.push_str(&rest[..=i]);
+        rest = &rest[i + 1..];
+        let key = SECRET_QUERY_KEYS
+            .iter()
+            .find(|k| rest.starts_with(**k) && rest[k.len()..].starts_with('='));
+        if let Some(k) = key {
+            let after = &rest[k.len() + 1..];
+            let end = after
+                .find(|c: char| matches!(c, '&' | '#' | '"' | '\'' | ')' | ']' | '>') || c.is_whitespace())
+                .unwrap_or(after.len());
+            out.push_str(k);
+            out.push('=');
+            out.push_str(REDACTED);
+            rest = &after[end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Errors surfaced from the Subsonic layer. We flatten the upstream error into
-/// a message so callers don't depend on the upstream error enum.
-#[derive(Debug, thiserror::Error)]
+/// a message so callers don't depend on the upstream error enum. Display AND
+/// Debug pass the message through [`redact_secrets`], so a credential-bearing
+/// request URL inside it can never reach a user-visible surface.
+#[derive(thiserror::Error)]
 pub enum SubsonicError {
-    #[error("subsonic client init: {0}")]
+    #[error("subsonic client init: {}", redact_secrets(.0))]
     Init(String),
-    #[error("subsonic request: {0}")]
+    #[error("subsonic request: {}", redact_secrets(.0))]
     Request(String),
     /// The server answered, authoritatively, that the requested data does not
     /// exist (Subsonic API error code 70). Distinct from [`Request`] (a
     /// transport / transient failure) because a permanent NotFound means the
     /// item is gone for good - a resume restore skips it rather than aborting
     /// and retrying forever.
-    #[error("subsonic not found: {0}")]
+    #[error("subsonic not found: {}", redact_secrets(.0))]
     NotFound(String),
+}
+
+impl std::fmt::Debug for SubsonicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, msg) = match self {
+            SubsonicError::Init(m) => ("Init", m),
+            SubsonicError::Request(m) => ("Request", m),
+            SubsonicError::NotFound(m) => ("NotFound", m),
+        };
+        f.debug_tuple(name).field(&redact_secrets(msg)).finish()
+    }
 }
 
 /// Map an upstream `opensubsonic::Error` into our flattened [`SubsonicError`],
@@ -1699,6 +1753,86 @@ mod tests {
         match client.ping().await {
             Err(SubsonicError::Request(_)) => {}
             other => panic!("a refused port must be a transient Request error, got {other:?}"),
+        }
+    }
+
+    /// Assert `text` carries no credential value: every `u=`/`t=`/`s=`/`p=`/`apiKey=`
+    /// query param must read `REDACTED`, and the fixture user/password never appear.
+    fn assert_no_secrets(text: &str, user: &str, password: &str) {
+        assert!(!text.contains(user), "username leaked: {text}");
+        assert!(!text.contains(password), "password leaked: {text}");
+        for sep in ['?', '&'] {
+            for k in SECRET_QUERY_KEYS {
+                let needle = format!("{sep}{k}=");
+                for (i, _) in text.match_indices(&needle) {
+                    assert!(
+                        text[i + needle.len()..].starts_with(REDACTED),
+                        "{k}= value not redacted: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn redact_secrets_strips_every_auth_param_and_nothing_else() {
+        let raw = "error sending request for url (http://h:4533/rest/getStarred2?u=alice&t=abc123&s=salt9&v=1.16.1&c=hypodj&f=json&p=enc:7365&apiKey=K)";
+        let red = redact_secrets(raw);
+        assert_eq!(
+            red,
+            "error sending request for url (http://h:4533/rest/getStarred2?u=REDACTED&t=REDACTED&s=REDACTED&v=1.16.1&c=hypodj&f=json&p=REDACTED&apiKey=REDACTED)"
+        );
+        // Prose and non-auth params are untouched.
+        assert_eq!(redact_secrets("songs=3 & tags=x ?q=1"), "songs=3 & tags=x ?q=1");
+        // Display and Debug both redact, whatever variant a caller built.
+        for e in [
+            SubsonicError::Request(raw.into()),
+            SubsonicError::Init(raw.into()),
+            SubsonicError::NotFound(raw.into()),
+        ] {
+            assert_no_secrets(&e.to_string(), "alice", "abc123");
+            assert_no_secrets(&format!("{e:?}"), "alice", "abc123");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_errors_never_carry_the_auth_query() {
+        // Regression for the offline `djc what is favorited` leak: reqwest's error
+        // Display embeds the full request URL, auth query included. Port 1 on
+        // loopback refuses instantly (no network, no wall-clock wait).
+        let (user, password) = ("fixtureuser-q7", "fixturepass-z9");
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1".into(),
+            username: user.into(),
+            password: password.into(),
+            client_name: "hypodj-test".into(),
+        };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return;
+            }
+        };
+        // The token the request would carry, so the assertion is about real values.
+        let stream = client.stream_url(&SongId("x".into())).expect("stream url");
+        let token: String = stream.query_pairs().find(|(k, _)| k == "t").map(|(_, v)| v.into_owned()).unwrap_or_default();
+        let errs = [
+            client.ping().await.err(),
+            client.starred().await.err(),
+            client.search3("anything").await.err(),
+            client.song(&SongId("x".into())).await.err(),
+            client.cover_art("x").await.err(),
+        ];
+        for e in errs {
+            let e = e.expect("an unreachable server must error");
+            for text in [e.to_string(), format!("{e:?}")] {
+                assert!(text.contains("127.0.0.1"), "error should still name the host: {text}");
+                assert_no_secrets(&text, user, password);
+                if !token.is_empty() {
+                    assert!(!text.contains(&token), "token leaked: {text}");
+                }
+            }
         }
     }
 

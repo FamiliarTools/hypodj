@@ -62,12 +62,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // `opensubsonic` logs every request URL at DEBUG ("GET http://..?u=..&t=..&s=.."),
+    // auth query included, and `reqwest` may echo URLs at DEBUG/TRACE too. Those
+    // targets are capped at INFO AFTER the user's RUST_LOG, so even `RUST_LOG=debug`
+    // (or an explicit `opensubsonic=trace`) can never put a replayable token in the
+    // daemon log. Our own errors are redacted at `subsonic.rs`.
+    let mut filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    for target in ["opensubsonic=info", "reqwest=info"] {
+        filter = filter.add_directive(target.parse().expect("static directive"));
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cfg_path = std::env::args()
         .nth(1)
