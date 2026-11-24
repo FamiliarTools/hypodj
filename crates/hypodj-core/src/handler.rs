@@ -1549,6 +1549,40 @@ impl State {
         self.playlist_version += 1;
     }
 
+    /// Resolve an MPD 0.23 [`crate::mpd::QueuePos`] to an absolute index. For a
+    /// move, `lifted` is the half-open range being moved: the destination is an
+    /// index in the queue WITHOUT it, so the current song's position is taken
+    /// after the lift, and moving the current song relative to itself is an
+    /// error. `+N` is `cur + 1 + N`, `-N` is `cur - N`. Only bounds below zero are
+    /// checked here; the caller checks the upper bound it owns.
+    fn resolve_queue_pos(
+        &self,
+        pos: crate::mpd::QueuePos,
+        lifted: Option<(usize, usize)>,
+    ) -> Result<usize, (u32, &'static str)> {
+        use crate::mpd::QueuePos;
+        let rel = match pos {
+            QueuePos::Abs(n) => return Ok(n),
+            QueuePos::After(n) | QueuePos::Before(n) => n,
+        };
+        let Some(mut cur) = self.current.filter(|&c| c < self.queue.len()) else {
+            return Err((ACK_ERROR_PLAYER_SYNC, "No current song"));
+        };
+        if let Some((start, end)) = lifted {
+            if (start..end).contains(&cur) {
+                return Err((ACK_ERROR_ARG, "Cannot move current song relative to itself"));
+            }
+            if cur >= end {
+                cur -= end.saturating_sub(start);
+            }
+        }
+        let to = match pos {
+            QueuePos::After(_) => cur.checked_add(1).and_then(|c| c.checked_add(rel)),
+            _ => cur.checked_sub(rel),
+        };
+        to.ok_or((ACK_ERROR_ARG, "Bad song index"))
+    }
+
     /// MPD `move START:END TO`: lift the half-open range out and reinsert it so its
     /// first entry lands at `to`. Returns false (nothing touched) when the range or
     /// destination is out of bounds, which MPD answers with a bad-index ACK.
@@ -14439,6 +14473,7 @@ const ACK_ERROR_ARG: u32 = 2;
 const ACK_ERROR_NO_EXIST: u32 = 50;
 const ACK_ERROR_UNKNOWN: u32 = 5;
 const ACK_ERROR_EXIST: u32 = 56;
+const ACK_ERROR_PLAYER_SYNC: u32 = 55;
 
 impl MpdHandler for HypodjHandler {
     async fn idle(&self, _subsystems: Vec<String>) -> Option<String> {
@@ -14880,12 +14915,19 @@ impl MpdHandler for HypodjHandler {
                 Err(e) => ack(ACK_ERROR_NO_EXIST, "add", &e),
             },
             MpdCommand::AddId(uri, pos) => {
-                // MPD rejects a position past the end BEFORE adding anything.
-                if let Some(p) = pos {
-                    if p > self.state.lock().unwrap().queue.len() {
-                        return ack(ACK_ERROR_ARG, "addid", "Bad song index");
+                // MPD rejects a position past the end BEFORE adding anything; a
+                // relative one resolves against the current song now.
+                let pos = match pos {
+                    None => None,
+                    Some(qp) => {
+                        let st = self.state.lock().unwrap();
+                        match st.resolve_queue_pos(qp, None) {
+                            Err((code, msg)) => return ack(code, "addid", msg),
+                            Ok(p) if p > st.queue.len() => return ack(ACK_ERROR_ARG, "addid", "Bad song index"),
+                            Ok(p) => Some(p),
+                        }
                     }
-                }
+                };
                 match self.enqueue_uri(&uri).await {
                 Ok(id) => {
                     if let Some(p) = pos {
@@ -14971,13 +15013,17 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::Move { start, end, to } => {
-                let ok = {
+                let res = {
                     let mut st = self.state.lock().unwrap();
                     let end = end.unwrap_or(st.queue.len());
-                    st.move_range(start, end, to)
+                    match st.resolve_queue_pos(to, Some((start, end))) {
+                        Ok(to) if st.move_range(start, end, to) => Ok(()),
+                        Ok(_) => Err((ACK_ERROR_ARG, "Bad song index")),
+                        Err(e) => Err(e),
+                    }
                 };
-                if !ok {
-                    return ack(ACK_ERROR_ARG, "move", "Bad song index");
+                if let Err((code, msg)) = res {
+                    return ack(code, "move", msg);
                 }
                 self.notify_change();
                 // A reorder can change what follows the current entry.
@@ -14989,8 +15035,11 @@ impl MpdHandler for HypodjHandler {
                     let mut st = self.state.lock().unwrap();
                     match st.queue.iter().position(|it| it.id == id) {
                         None => Err(ack(ACK_ERROR_NO_EXIST, "moveid", "No such song")),
-                        Some(from) if st.move_range(from, from + 1, to) => Ok(()),
-                        Some(_) => Err(ack(ACK_ERROR_ARG, "moveid", "Bad song index")),
+                        Some(from) => match st.resolve_queue_pos(to, Some((from, from + 1))) {
+                            Ok(to) if st.move_range(from, from + 1, to) => Ok(()),
+                            Ok(_) => Err(ack(ACK_ERROR_ARG, "moveid", "Bad song index")),
+                            Err((code, msg)) => Err(ack(code, "moveid", msg)),
+                        },
                     }
                 };
                 if let Err(e) = res {
@@ -17272,14 +17321,14 @@ mod tests {
         queue_of(&h, 5).await;
         h.state.lock().unwrap().current = Some(1);
         let v0 = h.state.lock().unwrap().playlist_version;
-        let r = h.handle(MpdCommand::Move { start: 0, end: Some(2), to: 3 }).await;
+        let r = h.handle(MpdCommand::Move { start: 0, end: Some(2), to: crate::mpd::QueuePos::Abs(3) }).await;
         assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
         assert_eq!(qids(&h), vec![2, 3, 4, 0, 1]);
         let st = h.state.lock().unwrap();
         assert_eq!(st.current, Some(4), "the playing entry (id 1) followed the move");
         assert!(st.playlist_version > v0);
         drop(st);
-        let r = h.handle(MpdCommand::Move { start: 3, end: Some(5), to: 4 }).await;
+        let r = h.handle(MpdCommand::Move { start: 3, end: Some(5), to: crate::mpd::QueuePos::Abs(4) }).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }), "dest past end");
         assert_eq!(qids(&h), vec![2, 3, 4, 0, 1], "a rejected move touches nothing");
     }
@@ -17289,12 +17338,12 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 3).await;
         h.state.lock().unwrap().current = Some(0);
-        h.handle(MpdCommand::MoveId(0, 2)).await;
+        h.handle(MpdCommand::MoveId(0, crate::mpd::QueuePos::Abs(2))).await;
         assert_eq!(qids(&h), vec![1, 2, 0]);
         assert_eq!(h.state.lock().unwrap().current, Some(2));
-        let r = h.handle(MpdCommand::MoveId(99, 0)).await;
+        let r = h.handle(MpdCommand::MoveId(99, crate::mpd::QueuePos::Abs(0))).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_NO_EXIST, .. }));
-        let r = h.handle(MpdCommand::MoveId(1, 3)).await;
+        let r = h.handle(MpdCommand::MoveId(1, crate::mpd::QueuePos::Abs(3))).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }));
     }
 
@@ -17338,13 +17387,53 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         queue_of(&h, 3).await;
         h.state.lock().unwrap().current = Some(1);
-        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(0))).await;
+        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(0)))).await;
         assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
         assert_eq!(qids(&h), vec![3, 0, 1, 2]);
         assert_eq!(h.state.lock().unwrap().current, Some(2), "current shifted with its entry");
-        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(9))).await;
+        let r = h.handle(MpdCommand::AddId(NTS.to_string(), Some(crate::mpd::QueuePos::Abs(9)))).await;
         assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }));
         assert_eq!(qids(&h).len(), 4, "a bad position adds nothing");
+    }
+
+    // Regression (adversarial review C): MPD 0.23 relative positions. `+N` is N
+    // after the current song and `-N` N before it (`+0` right after, `-0` right
+    // before), for move / moveid / addid alike; `usize::parse` used to read `+N`
+    // as absolute. With nothing playing a relative position ACKs.
+    #[tokio::test(start_paused = true)]
+    async fn relative_positions_are_relative_to_the_current_song() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        queue_of(&h, 5).await;
+        h.state.lock().unwrap().current = Some(3);
+        // Lift id 0 out: current (id 3) sits at 2, so `+1` lands at 4.
+        let r = h.handle(crate::mpd::parse("move 0 +1")).await;
+        assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
+        assert_eq!(qids(&h), vec![1, 2, 3, 4, 0]);
+        // `-0` is right before the current song (id 3, now at 2).
+        h.handle(crate::mpd::parse("moveid 0 -0")).await;
+        assert_eq!(qids(&h), vec![1, 2, 0, 3, 4]);
+        // `+0` is right after it.
+        h.handle(crate::mpd::parse("moveid 1 +0")).await;
+        assert_eq!(qids(&h), vec![2, 0, 3, 1, 4]);
+        assert_eq!(h.state.lock().unwrap().current, Some(2), "current followed its entry");
+        // Moving the current song relative to itself is an ACK.
+        let r = h.handle(crate::mpd::parse("moveid 3 +1")).await;
+        assert!(matches!(r, MpdResponse::Ack { code: ACK_ERROR_ARG, .. }), "{r:?}");
+        // addid `+0` inserts right after the current song.
+        let r = h.handle(crate::mpd::parse(&format!("addid {NTS} +0"))).await;
+        assert!(!matches!(r, MpdResponse::Ack { .. }), "{r:?}");
+        assert_eq!(qids(&h), vec![2, 0, 3, 5, 1, 4]);
+        // Out of range below the queue start ACKs and changes nothing.
+        let r = h.handle(crate::mpd::parse("moveid 4 -9")).await;
+        assert!(matches!(r, MpdResponse::Ack { .. }), "{r:?}");
+        assert_eq!(qids(&h), vec![2, 0, 3, 5, 1, 4]);
+        // Nothing playing: a relative position ACKs and nothing moves or is added.
+        h.state.lock().unwrap().current = None;
+        for cmd in ["move 0 +1".to_string(), "moveid 0 -0".to_string(), format!("addid {NTS} +0")] {
+            let r = h.handle(crate::mpd::parse(&cmd)).await;
+            assert!(matches!(r, MpdResponse::Ack { .. }), "{cmd}: {r:?}");
+        }
+        assert_eq!(qids(&h), vec![2, 0, 3, 5, 1, 4]);
     }
 
     /// A handler over a TWO-DECK headless player, so the crossfade path is drivable
