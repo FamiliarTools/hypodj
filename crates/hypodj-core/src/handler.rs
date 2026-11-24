@@ -17126,6 +17126,9 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song, now_unix: u64) {
 }
 
 #[cfg(test)]
+#[path = "reconcile.rs"]
+pub(crate) mod reconcile;
+
 #[path = "transition_witness.rs"]
 mod transition_witness;
 
