@@ -349,11 +349,39 @@ mod backend {
             Self { backend, gbnf: crate::gbnf::GBNF }
         }
 
+        /// The raw constrained-decode text for one ask, before parsing; the
+        /// backend's reason on failure (the translator folds it to NotUnderstood).
+        pub fn decode(&self, utterance: &str, ctx: &NlContext) -> Result<String, String> {
+            self.backend.generate(&Self::prompt(utterance, ctx), self.gbnf)
+        }
+
+        /// The instruction a small local model decodes under. The grammar already
+        /// fixes the SHAPE, so this carries only the MEANING: durations are in
+        /// seconds, and worked examples anchor the mapping a 0.5B model will not
+        /// infer from a schema alone.
         fn prompt(utterance: &str, ctx: &NlContext) -> String {
             format!(
-                "Translate the DJ request into ONE JSON plan matching the grammar.\n\
+                "You translate a music player request into one JSON plan.\n\
+                 All times are in SECONDS (1 minute = 60). \"in N minutes\" delays the \
+                 action (when after_secs); \"over N minutes\" is the fade length (secs). \
+                 \"after this track\" is when after_current; \"after this album\" is when \
+                 album_boundary. \"the Nth track\" is when queue_position with slot N. \
+                 \"more like this\" is sel similar_to_current. A request that is not \
+                 about music or playback is noop.\n\
+                 Examples:\n\
+                 fade the music out -> {{\"type\":\"fade_out\",\"secs\":30,\"once\":true}}\n\
+                 fade out over 5 minutes -> {{\"type\":\"fade_out\",\"secs\":300,\"once\":true}}\n\
+                 stop in 15 minutes -> {{\"type\":\"stop\",\"when\":\"after_secs\",\"when_secs\":900,\"once\":true}}\n\
+                 pause after this track -> {{\"type\":\"pause\",\"when\":\"after_current\",\"once\":true}}\n\
+                 fade out the 4th track -> {{\"type\":\"fade_out\",\"secs\":30,\"when\":\"queue_position\",\"slot\":4,\"once\":true}}\n\
+                 volume 40 -> {{\"type\":\"set_volume\",\"level\":40,\"once\":true}}\n\
+                 queue 3 jazz songs -> {{\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":3,\"once\":true}}\n\
+                 play some bon iver -> {{\"type\":\"play_now\",\"query\":\"bon iver\",\"count\":5,\"once\":true}}\n\
+                 add more like this -> {{\"type\":\"enqueue\",\"sel\":\"similar_to_current\",\"count\":5,\"once\":true}}\n\
+                 remove the 2nd track -> {{\"type\":\"remove\",\"sel\":\"position\",\"slot\":2,\"once\":true}}\n\
+                 what is the capital of France -> {{\"type\":\"noop\",\"once\":true}}\n\
                  Queue length: {}. Something is {}playing.\n\
-                 Request: {}\nJSON:",
+                 {} ->",
                 ctx.queue_len,
                 if ctx.current.is_some() { "" } else { "NOT " },
                 utterance,
@@ -363,11 +391,7 @@ mod backend {
 
     impl<B: LlmBackend> Translator for LlmTranslator<B> {
         fn translate(&self, utterance: &str, ctx: &NlContext) -> Result<NlHit, NlError> {
-            let prompt = Self::prompt(utterance, ctx);
-            let out = self
-                .backend
-                .generate(&prompt, self.gbnf)
-                .map_err(|_| NlError::NotUnderstood)?;
+            let out = self.decode(utterance, ctx).map_err(|_| NlError::NotUnderstood)?;
             let raw = super::parse_llm_output(&out).map_err(|_| NlError::NotUnderstood)?;
             Ok(NlHit { plans: vec![raw], source: NlSource::Llm, session: None })
         }

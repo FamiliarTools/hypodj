@@ -90,6 +90,13 @@
             # formats his stations actually serve. Same derivation the wrapper puts on
             # the daemon's PATH, so the devshell and production agree.
             pkgs.ffmpeg-headless
+            # The opt-in local model runtime (hypodj-nl feature `llm-llama`):
+            # llama-cpp-sys-2 compiles llama.cpp with cmake and generates its FFI
+            # with bindgen. bindgenHook exports LIBCLANG_PATH plus the libc/C++
+            # include flags bindgen needs. Build-time only: the default build and
+            # both packages never compile llama.cpp.
+            pkgs.cmake
+            pkgs.rustPlatform.bindgenHook
           ];
           buildInputs = [
             # provides libmpv + mpv.pc for libmpv2 (Phase 1); the foundation is

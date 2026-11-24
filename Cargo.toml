@@ -47,3 +47,9 @@ url = "2"
 [profile.dev]
 # Keep foundation builds cheap; the audio/link step is the expensive part.
 opt-level = 0
+
+# The opt-in local model (hypodj-nl `llm-llama`): an unoptimized llama.cpp decodes
+# a 0.5B model roughly ten times slower, past the translator deadline. Only this
+# C++ crate is optimized; the workspace stays opt-level 0.
+[profile.dev.package.llama-cpp-sys-2]
+opt-level = 3

@@ -872,22 +872,56 @@ mod tests {
         assert!(bad.is_empty(), "{} golden row(s) drifted:\n{}", bad.len(), bad.join("\n"));
     }
 
-    /// REAL-INFERENCE smoke for the local model path (5znoe5i): a golden ask the
-    /// rules also answer, decoded by the actual llama backend against the GBNF.
-    /// Ignored (needs a GGUF on disk and the llama.cpp build); run with
+    /// REAL-INFERENCE smoke for the local model path (5znoe5i, 01m85qw): golden
+    /// asks on the model surface, decoded by the actual llama backend against the
+    /// GBNF and compared with the rules translation. Every answer must be a plan
+    /// (the grammar admits nothing else); the agreement rate is printed, not
+    /// asserted, because it measures the model rather than the code. Ignored
+    /// (needs a GGUF on disk and the llama.cpp build); run with
     /// `HYPODJ_NL_MODEL=/path/model.gguf cargo test -p hypodj-nl --features
-    /// llm-llama -- --ignored llm_real_inference_smoke`.
+    /// llm-llama -- --ignored --nocapture llm_real_inference_smoke`.
     #[cfg(feature = "llm-llama")]
     #[test]
     #[ignore = "needs a local GGUF model (HYPODJ_NL_MODEL) and the llama.cpp build"]
     fn llm_real_inference_smoke() {
         let model = std::env::var_os("HYPODJ_NL_MODEL").expect("set HYPODJ_NL_MODEL to a GGUF path");
-        let t = LlmTranslator::new(llama::LlamaBackend::new(model.into()));
+        let t = LlmTranslator::new(llama::LlamaBackend::open(&model).expect("model file exists"));
         let c = ctx(Some("song-42"), 5);
-        let hit = t.translate("fade out over 20 minutes", &c).expect("the model must yield a plan");
-        assert_eq!(hit.source, NlSource::Llm);
-        assert_eq!(hit.plans.len(), 1);
-        assert!(matches!(hit.plans[0].action, Action::Fade(FadeIntentIr::Out { .. })), "{:?}", hit.plans[0]);
+        let asks = [
+            "fade out",
+            "fade in",
+            "fade out over 20 minutes",
+            "fade out in 20 minutes",
+            "fade the 3rd track",
+            "stop",
+            "pause",
+            "stop after this album",
+            "stop after this track",
+            "pause in 10 minutes",
+            "more like this",
+            "stop in a bit",
+            "do a barrel roll",
+        ];
+        let mut agree = 0;
+        for u in asks {
+            let started = std::time::Instant::now();
+            let raw = t.decode(u, &c).unwrap_or_else(|e| panic!("decode {u:?}: {e}"));
+            println!("    raw:   {raw}");
+            let hit = t.translate(u, &c).expect("the grammar admits only plans");
+            assert_eq!(hit.source, NlSource::Llm);
+            assert_eq!(hit.plans.len(), 1);
+            let p = &hit.plans[0];
+            let llm = render_dsl(p).unwrap_or_else(|| format!("{p:?}"));
+            let rules = golden_render(u, &c);
+            let same = llm == rules;
+            agree += usize::from(same);
+            println!(
+                "{} {u:?} ({} ms)\n    llm:   {llm}\n    rules: {rules}",
+                if same { "AGREE" } else { "DIFF " },
+                started.elapsed().as_millis()
+            );
+        }
+        println!("agreement {agree}/{}", asks.len());
     }
 
     // Sleep and wind-down name the daemon's single-instance FEATURES, so the hit
