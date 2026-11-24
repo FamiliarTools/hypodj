@@ -1091,6 +1091,16 @@ fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
 /// Parse an MPD position or half-open range: `N` is `(N, Some(N + 1))`, `N:M` is
 /// `(N, Some(M))`, and an open `N:` is `(N, None)` (to the end of the queue). A
 /// malformed spec or an inverted range (`M < N`) is `None` so the caller ACKs.
+/// A plain unsigned decimal: ASCII digits only. `usize::from_str` also accepts a
+/// leading `+`, which on the wire is MPD's RELATIVE-position marker, so it must
+/// never silently read as an absolute index.
+pub fn parse_unsigned(s: &str) -> Option<usize> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 pub fn parse_pos_range(spec: &str) -> Option<(usize, Option<usize>)> {
     match spec.split_once(':') {
         None => {
@@ -1546,11 +1556,16 @@ pub fn parse(line: &str) -> MpdCommand {
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         "playlistadd" => MpdCommand::PlaylistAdd(arg(0).unwrap_or_default(), arg(1).unwrap_or_default()),
-        "playlistdelete" => MpdCommand::PlaylistDelete(
-            arg(0).unwrap_or_default(),
-            arg(1).and_then(|s| s.parse().ok()).unwrap_or(0),
-        ),
-        "playlistclear" => MpdCommand::PlaylistClear(arg(0).unwrap_or_default()),
+        // Both are Navidrome writes (for Starred, an unstar): a missing name or a
+        // missing / non-integer position is a no-op ACK, never "song 0".
+        "playlistdelete" => match (arg(0), arg(1).as_deref().and_then(parse_unsigned)) {
+            (Some(name), Some(pos)) if !name.is_empty() && args.len() == 2 => MpdCommand::PlaylistDelete(name, pos),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "playlistclear" => match arg(0) {
+            Some(name) if !name.is_empty() && args.len() == 1 => MpdCommand::PlaylistClear(name),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
         "lsinfo" => MpdCommand::LsInfo(arg(0)),
         "listall" | "listallinfo" => MpdCommand::ListAllInfo(arg(0)),
         // find/search take `TAG VALUE ...` filters; keep the tag->value pairs so
@@ -2213,6 +2228,21 @@ mod parse_tests {
         }
         // A bare `save` with no name must NOT silently save an empty playlist.
         assert!(matches!(parse("save"), MpdCommand::Unsupported(_)));
+    }
+
+    // Regression (adversarial review B): `playlistdelete` is a Navidrome write
+    // (for Starred, an unstar). A missing, non-integer or negative position must
+    // ACK and change nothing - never fall back to deleting song 0 - and a bare
+    // `playlistclear` must not address an empty-named playlist.
+    #[test]
+    fn playlist_writes_reject_bad_arguments() {
+        assert!(matches!(parse("playlistdelete Mix 3"), MpdCommand::PlaylistDelete(n, 3) if n == "Mix"));
+        for bad in ["playlistdelete Mix", "playlistdelete Mix abc", "playlistdelete Mix -1", "playlistdelete Mix +1", "playlistdelete", "playlistdelete \"\" 0"] {
+            assert!(matches!(parse(bad), MpdCommand::Unsupported(_)), "{bad} must ACK");
+        }
+        assert!(matches!(parse("playlistclear Mix"), MpdCommand::PlaylistClear(n) if n == "Mix"));
+        assert!(matches!(parse("playlistclear"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("playlistclear \"\""), MpdCommand::Unsupported(_)));
     }
 
     #[test]
