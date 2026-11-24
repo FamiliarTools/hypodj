@@ -402,6 +402,23 @@ impl Rig {
         let scrobbler = Arc::new(crate::scrobble::Scrobbler::new(client.clone()));
         let runtime =
             crate::director::run(TokioClock, h.clone(), scrobbler, client, events);
+        // Mirror the daemon's checkpoint_loop elapsed feed (main.rs): Tick -> note, TrackStart /
+        // Stopped -> reset. Without it status.elapsed is always 0 in a bare rig.
+        {
+            let mut ev = runtime.events.subscribe();
+            let hh = h.clone();
+            tokio::spawn(async move {
+                use crate::event::DjEventKind;
+                while let Ok(dj) = ev.recv().await {
+                    match dj.kind {
+                        DjEventKind::Tick { time_pos, .. } => hh.note_elapsed_ms(time_pos.as_millis() as u64),
+                        DjEventKind::TrackStart(_) => hh.reset_elapsed(),
+                        DjEventKind::StateChanged(crate::player::PlayState::Stopped, _) => hh.reset_elapsed(),
+                        _ => {}
+                    }
+                }
+            });
+        }
         for s in songs {
             h.enqueue_song_for_test(song(s)).await;
         }
@@ -942,4 +959,301 @@ fn adv_churn() {
         assert_eq!(audible_count(&srcs), 1);
         assert!(srcs.iter().any(|s| s.as_deref() == Some("B")));
     }));
+}
+
+// ── adversarial protocol-surface repros (te-adv-2) ──────────────────────────
+
+fn kv(r: MpdResponse) -> Map<String, String> {
+    match r {
+        MpdResponse::Pairs(p) => p.into_iter().collect(),
+        other => panic!("not pairs: {other:?}"),
+    }
+}
+
+/// state/song/songid/elapsed/duration as a client sees them.
+async fn snap(h: &HypodjHandler, tag: &str) -> Map<String, String> {
+    let s = kv(h.handle(MpdCommand::Status).await);
+    let c = kv(h.handle(MpdCommand::CurrentSong).await);
+    eprintln!(
+        "ADV {tag}: state={} song={:?} songid={:?} elapsed={:?} dur={:?} | cur.Id={:?} cur.Title={:?}",
+        s.get("state").map(|x| x.as_str()).unwrap_or("-"),
+        s.get("song"), s.get("songid"), s.get("elapsed"), s.get("duration"),
+        c.get("Id"), c.get("Title"),
+    );
+    let mut m = s;
+    if let Some(v) = c.get("Id") { m.insert("cur_id".into(), v.clone()); }
+    if let Some(v) = c.get("Title") { m.insert("cur_title".into(), v.clone()); }
+    m
+}
+
+fn el(m: &Map<String, String>) -> f64 {
+    m.get("elapsed").and_then(|v| v.parse().ok()).unwrap_or(-1.0)
+}
+
+/// After a transition settles, status.songid must equal currentsong.Id and elapsed must advance.
+async fn assert_live(h: &HypodjHandler, tag: &str) {
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let a = snap(h, &format!("{tag}-a")).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let b = snap(h, &format!("{tag}-b")).await;
+    assert_eq!(a.get("state").map(String::as_str), Some("play"), "{tag}: state");
+    assert_eq!(a.get("songid"), a.get("cur_id"), "{tag}: status songid vs currentsong Id");
+    assert!(el(&b) > el(&a) + 0.3, "{tag}: elapsed frozen {} -> {}", el(&a), el(&b));
+}
+
+// Run: ADV=name nix develop --command cargo test -j2 -p hypodj-core -- --ignored adv_ --nocapture --test-threads=1
+#[test]
+#[ignore = "live libmpv ao=null adversarial protocol run"]
+fn adv_scenarios() {
+    let port = serve_tones();
+    let which = std::env::var("ADV").unwrap_or_default();
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let big = std::thread::Builder::new().stack_size(256 << 20).spawn(move || { rt.block_on(async {
+        let run = |n: &str| which.is_empty() || which.split(',').any(|w| w == n);
+        if run("baseline") {
+            let r = Rig::new(port, &["A", "B", "C"]).await;
+            r.play(0).await;
+            assert_live(&r.h, "baseline-first-play").await;
+            r.h.handle(MpdCommand::Next).await;
+            assert_live(&r.h, "baseline-single-next").await;
+        }
+        if run("next-during-xf") {
+            let r = Rig::new(port, &["A", "B", "C", "D"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            snap(&r.h, "nxf-mid1").await;
+            r.h.handle(MpdCommand::Next).await;
+            snap(&r.h, "nxf-after2nd").await;
+            assert_live(&r.h, "next-during-xf").await;
+            let s = snap(&r.h, "nxf-final").await;
+            assert_eq!(s.get("song").map(String::as_str), Some("2"), "two nexts -> pos 2");
+        }
+        if run("seek-during-xf") {
+            let r = Rig::new(port, &["A", "B", "C"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r.h.handle(MpdCommand::SeekCur { secs: 4.0, relative: false }).await;
+            snap(&r.h, "sxf-after-seek").await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let s = snap(&r.h, "sxf-seek+500ms").await;
+            assert!(el(&s) >= 3.5, "seek during xf: elapsed {} 500ms after seekcur 4.0", el(&s));
+            assert_live(&r.h, "seek-during-xf").await;
+        }
+        if run("stop-during-xf") {
+            let r = Rig::new(port, &["A", "B", "C"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r.h.handle(MpdCommand::Stop).await;
+            let s = snap(&r.h, "stxf-after-stop").await;
+            assert_eq!(s.get("state").map(String::as_str), Some("stop"));
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+            let s = snap(&r.h, "stxf-later").await;
+            assert_eq!(s.get("state").map(String::as_str), Some("stop"), "stop must stick");
+            let (probes, _) = r.h.player.witness_probe().await;
+            for p in &probes {
+                assert!(src_of(p).is_none(), "deck still audible after stop: {p:?}");
+            }
+        }
+        if run("pause-during-xf") {
+            let r = Rig::new(port, &["A", "B", "C"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r.h.handle(MpdCommand::Pause(Some(true))).await;
+            snap(&r.h, "pxf-imm").await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            snap(&r.h, "pxf-500").await;
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            let a = snap(&r.h, "pxf-a").await;
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let b = snap(&r.h, "pxf-b").await;
+            assert_eq!(b.get("state").map(String::as_str), Some("pause"));
+            assert!((el(&a) - el(&b)).abs() < 0.05, "elapsed moved while paused");
+            r.h.handle(MpdCommand::Pause(Some(false))).await;
+            assert_live(&r.h, "pause-during-xf-resume").await;
+        }
+        if run("delete-current-during-xf") {
+            let r = Rig::new(port, &["A", "B", "C", "D"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            snap(&r.h, "dxf-before").await;
+            r.h.handle(MpdCommand::Delete(Some("1".into()))).await;
+            snap(&r.h, "dxf-after").await;
+            let (probes, active) = r.h.player.witness_probe().await;
+            eprintln!("ADV dxf decks active={active:?} {probes:?}");
+            assert_live(&r.h, "delete-current-during-xf").await;
+        }
+        if run("delete-outgoing-during-xf") {
+            let r = Rig::new(port, &["A", "B", "C", "D"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r.h.handle(MpdCommand::Delete(Some("0".into()))).await;
+            let s = snap(&r.h, "doxf-after").await;
+            assert_eq!(s.get("song").map(String::as_str), Some("0"));
+            assert_live(&r.h, "delete-outgoing-during-xf").await;
+        }
+        if run("consume") {
+            let r = Rig::new(port, &["A", "B", "C"]).await;
+            r.h.handle(MpdCommand::Consume(true)).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let s = snap(&r.h, "cons-after-next").await;
+            assert_eq!(s.get("playlistlength").map(String::as_str), Some("2"), "consume next evicts A only");
+            assert_live(&r.h, "consume").await;
+        }
+        if run("single-eof") {
+            let r = Rig::new(port, &["X", "Y"]).await;
+            r.h.handle(MpdCommand::Single(true)).await;
+            r.h.handle(MpdCommand::Play(Some(0))).await;
+            tokio::time::sleep(Duration::from_millis(5500)).await;
+            let s = snap(&r.h, "single-eof").await;
+            assert_eq!(s.get("state").map(String::as_str), Some("stop"), "single stops after X");
+        }
+        if run("single-next") {
+            let r = Rig::new(port, &["A", "B"]).await;
+            r.h.handle(MpdCommand::Single(true)).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            assert_live(&r.h, "single-next").await;
+            let s = snap(&r.h, "single-next").await;
+            assert_eq!(s.get("song").map(String::as_str), Some("1"));
+        }
+        if run("repeat-one") {
+            let r = Rig::new(port, &["X", "Y"]).await;
+            r.h.handle(MpdCommand::Repeat(true)).await;
+            r.h.handle(MpdCommand::Single(true)).await;
+            r.h.handle(MpdCommand::Play(Some(0))).await;
+            tokio::time::sleep(Duration::from_millis(4500)).await;
+            let s = snap(&r.h, "r1-after-eof").await;
+            assert_eq!(s.get("song").map(String::as_str), Some("0"), "repeat+single loops X");
+            assert_live(&r.h, "repeat-one").await;
+        }
+        if run("repeat-wrap") {
+            let r = Rig::new(port, &["X", "P"]).await;
+            r.h.handle(MpdCommand::Repeat(true)).await;
+            r.h.handle(MpdCommand::Play(Some(1))).await;
+            tokio::time::sleep(Duration::from_millis(4500)).await;
+            let s = snap(&r.h, "rw-after-eof").await;
+            assert_eq!(s.get("song").map(String::as_str), Some("0"), "repeat wraps");
+            assert_live(&r.h, "repeat-wrap").await;
+        }
+        if run("random") {
+            let r = Rig::new(port, &["A", "B", "C", "D", "E"]).await;
+            r.h.handle(MpdCommand::Random(true)).await;
+            r.play(0).await;
+            for i in 0..3 {
+                r.h.handle(MpdCommand::Next).await;
+                assert_live(&r.h, &format!("random-{i}")).await;
+            }
+        }
+        if run("clear-add-play") {
+            let r = Rig::new(port, &["A", "B"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Clear).await;
+            let s = snap(&r.h, "cap-after-clear").await;
+            assert_eq!(s.get("state").map(String::as_str), Some("stop"));
+            r.h.enqueue_song_for_test(song("D")).await;
+            r.h.handle(MpdCommand::Play(Some(0))).await;
+            assert_live(&r.h, "clear-add-play").await;
+        }
+        if run("clear-only") {
+            let r = Rig::new(port, &["A", "B"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Clear).await;
+            for i in 0..8 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let (pr, _) = r.h.player.witness_probe().await;
+                eprintln!("ADV clear-only t+{}ms decks: {:?}", (i + 1) * 500, pr.iter().map(|p| (p.path.is_some(), p.core_idle, p.volume)).collect::<Vec<_>>());
+            }
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+            let s = snap(&r.h, "clear-only").await;
+            assert_eq!(s.get("state").map(String::as_str), Some("stop"));
+            let (probes, _) = r.h.player.witness_probe().await;
+            for p in &probes {
+                assert!(src_of(p).is_none(), "state=stop but deck still audible 3s after clear: {probes:?}");
+            }
+        }
+        if run("clear-end") {
+            let r = Rig::new(port, &["A", "B"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Clear).await;
+            let mut silent_at = None;
+            for i in 0..60 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let (pr, _) = r.h.player.witness_probe().await;
+                if pr.iter().all(|p| src_of(p).is_none()) && silent_at.is_none() {
+                    silent_at = Some((i + 1) * 500);
+                    eprintln!("ADV clear-end silent at {}ms decks {:?}", (i + 1) * 500, pr.iter().map(|p| (p.path.is_some(), p.volume)).collect::<Vec<_>>());
+                }
+            }
+            assert!(silent_at.is_some(), "deck never fell silent after clear (30s)");
+            let v = kv(r.h.handle(MpdCommand::Status).await);
+            eprintln!("ADV clear-end volume after {:?}", v.get("volume"));
+        }
+        if run("clear-explicit-stop") {
+            let r = Rig::new(port, &["A", "B"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Clear).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            r.h.handle(MpdCommand::Stop).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let (pr, _) = r.h.player.witness_probe().await;
+            assert!(pr.iter().all(|p| src_of(p).is_none()), "explicit stop after clear left audio: {pr:?}");
+        }
+        if run("stop-fade-audible") {
+            // a plain stop while playing: MPD stops at once
+            let r = Rig::new(port, &["A", "B"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Stop).await;
+            let (pr, _) = r.h.player.witness_probe().await;
+            eprintln!("ADV stop immediately decks {:?}", pr.iter().map(|p| (p.path.is_some(), p.volume)).collect::<Vec<_>>());
+        }
+        if run("pause-steady") {
+            let r = Rig::new(port, &["A", "B", "C"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Pause(Some(true))).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let s = snap(&r.h, "pause-steady").await;
+            assert_eq!(s.get("state").map(String::as_str), Some("pause"));
+        }
+        if run("clear-then-stop") {
+            let r = Rig::new(port, &["A", "B"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Clear).await;
+            r.h.handle(MpdCommand::Play(None)).await;
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+            let s = snap(&r.h, "cts").await;
+            assert_eq!(s.get("state").map(String::as_str), Some("stop"));
+            let (probes, _) = r.h.player.witness_probe().await;
+            for p in &probes {
+                assert!(src_of(p).is_none(), "state=stop but deck still audible 3s after clear: {probes:?}");
+            }
+        }
+        if run("play-during-xf") {
+            let r = Rig::new(port, &["A", "B", "C", "D"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r.h.handle(MpdCommand::Play(Some(3))).await;
+            snap(&r.h, "pdxf").await;
+            assert_live(&r.h, "play-during-xf").await;
+            let s = snap(&r.h, "pdxf-final").await;
+            assert_eq!(s.get("song").map(String::as_str), Some("3"));
+        }
+        if run("prev-during-xf") {
+            let r = Rig::new(port, &["A", "B", "C"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            r.h.handle(MpdCommand::Previous).await;
+            assert_live(&r.h, "prev-during-xf").await;
+        }
+    }); rt.shutdown_timeout(Duration::from_secs(2)); }).unwrap();
+    big.join().unwrap();
 }
