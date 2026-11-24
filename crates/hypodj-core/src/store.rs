@@ -4059,7 +4059,7 @@ async fn fetch_original(
     let mut resp = tokio::time::timeout(DOWNLOAD_CHUNK_TIMEOUT, http.get(url).send())
         .await
         .map_err(|_| "download: timed out connecting".to_string())?
-        .map_err(|e| format!("download: {e}"))?;
+        .map_err(|e| format!("download: {}", crate::subsonic::redact_secrets(&e.without_url().to_string())))?;
     if !resp.status().is_success() {
         return Err(format!("download: HTTP {}", resp.status()).into());
     }
@@ -4076,7 +4076,7 @@ async fn fetch_original(
         let chunk = tokio::time::timeout(DOWNLOAD_CHUNK_TIMEOUT, resp.chunk())
             .await
             .map_err(|_| "download: stalled".to_string())?
-            .map_err(|e| format!("download: {e}"))?;
+            .map_err(|e| format!("download: {}", crate::subsonic::redact_secrets(&e.without_url().to_string())))?;
         let Some(chunk) = chunk else { break };
         written = written.saturating_add(chunk.len() as u64);
         if written > cap {
@@ -4791,6 +4791,25 @@ async fn download_and_commit<P: PinSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn download_errors_never_carry_the_auth_query() {
+        // The download URL is the stream URL with auth baked into the query, and
+        // reqwest's error Display embeds the URL; the store's failure line is logged
+        // and surfaced, so it must carry no credential.
+        let http = match std::panic::catch_unwind(reqwest::Client::new) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let url = "http://127.0.0.1:1/rest/download?u=fixtureuser-q7&t=fixturetoken0&s=fixturesalt0&v=1.16.1";
+        let tmp = std::env::temp_dir().join(format!("hypodj-redact-{}", std::process::id()));
+        let err = fetch_original(&http, url, &tmp, 10).await.expect_err("port 1 refuses").to_string();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(err.contains("download:"), "{err}");
+        for secret in ["fixtureuser-q7", "fixturetoken0", "fixturesalt0"] {
+            assert!(!err.contains(secret), "{secret} leaked: {err}");
+        }
+    }
 
     // ADMISSION and DELETION are different questions. Admission stays strict - that is
     // what makes "cannot fill the disk" structural. Deletion must NOT track the
