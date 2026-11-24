@@ -620,7 +620,10 @@ fn curate(text: &str, ctx: &NlContext) -> Result<Option<Vec<RawPlan>>, NlError> 
 /// arm a timer the user never set.
 fn sleep(tv: &[&str]) -> Result<RawPlan, NlError> {
     let secs = (0..tv.len())
-        .find_map(|i| parse_dur(tv, i).filter(|_| tv[i].starts_with(|c: char| c.is_ascii_digit())))
+        .find_map(|i| {
+            parse_dur(tv, i)
+                .filter(|_| tv[i].starts_with(|c: char| c.is_ascii_digit()) || word_qty(tv, i).is_some())
+        })
         .map(|(s, _)| s)
         .ok_or_else(|| NlError::Ambiguous("sleep for how long?".into()))?;
     Ok(plan(
@@ -838,7 +841,7 @@ fn calmer_similar(tv: &[&str], calmer: bool, ctx: &NlContext) -> Result<RawPlan,
     // A "play" ask must START playback, never silently append (the play_now
     // correction): "play something calmer" enqueue-then-starts NOW, matching
     // "play something calm" (no -er, which reaches the model and play_now-starts).
-    // A bare "something calmer" / "more like this" stays append-only after current.
+    // A bare "something calmer" / "more like this" stays append-only.
     if leads_with_play(tv) {
         return Ok(plan(
             RawTrigger::Immediate,
@@ -846,11 +849,10 @@ fn calmer_similar(tv: &[&str], calmer: bool, ctx: &NlContext) -> Result<RawPlan,
             true,
         ));
     }
-    Ok(plan(
-        RawTrigger::TrackAfterCurrent,
-        Action::Enqueue { selector, count },
-        true,
-    ))
+    // Immediate, not TrackAfterCurrent: Enqueue is APPEND-ONLY, so firing now lands
+    // the tracks exactly where firing at the next track start would, and it needs no
+    // next track to exist (a one-track queue has none: "position out of range").
+    Ok(plan(RawTrigger::Immediate, Action::Enqueue { selector, count }, true))
 }
 
 /// A leading start-playback verb ("play"/"put on"/"throw on"/"start"). Present ->
@@ -954,7 +956,9 @@ fn parse_dur(toks: &[&str], i: usize) -> Option<(f64, usize)> {
             }
         }
     }
-    let n: f64 = t.parse().ok()?;
+    let Ok(n) = t.parse::<f64>() else {
+        return word_dur(toks, i);
+    };
     if !n.is_finite() || n < 0.0 {
         return None;
     }
@@ -966,6 +970,64 @@ fn parse_dur(toks: &[&str], i: usize) -> Option<(f64, usize)> {
         None if toks.get(i + 1).is_some_and(|u| is_unsupported_time_unit(u)) => None,
         None => Some((n, 1)),
     }
+}
+
+/// A SPOKEN duration at `toks[i]`: a word quantity ([`word_qty`]) that MUST be
+/// followed by a time unit, plus an optional "and a half" ("an hour and a half").
+/// Unlike digits, a word with no unit is never read as bare seconds: "in a bit" or
+/// "in a couple" is not a span, and guessing one would arm a timer nobody set.
+fn word_dur(toks: &[&str], i: usize) -> Option<(f64, usize)> {
+    let (n, used) = word_qty(toks, i)?;
+    let mult = unit_secs(toks.get(i + used)?)?;
+    let mut consumed = used + 1;
+    let mut secs = n * mult;
+    if toks.get(i + consumed..i + consumed + 3) == Some(&["and", "a", "half"][..]) {
+        secs += mult / 2.0;
+        consumed += 3;
+    }
+    Some((secs, consumed))
+}
+
+/// A spoken quantity at `toks[i]` as `(value, tokens consumed)`: "a"/"an"/"one",
+/// "half a"/"half an", "a couple of", and the cardinals zero to ninety-nine, written
+/// as one word, hyphenated ("twenty-five") or as two ("twenty five").
+fn word_qty(toks: &[&str], i: usize) -> Option<(f64, usize)> {
+    let t = *toks.get(i)?;
+    let next = toks.get(i + 1).copied();
+    match t {
+        "a" | "an" if next == Some("couple") => {
+            Some((2.0, if toks.get(i + 2) == Some(&"of") { 3 } else { 2 }))
+        }
+        "couple" => Some((2.0, if next == Some("of") { 2 } else { 1 })),
+        "half" => Some((0.5, if matches!(next, Some("a" | "an")) { 2 } else { 1 })),
+        "a" | "an" => Some((1.0, 1)),
+        _ => {
+            if let Some((tens, ones)) = t.split_once('-') {
+                return Some((tens_word(tens)? + unit_word(ones).filter(|&n| n > 0.0 && n < 10.0)?, 1));
+            }
+            if let Some(tens) = tens_word(t) {
+                if let Some(ones) = next.and_then(unit_word).filter(|&n| n > 0.0 && n < 10.0) {
+                    return Some((tens + ones, 2));
+                }
+                return Some((tens, 1));
+            }
+            unit_word(t).map(|n| (n, 1))
+        }
+    }
+}
+
+fn unit_word(w: &str) -> Option<f64> {
+    const WORDS: [&str; 20] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+        "eighteen", "nineteen",
+    ];
+    WORDS.iter().position(|x| *x == w).map(|n| n as f64)
+}
+
+fn tens_word(w: &str) -> Option<f64> {
+    const WORDS: [&str; 8] = ["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+    WORDS.iter().position(|x| *x == w).map(|n| (n as f64 + 2.0) * 10.0)
 }
 
 fn unit_secs(w: &str) -> Option<f64> {

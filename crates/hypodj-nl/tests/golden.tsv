@@ -17,12 +17,12 @@ stop after this track	trigger after action stop once
 pause in 10 minutes	trigger in 600 action pause once
 stop in a bit	ERR NotUnderstood
 pause in 2 days	ERR NotUnderstood
-something calmer	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
-5 more like this	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Similar(SongId("song-42")), count: 5 }, once: true, origin: "" }
-more like this	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Similar(SongId("song-42")), count: 5 }, once: true, origin: "" }
+something calmer	RawPlan { version: 1, trigger: Immediate, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
+5 more like this	RawPlan { version: 1, trigger: Immediate, action: Enqueue { selector: Similar(SongId("song-42")), count: 5 }, once: true, origin: "" }
+more like this	RawPlan { version: 1, trigger: Immediate, action: Enqueue { selector: Similar(SongId("song-42")), count: 5 }, once: true, origin: "" }
 play something calmer	RawPlan { version: 1, trigger: Immediate, action: PlayNow { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
-something calmer, not too loud	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
-something calmer, but nothing too slow	RawPlan { version: 1, trigger: TrackAfterCurrent, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
+something calmer, not too loud	RawPlan { version: 1, trigger: Immediate, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
+something calmer, but nothing too slow	RawPlan { version: 1, trigger: Immediate, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
 something calmer, not my favorites	ERR Ambiguous("\"not\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
 shuffle on	trigger immediate action mode random on once
 don't shuffle	trigger immediate action mode random off once
@@ -41,7 +41,11 @@ wind down	RawPlan { version: 1, trigger: Immediate, action: Fade(ToFloor { secs:
 start a wind-down in 10 minutes	RawPlan { version: 1, trigger: SpanElapsed { secs: 600.0 }, action: Fade(ToFloor { secs: 300.0 }), once: true, origin: "" }
 never wind down	ERR Ambiguous("\"never\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
 sleep in 30 minutes	trigger in 1800 action fade out 480 once
-go to sleep in an hour	ERR Ambiguous("sleep for how long?")
+go to sleep in an hour	trigger in 3600 action fade out 480 once
+sleep in half an hour	trigger in 1800 action fade out 480 once
+sleep in a couple of minutes	trigger in 120 action fade out 480 once
+sleep in ninety minutes	trigger in 5400 action fade out 480 once
+stop in a couple	ERR NotUnderstood
 sleep timer	ERR Ambiguous("sleep for how long?")
 don't go to sleep in 30 minutes	ERR Ambiguous("\"don't\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
 wake me at 7 with jazz	RawPlan { version: 1, trigger: WallClock { at: 2026-07-15T07:00:00Z }, action: Wake { selector: Some(Genre("jazz")), count: 5 }, once: true, origin: "" }

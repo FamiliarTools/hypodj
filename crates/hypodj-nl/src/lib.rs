@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn corpus_calmer_similar_and_unresolvable() {
         let c = ctx(Some("song-42"), 5);
-        // A bare "something calmer" (no start verb) stays append-only after current.
+        // A bare "something calmer" (no start verb) stays an append-only Enqueue.
         let calmer = &tr("something calmer", &c).unwrap()[0];
         match &calmer.action {
             Action::Enqueue { selector: Selector::Calmer(id), .. } => {
@@ -342,7 +342,7 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
-        assert!(matches!(calmer.trigger, RawTrigger::TrackAfterCurrent), "append-only");
+        assert!(matches!(calmer.trigger, RawTrigger::Immediate), "append-only enqueue, now");
         // A "play" ask STARTS playback: "play something calmer" -> immediate PlayNow,
         // never a silent append (the play_now correction). Matches "play something
         // calm" (no -er), which reaches the model and play_now-starts.
@@ -766,6 +766,61 @@ mod tests {
         }
     }
 
+    /// Task 01m85qwy: spoken durations. "go to sleep in an hour" was refused with
+    /// "sleep for how long?" because only digits read as a quantity.
+    #[test]
+    fn word_number_durations_arm_the_span() {
+        let c = ctx(Some("song-42"), 4);
+        let span = |u: &str| match tr(u, &c).unwrap_or_else(|e| panic!("{u}: {e:?}"))[0].trigger {
+            RawTrigger::SpanElapsed { secs } => secs,
+            ref t => panic!("{u}: {t:?}"),
+        };
+        for (u, want) in [
+            ("go to sleep in an hour", 3600.0),
+            ("sleep in half an hour", 1800.0),
+            ("sleep in a couple of minutes", 120.0),
+            ("sleep in ninety minutes", 5400.0),
+            ("sleep in twenty five minutes", 1500.0),
+            ("sleep in twenty-five minutes", 1500.0),
+            ("sleep in an hour and a half", 5400.0),
+            ("sleep in one hour", 3600.0),
+            ("pause in a minute", 60.0),
+            ("stop in fifteen minutes", 900.0),
+        ] {
+            assert_eq!(span(u), want, "{u}");
+        }
+        // A word quantity with no unit is still not a duration: never guess a span.
+        assert!(matches!(tr("stop in a bit", &c), Err(NlError::NotUnderstood)));
+        assert!(matches!(tr("pause in a couple", &c), Err(NlError::NotUnderstood)));
+        assert!(matches!(tr("pause in two days", &c), Err(NlError::NotUnderstood)));
+    }
+
+    /// Task 01m85qwy: "something calmer" / "more like this" with ONE track queued
+    /// must validate. The append-only enqueue used to wait for the track AFTER the
+    /// current one, which a one-track queue does not have ("position out of range").
+    #[test]
+    fn calmer_and_similar_validate_on_a_one_track_queue() {
+        use hypodj_core::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
+        let c = ctx(Some("song-42"), 1);
+        let snap = QueueSnapshot {
+            playlist_version: 1,
+            current: Some(Cursor { index: 0, queue_id: QueueId(7) }),
+            entries: vec![EntrySnapshot {
+                queue_id: QueueId(7),
+                song: Some(SongId("song-42".into())),
+                album_id: None,
+                duration: Some(std::time::Duration::from_secs(200)),
+            }],
+        };
+        let bounds = hypodj_core::plan::PlanBounds::from_fade_config(&Default::default());
+        for u in ["something calmer", "more like this", "5 more like this", "something calmer, not too loud"] {
+            for p in tr(u, &c).unwrap_or_else(|e| panic!("{u}: {e:?}")) {
+                hypodj_core::plan::validate(&p, &snap, c.now, c.now_civil, &bounds)
+                    .unwrap_or_else(|e| panic!("{u}: {e}"));
+            }
+        }
+    }
+
     #[test]
     fn golden_corpus() {
         let c = ctx(Some("song-42"), 5);
@@ -786,8 +841,8 @@ mod tests {
             ("stop after this album", ok(vec![raw(RawTrigger::AlbumBoundary { track: TrackSel::Current }, Action::Stop)])),
             ("stop after this track", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Stop)])),
             ("pause in 10 minutes", ok(vec![raw(RawTrigger::SpanElapsed { secs: 600.0 }, Action::Pause)])),
-            ("something calmer", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Enqueue { selector: Selector::Calmer(SongId("song-42".into())), count: 5 })])),
-            ("more like this", ok(vec![raw(RawTrigger::TrackAfterCurrent, Action::Enqueue { selector: Selector::Similar(SongId("song-42".into())), count: 5 })])),
+            ("something calmer", ok(vec![raw(RawTrigger::Immediate, Action::Enqueue { selector: Selector::Calmer(SongId("song-42".into())), count: 5 })])),
+            ("more like this", ok(vec![raw(RawTrigger::Immediate, Action::Enqueue { selector: Selector::Similar(SongId("song-42".into())), count: 5 })])),
             ("play something calmer", ok(vec![imm(Action::PlayNow { selector: Selector::Calmer(SongId("song-42".into())), count: 5 })])),
             ("shuffle on", ok(vec![mode(PlayMode::Random, true)])),
             ("turn off random", ok(vec![mode(PlayMode::Random, false)])),
