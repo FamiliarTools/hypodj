@@ -42,6 +42,9 @@ pub const NTS_CATALOGUE_CACHE_KEY: &str = "nts/mixtapes";
 pub enum StationIdentitySource {
     /// Matched against the NTS `/api/v2/mixtapes` catalogue by `audio_stream_endpoint`.
     NtsMixtape,
+    /// The show currently on an NTS LIVE channel, from `/api/v2/live` (task r7ql64x P4).
+    /// Rotates per show, so the caller re-resolves at the show's `end_timestamp`.
+    NtsLive,
 }
 
 /// A resolved station/show identity for a raw stream: a display `name` and a cover
@@ -119,6 +122,92 @@ pub fn match_nts_mixtape(catalogue_json: &str, url: &str) -> Option<StationIdent
     })
 }
 
+/// The NTS live-channel endpoint (no auth): the show now on each of the two channels,
+/// with its `end_timestamp`.
+pub const NTS_LIVE_URL: &str = "https://www.nts.live/api/v2/live";
+
+/// Is the mixtapes catalogue body a real catalogue? A captive portal or CDN error page
+/// can answer 200 with HTML, and caching that would poison NTS resolution for the whole
+/// TTL - so the caller caches only a body this accepts.
+pub fn is_valid_nts_catalogue(json: &str) -> bool {
+    serde_json::from_str::<NtsMixtapesResponse>(json).is_ok_and(|r| !r.results.is_empty())
+}
+
+/// Which NTS LIVE channel a stream url plays, by NTS's url convention: path `/stream` is
+/// channel `"1"`, `/stream2` is channel `"2"`, on an `ntslive.net` host. `None` for a
+/// mixtape or any other url, so the live endpoint is only ever fetched for a live stream.
+pub fn nts_live_channel(url: &str) -> Option<&'static str> {
+    let rest = normalize_url(url);
+    let (host, path) = rest.split_once('/')?;
+    if !host.ends_with("ntslive.net") {
+        return None;
+    }
+    match path.split(['?', '#']).next().unwrap_or("").trim_end_matches('/') {
+        "stream" => Some("1"),
+        "stream2" => Some("2"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NtsLiveResponse {
+    results: Vec<NtsLiveChannel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NtsLiveChannel {
+    channel_name: Option<String>,
+    now: Option<NtsLiveNow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NtsLiveNow {
+    broadcast_title: Option<String>,
+    end_timestamp: Option<String>,
+    embeds: Option<NtsLiveEmbeds>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NtsLiveEmbeds {
+    details: Option<NtsLiveDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NtsLiveDetails {
+    name: Option<String>,
+    media: Option<NtsMedia>,
+}
+
+/// Resolve the show now on live `channel` from the `/api/v2/live` JSON: the identity
+/// (name = `embeds.details.name`, else `broadcast_title`; image = the show's 400x400
+/// picture) and the show's END as unix seconds, when the body carries a parseable one.
+/// PURE, unit-tested against a captured fixture.
+pub fn match_nts_live(live_json: &str, channel: &str) -> Option<(StationIdentity, Option<i64>)> {
+    let parsed: NtsLiveResponse = serde_json::from_str(live_json).ok()?;
+    let now = parsed
+        .results
+        .into_iter()
+        .find(|c| c.channel_name.as_deref() == Some(channel))?
+        .now?;
+    let details = now.embeds.and_then(|e| e.details);
+    let nonblank = |s: Option<String>| s.filter(|t| !t.trim().is_empty());
+    let name = nonblank(details.as_ref().and_then(|d| d.name.clone())).or_else(|| nonblank(now.broadcast_title));
+    let image_url = nonblank(
+        details
+            .and_then(|d| d.media)
+            .and_then(|md| md.picture_medium.or(md.picture_large)),
+    );
+    if name.is_none() && image_url.is_none() {
+        return None;
+    }
+    let end = now
+        .end_timestamp
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|d| d.timestamp());
+    Some((StationIdentity { name, image_url, source: StationIdentitySource::NtsLive }, end))
+}
+
 /// Normalize a stream URL for equality: strip an `http(s)://` scheme and a trailing
 /// slash so a queued `https://.../mixtape5` matches a catalogue `https://.../mixtape5`
 /// even if one side lacks the scheme or carries a trailing slash. Kept minimal - the
@@ -192,6 +281,47 @@ mod tests {
         let id = match_nts_mixtape(NTS_FIXTURE, "https://stream-mixtape-geo.ntslive.net/mixtape4")
             .expect("mixtape4 must match the poolside row");
         assert_eq!(id.name.as_deref(), Some("Poolside"));
+    }
+
+    const NTS_LIVE_FIXTURE: &str = r#"{"results":[
+      {"channel_name":"1","now":{"broadcast_title":"BODY MOTION W/ SEEP",
+        "end_timestamp":"2026-11-24T01:00:00Z",
+        "embeds":{"details":{"name":"Body Motion W/ SEEP",
+          "media":{"picture_medium":"https://media.ntslive.co.uk/resize/400x400/a.png",
+                   "picture_large":"https://media2.ntslive.co.uk/resize/1600x1600/a.png"}}}}},
+      {"channel_name":"2","now":{"broadcast_title":"miss(ed) connections",
+        "end_timestamp":"not a time","embeds":{"details":{"name":"  "}}}}
+    ]}"#;
+
+    #[test]
+    fn nts_live_channel_follows_the_url_convention() {
+        assert_eq!(nts_live_channel("https://stream-relay-geo.ntslive.net/stream"), Some("1"));
+        assert_eq!(nts_live_channel("http://stream-relay-geo.ntslive.net/stream2/"), Some("2"));
+        assert_eq!(nts_live_channel("https://stream-relay-geo.ntslive.net/stream2?client=x"), Some("2"));
+        assert_eq!(nts_live_channel("https://stream-mixtape-geo.ntslive.net/mixtape5"), None);
+        assert_eq!(nts_live_channel("https://example.com/stream"), None);
+    }
+
+    #[test]
+    fn nts_live_resolves_name_image_and_end() {
+        let (id, end) = match_nts_live(NTS_LIVE_FIXTURE, "1").expect("channel 1");
+        assert_eq!(id.name.as_deref(), Some("Body Motion W/ SEEP"));
+        assert_eq!(id.image_url.as_deref(), Some("https://media.ntslive.co.uk/resize/400x400/a.png"));
+        assert_eq!(id.source, StationIdentitySource::NtsLive);
+        assert_eq!(end, Some(1_795_482_000));
+        // A blank details name falls back to the broadcast title; a bad end is None.
+        let (id2, end2) = match_nts_live(NTS_LIVE_FIXTURE, "2").expect("channel 2");
+        assert_eq!(id2.name.as_deref(), Some("miss(ed) connections"));
+        assert_eq!(end2, None);
+        assert!(match_nts_live(NTS_LIVE_FIXTURE, "3").is_none());
+        assert!(match_nts_live("<html>portal</html>", "1").is_none());
+    }
+
+    #[test]
+    fn only_a_parseable_catalogue_is_cacheable() {
+        assert!(is_valid_nts_catalogue(NTS_FIXTURE));
+        assert!(!is_valid_nts_catalogue("<html>captive portal</html>"));
+        assert!(!is_valid_nts_catalogue(r#"{"results":[]}"#));
     }
 
     #[test]
