@@ -53,7 +53,18 @@ rustPlatform.buildRustPackage {
   # hypodj-mcp's integration test drives the real binary over a pipe against a
   # loopback stand-in daemon; both are inside the sandbox, so it needs no network.
   doCheck = true;
-  cargoTestFlags = [ "-p" "hypodj-client" "-p" "hypodj-cli" "-p" "dj-gui" "-p" "hypodj-mcp" "-p" "hypodj-search" ];
+  # hypodj-style's ratatui and egui adapters are features. The other packages
+  # do not define those feature names; cargo applies --features to the
+  # selected packages that have them. hypodj-mcp is the agent client.
+  cargoTestFlags = [
+    "-p" "hypodj-client"
+    "-p" "hypodj-cli"
+    "-p" "dj-gui"
+    "-p" "hypodj-mcp"
+    "-p" "hypodj-search"
+    "-p" "hypodj-style"
+    "--features" "ratatui,egui"
+  ];
 
   # libmpv2-sys uses pkg-config to find mpv at build time.
   PKG_CONFIG_PATH = "${mpv-unwrapped.dev}/lib/pkgconfig";

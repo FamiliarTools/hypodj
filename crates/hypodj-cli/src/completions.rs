@@ -10,11 +10,33 @@ use hypodj_client::route::{VerbSpec, ROUTED_VERBS};
 /// with the subcommand words their own parsers accept. Where a word is also routed
 /// (`heard`, `store`), these args are merged with the routed ones.
 pub const CLI_VERBS: &[VerbSpec] = &[
-    VerbSpec { word: "stations", args: &["import", "rm", "list"], help: "manage radio stations (.pls import)" },
-    VerbSpec { word: "heard", args: &["all", "marks", "limit", "keep", "drop"], help: "what played tonight" },
-    VerbSpec { word: "store", args: &["status", "show", "frontier", "pause", "resume", "now", "limit"], help: "offline store status and control" },
-    VerbSpec { word: "journal", args: &[], help: "what the daemon did, newest first" },
-    VerbSpec { word: "undo", args: &[], help: "retract the newest retractable action" },
+    VerbSpec {
+        word: "stations",
+        args: &["import", "rm", "list"],
+        help: "manage radio stations (.pls import)",
+    },
+    VerbSpec {
+        word: "heard",
+        args: &["all", "marks", "limit", "keep", "drop"],
+        help: "what played tonight",
+    },
+    VerbSpec {
+        word: "store",
+        args: &[
+            "status", "show", "frontier", "pause", "resume", "now", "limit",
+        ],
+        help: "offline store status and control",
+    },
+    VerbSpec {
+        word: "journal",
+        args: &[],
+        help: "what the daemon did, newest first",
+    },
+    VerbSpec {
+        word: "undo",
+        args: &[],
+        help: "retract the newest retractable action",
+    },
 ];
 
 /// The merged first-word set, in table order, each word once with its arg union.
@@ -88,7 +110,10 @@ mod tests {
         }
         assert!(found.len() >= 5, "scanner found too little: {found:?}");
         for w in found {
-            assert!(CLI_VERBS.iter().any(|v| v.word == w), "intercepted `{w}` missing from CLI_VERBS");
+            assert!(
+                CLI_VERBS.iter().any(|v| v.word == w),
+                "intercepted `{w}` missing from CLI_VERBS"
+            );
         }
     }
 
@@ -104,16 +129,31 @@ mod tests {
     fn script_offers_every_verb_and_its_args_once() {
         let s = fish();
         for v in ROUTED_VERBS.iter().chain(CLI_VERBS) {
-            assert_eq!(s.matches(&format!(" -a {} -d ", v.word)).count(), 1, "{}", v.word);
-            if let Some(line) = s.lines().find(|l| l.contains(&format!("from {}; and", v.word))) {
+            assert_eq!(
+                s.matches(&format!(" -a {} -d ", v.word)).count(),
+                1,
+                "{}",
+                v.word
+            );
+            if let Some(line) = s
+                .lines()
+                .find(|l| l.contains(&format!("from {}; and", v.word)))
+            {
                 for a in v.args {
-                    assert!(line.split('\'').nth(3).unwrap().split(' ').any(|w| w == *a), "{} {a}", v.word);
+                    assert!(
+                        line.split('\'').nth(3).unwrap().split(' ').any(|w| w == *a),
+                        "{} {a}",
+                        v.word
+                    );
                 }
             } else {
                 assert!(v.args.is_empty(), "{} has args but no arg line", v.word);
             }
         }
         // No help text may break the single-quoted fish string.
-        assert!(ROUTED_VERBS.iter().chain(CLI_VERBS).all(|v| !v.help.contains('\'')));
+        assert!(ROUTED_VERBS
+            .iter()
+            .chain(CLI_VERBS)
+            .all(|v| !v.help.contains('\'')));
     }
 }

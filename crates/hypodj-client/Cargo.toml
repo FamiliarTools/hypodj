@@ -10,4 +10,6 @@ license.workspace = true
 # hypodj-core, or any model, so the default workspace build stays model-free.
 # NO async, NO TUI, NO JSON.
 [dependencies]
+hypodj-dsl = { path = "../hypodj-dsl" }
+hypodj-style = { path = "../hypodj-style" }
 thiserror.workspace = true

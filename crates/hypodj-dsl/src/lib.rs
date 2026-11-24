@@ -1,6 +1,8 @@
-//! The `plan add` DSL value grammar - quoting and its inverse, and nothing else.
+//! Shared, dependency-free words: the `plan add` quoting rule, the fixed result
+//! sentences, and the wind-down phase values. The daemon and the client both
+//! import them, and neither side links libmpv to do it.
 //!
-//! This crate exists so there is EXACTLY ONE implementation of the quoting rule.
+//! The quoting rule is here so there is EXACTLY ONE implementation.
 //! The daemon's echo ([`hypodj_core::echo`]) renders a plan back to the DSL; an
 //! out-of-process producer (a stdio MCP server, a script) builds the same line
 //! from structured fields. Both must agree with the daemon's tokenizer character
@@ -93,6 +95,26 @@ pub fn tokenize(line: &str) -> Vec<String> {
     }
     toks
 }
+
+/// A play that found nothing. The client refuses this sentence by the constant.
+pub const RESULT_NO_JUMP: &str = "no matching track to play";
+
+/// Stem of a failed action. The reason follows.
+pub const RESULT_FAILED: &str = "could not do that: ";
+
+/// Stem of an enqueue that resolved to nothing. The selector follows.
+pub const RESULT_ADDED_NONE: &str = "added 0 - no matches for ";
+
+/// Status pair: the wind-down is waiting (`armed`) or the fade has started (`running`).
+pub const WINDDOWN_KEY: &str = "X-hypodj-winddown";
+pub const WINDDOWN_ARMED: &str = "armed";
+pub const WINDDOWN_RUNNING: &str = "running";
+
+/// Status pair: why an armed wind-down will fire.
+pub const WINDDOWN_WHEN_KEY: &str = "X-hypodj-winddown-when";
+pub const WINDDOWN_WHEN_ALBUM: &str = "album";
+pub const WINDDOWN_WHEN_TRACK: &str = "track";
+pub const WINDDOWN_WHEN_DEADLINE: &str = "deadline";
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,24 @@
+[package]
+name = "hypodj-style"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HypoDJ design tokens, contrast policy, and surface adapters"
+
+# Roles and contrast live here. Surface crates only map them.
+# `ratatui` and `egui` are optional so `cargo test -p hypodj-style` needs neither
+# a terminal nor a GUI toolkit. ANSI is always available (the CLI path).
+[features]
+default = []
+ratatui = ["dep:ratatui"]
+egui = ["dep:egui"]
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+ratatui = { workspace = true, optional = true }
+# Colour and Visuals only. Default features pull winit and a glow renderer,
+# which this adapter never calls.
+# 0.29 matches the workspace MSRV (1.85). 0.31 pulls crates that want rustc 1.88.
+egui = { version = "=0.29.1", default-features = false, optional = true }

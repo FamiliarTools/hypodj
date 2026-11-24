@@ -11,6 +11,7 @@ members = [
     "crates/hypodj-tui",
     "crates/hypodj-search",
     "crates/hypodj-build-info",
+    "crates/hypodj-style",
 ]
 
 [workspace.package]
