@@ -2874,7 +2874,18 @@ async fn serve_conn<H>(sock: tokio::net::TcpStream, handler: Arc<H>) -> anyhow::
 where
     H: MpdHandler + 'static,
 {
-    let (rd, mut wr) = sock.into_split();
+    let (rd, wr) = sock.into_split();
+    serve_stream(rd, wr, handler).await
+}
+
+/// The transport-agnostic body of [`serve_conn`]: one MPD session over any byte
+/// stream pair, so the wire loop is testable over an in-memory duplex.
+async fn serve_stream<R, W, H>(rd: R, mut wr: W, handler: Arc<H>) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+    H: MpdHandler + 'static,
+{
     let mut reader = BufReader::new(rd);
     wr.write_all(format!("OK MPD {ADVERTISED_MPD_VERSION}\n").as_bytes())
         .await?;
@@ -2895,11 +2906,18 @@ where
     };
 
     let mut line = String::new();
+    // A line already read off the wire by the idle branch (a command sent while
+    // idle) that must still be dispatched as a command in its own right.
+    let mut carried: Option<String> = None;
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // client closed
+        if let Some(l) = carried.take() {
+            line = l;
+        } else {
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break; // client closed
+            }
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
 
@@ -2946,18 +2964,21 @@ where
         // ── idle: block until a subsystem changes, or noidle ──────────────
         let cmd = parse(trimmed);
         if let MpdCommand::Idle(subsystems) = &cmd {
-            // Race a real change event against the client sending another line
-            // (typically `noidle`). Whichever wins ends the idle. If the client
-            // sends a line, it is consumed here; `noidle` yields no change, any
-            // other command is ignored for simplicity (ncmpcpp only sends
-            // noidle to break idle).
-            let mut peek = String::new();
-            let changed = tokio::select! {
-                sys = handler.idle(subsystems.clone()) => sys,
-                r = reader.read_line(&mut peek) => {
+            // Race a real change event against the client sending anything
+            // (typically `noidle`). Whichever wins ends the idle.
+            //
+            // The client side of the race is `fill_buf`, NOT `read_line`:
+            // `fill_buf` is cancel safe (it only waits for bytes, consuming
+            // nothing), while a `read_line` dropped by a winning idle event loses
+            // whatever partial line it had already moved out of the BufReader, so
+            // the next read starts mid-command. Bytes are consumed only after the
+            // race is decided.
+            let (changed, interrupted) = tokio::select! {
+                sys = handler.idle(subsystems.clone()) => (sys, false),
+                r = reader.fill_buf() => {
                     match r {
-                        Ok(0) => break,
-                        Ok(_) => None, // noidle (or any interrupt): no change
+                        Ok([]) => break,       // client closed
+                        Ok(_) => (None, true), // the client spoke: no change
                         Err(e) => return Err(e.into()),
                     }
                 }
@@ -2969,11 +2990,27 @@ where
             buf.extend_from_slice(b"OK\n");
             wr.write_all(&buf).await?;
             wr.flush().await?;
+            if interrupted {
+                // The client interrupted the idle. `noidle` is fully answered by
+                // the OK above; any other command (pipelined behind `idle`) is
+                // dispatched normally on the next turn, never swallowed - a
+                // silently dropped command leaves the client one reply short and
+                // reading every later answer against the wrong request.
+                let mut next = String::new();
+                if reader.read_line(&mut next).await? == 0 {
+                    break;
+                }
+                if next.trim_end_matches(['\r', '\n']).trim() != "noidle" {
+                    carried = Some(next);
+                }
+            }
             continue;
         }
         if let MpdCommand::NoIdle = cmd {
-            wr.write_all(b"OK\n").await?;
-            wr.flush().await?;
+            // A `noidle` outside idle is the client losing the race against a
+            // change event that already ended its idle (the idle reply is in
+            // flight). MPD ignores it WITHOUT a reply; answering it would hand the
+            // client one OK it never asked for and shift every later reply.
             continue;
         }
 
@@ -2988,4 +3025,161 @@ where
         wr.flush().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+    use tokio::sync::Notify;
+
+    /// A handler whose `add` is SLOW (a network-bound station resolve) and whose
+    /// idle wakes on demand, recording every command it actually ran.
+    #[derive(Default)]
+    struct Probe {
+        ran: Mutex<Vec<String>>,
+        wake: Notify,
+    }
+
+    impl MpdHandler for Probe {
+        async fn handle(&self, cmd: MpdCommand) -> MpdResponse {
+            let name = match &cmd {
+                MpdCommand::Add(_) => {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    "add"
+                }
+                MpdCommand::PlaylistInfo(_) => "playlistinfo",
+                MpdCommand::Play(_) => "play",
+                MpdCommand::Status => "status",
+                _ => "other",
+            };
+            self.ran.lock().unwrap().push(name.to_string());
+            MpdResponse::Pairs(vec![("ran".into(), name.into())])
+        }
+
+        async fn idle(&self, _subsystems: Vec<String>) -> Option<String> {
+            self.wake.notified().await;
+            Some("playlist".into())
+        }
+    }
+
+    fn session(h: Arc<Probe>) -> DuplexStream {
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let (rd, wr) = tokio::io::split(server);
+            let _ = serve_stream(rd, wr, h).await;
+        });
+        client
+    }
+
+    /// Read until `want` complete `OK`/`ACK`-terminated replies have arrived (or
+    /// the virtual clock runs out), returning the raw text after the greeting.
+    async fn replies(c: &mut DuplexStream, want: usize) -> String {
+        let mut out = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let done = |s: &str| {
+            s.lines()
+                .filter(|l| *l == "OK" || l.starts_with("ACK "))
+                .count()
+                >= want
+        };
+        while !done(&out) {
+            let mut b = [0u8; 1024];
+            match tokio::time::timeout_at(deadline, c.read(&mut b)).await {
+                Ok(Ok(n)) if n > 0 => out.push_str(&String::from_utf8_lossy(&b[..n])),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    async fn greeting(c: &mut DuplexStream) {
+        let mut b = [0u8; 64];
+        let n = c.read(&mut b).await.unwrap();
+        assert!(String::from_utf8_lossy(&b[..n]).starts_with("OK MPD "));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipelined_burst_after_a_slow_command_answers_every_command_in_order() {
+        let h = Arc::new(Probe::default());
+        let mut c = session(h.clone());
+        greeting(&mut c).await;
+        c.write_all(b"add \"station/RNE Radio 3\"\nplaylistinfo\nplay 0\n")
+            .await
+            .unwrap();
+        let out = replies(&mut c, 3).await;
+        assert_eq!(out, "ran: add\nOK\nran: playlistinfo\nOK\nran: play\nOK\n");
+        assert_eq!(*h.ran.lock().unwrap(), ["add", "playlistinfo", "play"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_then_half_close_still_answers_every_command() {
+        let h = Arc::new(Probe::default());
+        let mut c = session(h.clone());
+        greeting(&mut c).await;
+        c.write_all(b"add station/x\nplaylistinfo\nplay 0\n").await.unwrap();
+        c.shutdown().await.unwrap();
+        let out = replies(&mut c, 3).await;
+        assert_eq!(out, "ran: add\nOK\nran: playlistinfo\nOK\nran: play\nOK\n");
+    }
+
+    /// A line split across two writes while idle must keep its first half when
+    /// the idle event wins the race in between: `read_line` is not cancel safe.
+    #[tokio::test(start_paused = true)]
+    async fn idle_change_mid_line_keeps_the_partial_line() {
+        let h = Arc::new(Probe::default());
+        let mut c = session(h.clone());
+        greeting(&mut c).await;
+        c.write_all(b"idle\nsta").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        h.wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        c.write_all(b"tus\n").await.unwrap();
+        let out = replies(&mut c, 2).await;
+        // The first byte of `sta` already ends the idle (no change); the command
+        // then completes intact. Before the fix the idle event dropped `sta` and
+        // `tus` ran as an unknown command.
+        assert_eq!(out, "OK\nran: status\nOK\n");
+        assert_eq!(*h.ran.lock().unwrap(), ["status"]);
+    }
+
+    /// A command pipelined behind `idle` (anything but `noidle`) ends the idle and
+    /// is then ANSWERED, never silently swallowed.
+    #[tokio::test(start_paused = true)]
+    async fn command_sent_during_idle_is_answered_not_swallowed() {
+        let h = Arc::new(Probe::default());
+        let mut c = session(h.clone());
+        greeting(&mut c).await;
+        c.write_all(b"idle\nstatus\nplaylistinfo\n").await.unwrap();
+        let out = replies(&mut c, 3).await;
+        assert_eq!(out, "OK\nran: status\nOK\nran: playlistinfo\nOK\n");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn noidle_ends_idle_with_a_single_ok() {
+        let h = Arc::new(Probe::default());
+        let mut c = session(h.clone());
+        greeting(&mut c).await;
+        c.write_all(b"idle\nnoidle\nstatus\n").await.unwrap();
+        let out = replies(&mut c, 2).await;
+        assert_eq!(out, "OK\nran: status\nOK\n");
+    }
+
+    /// The change event wins, THEN the client's `noidle` arrives: the stray noidle
+    /// gets no reply (as in MPD), so the next command's reply stays aligned.
+    #[tokio::test(start_paused = true)]
+    async fn noidle_that_lost_the_race_gets_no_extra_ok() {
+        let h = Arc::new(Probe::default());
+        let mut c = session(h.clone());
+        greeting(&mut c).await;
+        c.write_all(b"idle\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        h.wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        c.write_all(b"noidle\nstatus\n").await.unwrap();
+        let out = replies(&mut c, 2).await;
+        assert_eq!(out, "changed: playlist\nOK\nran: status\nOK\n");
+    }
 }
