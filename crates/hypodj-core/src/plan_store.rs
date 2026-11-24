@@ -15,8 +15,10 @@
 //! was down: within [`MISSED_GRACE`] it fires right after startup (a switch that
 //! restarted hypodj across 07:00 must not swallow the alarm); beyond it the plan
 //! is dropped with a warn (a wake firing at 11:00 because the daemon came back
-//! late would be a startle, not a service). A recurring plan never "misses": it
-//! simply re-arms to its next occurrence.
+//! late would be a startle, not a service). A recurring plan gets the SAME grace
+//! for the occurrence the restart straddled ([`missed_daily_occurrence`]): today's
+//! 07:00 missed by at most the grace fires right after startup, then the plan
+//! re-arms to its next occurrence as usual; missed by more, it simply re-arms.
 //!
 //! Corruption safety mirrors [`crate::resume`]: [`from_json`] / [`load`] return
 //! `None` on ANY error or schema mismatch and never panic, and the write goes
@@ -71,6 +73,26 @@ pub fn restore_trigger(t: &RawTrigger, now_civil: chrono::DateTime<chrono::Utc>)
         }),
         _ => None,
     }
+}
+
+/// The occurrence of a recurring `Daily` trigger that a restart swallowed: the
+/// most recent occurrence at or before `now_civil`, if it lies within
+/// [`MISSED_GRACE`]. The caller fires the plan right after startup for it (the
+/// same promise a one-shot gets), then re-arms as usual. `None` for any other
+/// trigger shape or when nothing was missed inside the grace.
+pub fn missed_daily_occurrence<Tz: chrono::TimeZone>(
+    tz: &Tz,
+    t: &RawTrigger,
+    now_civil: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let RawTrigger::Daily { hour, minute, days } = *t else {
+        return None;
+    };
+    // `next_daily_fire` is strictly after its anchor, so anchoring one second
+    // before the grace window finds an occurrence inside [now - grace, ...].
+    let anchor = now_civil - MISSED_GRACE - chrono::Duration::seconds(1);
+    let occ = crate::plan::next_daily_fire(tz, hour, minute, days, anchor)?;
+    (occ <= now_civil).then_some(occ)
 }
 
 pub fn to_json(f: &PlansFile) -> serde_json::Result<String> {
@@ -214,20 +236,27 @@ mod tests {
 #[cfg(test)]
 mod adversary_repro {
     use super::*;
-    use crate::plan::{next_daily_fire, DaySet};
+    use crate::plan::DaySet;
     use chrono::TimeZone;
 
+    // Regression (adversarial review A): a restart across a Daily alarm time must
+    // fire today's occurrence within the grace, exactly as a one-shot does.
     #[test]
-    fn restart_across_seven_swallows_daily_but_not_oneshot() {
+    fn restart_across_seven_fires_missed_daily_within_grace() {
         let seven = chrono::Utc.with_ymd_and_hms(2026, 11, 24, 7, 0, 0).unwrap();
-        let back_up = seven + chrono::Duration::minutes(1);
-        let one = restore_trigger(&RawTrigger::WallClock { at: seven }, back_up);
-        println!("one-shot restored as: {one:?}");
         let daily = RawTrigger::Daily { hour: 7, minute: 0, days: DaySet::EVERY };
-        let restored = restore_trigger(&daily, back_up).unwrap();
-        let RawTrigger::Daily { hour, minute, days } = restored else { panic!() };
-        let next = next_daily_fire(&chrono::Utc, hour, minute, days, back_up).unwrap();
-        println!("daily restored fires at: {next}");
-        assert!(next - back_up <= MISSED_GRACE, "today's 07:00 daily was swallowed; next fire {next}");
+        let back_up = seven + chrono::Duration::minutes(1);
+        assert_eq!(missed_daily_occurrence(&chrono::Utc, &daily, back_up), Some(seven));
+        // Exactly at the grace edge still fires; past it does not.
+        assert_eq!(missed_daily_occurrence(&chrono::Utc, &daily, seven + MISSED_GRACE), Some(seven));
+        let late = seven + MISSED_GRACE + chrono::Duration::seconds(1);
+        assert_eq!(missed_daily_occurrence(&chrono::Utc, &daily, late), None);
+        // Before the occurrence nothing was missed.
+        assert_eq!(missed_daily_occurrence(&chrono::Utc, &daily, seven - chrono::Duration::minutes(1)), None);
+        // A day the plan does not run on is never a catch-up.
+        let weekend_only = RawTrigger::Daily { hour: 7, minute: 0, days: DaySet::WEEKENDS };
+        assert_eq!(missed_daily_occurrence(&chrono::Utc, &weekend_only, back_up), None);
+        // A one-shot is not this function's business.
+        assert_eq!(missed_daily_occurrence(&chrono::Utc, &RawTrigger::WallClock { at: seven }, back_up), None);
     }
 }

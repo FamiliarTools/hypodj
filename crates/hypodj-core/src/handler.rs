@@ -4388,6 +4388,7 @@ impl HypodjHandler {
                 tracing::warn!(origin = %p.raw.origin, "persisted plan missed while down; dropped");
                 continue;
             };
+            let catch_up = crate::plan_store::missed_daily_occurrence(&chrono::Local, &trigger, now_civil);
             let raw = RawPlan { trigger, ..p.raw };
             let origin = raw.origin.clone();
             let reserved_origin =
@@ -4400,12 +4401,34 @@ impl HypodjHandler {
             match res {
                 Ok(id) => {
                     armed += 1;
+                    if let Some(missed) = catch_up {
+                        tracing::info!(plan = id.0, missed = %missed, "daily occurrence missed while down; firing now");
+                        self.fire_recurring_soon(id);
+                    }
                     tracing::info!(plan = id.0, origin = %origin, "persisted plan re-armed");
                 }
                 Err(e) => tracing::warn!(origin = %origin, error = %e, "persisted plan did not re-arm"),
             }
         }
         armed
+    }
+
+    /// Point a just-armed recurring plan's deadline at one second from now (the
+    /// restart catch-up for an occurrence missed inside the grace). After it
+    /// fires, [`Self::rearm_recurring`] moves it to its next occurrence as usual.
+    fn fire_recurring_soon(&self, id: PlanId) {
+        let (now, now_civil) = (Instant::now(), crate::clock::civil_now());
+        let deadline = now + Duration::from_secs(1);
+        let mut g = self.plan_pending.lock().unwrap();
+        if let Some(pp) = g.iter_mut().find(|pp| pp.armed.id == id) {
+            if let Some(timers) = self.plan_timers.get() {
+                let (tid, guard) = timers.arm(deadline);
+                pp.armed.timer_id = Some(tid);
+                pp.guard = Some(guard);
+            }
+            pp.armed.resolved = Resolved::OnDeadline(deadline);
+            pp.civil_at = Some(now_civil + chrono::Duration::seconds(1));
+        }
     }
 
     /// Replace a plan: cancel `id` (RAII-disarming its timer) then arm `raw` as a
@@ -27465,6 +27488,33 @@ mod tests {
         assert!(h.wake_cancel());
         assert!(crate::plan_store::load(&path).unwrap().plans.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Regression (adversarial review A): a daemon restarted one minute after a
+    // Daily plan's time fires that missed occurrence right after startup (the
+    // same grace a one-shot gets), instead of silently waiting until tomorrow.
+    #[tokio::test(start_paused = true)]
+    async fn restore_fires_daily_missed_inside_grace() {
+        use chrono::Timelike;
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let missed = (crate::clock::civil_now() - chrono::Duration::minutes(1)).with_timezone(&chrono::Local);
+        let raw = RawPlan {
+            version: 1,
+            trigger: RawTrigger::Daily { hour: missed.hour() as u8, minute: missed.minute() as u8, days: crate::plan::DaySet::EVERY },
+            action: Action::Pause,
+            once: false,
+            origin: "mpd".into(),
+        };
+        let file = crate::plan_store::PlansFile {
+            schema_version: crate::plan_store::PLANS_SCHEMA_VERSION,
+            plans: vec![crate::plan_store::PersistedPlan { reserved: false, raw }],
+        };
+        assert_eq!(h.restore_plans(file), 1);
+        let list = h.plan_list_with_deadlines();
+        let deadline = list[0].2.expect("deadline plan");
+        let wait = deadline.saturating_duration_since(Instant::now());
+        assert!(wait <= Duration::from_secs(1), "missed daily must fire now, not in {wait:?}");
+        assert!(matches!(list[0].1.trigger, RawTrigger::Daily { .. }), "still recurring");
     }
 
     // SAFETY (reserved-origin masquerade): `plan add ... origin sleep` lets a
