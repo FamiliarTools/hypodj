@@ -2346,6 +2346,10 @@ pub const PAIR_NL_ANSWER: &str = "nl_answer";
 pub const PAIR_OFFLINE_ALBUM: &str = "OfflineAlbum";
 /// The `album/<id>` (or `-`) that follows each [`PAIR_OFFLINE_ALBUM`].
 pub const PAIR_OFFLINE_ALBUM_URI: &str = "OfflineAlbumUri";
+/// The bare album name of the row, for a client that lists it as a browse row.
+pub const PAIR_OFFLINE_ALBUM_NAME: &str = "OfflineAlbumName";
+/// How many of the album's songs the mirror holds.
+pub const PAIR_OFFLINE_ALBUM_SONGS: &str = "OfflineAlbumSongs";
 
 /// How long a best-effort server read waits when there is an offline answer to fall
 /// back on (`nl` grounding, an `album/<id>` add the mirror holds). Well under the
@@ -3108,6 +3112,9 @@ pub struct HypodjHandler {
     /// a SHORT scope that clones the `Arc` out - the store's own methods are then
     /// called with NO handler lock held.
     audio_store: Mutex<Option<Arc<AudioStore>>>,
+    /// The server reachability slot ([`crate::reach`]), fed by the daemon's
+    /// heartbeat. `None` until plumbed (tests, probes): `status` then says nothing.
+    server_reach: Mutex<Option<Arc<crate::reach::ServerReach>>>,
     /// The HEARD LEDGER handle ([`crate::heard`]), plumbed once at daemon startup when a
     /// ledger directory resolves. `Mutex<Option<..>>` rather than `OnceLock` for the
     /// same reason as [`Self::audio_store`]: an unset ledger (no state dir, the feature
@@ -3717,6 +3724,7 @@ impl HypodjHandler {
             // No store until the daemon plumbs one: a raw handler resolves every
             // play to a stream URL exactly as before.
             audio_store: Mutex::new(None),
+            server_reach: Mutex::new(None),
             // No ledger until the daemon plumbs one: every append is then a no-op and
             // playback is byte-identical to a ledger-less build.
             heard_ledger: Mutex::new(None),
@@ -7256,7 +7264,15 @@ impl HypodjHandler {
         let Some(store) = self.audio_store() else { return Vec::new() };
         let st = store.status();
         if !st.known {
-            return Vec::new();
+            // No server pass has published yet - and offline none ever will. The DISK
+            // is still authoritative for what plays offline, so say that much rather
+            // than nothing: the badge exists for exactly the situation in which the
+            // server pass cannot run.
+            let held = store.held_count();
+            if held == 0 {
+                return Vec::new();
+            }
+            return vec![("X-Store", Self::songs_on_disk(held))];
         }
         // The HEAD is the one thing every surface keeps, so it has to stand alone as a
         // sentence: "80 of 360 songs", not "80/360". A bare ratio next to the deck's
@@ -7417,6 +7433,11 @@ impl HypodjHandler {
             ));
         }
         vec![("X-Store", line)]
+    }
+
+    /// The disk-only head: "3 songs on disk".
+    fn songs_on_disk(n: usize) -> String {
+        format!("{n} song{} on disk", if n == 1 { "" } else { "s" })
     }
 
     /// One mis-sized song as a person reads it: name first, then the two numbers that
@@ -7794,7 +7815,9 @@ impl HypodjHandler {
         for a in &albums {
             b = b
                 .pair(PAIR_OFFLINE_ALBUM, a.line())
-                .pair(PAIR_OFFLINE_ALBUM_URI, a.uri.clone().unwrap_or_else(|| "-".to_string()));
+                .pair(PAIR_OFFLINE_ALBUM_URI, a.uri.clone().unwrap_or_else(|| "-".to_string()))
+                .pair(PAIR_OFFLINE_ALBUM_NAME, a.album.clone())
+                .pair(PAIR_OFFLINE_ALBUM_SONGS, a.songs.to_string());
         }
         b.build()
     }
@@ -7865,7 +7888,15 @@ impl HypodjHandler {
         if !st.known {
             // Honest: the reconciler has not completed a full pass with an
             // authoritative pin set yet, so every number would be invented.
-            return b.pair("X-Store", "starting").build();
+            let held = store.held_count();
+            if held == 0 {
+                return b.pair("X-Store", "starting").build();
+            }
+            // What the disk holds is known without the server; the plan numbers are not.
+            return b
+                .pair("X-Store", Self::songs_on_disk(held))
+                .pair("X-StoreEntries", held.to_string())
+                .build();
         }
         b = b
             .pair("X-Store", if st.complete() { "complete" } else { "mirroring" })
@@ -9578,6 +9609,23 @@ impl HypodjHandler {
     ///
     /// Absent (a raw handler, a disabled store, a store that failed to open) every
     /// seam below no-ops and playback is byte-identical to a store-less build.
+    /// Plumb the server reachability slot the heartbeat writes.
+    pub fn set_server_reach(&self, reach: Arc<crate::reach::ServerReach>) {
+        *self.server_reach.lock().unwrap() = Some(reach);
+    }
+
+    /// `X-Server` (online | unreachable | no-network | error | unknown) and
+    /// `X-ServerSince` (whole seconds in that state). A copy out of a std mutex:
+    /// `status` never waits on the network for this.
+    fn server_status_pairs(&self) -> Vec<(&'static str, String)> {
+        let Some(reach) = self.server_reach.lock().unwrap().clone() else { return Vec::new() };
+        let (r, since) = reach.snapshot();
+        vec![
+            ("X-Server", r.label().to_string()),
+            ("X-ServerSince", since.elapsed().as_secs().to_string()),
+        ]
+    }
+
     pub fn set_audio_store(&self, store: Arc<AudioStore>) {
         *self.audio_store.lock().unwrap() = Some(store);
     }
@@ -13944,6 +13992,17 @@ impl OfflineAlbum {
 
 /// Read every held song's sidecar and group them by album. A song whose sidecar is
 /// unreadable is skipped: it cannot be named, and the reconciler will repair it.
+/// `X-Offline: 1|0` on a library queue row: whether the mirror holds it (index
+/// only, no stat - a listing cannot afford one per row). Nothing for a stream row or
+/// with no store, so "unknown" is never rendered as "stream only".
+fn held_pair(pairs: &mut Vec<(String, String)>, store: Option<&AudioStore>, item: &QueueItem) {
+    let (Some(store), QueueEntry::Song(s)) = (store, &item.entry) else { return };
+    pairs.push((
+        "X-Offline".to_string(),
+        if store.holds(&s.id) { "1" } else { "0" }.to_string(),
+    ));
+}
+
 fn offline_albums(store: &crate::store::AudioStore) -> Vec<OfflineAlbum> {
     let songs = store
         .entries()
@@ -14165,6 +14224,9 @@ impl MpdHandler for HypodjHandler {
                 // costs no extra round trip, and MPD clients skip unknown status
                 // keys - ncmpcpp ignores it entirely.
                 for (k, v) in self.store_status_pairs() {
+                    b = b.pair(k, v);
+                }
+                for (k, v) in self.server_status_pairs() {
                     b = b.pair(k, v);
                 }
                 b.build()
@@ -14627,29 +14689,35 @@ impl MpdHandler for HypodjHandler {
                 MpdResponse::ok()
             }
             MpdCommand::PlaylistInfo(_) => {
+                let store = self.audio_store();
                 let st = self.state.lock().unwrap();
                 let mut pairs = Vec::new();
                 for (pos, item) in st.queue.iter().enumerate() {
                     pairs.extend(song_pairs(item, pos));
+                    held_pair(&mut pairs, store.as_deref(), item);
                 }
                 MpdResponse::Pairs(pairs)
             }
             MpdCommand::PlaylistId(id) => {
+                let store = self.audio_store();
                 let st = self.state.lock().unwrap();
                 let mut pairs = Vec::new();
                 for (pos, item) in st.queue.iter().enumerate() {
                     if id.is_none() || id == Some(item.id) {
                         pairs.extend(song_pairs(item, pos));
+                        held_pair(&mut pairs, store.as_deref(), item);
                     }
                 }
                 MpdResponse::Pairs(pairs)
             }
             MpdCommand::PlChanges(_) => {
                 // Full queue (a correct superset of the diff; ncmpcpp re-reads).
+                let store = self.audio_store();
                 let st = self.state.lock().unwrap();
                 let mut pairs = Vec::new();
                 for (pos, item) in st.queue.iter().enumerate() {
                     pairs.extend(song_pairs(item, pos));
+                    held_pair(&mut pairs, store.as_deref(), item);
                 }
                 MpdResponse::Pairs(pairs)
             }
@@ -15356,12 +15424,18 @@ impl HypodjHandler {
                 if let Some(songs) = self.listings.get(&key) {
                     return song_rows(&songs);
                 }
-                match self.client.album_songs(&AlbumId(id)).await {
+                match self.client.album_songs(&AlbumId(id.clone())).await {
                     Ok(songs) => {
                         self.listings.put(key, songs.clone());
                         song_rows(&songs)
                     }
-                    Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
+                    // Offline, the held songs of the album are still a true listing
+                    // of what can be played - not cached, so the full album returns
+                    // the moment the server does.
+                    Err(e) => match self.offline_album_songs(&AlbumId(id)).await {
+                        Some(songs) => song_rows(&songs),
+                        None => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
+                    },
                 }
             }
 
@@ -28816,6 +28890,38 @@ mod tests {
         // the pin set - a light kick would never notice a newly starred album.
         h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Now)).await;
         assert!(store.take_full_request_for_test(), "`store now` requests a FULL pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OFFLINE, no server pass ever publishes - and that is exactly when the badge
+    /// matters. What is on disk is known from the index alone, so `status`, `store`
+    /// and the queue rows say it without one.
+    #[tokio::test]
+    async fn what_is_on_disk_is_reported_with_no_server_pass() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-disk-only");
+        let store = open_store(&dir);
+        commit_into(&store, &store_song("held1", 64));
+        commit_into(&store, &store_song("held2", 64));
+        h.set_audio_store(store.clone());
+        assert!(!store.status().known, "no pass has run");
+
+        let status = pairs_of(h.handle(MpdCommand::Status).await);
+        let get = |p: &[(String, String)], k: &str| {
+            p.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone())
+        };
+        assert_eq!(get(&status, "X-Store").as_deref(), Some("2 songs on disk"));
+        let st = pairs_of(h.handle(MpdCommand::Store(crate::mpd::StoreCmd::Show)).await);
+        assert_eq!(get(&st, "X-Store").as_deref(), Some("2 songs on disk"));
+        assert_eq!(get(&st, "X-StoreEntries").as_deref(), Some("2"));
+
+        // Queue rows carry availability in words-ready form.
+        h.enqueue_song_for_test(store_song("held1", 64)).await;
+        h.enqueue_song_for_test(store_song("streamed", 64)).await;
+        let rows = pairs_of(h.handle(MpdCommand::PlaylistInfo(None)).await);
+        let offline: Vec<&str> =
+            rows.iter().filter(|(k, _)| k == "X-Offline").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(offline, vec!["1", "0"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -161,7 +161,16 @@ pub enum RespKind {
     /// An old daemon ACKed `unknown command "knob"`; render computes a setvol
     /// fallback from the last-known volume.
     KnobUnknown(String),
-    Browse { target: Screen, rows: Vec<BrowseRow>, path: String, title: String, restore_sel: Option<usize> },
+    Browse {
+        target: Screen,
+        rows: Vec<BrowseRow>,
+        path: String,
+        title: String,
+        restore_sel: Option<usize>,
+        /// Album uri -> songs on disk, when `store albums` answered (see
+        /// [`state::Browse::held`]); `None` when it was not asked or not answered.
+        held: Option<std::collections::HashMap<String, u32>>,
+    },
     /// A library-query result. Carries the query it ANSWERS so the render thread can
     /// drop a superseded response by echo comparison - the same guarantee as a
     /// generation counter, with no new plumbing. The Result keeps the failure
@@ -726,10 +735,65 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             }
             Err(_) => true,
         },
+        // THE ALBUMS ROOT knows what is on disk as well as what the server lists, so
+        // every row can say "on disk" / "stream only", and a server that cannot be
+        // reached still leaves the held albums browsable and playable instead of an
+        // empty pane that reads "you have no albums".
+        Req::Browse { target, command, path, title, restore_sel } if path == "albums/all" => {
+            let listed = conn.command(&command);
+            let held = match conn.command("store albums") {
+                Ok(p) => Some(held_albums(&p)),
+                Err(MpdError::Ack(_)) => None,
+                Err(_) => return true,
+            };
+            let held_map = held.as_ref().map(|h| {
+                h.iter().filter_map(|a| Some((a.uri.clone()?, a.songs))).collect()
+            });
+            match listed {
+                Ok(pairs) => {
+                    let rows = state::parse_browse(&pairs);
+                    send(RespKind::Browse { target, rows, path, title, restore_sel, held: held_map });
+                    false
+                }
+                Err(MpdError::Ack(m)) => {
+                    let reason = hypodj_client::nl::map_ack_reason(&m);
+                    let on_disk = held.unwrap_or_default();
+                    let title = if on_disk.is_empty() {
+                        format!("{title} - could not list: {reason}")
+                    } else {
+                        format!(
+                            "{title} - server unreachable, showing {} on disk",
+                            if on_disk.len() == 1 {
+                                "1 album".to_string()
+                            } else {
+                                format!("{} albums", on_disk.len())
+                            }
+                        )
+                    };
+                    let rows = on_disk
+                        .iter()
+                        .filter_map(|a| {
+                            Some(BrowseRow {
+                                label: a.name.clone(),
+                                uri: a.uri.clone()?,
+                                is_dir: true,
+                                song_count: Some(a.songs),
+                                artist: None,
+                                album_uri: None,
+                                artist_uri: None,
+                            })
+                        })
+                        .collect();
+                    send(RespKind::Browse { target, rows, path, title, restore_sel, held: held_map });
+                    false
+                }
+                Err(_) => true,
+            }
+        }
         Req::Browse { target, command, path, title, restore_sel } => match conn.command(&command) {
             Ok(pairs) => {
                 let rows = state::parse_browse(&pairs);
-                send(RespKind::Browse { target, rows, path, title, restore_sel });
+                send(RespKind::Browse { target, rows, path, title, restore_sel, held: None });
                 false
             }
             Err(MpdError::Ack(m)) => {
@@ -739,6 +803,42 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             Err(_) => true,
         },
     }
+}
+
+/// One held album from `store albums`: its bare name, browse uri and how many of
+/// its songs are on disk. Rows with no album id (`-`) carry no uri.
+struct HeldAlbum {
+    name: String,
+    uri: Option<String>,
+    songs: u32,
+}
+
+/// Zip the `store albums` record pairs into rows. Each record starts at
+/// `OfflineAlbum`; the name falls back to the worded line from an older daemon.
+fn held_albums(pairs: &[(String, String)]) -> Vec<HeldAlbum> {
+    let mut out: Vec<HeldAlbum> = Vec::new();
+    for (k, v) in pairs {
+        match k.as_str() {
+            "OfflineAlbum" => out.push(HeldAlbum { name: v.clone(), uri: None, songs: 0 }),
+            "OfflineAlbumUri" if v != "-" => {
+                if let Some(l) = out.last_mut() {
+                    l.uri = Some(v.clone());
+                }
+            }
+            "OfflineAlbumName" => {
+                if let Some(l) = out.last_mut() {
+                    l.name = v.clone();
+                }
+            }
+            "OfflineAlbumSongs" => {
+                if let Some(l) = out.last_mut() {
+                    l.songs = v.parse().unwrap_or(0);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A command outcome collapsed to the two render-visible cases.

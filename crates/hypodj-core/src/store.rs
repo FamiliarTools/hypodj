@@ -3089,6 +3089,22 @@ impl AudioStore {
         v
     }
 
+    /// Whether the index holds a servable (non-suspect) copy of `id`. Index only,
+    /// no stat: cheap enough for one call per queue row.
+    pub fn holds(&self, id: &SongId) -> bool {
+        self.index
+            .lock()
+            .expect("store index lock")
+            .get(id)
+            .is_some_and(|e| !e.suspect)
+    }
+
+    /// How many servable songs the index holds. Known from the startup scan alone,
+    /// so it is true with no server pass ever completed.
+    pub fn held_count(&self) -> usize {
+        self.index.lock().expect("store index lock").values().filter(|e| !e.suspect).count()
+    }
+
     /// Total stored audio bytes, as the index believes them.
     pub fn total_bytes(&self) -> u64 {
         self.index
@@ -4513,6 +4529,16 @@ async fn run_pass<C: Clock, P: PinSource>(
     let (actions, status) = plan_pass_with_status(&input);
     let mut report = execute(store, source, &input, actions, clock, backoff).await;
     report.budget = input.max_bytes;
+    // RE-DESCRIBE AFTER EXECUTING. The plan's status was drawn BEFORE its downloads
+    // ran, so publishing it as-is kept "entries 0, pending 3" on the badge for a whole
+    // interval after those three songs were on disk. Re-planning against the index as
+    // it now stands is pure (no I/O) and makes the counters say what the pass DID.
+    let status = if status.is_some() {
+        input.entries = store.entries();
+        plan_pass_with_status(&input).1
+    } else {
+        status
+    };
     if let Some(mut status) = status {
         // The one number the plan cannot know: ids this PROCESS has stopped
         // retrying. Without it a pending count that will never reach zero is

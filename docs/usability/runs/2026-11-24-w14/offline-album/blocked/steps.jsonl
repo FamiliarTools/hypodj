@@ -1,0 +1,7 @@
+{"n":0,"step":"start","t_ms":660,"settled":true,"settle_ms":646}
+{"n":1,"step":"key F2","t_ms":1288,"settled":true,"settle_ms":610}
+{"n":2,"step":"wait 6","t_ms":7955,"settled":true,"settle_ms":640}
+{"n":3,"step":"key j","t_ms":8565,"settled":true,"settle_ms":601}
+{"n":4,"step":"key Enter","t_ms":9179,"settled":true,"settle_ms":606}
+{"n":5,"step":"wait 4","t_ms":13834,"settled":true,"settle_ms":627}
+{"n":6,"step":"snap playing","t_ms":14453,"settled":true,"settle_ms":602}

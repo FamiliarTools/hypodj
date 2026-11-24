@@ -259,6 +259,32 @@ impl SubsonicClient {
             .map_err(|e| SubsonicError::Request(e.to_string()))
     }
 
+    /// One heartbeat probe: a ping, classified into the reachability verdict
+    /// [`crate::reach`] publishes. Classified HERE, before the upstream error is
+    /// flattened to a string, because only the typed error chain can tell "no route
+    /// from this machine" (an io error the kernel raised) from "the server is not
+    /// answering" (a timeout, a refusal).
+    pub async fn probe_reach(&self) -> crate::reach::Reach {
+        use crate::reach::Reach;
+        match self.inner.ping().await {
+            Ok(_) => Reach::Online,
+            Err(opensubsonic::Error::Http(e)) => {
+                let mut src: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+                while let Some(s) = src {
+                    if let Some(io) = s.downcast_ref::<std::io::Error>() {
+                        // ENETUNREACH (101) / EHOSTUNREACH (113): nothing to route by.
+                        if matches!(io.raw_os_error(), Some(101) | Some(113)) {
+                            return Reach::NoNetwork;
+                        }
+                    }
+                    src = s.source();
+                }
+                Reach::Unreachable
+            }
+            Err(_) => Reach::Error,
+        }
+    }
+
     /// Browse: all artists. Vertical-slice step 3a. REAL: calls `get_artists`
     /// and flattens the `ArtistsId3 { index: Vec<IndexId3 { artist: Vec<..> }> }`
     /// shape into our flat `Vec<Artist>`.

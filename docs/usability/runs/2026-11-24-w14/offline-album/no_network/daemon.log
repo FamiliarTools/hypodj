@@ -1,0 +1,17 @@
+[2m2026-11-24T12:25:50.839063Z[0m [33m WARN[0m [2mhypodj[0m[2m:[0m subsonic server did not answer; starting anyway (MPD serves; server calls retry as they are made) [3merror[0m[2m=[0msubsonic request: HTTP error: error sending request for url (http://10.77.0.1:4533/rest/ping?u=REDACTED&t=REDACTED&s=REDACTED&v=1.16.1&c=usability-harness&f=json) [3murl[0m[2m=[0mhttp://10.77.0.1:4533
+[2m2026-11-24T12:25:51.012112Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m P2 plan executor started
+[2m2026-11-24T12:25:51.012180Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m P3 NL translator injected (rules fast-path, local model behind it when wired) [3mwith_model[0m[2m=[0mfalse
+[2m2026-11-24T12:25:51.012194Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m MPRIS disabled by config
+[2m2026-11-24T12:25:51.012645Z[0m [32m INFO[0m [2mhypodj_core::reach[0m[2m:[0m server reachability changed [3mserver[0m[2m=[0m"no-network"
+[2m2026-11-24T12:25:51.013987Z[0m [32m INFO[0m [2mhypodj_core::store[0m[2m:[0m store: opened [3mroot[0m[2m=[0m/tmp/hypodj-usability-434745/runs/offline-album/no_network/store [3mentries[0m[2m=[0m3 [3mbytes[0m[2m=[0m2161638 [3mswept[0m[2m=[0m0 [3morphans[0m[2m=[0m0 [3mhealed[0m[2m=[0m0
+[2m2026-11-24T12:25:51.060724Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m cover store open [3mdir[0m[2m=[0m/tmp/hypodj-usability-434745/runs/offline-album/no_network/state/covers [3mbytes[0m[2m=[0m0
+[2m2026-11-24T12:25:51.060725Z[0m [32m INFO[0m [2mhypodj_core::store[0m[2m:[0m store: reconciler started [3minterval_secs[0m[2m=[0m900 [3mmax_bytes[0m[2m=[0m17179869184
+[2m2026-11-24T12:25:51.060809Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m heard ledger open [3mdir[0m[2m=[0m/tmp/hypodj-usability-434745/runs/offline-album/no_network/state/heard
+[2m2026-11-24T12:25:51.060849Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m station metadata open [3mpath[0m[2m=[0m/tmp/hypodj-usability-434745/runs/offline-album/no_network/state/station_meta.json
+[2m2026-11-24T12:25:51.064065Z[0m [32m INFO[0m [2mhypodj_core::store[0m[2m:[0m store: pin set unavailable this pass; keeping every claim [3merror[0m[2m=[0msubsonic request: HTTP error: error sending request for url (http://10.77.0.1:4533/rest/getStarred2?u=REDACTED&t=REDACTED&s=REDACTED&v=1.16.1&c=usability-harness&f=json)
+[2m2026-11-24T12:25:51.066753Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m tape open; a mark keeps the sound [3mdir[0m[2m=[0m/tmp/hypodj-usability-434745/runs/offline-album/no_network/state/tape [3mmax_bytes[0m[2m=[0m2147483648
+[2m2026-11-24T12:25:51.069635Z[0m [32m INFO[0m [2mhypodj_core::resume[0m[2m:[0m no readable resume state; cold starting [3mpath[0m[2m=[0m/tmp/hypodj-usability-434745/runs/offline-album/no_network/state/resume.toml
+[2m2026-11-24T12:25:51.069685Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m starting MPD server [3mbind[0m[2m=[0m127.0.0.1:6610 [3mserver_online[0m[2m=[0mfalse
+[2m2026-11-24T12:25:51.069773Z[0m [32m INFO[0m [2mhypodj_core::mpd[0m[2m:[0m MPD server listening [3mbind[0m[2m=[0m127.0.0.1:6610
+[2m2026-11-24T12:25:51.069788Z[0m [32m INFO[0m [2mhypodj_core::viz[0m[2m:[0m viz socket listening [3mbind[0m[2m=[0m127.0.0.1:6611
+[2m2026-11-24T12:26:06.413101Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m shutdown signal received; persisting resume state then fading out

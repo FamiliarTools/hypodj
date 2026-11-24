@@ -1,0 +1,6 @@
+key F2
+wait 6
+key j
+key Enter
+wait 4
+snap playing

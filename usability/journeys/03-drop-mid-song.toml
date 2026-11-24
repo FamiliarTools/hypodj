@@ -6,6 +6,10 @@ start = "online"
 states = ["online", "blocked", "no_network"]
 min_steps = 0          # after the drop, the answer must come to the listener unasked
 step_budget = 4        # the scripted setup to start a streamed song
+# A queue LONGER than the prefetch window: with one song mirrored ahead, the third
+# song of Stream Summit is never fetched before the drop, so the "never fetched song
+# is due" checks below have a real song to judge instead of an n/a.
+store_queue_ahead = 1
 script = [
   "key F2",
   "wait 2",

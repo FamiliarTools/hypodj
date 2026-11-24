@@ -359,6 +359,14 @@ pub struct Browse {
     pub stack: Vec<(String, usize)>,
     /// Lazy-fetch guard: false until the first ShowScreen fetch lands.
     pub loaded: bool,
+    /// Album uri (`album/<id>`) -> how many of its songs are on disk, from the
+    /// daemon's `store albums`. Empty when the store is off or nothing is held; an
+    /// album dir row absent from a NON-empty map is stream only.
+    pub held: std::collections::HashMap<String, u32>,
+    /// Whether `store albums` answered for this listing at all. Without it an empty
+    /// `held` cannot tell "nothing on disk" from "no store", and the second must not
+    /// be rendered as "stream only".
+    pub held_known: bool,
     /// Top visible row for the scrolloff viewport (see [`scroll_offset`]).
     pub offset: Cell<usize>,
 }
@@ -372,6 +380,8 @@ impl Browse {
             title: title.to_string(),
             stack: Vec::new(),
             loaded: false,
+            held: std::collections::HashMap::new(),
+            held_known: false,
             offset: Cell::new(0),
         }
     }

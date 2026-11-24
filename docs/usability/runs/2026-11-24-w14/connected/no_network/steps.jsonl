@@ -1,0 +1,3 @@
+{"n":0,"step":"start","t_ms":641,"settled":true,"settle_ms":626}
+{"n":1,"step":"wait 3","t_ms":4281,"settled":true,"settle_ms":627}
+{"n":2,"step":"snap first-look","t_ms":4894,"settled":true,"settle_ms":601}
