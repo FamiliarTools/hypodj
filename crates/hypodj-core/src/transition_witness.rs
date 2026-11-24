@@ -757,3 +757,189 @@ fn classifier_tells_the_shapes_apart() {
     let d = diff_tables("cause\tshape\toverlap_ms\nnext\tDIP\t0\n", "next\tCROSSFADE\t900\n");
     assert!(d.contains("next\tDIP\tCROSSFADE\t0\t900\tSHAPE"), "{d}");
 }
+
+// ── adversarial mid-flight repros (agents/te-adv-1) ─────────────────────────
+
+async fn adv_settled(r: &Rig, label: &str) -> (Vec<Option<String>>, Option<String>, Vec<f64>) {
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+    let (probes, _) = r.h.player.witness_probe().await;
+    let srcs: Vec<Option<String>> = probes.iter().map(src_of).collect();
+    let vols: Vec<f64> = probes.iter().map(|p| p.volume).collect();
+    let head = head_of(&r.h);
+    let st = r.h.state.lock().unwrap();
+    eprintln!(
+        "ADV {label}: decks={srcs:?} vols={vols:?} paths={:?} idle={:?} head={head:?} playstate={:?} transit={:?} target_vol={}",
+        probes.iter().map(|p| p.path.clone()).collect::<Vec<_>>(),
+        probes.iter().map(|p| p.core_idle).collect::<Vec<_>>(),
+        r.h.player.state(),
+        st.transit,
+        st.target_volume
+    );
+    (srcs, head, vols)
+}
+
+fn adv_run(f: impl FnOnce(u16) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>) {
+    let port = serve_tones();
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async move { f(port).await });
+    rt.shutdown_timeout(Duration::from_secs(2));
+}
+
+fn audible_count(srcs: &[Option<String>]) -> usize {
+    srcs.iter().filter(|s| s.is_some()).count()
+}
+
+#[test]
+#[ignore = "adversarial live"]
+fn adv_triple_skip() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["A", "B", "C", "D", "E"]).await;
+        r.play(0).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        r.h.handle(MpdCommand::Next).await;
+        let (srcs, head, _) = adv_settled(&r, "triple-skip").await;
+        assert_eq!(head.as_deref(), Some("D"));
+        assert_eq!(audible_count(&srcs), 1, "exactly one deck audible");
+        assert!(srcs.iter().any(|s| s.as_deref() == Some("D")), "head D audible");
+    }));
+}
+
+#[test]
+#[ignore = "adversarial live"]
+fn adv_reverse_to_outgoing() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["A", "B", "C"]).await;
+        r.play(0).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.h.handle(MpdCommand::Previous).await;
+        let (srcs, head, _) = adv_settled(&r, "reverse").await;
+        assert_eq!(head.as_deref(), Some("A"));
+        assert_eq!(audible_count(&srcs), 1);
+        assert!(srcs.iter().any(|s| s.as_deref() == Some("A")));
+    }));
+}
+
+#[test]
+#[ignore = "adversarial live"]
+fn adv_delete_incoming_row() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["A", "B", "C"]).await;
+        r.play(0).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.h.handle(MpdCommand::Delete(Some("1".into()))).await;
+        let (srcs, head, _) = adv_settled(&r, "delete-incoming").await;
+        assert_eq!(audible_count(&srcs), 1);
+        assert_eq!(srcs.iter().flatten().next().cloned(), head);
+    }));
+}
+
+#[test]
+#[ignore = "adversarial live"]
+fn adv_clear_during_xf() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["A", "B", "C"]).await;
+        r.play(0).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.h.handle(MpdCommand::Clear).await;
+        let (srcs, _, _) = adv_settled(&r, "clear-during-xf").await;
+        assert_eq!(audible_count(&srcs), 0, "nothing audible after clear");
+    }));
+}
+
+#[test]
+#[ignore = "adversarial live"]
+fn adv_pause_during_xf() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["A", "B", "C"]).await;
+        r.play(0).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.h.handle(MpdCommand::Pause(Some(true))).await;
+        let (srcs, _, _) = adv_settled(&r, "pause-during-xf").await;
+        assert_eq!(audible_count(&srcs), 0, "nothing audible after pause");
+        r.h.handle(MpdCommand::Pause(Some(false))).await;
+        let (srcs, head, _) = adv_settled(&r, "resume-after-pause-during-xf").await;
+        assert_eq!(audible_count(&srcs), 1);
+        assert_eq!(srcs.iter().flatten().next().cloned(), head);
+    }));
+}
+
+#[test]
+#[ignore = "adversarial live"]
+fn adv_setvol_during_xf() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["A", "B", "C"]).await;
+        r.play(0).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.h.handle(MpdCommand::SetVol(40)).await;
+        let (srcs, head, vols) = adv_settled(&r, "setvol-during-xf").await;
+        assert_eq!(audible_count(&srcs), 1, "one deck after setvol mid-xf");
+        assert_eq!(srcs.iter().flatten().next().cloned(), head);
+        let v = srcs.iter().zip(&vols).find(|(s, _)| s.is_some()).map(|(_, v)| *v).unwrap();
+        assert!((v - 40.0).abs() < 2.0, "audible deck at setvol 40, got {v}");
+    }));
+}
+
+#[test]
+#[ignore = "adversarial live"]
+fn adv_stop_during_xf() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["A", "B", "C"]).await;
+        r.play(0).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.h.handle(MpdCommand::Stop).await;
+        let (srcs, _, _) = adv_settled(&r, "stop-during-xf").await;
+        assert_eq!(audible_count(&srcs), 0);
+        r.h.handle(MpdCommand::Play(None)).await;
+        let (srcs, head, _) = adv_settled(&r, "play-after-stop-during-xf").await;
+        assert_eq!(audible_count(&srcs), 1);
+        assert_eq!(srcs.iter().flatten().next().cloned(), head);
+    }));
+}
+
+/// X is 3 s long: skip off X with ~0.6 s left so X hits EOF inside the overlap.
+/// Intent: head lands on Y (the skip target), never double-advances to C.
+#[test]
+#[ignore = "adversarial live"]
+fn adv_outgoing_eof_inside_window() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["X", "Y", "C"]).await;
+        r.h.handle(MpdCommand::Play(Some(0))).await;
+        tokio::time::sleep(Duration::from_millis(2400)).await;
+        r.h.handle(MpdCommand::Next).await;
+        let (srcs, head, _) = adv_settled(&r, "outgoing-eof-in-window").await;
+        assert_eq!(head.as_deref(), Some("Y"), "no double advance");
+        assert_eq!(audible_count(&srcs), 1);
+        assert!(srcs.iter().any(|s| s.as_deref() == Some("Y")));
+    }));
+}
+
+#[test]
+#[ignore = "adversarial live"]
+fn adv_churn() {
+    adv_run(|port| Box::pin(async move {
+        let r = Rig::new(port, &["A", "B", "C", "D"]).await;
+        r.play(0).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        r.h.handle(MpdCommand::Previous).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        r.h.handle(MpdCommand::Next).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        r.h.handle(MpdCommand::Previous).await;
+        let (srcs, head, _) = adv_settled(&r, "churn").await;
+        assert_eq!(head.as_deref(), Some("B"));
+        assert_eq!(audible_count(&srcs), 1);
+        assert!(srcs.iter().any(|s| s.as_deref() == Some("B")));
+    }));
+}
