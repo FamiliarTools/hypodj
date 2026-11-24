@@ -401,6 +401,10 @@ enum PlayerCommand {
     /// boundary headlessly without a real mpv end-of-stream.
     #[cfg(test)]
     TestEof,
+    /// TEST-ONLY: read what this deck is ACTUALLY doing, from mpv itself (the
+    /// transition witness samples it). Read-only: no property is written.
+    #[cfg(test)]
+    WitnessProbe(oneshot::Sender<DeckProbe>),
     Pause(oneshot::Sender<Result<(), PlayerError>>),
     Resume(oneshot::Sender<Result<(), PlayerError>>),
     Stop(oneshot::Sender<Result<(), PlayerError>>),
@@ -741,6 +745,23 @@ impl PlayerHandle {
             reply,
         })
         .await
+    }
+
+    /// TEST-ONLY: one [`DeckProbe`] per deck, in deck order, plus the active deck's
+    /// index. A deck that does not answer reads as the default (silent, nothing loaded).
+    #[cfg(test)]
+    pub(crate) async fn witness_probe(&self) -> (Vec<DeckProbe>, usize) {
+        let mut out = Vec::with_capacity(self.decks.len());
+        for d in self.decks.iter() {
+            let (tx, rx) = oneshot::channel();
+            let probe = if d.cmd_tx.send(PlayerCommand::WitnessProbe(tx)).await.is_ok() {
+                rx.await.unwrap_or_default()
+            } else {
+                DeckProbe::default()
+            };
+            out.push(probe);
+        }
+        (out, self.active.load(Ordering::Acquire) % self.decks.len())
     }
 
     /// TEST-ONLY: drive a natural end-of-file for the latched entry.
@@ -1135,6 +1156,10 @@ impl NullPlayer {
                             continue;
                         }
                         let _ = reply.send(Err(DumpFailure::NoEntry));
+                    }
+                    #[cfg(test)]
+                    PlayerCommand::WitnessProbe(reply) => {
+                        let _ = reply.send(DeckProbe::default());
                     }
                     #[cfg(test)]
                     PlayerCommand::TestEof => {
@@ -2240,8 +2265,26 @@ fn handle_cmd(
         // command enum carries it in test builds so this arm keeps the match total.
         #[cfg(test)]
         PlayerCommand::TestEof => {}
+        #[cfg(test)]
+        PlayerCommand::WitnessProbe(reply) => {
+            let path: Option<String> = mpv.get_property::<String>("path").ok();
+            let core_idle: bool = mpv.get_property("core-idle").unwrap_or(true);
+            let volume: f64 = mpv.get_property("volume").unwrap_or(0.0);
+            let _ = reply.send(DeckProbe { path, core_idle, volume });
+        }
     }
     false
+}
+
+/// TEST-ONLY: one deck's real mpv state at one instant (see
+/// [`PlayerHandle::witness_probe`]). `core_idle = false` means mpv is actually
+/// pushing decoded audio; `volume` is the softvol property (0..=100, cubic).
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeckProbe {
+    pub path: Option<String>,
+    pub core_idle: bool,
+    pub volume: f64,
 }
 
 /// mpv's `command`/`loadfile` treats spaces as argument separators, so a URL

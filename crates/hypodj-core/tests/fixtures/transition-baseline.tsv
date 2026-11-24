@@ -1,0 +1,14 @@
+cause	shape	overlap_ms	gap_ms	old_min_vol	new_first_vol	switch_ms	power_dev_pct	src_before	src_after	head_before	head_after
+next	CROSSFADE	290	0	87.5	37.4	436	3	A	B	A	A
+previous	CROSSFADE	280	0	88.3	29.7	492	4	B	A	B	B
+eof-other-album	CUT	0	10	100.0	100.0	100	0	X	Y	X	Y
+eof-same-album	CUT	0	10	100.0	100.0	201	0	P	Q	P	Q
+play-n-while-playing	CUT	0	20	100.0	100.0	502	0	A	C	A	C
+playid	CUT	0	10	100.0	100.0	304	0	A	C	A	C
+delete-playing-row	CROSSFADE	330	0	86.6	29.7	414	3	A	B	A	A
+clear-add-play	CUT	0	30	100.0	100.0	602	0	A	D	A	D
+move-playing-row	NONE	0	0	100.0	0.0	-1	0	A	A	A	A
+plan-play	CUT	0	10	100.0	100.0	303	0	A	C	A	C
+radio-start-while-playing	CUT	0	0	100.0	100.0	426	0	A	R	A	R
+plan-remove-current	STOP	0	0	100.0	0.0	-1	0	A	-	A	-
+undo-head-change	DIP	0	60	100.0	10.3	601	0	-	A	-	A
