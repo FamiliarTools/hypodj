@@ -148,8 +148,28 @@ impl<C: Clock> Publisher<C> {
         }
     }
 
+    /// Feed the handler's live-elapsed atomic off the event being published: a tick
+    /// notes its position, a track start or a Stopped edge resets it. This lives on
+    /// the spine, BEFORE the event reaches any observer, because elapsed is a fact of
+    /// playback rather than of persistence: it used to be fed by the daemon's
+    /// checkpoint loop, which only runs with a state dir, so a daemon without one
+    /// reported elapsed 0 forever. Feeding before the send also means an observer
+    /// that checkpoints on a TrackStart already reads the reset value.
+    fn feed_elapsed(&self, kind: &DjEventKind) {
+        match kind {
+            DjEventKind::Tick { time_pos, .. } => {
+                self.handler.note_elapsed_ms(time_pos.as_millis() as u64)
+            }
+            DjEventKind::TrackStart(_) | DjEventKind::StateChanged(PlayState::Stopped, _) => {
+                self.handler.reset_elapsed()
+            }
+            _ => {}
+        }
+    }
+
     /// Publish a LOSSY, broadcast-only event (used for high-rate `Tick`).
     fn broadcast_only(&mut self, kind: DjEventKind) {
+        self.feed_elapsed(&kind);
         let ev = self.envelope(kind);
         let _ = self.bcast.send(ev);
     }
@@ -158,6 +178,7 @@ impl<C: Clock> Publisher<C> {
     /// version/cursor stamp and the resync source both reflect this boundary),
     /// then send losslessly to every trigger subscriber AND the lossy broadcast.
     fn edge(&mut self, kind: DjEventKind) {
+        self.feed_elapsed(&kind);
         self.refresh_watch();
         let ev = self.envelope(kind);
         // Lossless fan-out to the executor(s); prune any closed subscriber.
@@ -822,6 +843,34 @@ mod tests {
             }
         };
         assert_eq!(tick2, None, "duration-less song -> honest None remaining");
+    }
+
+    // ELAPSED IS A PLAYBACK FACT, NOT A PERSISTENCE ONE (task 01m85x0): the director
+    // alone must feed the live-elapsed atomic. It used to be fed only by the daemon's
+    // checkpoint_loop, which runs only with a state dir, so a daemon started without
+    // STATE_DIRECTORY reported `elapsed: 0.000` forever. This rig has no state path and
+    // no checkpoint loop: a tick must still move elapsed, and a new track must zero it.
+    #[tokio::test]
+    async fn director_feeds_elapsed_without_any_persistence() {
+        let Some((handler, rt, player)) = rig(&[("s0", Some(100), Some("A")), ("s1", Some(100), Some("A"))]).await
+        else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let mut triggers = rt.subscribe_triggers();
+        let mut ticks = rt.events.subscribe();
+        handler.play_for_test(0).await;
+        let _ = drain_to_track_start(&mut triggers).await;
+        player.seek(40.0).await.unwrap();
+        loop {
+            if matches!(ticks.recv().await.unwrap().kind, DjEventKind::Tick { .. }) {
+                break;
+            }
+        }
+        assert_eq!(handler.last_elapsed_secs(), 40.0, "a tick feeds elapsed with no state dir");
+        player.test_emit_eof().await.unwrap();
+        let _ = drain_to_track_start(&mut triggers).await;
+        assert_eq!(handler.last_elapsed_secs(), 0.0, "a new track starts at zero");
     }
 
     // THE FUSE WIRING: a live position tick on the LATCHED entry re-arms the

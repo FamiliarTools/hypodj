@@ -402,23 +402,6 @@ impl Rig {
         let scrobbler = Arc::new(crate::scrobble::Scrobbler::new(client.clone()));
         let runtime =
             crate::director::run(TokioClock, h.clone(), scrobbler, client, events);
-        // Mirror the daemon's checkpoint_loop elapsed feed (main.rs): Tick -> note, TrackStart /
-        // Stopped -> reset. Without it status.elapsed is always 0 in a bare rig.
-        {
-            let mut ev = runtime.events.subscribe();
-            let hh = h.clone();
-            tokio::spawn(async move {
-                use crate::event::DjEventKind;
-                while let Ok(dj) = ev.recv().await {
-                    match dj.kind {
-                        DjEventKind::Tick { time_pos, .. } => hh.note_elapsed_ms(time_pos.as_millis() as u64),
-                        DjEventKind::TrackStart(_) => hh.reset_elapsed(),
-                        DjEventKind::StateChanged(crate::player::PlayState::Stopped, _) => hh.reset_elapsed(),
-                        _ => {}
-                    }
-                }
-            });
-        }
         for s in songs {
             h.enqueue_song_for_test(song(s)).await;
         }

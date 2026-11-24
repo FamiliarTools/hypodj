@@ -570,11 +570,11 @@ async fn graceful_shutdown(handler: Arc<HypodjHandler>, resume_enabled: bool, bu
     std::process::exit(0);
 }
 
-/// The best-effort resume checkpoint loop. Updates the lockless live-elapsed
-/// atomic on every high-rate `Tick`, and writes a full checkpoint on state EDGES
+/// The best-effort resume checkpoint loop. Writes a full checkpoint on state EDGES
 /// (track start/end, play-state change, queue resync) plus a coarse periodic
-/// refresh while a track is live. NEVER queries mpv; the elapsed comes from the
-/// P1 tick stream, so a checkpoint is race-free against shutdown.
+/// refresh while a track is live. NEVER queries mpv; the elapsed is the live
+/// atomic the director feeds off the tick stream, so a checkpoint is race-free
+/// against shutdown.
 async fn checkpoint_loop(
     handler: Arc<HypodjHandler>,
     mut ev: tokio::sync::broadcast::Receiver<hypodj_core::event::DjEvent>,
@@ -591,20 +591,13 @@ async fn checkpoint_loop(
         tokio::select! {
             r = ev.recv() => match r {
                 Ok(dj) => match dj.kind {
-                    DjEventKind::Tick { time_pos, .. } => {
-                        handler.note_elapsed_ms(time_pos.as_millis() as u64);
-                    }
                     DjEventKind::TrackStart(_) => {
-                        handler.reset_elapsed();
                         handler.checkpoint(handler.last_elapsed_secs()).await;
                     }
                     DjEventKind::TrackEnd(_) => {
                         handler.checkpoint(handler.last_elapsed_secs()).await;
                     }
-                    DjEventKind::StateChanged(st, _) => {
-                        if st == PlayState::Stopped {
-                            handler.reset_elapsed();
-                        }
+                    DjEventKind::StateChanged(..) => {
                         handler.checkpoint(handler.last_elapsed_secs()).await;
                     }
                     DjEventKind::Resync => {
