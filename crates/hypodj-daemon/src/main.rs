@@ -288,7 +288,12 @@ async fn main() -> anyhow::Result<()> {
         if let Some(dir) =
             cfg.features.dir.clone().or_else(|| state_dir.as_ref().map(|d| d.join("features")))
         {
-            let fs = hypodj_core::features::FileFeatureStore::open(dir.clone());
+            // The first scan reads every file: off the runtime's workers.
+            let d = dir.clone();
+            let fs = tokio::task::spawn_blocking(move || {
+                hypodj_core::features::FileFeatureStore::open(d)
+            })
+            .await?;
             tracing::info!(dir = %dir.display(), measured = fs.count(), "audio features");
             handler.set_feature_store(Arc::new(fs));
         }

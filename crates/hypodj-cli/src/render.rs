@@ -45,7 +45,10 @@ pub fn render_features(pairs: &[(String, String)]) -> String {
     let get = |k: &str| pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
     let mut lines = vec![match get("X-Features") {
         Some("off") | None => "audio features: off".to_string(),
-        Some(c) => format!("audio features: {c}"),
+        Some(c) => match get("X-FeaturesStale") {
+            Some(n) => format!("audio features: {c} ({n} stale, re-run hypodj-mir)"),
+            None => format!("audio features: {c}"),
+        },
     }];
     if let Some(src) = get("X-FeatureSource") {
         let mut l = format!("this track ({src}): energy {}", get("X-FeatureEnergy").unwrap_or("?"));
@@ -261,6 +264,10 @@ mod tests {
             "audio features: 7 of 422 analysed\nthis track (measured): energy 0.26, voice 0.01 instrumental, 139.6 bpm"
         );
         assert_eq!(super::render_features(&p(&[("X-Features", "off")])), "audio features: off");
+        assert_eq!(
+            super::render_features(&p(&[("X-Features", "3 of 9 analysed"), ("X-FeaturesStale", "2")])),
+            "audio features: 3 of 9 analysed (2 stale, re-run hypodj-mir)"
+        );
     }
 
     use super::*;

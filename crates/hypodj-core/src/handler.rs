@@ -9730,12 +9730,17 @@ impl HypodjHandler {
         let store = self.feature_store();
         store.refresh();
         let mut b = MpdResponse::pairs();
-        let line = match (store.measured_count(), self.audio_store()) {
+        let entries = self.audio_store().map(|m| m.entries());
+        let cov = store.measured_coverage(entries.as_deref());
+        let line = match (cov, &entries) {
             (None, _) => "off".to_string(),
-            (Some(n), Some(mirror)) => format!("{n} of {} analysed", mirror.entries().len()),
-            (Some(n), None) => format!("{n} analysed"),
+            (Some(c), Some(e)) => format!("{} of {} analysed", c.measured, e.len()),
+            (Some(c), None) => format!("{} analysed", c.measured),
         };
         b = b.pair("X-Features", line);
+        if let Some(c) = cov.filter(|c| c.stale > 0) {
+            b = b.pair("X-FeaturesStale", c.stale.to_string());
+        }
         if let Some(song) = self.current_song() {
             if let Some(f) = store.features(&song) {
                 b = b.pair("X-FeatureSource", if f.measured { "measured" } else { "metadata" });
@@ -17247,6 +17252,24 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    #[tokio::test]
+    async fn features_verb_is_well_formed_with_no_store_and_with_a_missing_dir() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let pairs = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("features must never ACK: {other:?}"),
+        };
+        let p = pairs(h.handle(MpdCommand::Features).await);
+        assert!(p.iter().any(|(k, v)| k == "X-Features" && v == "off"), "{p:?}");
+        // The batch never ran: the configured dir does not exist yet.
+        let dir = std::env::temp_dir().join(format!("hypodj-feat-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        h.set_feature_store(Arc::new(crate::features::FileFeatureStore::open(dir)));
+        let p = pairs(h.handle(MpdCommand::Features).await);
+        assert!(p.iter().any(|(k, v)| k == "X-Features" && v == "0 analysed"), "{p:?}");
+        assert!(!p.iter().any(|(k, _)| k == "X-FeaturesStale"), "{p:?}");
     }
 
     /// Queue ids in position order, for the queue-edit parity tests.

@@ -18,14 +18,18 @@
 //! mismatch means "analyse again"; a match is a no-op, so a killed run resumes at
 //! the first song it had not yet written.
 
-use crate::intelligence::{FeatureStore, MetadataStore, TrackFeatures};
+use crate::intelligence::{Coverage, FeatureStore, MetadataStore, TrackFeatures};
 use crate::model::Song;
-use crate::store::Fingerprint;
+use crate::store::{Fingerprint, IndexEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 /// On-disk schema version. A file with another value is ignored (re-analysed).
 pub const FEATURES_SCHEMA: u32 = 1;
@@ -235,28 +239,86 @@ pub struct TfOutput {
     pub models: Vec<String>,
 }
 
+/// The range rules, shared by the batch (which DROPS a bad value from the TF
+/// helper) and the daemon (which REJECTS a file carrying one): the batch never
+/// writes what the daemon would refuse, and a hand-edited or foreign file cannot
+/// smuggle in an `inf` that `unit` would quietly read as energy 0.5.
+fn prob_ok(v: f32) -> bool {
+    v.is_finite() && (0.0..=1.0).contains(&v)
+}
+fn deam_ok(v: f32) -> bool {
+    v.is_finite() && (0.0..=10.0).contains(&v)
+}
+fn embedding_ok(e: &[f32]) -> bool {
+    !e.is_empty() && e.iter().all(|x| x.is_finite())
+}
+
 /// Parse the TF helper output; a probability outside `0..=1` or a non-finite
 /// value is dropped rather than trusted.
 pub fn parse_tf(raw: &str) -> Option<TfOutput> {
     let mut o: TfOutput = serde_json::from_str(raw.trim()).ok()?;
-    let p = |x: Option<f32>| x.filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
-    let deam = |x: Option<f32>| x.filter(|v| v.is_finite() && (0.0..=10.0).contains(v));
-    o.voice = p(o.voice);
-    o.relaxed = p(o.relaxed);
-    o.danceable = p(o.danceable);
-    o.arousal = deam(o.arousal);
-    o.valence = deam(o.valence);
-    if o.embedding.as_ref().is_some_and(|e| e.is_empty() || e.iter().any(|x| !x.is_finite())) {
+    o.voice = o.voice.filter(|v| prob_ok(*v));
+    o.relaxed = o.relaxed.filter(|v| prob_ok(*v));
+    o.danceable = o.danceable.filter(|v| prob_ok(*v));
+    o.arousal = o.arousal.filter(|v| deam_ok(*v));
+    o.valence = o.valence.filter(|v| deam_ok(*v));
+    if o.embedding.as_ref().is_some_and(|e| !embedding_ok(e)) {
         o.embedding = None;
     }
     Some(o)
 }
 
-/// Read one feature file; `None` for anything unreadable or unparseable.
+impl Scalars {
+    /// Does every present value pass the same rules [`parse_tf`] and
+    /// [`parse_classic`] apply on the way in? (JSON cannot spell `inf`, but a
+    /// `1e39` deserialises to an `f32` infinity.)
+    pub fn is_sane(&self) -> bool {
+        let fin = |x: Option<f32>| x.is_none_or(f32::is_finite);
+        fin(self.bpm)
+            && self.bpm.is_none_or(|b| b > 0.0)
+            && fin(self.replay_gain_db)
+            && fin(self.danceability_dfa)
+            && fin(self.onset_rate)
+            && fin(self.dynamic_complexity)
+            && [self.voice, self.relaxed, self.danceable].iter().all(|x| x.is_none_or(prob_ok))
+            && [self.arousal, self.valence].iter().all(|x| x.is_none_or(deam_ok))
+    }
+}
+
+/// The largest feature file the daemon will read. Measured, not picked: the
+/// largest legitimate file is a 1280-d embedding plus a beat grid, and
+/// `largest_legitimate_file_fits_the_cap` builds a deliberately oversized one (a
+/// three-hour track at 300 bpm, every float at full printed width) and asserts
+/// it stays under a quarter of this (about 0.6 MB). Anything bigger is not something `hypodj-mir` wrote.
+pub const MAX_FEATURE_FILE: u64 = 4 << 20;
+
+/// Read at most [`MAX_FEATURE_FILE`] bytes of a REGULAR file, in bounded time.
+/// `O_NOFOLLOW` refuses a symlink, `O_NONBLOCK` makes opening a FIFO return at
+/// once instead of waiting for a writer forever, and the `fstat` of the OPENED
+/// descriptor (not the name, which can be swapped in between) rejects anything
+/// that is not a regular file before a single byte is read.
+fn read_bounded(path: &Path) -> Option<Vec<u8>> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let md = f.metadata().ok()?;
+    if !md.is_file() || md.len() > MAX_FEATURE_FILE {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(md.len() as usize);
+    f.take(MAX_FEATURE_FILE + 1).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 <= MAX_FEATURE_FILE).then_some(buf)
+}
+
+/// Read one feature file; `None` for anything unreadable, unparseable, not a
+/// regular file, oversized, of another schema, or carrying an out-of-range value.
 pub fn read_file(path: &Path) -> Option<FeatureFile> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let ff: FeatureFile = serde_json::from_str(&raw).ok()?;
-    (ff.schema == FEATURES_SCHEMA).then_some(ff)
+    let raw = read_bounded(path)?;
+    let ff: FeatureFile = serde_json::from_slice(&raw).ok()?;
+    let sane = ff.scalars.is_sane() && ff.embedding.as_deref().is_none_or(embedding_ok);
+    (ff.schema == FEATURES_SCHEMA && sane).then_some(ff)
 }
 
 /// The path of `song_id`'s file under `dir`.
@@ -290,79 +352,179 @@ pub fn workers_for(
     by_cpu.min(by_mem).min(cap)
 }
 
-#[derive(Default)]
-struct Loaded {
-    /// The directory mtime the map was read at; `None` = never read / missing.
+/// One directory entry as last seen: the identity of the bytes (inode, length,
+/// mtime) and what they parsed to. An unchanged identity is never re-read; an
+/// atomic rename always changes the inode, so a rewrite can never hide behind an
+/// equal size and a coarse timestamp.
+struct Seen {
+    ino: u64,
+    len: u64,
     mtime: Option<SystemTime>,
-    map: HashMap<String, FeatureFile>,
+    /// `None` = read and rejected (kept so a bad file is not re-parsed forever).
+    ff: Option<Arc<FeatureFile>>,
+}
+
+#[derive(Default)]
+struct ScanState {
+    /// The directory mtime of the last COMPLETE scan; `None` forces a rescan.
+    dir_mtime: Option<SystemTime>,
+    seen: HashMap<OsString, Seen>,
+}
+
+/// Directory mtimes this close to now are not trusted to mean "nothing changed
+/// since": timestamps are kernel-tick coarse, so a rename landing in the same tick
+/// as the scan's stat would otherwise leave the same mtime and be missed forever.
+const MTIME_SETTLE: Duration = Duration::from_secs(2);
+
+struct Inner {
+    dir: PathBuf,
+    /// The served snapshot: song id -> its valid, energy-bearing file. Readers
+    /// clone the `Arc` out under a short lock; a reload swaps it whole.
+    snap: RwLock<Arc<HashMap<String, Arc<FeatureFile>>>>,
+    /// Serialises scans; held only by the (blocking) reloader, never by readers.
+    scan: Mutex<ScanState>,
+    /// A background reload is queued or running (so refreshes never pile up).
+    inflight: AtomicBool,
+    /// Files opened and parsed so far (the incremental scan's own receipt).
+    reads: AtomicUsize,
+}
+
+impl Inner {
+    fn reload(&self) {
+        let mut st = self.scan.lock().unwrap();
+        let dir_mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+        if dir_mtime.is_some() && st.dir_mtime == dir_mtime {
+            return;
+        }
+        let mut seen = HashMap::new();
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                    continue;
+                };
+                // The name, NOT followed: a symlink, FIFO, socket or directory is
+                // never opened (read_bounded re-checks the opened descriptor).
+                let Ok(md) = std::fs::symlink_metadata(e.path()) else { continue };
+                if !md.file_type().is_file() {
+                    continue;
+                }
+                let (ino, len, mtime) = (md.ino(), md.len(), md.modified().ok());
+                let ff = match st.seen.remove(&name) {
+                    Some(old) if old.ino == ino && old.len == len && old.mtime == mtime => old.ff,
+                    _ => {
+                        self.reads.fetch_add(1, Ordering::Relaxed);
+                        read_file(&e.path())
+                        // Keyed by NAME, like hypodj-mir's own lookup: a file whose
+                        // stem is not its song id is not the answer for either id.
+                        .filter(|ff| ff.song_id == stem)
+                        .filter(|ff| ff.extractor.version == EXTRACTOR_VERSION)
+                        // A file with no energy-bearing value measures nothing the
+                        // daemon serves; it is not counted as analysed.
+                        .filter(|ff| ff.energy().is_some())
+                        .map(Arc::new)
+                    }
+                };
+                seen.insert(name, Seen { ino, len, mtime, ff });
+            }
+        }
+        let map: HashMap<String, Arc<FeatureFile>> = seen
+            .values()
+            .filter_map(|s| s.ff.as_ref().map(|ff| (ff.song_id.clone(), ff.clone())))
+            .collect();
+        *self.snap.write().unwrap() = Arc::new(map);
+        st.seen = seen;
+        let settled = dir_mtime
+            .and_then(|m| SystemTime::now().duration_since(m).ok())
+            .is_some_and(|age| age >= MTIME_SETTLE);
+        st.dir_mtime = if settled { dir_mtime } else { None };
+    }
 }
 
 /// The daemon's READ-ONLY view of the features directory. Implements
 /// [`FeatureStore`]: a song with a valid measured file gets MEASURED energy (and
 /// voice/bpm/embedding); every other song falls through to [`MetadataStore`], so
 /// callers keep working on a library that is only partly analysed.
+///
+/// Reads never touch the disk; [`FeatureStore::refresh`] hands the scan to a
+/// blocking-pool thread and returns at once, so a large or hostile directory can
+/// never stall a tokio worker. The scan itself is incremental: one `stat` per
+/// entry, and only entries whose identity moved are read and parsed.
 pub struct FileFeatureStore {
-    dir: PathBuf,
-    loaded: RwLock<Loaded>,
+    inner: Arc<Inner>,
 }
 
 impl FileFeatureStore {
-    /// Open (and read) `dir`. A missing directory is an empty store, not an error:
-    /// the batch may simply not have run yet.
+    /// Open (and synchronously read) `dir`. A missing directory is an empty store,
+    /// not an error: the batch may simply not have run yet. Blocking: call it off
+    /// the runtime (the daemon uses `spawn_blocking`).
     pub fn open(dir: PathBuf) -> Self {
-        let s = FileFeatureStore { dir, loaded: RwLock::new(Loaded::default()) };
-        s.reload_if_changed();
+        let s = FileFeatureStore {
+            inner: Arc::new(Inner {
+                dir,
+                snap: RwLock::new(Arc::new(HashMap::new())),
+                scan: Mutex::new(ScanState::default()),
+                inflight: AtomicBool::new(false),
+                reads: AtomicUsize::new(0),
+            }),
+        };
+        s.reload_now();
         s
     }
 
     pub fn dir(&self) -> &Path {
-        &self.dir
+        &self.inner.dir
     }
 
-    /// Re-read the directory when its mtime moved (an atomic write renames into
-    /// it, which bumps the directory mtime). Cheap when nothing changed: one stat.
-    pub fn reload_if_changed(&self) {
-        let mtime = std::fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
-        if self.loaded.read().unwrap().mtime == mtime && mtime.is_some() {
+    /// Scan now, on the calling thread (blocking). For startup and tests.
+    pub fn reload_now(&self) {
+        self.inner.reload();
+    }
+
+    /// Queue a scan on tokio's blocking pool and return immediately; without a
+    /// runtime (a plain thread, a sync test) scan inline. At most one is queued.
+    pub fn reload_in_background(&self) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.reload_now();
+            return;
+        };
+        if self.inner.inflight.swap(true, Ordering::AcqRel) {
             return;
         }
-        let mut map = HashMap::new();
-        if let Ok(rd) = std::fs::read_dir(&self.dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) != Some("json") {
-                    continue;
-                }
-                if let Some(ff) = read_file(&p) {
-                    if ff.extractor.version == EXTRACTOR_VERSION {
-                        map.insert(ff.song_id.clone(), ff);
-                    }
-                }
-            }
-        }
-        let mut l = self.loaded.write().unwrap();
-        l.mtime = mtime;
-        l.map = map;
+        let inner = self.inner.clone();
+        rt.spawn_blocking(move || {
+            // Cleared BEFORE the scan: a change landing mid-scan queues another.
+            inner.inflight.store(false, Ordering::Release);
+            inner.reload();
+        });
     }
 
-    /// How many songs carry a measured file right now.
+    /// How many files the scans have opened and parsed in total.
+    pub fn files_read(&self) -> usize {
+        self.inner.reads.load(Ordering::Relaxed)
+    }
+
+    fn snapshot(&self) -> Arc<HashMap<String, Arc<FeatureFile>>> {
+        self.inner.snap.read().unwrap().clone()
+    }
+
+    /// How many songs carry a valid, energy-bearing measured file right now
+    /// (regardless of whether they are still in any mirror).
     pub fn count(&self) -> usize {
-        self.loaded.read().unwrap().map.len()
+        self.snapshot().len()
     }
 
     /// The raw file for `id`, if loaded.
     pub fn get(&self, id: &str) -> Option<FeatureFile> {
-        self.loaded.read().unwrap().map.get(id).cloned()
+        self.snapshot().get(id).map(|ff| (**ff).clone())
     }
 
     /// The measured features for `song`, or `None` when it has no file or the
     /// file describes different bytes (the song's size/suffix moved since).
     fn measured(&self, song: &Song) -> Option<TrackFeatures> {
-        let l = self.loaded.read().unwrap();
-        let ff = l.map.get(&song.id.0)?;
-        if song.size.is_some_and(|s| s != ff.source.size)
-            || song.suffix.as_deref().is_some_and(|x| !x.eq_ignore_ascii_case(&ff.source.suffix))
-        {
+        let snap = self.snapshot();
+        let ff = snap.get(&song.id.0)?;
+        if !describes(ff, song.size, song.suffix.as_deref()) {
             return None;
         }
         let energy = ff.energy()?;
@@ -378,17 +540,37 @@ impl FileFeatureStore {
     }
 }
 
+/// Does `ff` describe these bytes? An unknown size/suffix does not disqualify it.
+fn describes(ff: &FeatureFile, size: Option<u64>, suffix: Option<&str>) -> bool {
+    size.is_none_or(|s| s == ff.source.size)
+        && suffix.is_none_or(|x| x.eq_ignore_ascii_case(&ff.source.suffix))
+}
+
 impl FeatureStore for FileFeatureStore {
     fn features(&self, song: &Song) -> Option<TrackFeatures> {
         self.measured(song).or_else(|| MetadataStore.features(song))
     }
 
     fn refresh(&self) {
-        self.reload_if_changed();
+        self.reload_in_background();
     }
 
-    fn measured_count(&self) -> Option<usize> {
-        Some(self.count())
+    fn measured_coverage(&self, mirror: Option<&[IndexEntry]>) -> Option<Coverage> {
+        let snap = self.snapshot();
+        let Some(entries) = mirror else {
+            return Some(Coverage { measured: snap.len(), stale: 0 });
+        };
+        let mut c = Coverage::default();
+        for e in entries {
+            if let Some(ff) = snap.get(&e.id.0) {
+                if describes(ff, Some(e.size), Some(e.suffix.as_str())) {
+                    c.measured += 1;
+                } else {
+                    c.stale += 1;
+                }
+            }
+        }
+        Some(c)
     }
 }
 
@@ -509,7 +691,7 @@ mod tests {
             .unwrap();
         std::fs::write(dir.join("junk.json"), "{").unwrap();
         let store = FileFeatureStore::open(dir.clone());
-        assert_eq!(store.measured_count(), Some(1), "the corrupt file is skipped");
+        assert_eq!(store.count(), 1, "the corrupt file is skipped");
 
         let mut song = mk("s1");
         song.size = Some(10);
@@ -546,7 +728,209 @@ mod tests {
     fn missing_dir_is_an_empty_store() {
         let store = FileFeatureStore::open(PathBuf::from("/nonexistent/hypodj-features"));
         assert_eq!(store.count(), 0);
-        store.reload_if_changed();
+        store.reload_now();
         assert_eq!(store.count(), 0);
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hypodj-feat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn put(dir: &Path, name: &str, ff: &FeatureFile) {
+        crate::resume::atomic_write_bytes(&dir.join(name), &serde_json::to_vec(ff).unwrap()).unwrap();
+    }
+
+    fn with_id(id: &str, arousal: f32) -> FeatureFile {
+        let mut ff = file(Scalars { arousal: Some(arousal), ..Default::default() });
+        ff.song_id = id.into();
+        ff
+    }
+
+    /// Open on a worker thread; panics if it does not return within `secs`.
+    fn open_bounded(dir: PathBuf, secs: u64) -> FileFeatureStore {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(FileFeatureStore::open(dir));
+        });
+        rx.recv_timeout(Duration::from_secs(secs)).expect("open() hung on the features dir")
+    }
+
+    #[test]
+    fn fifo_symlink_dir_and_oversized_entries_are_skipped_in_bounded_time() {
+        let dir = tmp("hostile");
+        put(&dir, "s1.json", &with_id("s1", 5.0));
+        // A FIFO with no writer: open(O_RDONLY) without O_NONBLOCK blocks forever.
+        let fifo = std::ffi::CString::new(dir.join("s2.json").into_os_string().into_encoded_bytes())
+            .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // A symlink to a VALID file elsewhere is still not followed.
+        let outside = tmp("hostile-outside");
+        put(&outside, "s3.json", &with_id("s3", 5.0));
+        std::os::unix::fs::symlink(outside.join("s3.json"), dir.join("s3.json")).unwrap();
+        std::fs::create_dir(dir.join("s4.json")).unwrap();
+        // Valid JSON, padded past the cap.
+        let mut big = serde_json::to_vec(&with_id("s5", 5.0)).unwrap();
+        big.pop();
+        big.extend(std::iter::repeat_n(b' ', MAX_FEATURE_FILE as usize));
+        big.push(b'}');
+        std::fs::write(dir.join("s5.json"), &big).unwrap();
+
+        let store = open_bounded(dir.clone(), 10);
+        assert_eq!(store.count(), 1, "only the regular, in-cap file loads");
+        assert!(store.get("s1").is_some());
+        store.reload_now();
+        assert_eq!(store.count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn largest_legitimate_file_fits_the_cap() {
+        // Worst case on purpose: a 1280-d embedding and a three-hour beat grid at
+        // 300 bpm, every float at the widest width serde prints for an f32.
+        let mut ff = file(Scalars {
+            bpm: Some(123.45678),
+            arousal: Some(1.2345678),
+            ..Default::default()
+        });
+        ff.embedding = Some(vec![-1.2345678e-30; 1280]);
+        ff.timeline.beats = vec![-12345.678; 3 * 60 * 300];
+        let n = serde_json::to_vec(&ff).unwrap().len() as u64;
+        assert!(n * 4 < MAX_FEATURE_FILE, "{n} bytes must sit far below the cap");
+    }
+
+    #[test]
+    fn reload_is_incremental_and_rereads_only_what_changed() {
+        let dir = tmp("incr");
+        for i in 0..50 {
+            put(&dir, &format!("t{i}.json"), &with_id(&format!("t{i}"), 5.0));
+        }
+        let store = FileFeatureStore::open(dir.clone());
+        assert_eq!((store.count(), store.files_read()), (50, 50));
+        // A fresh dir mtime is never trusted, so this rescans - and re-reads none.
+        store.reload_now();
+        assert_eq!(store.files_read(), 50, "unchanged files are not re-parsed");
+        put(&dir, "t7.json", &with_id("t7", 9.0));
+        store.reload_now();
+        assert_eq!(store.files_read(), 51, "exactly the rewritten file is re-read");
+        assert_eq!(store.get("t7").unwrap().scalars.arousal, Some(9.0));
+        std::fs::remove_file(dir.join("t8.json")).unwrap();
+        store.reload_now();
+        assert_eq!((store.count(), store.files_read()), (49, 51), "a removal reads nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_on_the_runtime_never_scans_inline() {
+        let dir = tmp("bg");
+        let store = FileFeatureStore::open(dir.clone());
+        put(&dir, "s1.json", &with_id("s1", 5.0));
+        {
+            // A scan inline would deadlock on this lock; refresh must just return.
+            let _held = store.inner.scan.lock().unwrap();
+            store.refresh();
+            store.refresh();
+            assert_eq!(store.count(), 0);
+        }
+        for _ in 0..500 {
+            if store.count() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(store.count(), 1, "the background scan picked the file up");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_is_only_the_answer_for_the_id_it_is_named_after() {
+        let dir = tmp("stem");
+        put(&dir, "a.json", &with_id("b", 5.0));
+        put(&dir, "c.json", &with_id("c", 5.0));
+        let store = FileFeatureStore::open(dir.clone());
+        assert!(store.get("b").is_none() && store.get("a").is_none(), "a.json claiming b is rejected");
+        assert_eq!(store.count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_of_range_and_energy_less_files_are_rejected() {
+        let dir = tmp("range");
+        let mut v = serde_json::to_value(with_id("inf", 5.0)).unwrap();
+        v["scalars"]["arousal"] = serde_json::json!(1e39); // reads as f32 inf
+        std::fs::write(dir.join("inf.json"), v.to_string()).unwrap();
+        put(&dir, "hi.json", &with_id("hi", 42.0));
+        let mut vp = with_id("vp", 5.0);
+        vp.scalars.voice = Some(1.5);
+        put(&dir, "vp.json", &vp);
+        let mut none = file(Scalars { voice: Some(0.1), ..Default::default() });
+        none.song_id = "none".into();
+        put(&dir, "none.json", &none);
+        put(&dir, "ok.json", &with_id("ok", 5.0));
+        let store = FileFeatureStore::open(dir.clone());
+        assert_eq!(store.count(), 1, "only ok.json is a valid measurement");
+        let mut s = mk("inf");
+        s.size = Some(10);
+        assert!(!store.features(&s).unwrap().measured, "inf arousal is not energy 0.5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_counts_valid_mirror_entries_and_reports_stale_apart() {
+        let dir = tmp("cov");
+        for id in ["m1", "m2", "gone"] {
+            put(&dir, &format!("{id}.json"), &with_id(id, 5.0));
+        }
+        let store = FileFeatureStore::open(dir.clone());
+        let entry = |id: &str, size: u64| IndexEntry {
+            id: crate::model::SongId(id.into()),
+            suffix: "flac".into(),
+            size,
+            created: None,
+            indexed: None,
+            pinned: false,
+            stale: false,
+            suspect: false,
+            last_played_unix: 0,
+            recency_dirty: false,
+        };
+        // m1 matches, m2's bytes moved (stale), m3 unanalysed, `gone` left the mirror.
+        let mirror = [entry("m1", 10), entry("m2", 11), entry("m3", 10)];
+        assert_eq!(store.measured_coverage(Some(&mirror)), Some(Coverage { measured: 1, stale: 1 }));
+        assert_eq!(store.measured_coverage(None), Some(Coverage { measured: 3, stale: 0 }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_replace_during_reloads_never_tears() {
+        let dir = tmp("swap");
+        put(&dir, "s1.json", &with_id("s1", 2.0));
+        let store = FileFeatureStore::open(dir.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = {
+            let (dir, stop) = (dir.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    // Different lengths too, so a torn read would not parse.
+                    let mut ff = with_id("s1", if i % 2 == 0 { 8.0 } else { 2.0 });
+                    ff.timeline.beats = vec![1.0; (i % 7) as usize];
+                    put(&dir, "s1.json", &ff);
+                    i += 1;
+                }
+            })
+        };
+        for _ in 0..300 {
+            store.reload_now();
+            let a = store.get("s1").expect("s1 never vanishes mid-replace").scalars.arousal;
+            assert!(a == Some(2.0) || a == Some(8.0), "{a:?}");
+        }
+        stop.store(true, Ordering::Relaxed);
+        w.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

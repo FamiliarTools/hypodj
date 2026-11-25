@@ -55,19 +55,30 @@ impl TrackFeatures {
 /// ops path is an alternate impl that ignores metadata and looks a real embedding
 /// up by `song.id`. Selector resolution depends only on THIS trait, so the
 /// embedding path swaps in without touching handler or wire code.
+/// What [`FeatureStore::measured_coverage`] reports: songs with a VALID measured
+/// energy, and songs whose file describes bytes other than the current copy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Coverage {
+    pub measured: usize,
+    pub stale: usize,
+}
+
 pub trait FeatureStore: Send + Sync {
     /// Features for `song`, or `None` when this store has nothing for it. The
     /// metadata store always yields `Some` (it can always score genre); a
     /// precomputed store yields `None` for a song it never extracted.
     fn features(&self, song: &Song) -> Option<TrackFeatures>;
 
-    /// Pick up new data from the backing source, when there is one. Cheap and
-    /// synchronous; the default (metadata) store has nothing to refresh.
+    /// Pick up new data from the backing source, when there is one. Must never
+    /// block the caller on I/O (it is called from async handlers): a store with a
+    /// backing directory kicks a background reload and returns at once, so the
+    /// NEXT read sees the change. The default (metadata) store has nothing to do.
     fn refresh(&self) {}
 
-    /// How many songs carry MEASURED features, or `None` for a store that never
-    /// measures (the metadata heuristic).
-    fn measured_count(&self) -> Option<usize> {
+    /// Measured coverage, or `None` for a store that never measures (the metadata
+    /// heuristic). With `mirror`, only songs IN it count, and a file that describes
+    /// other bytes than the mirrored copy is counted as stale instead.
+    fn measured_coverage(&self, _mirror: Option<&[crate::store::IndexEntry]>) -> Option<Coverage> {
         None
     }
 }
