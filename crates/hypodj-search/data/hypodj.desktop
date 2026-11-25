@@ -5,6 +5,6 @@ GenericName=Music Player
 Comment=hypodj jukebox
 Exec=dj-gui
 Terminal=true
-Icon=audio-x-generic
+Icon=hypodj
 Categories=Audio;AudioVideo;Player;
 Keywords=music;dj;hypodj;next;pause;
