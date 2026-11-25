@@ -1359,28 +1359,39 @@ impl TuiState {
         self.heard.reset();
     }
 
-    /// Map a key to an Intent (or pure state change). The dispatch is per-mode.
-    /// The album identity the deck names right now, the key [`TuiState::art_album`]
-    /// is compared against.
+    /// The identity of what the deck names right now, the key [`TuiState::art_album`]
+    /// is compared against. An album uri is the album on its own (a compilation's
+    /// per-track artist must not drop its cover); a bare album name is ambiguous, so
+    /// it is paired with the artist; an item with no album identity at all (a stream)
+    /// is keyed by what its cover was fetched for - the uri and the cover id - so two
+    /// streams never share a cover. Nothing playing is `(None, None)`, which never
+    /// matches.
     pub fn album_identity(&self) -> (Option<String>, Option<String>) {
-        (self.now.album_uri.clone().or_else(|| self.now.album.clone()), self.now.artist.clone())
+        if let Some(u) = &self.now.album_uri {
+            return (Some(u.clone()), None);
+        }
+        if let Some(a) = &self.now.album {
+            return (Some(a.clone()), self.now.artist.clone());
+        }
+        match &self.now.file {
+            Some(f) => (None, Some(format!("fetch:{f}\u{1f}{}", self.now.cover.as_deref().unwrap_or("")))),
+            None => (None, None),
+        }
     }
 
     /// The cover to draw for what is playing, or `None` for the neutral swatch: the
-    /// held art only while it belongs to the album on screen. What is drawn belongs to
+    /// held art only while it belongs to the item on screen. What is drawn belongs to
     /// what is named.
     pub fn art_for_now(&self) -> Option<&crate::art::AlbumArt> {
         let art = self.art.as_ref()?;
         let id = self.album_identity();
-        let named = id.0.is_some() || id.1.is_some();
         match &self.art_album {
-            Some(held) if named && *held == id => Some(art),
-            // A stream (no album) keeps the per-uri key the fetch already enforces.
-            Some((None, None)) if !named => Some(art),
+            Some(held) if id != (None, None) && *held == id => Some(art),
             _ => None,
         }
     }
 
+    /// Map a key to an Intent (or pure state change). The dispatch is per-mode.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
         // Any keypress dismisses a stale banner; the action below may set a new one.
         self.clear_status();
@@ -2985,6 +2996,35 @@ impl TuiState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stream_to_stream_drops_the_previous_stations_cover() {
+        let mut s = TuiState::new();
+        s.now.file = Some("https://a.example/live".into());
+        s.now.cover = Some("https://a.example/a.jpg".into());
+        s.art = Some(crate::art::AlbumArt::for_test_solid([1, 2, 3]));
+        s.art_album = Some(s.album_identity());
+        assert!(s.art_for_now().is_some(), "a station draws its own cover");
+        s.now.file = Some("https://b.example/live".into());
+        s.now.cover = Some("https://b.example/b.jpg".into());
+        assert!(s.art_for_now().is_none(), "station B must not wear station A's cover");
+    }
+
+    #[test]
+    fn compilation_track_artist_change_keeps_the_album_cover() {
+        let mut s = TuiState::new();
+        s.now.file = Some("song/1".into());
+        s.now.album_uri = Some("album/7".into());
+        s.now.album = Some("Hits".into());
+        s.now.artist = Some("Artist One".into());
+        s.art = Some(crate::art::AlbumArt::for_test_solid([1, 2, 3]));
+        s.art_album = Some(s.album_identity());
+        s.now.file = Some("song/2".into());
+        s.now.artist = Some("Artist Two".into());
+        assert!(s.art_for_now().is_some(), "same album uri keeps its cover across artists");
+        s.now.album_uri = Some("album/8".into());
+        assert!(s.art_for_now().is_none(), "another album drops it");
+    }
 
     #[test]
     fn live_elapsed_advances_only_while_playing_and_stops_at_the_end() {

@@ -1,0 +1,40 @@
+ nothing playing                   Queue  Albums  Lists  DJ  Find                                              server unreachable
+ press : and say what to play,    Albums - server unreachable, showing 1 album on disk
+ or Tab to browse albums            Held Harbour                                                                         on disk
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Tab or 1-5 switch views now; F1-F5 retire next release

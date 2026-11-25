@@ -1,0 +1,19 @@
+key F2
+wait 2
+key j
+key j
+key Enter
+wait 5
+exec nft delete table inet hjblock 2>/dev/null; ip addr replace 10.77.0.1/24 dev srv0 2>/dev/null; ip addr del 10.77.0.1/24 dev srv0; echo no_network > /tmp/hypodj-usability-2215872/world
+wait 10
+snap ten-seconds-after
+wait 40
+snap fifty-seconds-after
+wait 75
+snap after-the-buffered-song-ends
+wait 115
+snap when-the-unfetched-song-is-due
+wait 20
+snap half-a-minute-after-due
+wait 60
+snap ninety-seconds-after-due

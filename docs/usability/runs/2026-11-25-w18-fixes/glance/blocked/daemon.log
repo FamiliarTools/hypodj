@@ -1,0 +1,18 @@
+[2m2026-11-25T07:33:54.111365Z[0m [32m INFO[0m [2mhypodj_core::subsonic[0m[2m:[0m negotiated OpenSubsonic extensions [3mcount[0m[2m=[0m7
+[2m2026-11-25T07:33:54.111426Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m connected [3murl[0m[2m=[0mhttp://10.77.0.1:4533
+[2m2026-11-25T07:33:54.180191Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m P2 plan executor started
+[2m2026-11-25T07:33:54.180261Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m P3 NL translator injected (rules fast-path, local model behind it when wired) [3mwith_model[0m[2m=[0mfalse
+[2m2026-11-25T07:33:54.180272Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m MPRIS disabled by config
+[2m2026-11-25T07:33:54.181845Z[0m [32m INFO[0m [2mhypodj_core::store[0m[2m:[0m store: opened [3mroot[0m[2m=[0m/tmp/hypodj-usability-2215872/runs/glance/blocked/store [3mentries[0m[2m=[0m3 [3mbytes[0m[2m=[0m2190762 [3mswept[0m[2m=[0m0 [3morphans[0m[2m=[0m0 [3mhealed[0m[2m=[0m0
+[2m2026-11-25T07:33:54.216612Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m cover store open [3mdir[0m[2m=[0m/tmp/hypodj-usability-2215872/runs/glance/blocked/state/covers [3mbytes[0m[2m=[0m0
+[2m2026-11-25T07:33:54.216619Z[0m [32m INFO[0m [2mhypodj_core::store[0m[2m:[0m store: reconciler started [3minterval_secs[0m[2m=[0m900 [3mmax_bytes[0m[2m=[0m17179869184
+[2m2026-11-25T07:33:54.216689Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m heard ledger open [3mdir[0m[2m=[0m/tmp/hypodj-usability-2215872/runs/glance/blocked/state/heard
+[2m2026-11-25T07:33:54.216732Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m station metadata open [3mpath[0m[2m=[0m/tmp/hypodj-usability-2215872/runs/glance/blocked/state/station_meta.json
+[2m2026-11-25T07:33:54.222521Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m tape open; a mark keeps the sound [3mdir[0m[2m=[0m/tmp/hypodj-usability-2215872/runs/glance/blocked/state/tape [3mmax_bytes[0m[2m=[0m2147483648
+[2m2026-11-25T07:33:54.224234Z[0m [32m INFO[0m [2mhypodj_core::store[0m[2m:[0m store: mirror frontier [3mresident[0m[2m=[0m3 [3mcached[0m[2m=[0m3 [3mpending[0m[2m=[0m0 [3mdeferred[0m[2m=[0m0 [3mbytes[0m[2m=[0m2190762 [3mbudget[0m[2m=[0m17179869184 [3msource[0m[2m=[0m"free-space" [3mwaiting[0m[2m=[0m"none" [3mrule[0m[2m=[0mnot played in 60 days first, by share of the album; what is already on disk keeps a tie; starred albums before loose starred songs where anything is neglected, loose starred songs first where nothing is; a starred artist's other albums last
+[2m2026-11-25T07:33:54.225349Z[0m [32m INFO[0m [2mhypodj_core::resume[0m[2m:[0m no readable resume state; cold starting [3mpath[0m[2m=[0m/tmp/hypodj-usability-2215872/runs/glance/blocked/state/resume.toml
+[2m2026-11-25T07:33:54.225392Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m starting MPD server [3mbind[0m[2m=[0m127.0.0.1:6610 [3mserver_online[0m[2m=[0mtrue
+[2m2026-11-25T07:33:54.225469Z[0m [32m INFO[0m [2mhypodj_core::mpd[0m[2m:[0m MPD server listening [3mbind[0m[2m=[0m127.0.0.1:6610
+[2m2026-11-25T07:33:54.225480Z[0m [32m INFO[0m [2mhypodj_core::viz[0m[2m:[0m viz socket listening [3mbind[0m[2m=[0m127.0.0.1:6611
+[2m2026-11-25T07:34:07.183370Z[0m [32m INFO[0m [2mhypodj_core::reach[0m[2m:[0m server reachability changed [3mserver[0m[2m=[0m"unreachable"
+[2m2026-11-25T07:34:23.600700Z[0m [32m INFO[0m [2mhypodj[0m[2m:[0m shutdown signal received; persisting resume state then fading out

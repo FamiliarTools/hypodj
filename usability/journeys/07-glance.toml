@@ -24,7 +24,37 @@ at = 7
 severity = "S0"
 sizes = ["80x24", "60x20"]
 # findadd queues the album in search order, so the titles are matched as a set.
-screen_require_re = ["(Low Tide|Harbour Lights|Moorings)  Fixture Band", "next  (Low Tide|Harbour Lights|Moorings)", "server (online|unreachable)|no network", "held  stop playback in \\d+ min"]
+screen_require_re = ["(Low Tide|Harbour Lights|Moorings)  Fixture Band", "next  (Low Tide|Harbour Lights|Moorings)", "held  stop playback in \\d+ min"]
+
+# The server word, per state: a regex that accepts every word cannot fail, so each
+# world names the one word that is true in it. A dropped address is reported by the
+# daemon as either (it sees a refused or unroutable connect), so no_network takes both.
+[[check]]
+name = "online: the glance says server online"
+at = 7
+when = ["online"]
+severity = "S1"
+sizes = ["80x24", "60x20"]
+screen_require_re = ["server online"]
+screen_forbid_re = ["server unreachable|no network"]
+
+[[check]]
+name = "blocked: the glance says server unreachable"
+at = 7
+when = ["blocked"]
+severity = "S1"
+sizes = ["80x24", "60x20"]
+screen_require_re = ["server unreachable"]
+screen_forbid_re = ["server online"]
+
+[[check]]
+name = "no_network: the glance says no network or server unreachable"
+at = 7
+when = ["no_network"]
+severity = "S1"
+sizes = ["80x24", "60x20"]
+screen_require_re = ["no network|server unreachable"]
+screen_forbid_re = ["server online"]
 
 [[check]]
 name = "at 80x24 the Albums view shows at least 16 album rows"

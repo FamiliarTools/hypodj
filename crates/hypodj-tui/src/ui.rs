@@ -54,9 +54,13 @@ pub(crate) fn regions(area: Rect, state: &TuiState) -> Regions {
         let right = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(cols[1]);
         return Regions { deck: cols[0], rail: true, views: right[0], body: right[1], bar };
     }
-    let strip_h = deck_lines(state, area.width.saturating_sub(strip_cover_cols(state)) as usize, false)
+    // Six rows normally; more only while the body would still keep BODY_KEEP rows, so a
+    // tall terminal shows every held plan and a short one counts the rest.
+    const BODY_KEEP: u16 = 10;
+    let cap = main.height.saturating_sub(1 + BODY_KEEP).max(6) as usize;
+    let strip_h = deck_lines(state, area.width.saturating_sub(strip_cover_cols(state)) as usize, false, None)
         .len()
-        .clamp(3, 6) as u16;
+        .clamp(3, cap) as u16;
     let v = Layout::vertical([
         Constraint::Length(strip_h),
         Constraint::Length(1),
@@ -900,7 +904,10 @@ fn deck_is_empty(np: &NowPlaying) -> bool {
 /// different things: what is playing, the transport line, why it stopped, what comes
 /// next, and one line per hold (timer, armed plan) and field pull. A line that has
 /// nothing to say is not drawn, so a resting deck reserves no row for it.
-fn deck_lines(state: &TuiState, width: usize, rail: bool) -> Vec<Line<'static>> {
+/// `max_rows` is the strip's height when the caller knows it: held plans that do not
+/// fit are COUNTED on a `+N more held` line rather than cut off by the edge with no
+/// trace. `None` is the measuring pass (and the rail, which wraps).
+fn deck_lines(state: &TuiState, width: usize, rail: bool, max_rows: Option<usize>) -> Vec<Line<'static>> {
     let np = &state.now;
     let quiet = hypodj_style::ratatui::style_for(hypodj_style::Role::InkQuiet, state.term_bg, state.truecolor);
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -920,10 +927,10 @@ fn deck_lines(state: &TuiState, width: usize, rail: bool) -> Vec<Line<'static>> 
         if np.error.is_none() {
             // The one empty state a new user meets, so it says the act, not the keys
             // to navigate to it.
-            lines.push(Line::from(Span::styled(
-                "press : and say what to play, or Tab to browse albums",
-                quiet,
-            )));
+            // Wrapped into the strip's spare row, so a narrow terminal keeps the end.
+            for row in status_lines("press : and say what to play, or Tab to browse albums", width.max(8), 2) {
+                lines.push(Line::from(Span::styled(row, quiet)));
+            }
         }
         if let Some(m) = np.modes.label() {
             lines.push(Line::from(Span::styled(format!("modes: {m}"), quiet)));
@@ -995,24 +1002,65 @@ fn deck_lines(state: &TuiState, width: usize, rail: bool) -> Vec<Line<'static>> 
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    for p in state.held_plans.iter().filter(|p| !p.is_feature()) {
-        lines.push(Line::from(vec![
-            Span::styled("held  ", Style::default().quiet()),
-            Span::raw(p.sentence(now_unix)),
-        ]));
-    }
+    let held: Vec<Line<'static>> = state
+        .held_plans
+        .iter()
+        .filter(|p| !p.is_feature())
+        .map(|p| {
+            Line::from(vec![
+                Span::styled("held  ", Style::default().quiet()),
+                // The rail wraps, so it keeps the whole sentence; the strip has one row.
+                Span::raw(if rail { p.sentence(now_unix) } else { ellipsize_words(&p.sentence(now_unix), width.saturating_sub(6)) }),
+            ])
+        })
+        .collect();
+    let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(fl) = field_hud(&np.field) {
-        lines.push(Line::from(Span::styled(fl, Style::default().quiet())));
+        tail.push(Line::from(Span::styled(fl, Style::default().quiet())));
     }
     // The just-finished hint: the one ambient line no other surface shows, since the
     // track has left the queue. Off the DJ view only (the DJ view owns that voice).
     // A playing deck already names its track, so only a resting one carries it.
     if let Some(hint) = np.hint.as_ref().filter(|_| np.error.is_none() && deck_is_empty(np)) {
         if state.screen != Screen::Dj && hint_earns_line(&hint.kind) {
-            lines.push(Line::from(Span::styled(hint.phrase(), Style::default().quiet())));
+            tail.push(Line::from(Span::styled(hint.phrase(), Style::default().quiet())));
         }
     }
+    let avail = max_rows.map_or(usize::MAX, |m| m.saturating_sub(lines.len()));
+    if held.len() + tail.len() <= avail {
+        lines.extend(held);
+        lines.extend(tail);
+    } else {
+        // Held plans outrank the ambient tail, and the count of what did not fit is
+        // never the part that goes missing.
+        let shown = held.len().min(avail.saturating_sub(1));
+        let more = held.len() - shown;
+        lines.extend(held.into_iter().take(shown));
+        if more > 0 {
+            lines.push(Line::from(Span::styled(format!("+{more} more held"), Style::default().quiet())));
+        }
+        let used = shown + usize::from(more > 0);
+        lines.extend(tail.into_iter().take(avail.saturating_sub(used)));
+    }
     lines
+}
+
+/// Cut `s` to `width` columns at a word boundary, ending in an ellipsis, so a held
+/// plan never reads as a whole sentence that the edge took the end of.
+fn ellipsize_words(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let room = width - 1;
+    let cut = s.char_indices().nth(room).map_or(s.len(), |(i, _)| i);
+    let head = match s[..cut].rfind(' ') {
+        Some(i) if i > 0 => &s[..i],
+        _ => &s[..cut],
+    };
+    format!("{}\u{2026}", head.trim_end())
 }
 
 /// `next  <title> · <artist> · on disk · +N more`: the song after this one, with its
@@ -1086,7 +1134,7 @@ fn render_strip(f: &mut Frame, area: Rect, state: &TuiState) {
         render_cover(f, rect, state);
     }
     let text = Rect { x: area.x + cover_w, width: area.width - cover_w, ..area };
-    let lines = deck_lines(state, text.width as usize, false);
+    let lines = deck_lines(state, text.width as usize, false, Some(text.height as usize));
     f.render_widget(Paragraph::new(lines), text);
 }
 
@@ -1108,7 +1156,7 @@ fn render_rail(f: &mut Frame, area: Rect, state: &TuiState) {
         }
     }
     let text = Rect { y, height: (inner.y + inner.height).saturating_sub(y), ..inner };
-    let lines = deck_lines(state, text.width as usize, true);
+    let lines = deck_lines(state, text.width as usize, true, None);
     f.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), text);
 }
 
@@ -1446,6 +1494,45 @@ mod tests {
         s.now_at = Some(std::time::Instant::now());
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(out.contains("paused \u{b7} 1:23 / 5:37"), "playhead drawn:\n{out}");
+    }
+
+    fn held(id: u64, what: &str) -> hypodj_client::model::HeldPlan {
+        hypodj_client::model::HeldPlan {
+            id,
+            origin: "mcp:x".into(),
+            what: Some(what.into()),
+            when: "at 23:00".into(),
+            next_fire: None,
+        }
+    }
+
+    #[test]
+    fn held_plans_past_the_strip_are_counted_and_cut_at_a_word() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("A Song".into());
+        s.now.file = Some("song/1".into());
+        for i in 0..8 {
+            s.held_plans.push(held(i, &format!("play the long ambient record number {i} quietly through the evening")));
+        }
+        let out = render_to_lines_sized(&s, 60, 20).join("\n");
+        assert!(out.contains("more held"), "clipped held plans must be counted:\n{out}");
+        assert!(out.contains('\u{2026}'), "a cut held line ends in an ellipsis:\n{out}");
+        for line in out.lines().filter(|l| l.contains("held  play")) {
+            let t = line.trim_end();
+            assert!(t.ends_with('\u{2026}') || t.ends_with("23:00"), "cut mid-phrase: {t}");
+        }
+        // A tall terminal has room for every plan, and spends it.
+        let tall = render_to_lines_sized(&s, 60, 40).join("\n");
+        assert!(!tall.contains("more held"), "spare body rows show every plan:\n{tall}");
+        assert_eq!(tall.matches("held  ").count(), 8, "{tall}");
+    }
+
+    #[test]
+    fn empty_deck_hint_fits_a_narrow_strip() {
+        let s = TuiState::new();
+        let out = render_to_lines_sized(&s, 40, 20).join("\n");
+        assert!(out.contains("browse albums"), "the hint must not be cut at 40 cols:\n{out}");
     }
 
     #[test]
@@ -4354,6 +4441,7 @@ mod sixel_render_tests {
         let mut s = TuiState::new();
         s.sixel_cell_px = Some((8, 17));
         s.art = Some(crate::art::AlbumArt::for_test_solid([10, 20, 30]));
+        s.now.file = Some("song/1".into());
         s.art_album = Some(s.album_identity());
         s.now.title = Some("The Peacocks".into());
         s.now.state = Some("play".into());
@@ -4414,6 +4502,7 @@ mod sixel_render_tests {
         let mut s = TuiState::new();
         s.sixel_cell_px = Some((8, 17));
         s.art = Some(art());
+        s.now.file = Some("song/1".into());
         s.art_album = Some(s.album_identity());
         s.now.title = Some("Future Proof".into());
         s.now.state = Some("play".into());
@@ -4481,6 +4570,7 @@ mod sixel_render_tests {
         s.now.state = Some("play".into());
         s.now.title = Some("A".into());
         s.art = Some(art());
+        s.now.file = Some("song/1".into());
         s.art_album = Some(s.album_identity());
 
         let payload_of = |t: &Terminal<TestBackend>| -> Option<String> {
@@ -4510,6 +4600,7 @@ mod sixel_render_tests {
 
         // The track advances while the menu is still up: a DIFFERENT cover.
         s.art = Some(crate::art::AlbumArt::for_test_solid([20, 40, 220]));
+        s.now.file = Some("song/1".into());
         s.art_album = Some(s.album_identity());
         terminal.draw(|f| render(f, &s)).unwrap();
         assert_eq!(
@@ -4538,6 +4629,7 @@ mod sixel_render_tests {
         s.now.state = Some("play".into());
         s.now.title = Some("A".into());
         s.art = Some(art());
+        s.now.file = Some("song/1".into());
         s.art_album = Some(s.album_identity());
         let payload_of = |t: &Terminal<TestBackend>| -> Option<String> {
             t.backend().buffer().content().iter()

@@ -3,7 +3,13 @@ goal = "Skip from an album with a cover into one whose cover cannot be fetched (
 # Timeline: online while the covered album plays and the next album is queued and
 # mirrored; then the server goes and the listener skips into the next album.
 start = "online"
-states = ["blocked", "no_network"]
+# blocked only. The stale cover is a PENDING-fetch bug: the outgoing art is held until
+# the new cover's fetch answers. Under blocked that fetch hangs, so the old album's
+# cover sits under the new title and the check bites. Under no_network the connect is
+# refused at once, the fetch answers None within milliseconds and every build (master
+# included) drops to the swatch before the snap, so that state could only ever pass -
+# a check that cannot fail is not evidence, so it is not claimed here.
+states = ["blocked"]
 min_steps = 8          # open Albums, pick, play, move, enqueue, then one skip key
 step_budget = 8        # three times across the album boundary
 script = [

@@ -1,0 +1,7 @@
+{"n":0,"step":"start","t_ms":641,"settled":true,"settle_ms":630}
+{"n":1,"step":"key F2","t_ms":1278,"settled":true,"settle_ms":631}
+{"n":2,"step":"wait 6","t_ms":7952,"settled":true,"settle_ms":634}
+{"n":3,"step":"snap fallback","t_ms":8563,"settled":true,"settle_ms":605}
+{"n":4,"step":"exec nft delete table inet hjblock 2>/dev/null; ip addr replace 10.77.0.1/24 dev srv0 2>/dev/null; echo online > /tmp/hypodj-usability-2215872/world","t_ms":9190,"settled":true,"settle_ms":605,"exit":0}
+{"n":5,"step":"wait 20","t_ms":29903,"settled":true,"settle_ms":657}
+{"n":6,"step":"snap server-back","t_ms":30515,"settled":true,"settle_ms":603}

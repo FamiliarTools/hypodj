@@ -1,0 +1,20 @@
+nothing playing
+press : and say what to play, or Tab to browse albums
+
+ Queue  Albums  Lists  DJ  Find                   no network
+Albums - server unreachable, showing 1 album on disk
+  Held Harbour                                      on disk
+
+
+
+
+
+
+
+
+
+
+
+
+
+Tab or 1-5 switch views now; F1-F5 retire next release

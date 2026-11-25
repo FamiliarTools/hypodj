@@ -1,0 +1,7 @@
+{"n":0,"step":"start","t_ms":641,"settled":true,"settle_ms":631}
+{"n":1,"step":"exec python3 -I /tmp/hypodj-usability-2215872/mpdsend.py 'findadd album \"Held Harbour\" ; play'","t_ms":1437,"settled":true,"settle_ms":759,"exit":0}
+{"n":2,"step":"wait 4","t_ms":6090,"settled":true,"settle_ms":629}
+{"n":3,"step":"key 1","t_ms":6707,"settled":true,"settle_ms":609}
+{"n":4,"step":"key i","t_ms":7450,"settled":true,"settle_ms":733}
+{"n":5,"step":"wait 3","t_ms":11106,"settled":true,"settle_ms":633}
+{"n":6,"step":"snap info-open","t_ms":11719,"settled":true,"settle_ms":604}

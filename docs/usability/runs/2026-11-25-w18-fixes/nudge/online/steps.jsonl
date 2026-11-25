@@ -1,0 +1,14 @@
+{"n":0,"step":"start","t_ms":643,"settled":true,"settle_ms":632}
+{"n":1,"step":"exec python3 -I /tmp/hypodj-usability-2215872/mpdsend.py 'findadd album \"Held Harbour\" ; play'","t_ms":1443,"settled":true,"settle_ms":760,"exit":0}
+{"n":2,"step":"wait 4","t_ms":6097,"settled":true,"settle_ms":629}
+{"n":3,"step":"key >","t_ms":6860,"settled":true,"settle_ms":754}
+{"n":4,"step":"wait 2","t_ms":9509,"settled":true,"settle_ms":631}
+{"n":5,"step":"snap skipped","t_ms":10124,"settled":true,"settle_ms":607}
+{"n":6,"step":"say more like this","t_ms":10766,"settled":true,"settle_ms":631}
+{"n":7,"step":"key y","t_ms":11433,"settled":true,"settle_ms":655}
+{"n":8,"step":"wait 4","t_ms":16098,"settled":true,"settle_ms":632}
+{"n":9,"step":"snap more-like-this","t_ms":16716,"settled":true,"settle_ms":608}
+{"n":10,"step":"say stop after this album","t_ms":17361,"settled":true,"settle_ms":635}
+{"n":11,"step":"key y","t_ms":18003,"settled":true,"settle_ms":633}
+{"n":12,"step":"wait 2","t_ms":20659,"settled":true,"settle_ms":633}
+{"n":13,"step":"snap stop-after-album","t_ms":21277,"settled":true,"settle_ms":609}
