@@ -150,6 +150,20 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
             println!("  {v}");
         }
     }
+    // Held, but the server's index still mis-sizes them (task 01m86ehm): the copy
+    // is good, the index is stale. Only a FULL rescan fixes it (a quick scan does
+    // not look at size).
+    if let Some(n) = pairs
+        .iter()
+        .find(|(k, _)| k == "X-StoreStaleIndex")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        println!(
+            "{n} held song{} the server's index mis-sizes - a full server rescan fixes it",
+            if n == 1 { "" } else { "s" }
+        );
+    }
     // A frontier view with no groups is a real answer (an empty pin set), and so is a
     // store with nothing deferred. Say so rather than ending on a bare summary line,
     // which reads as truncated output.

@@ -7310,7 +7310,7 @@ impl HypodjHandler {
             )
         } else if st.complete() {
             (
-                format!("all {} songs", st.cached_tracks),
+                format!("all {} songs{}", st.cached_tracks, Self::held_beyond(&st)),
                 Some(format!("{} GiB", Self::gib(st.bytes))),
             )
         } else {
@@ -7336,7 +7336,12 @@ impl HypodjHandler {
                 .pending_tracks
                 .saturating_sub(st.given_up)
                 .saturating_sub(st.size_disagreements.len());
-            let mut head = format!("{} of {} songs", st.cached_tracks, st.resident_tracks);
+            let mut head = format!(
+                "{} of {} songs{}",
+                st.cached_tracks,
+                st.resident_tracks,
+                Self::held_beyond(&st)
+            );
             if moving > 0 {
                 head.push_str(&format!(" - {moving} still coming"));
             }
@@ -7444,6 +7449,21 @@ impl HypodjHandler {
             ));
         }
         vec![("X-Store", line)]
+    }
+
+    /// The songs on disk OUTSIDE the favourites line, as a head suffix: " + 13 more
+    /// on disk" (task 01m886zg). The head counted only the claimed set while `store
+    /// albums` lists every held entry, so a live mirror read "all 409 songs" beside
+    /// "422 songs": the 13 were an unstarred album's tracks the demote path keeps (an
+    /// accidental unstar costs no re-download) plus opportunistic queue-ahead songs.
+    /// Both play offline. ONE truth - the index entries - so cached + this suffix ==
+    /// `store albums`' total == `X-StoreEntries`. Joined with " + ", never ", ", so the
+    /// head stays one clause for `store_badge`.
+    fn held_beyond(st: &crate::store::StoreStatus) -> String {
+        match st.entries.saturating_sub(st.cached_tracks) {
+            0 => String::new(),
+            n => format!(" + {n} more on disk"),
+        }
     }
 
     /// The disk-only head: "3 songs on disk".
@@ -7935,7 +7955,10 @@ impl HypodjHandler {
             // LOAD-BEARING: without it a pending count that will NEVER reach zero is
             // indistinguishable from one that is merely slow.
             .pair("X-StoreGivenUp", st.given_up.to_string())
-            .pair("X-StoreSizeMismatch", st.size_disagreements.len().to_string());
+            .pair("X-StoreSizeMismatch", st.size_disagreements.len().to_string())
+            // Held songs the server's index still mis-sizes (task 01m86ehm): they
+            // play, the index is what is wrong, and a full server rescan fixes it.
+            .pair("X-StoreStaleIndex", st.stale_index.to_string());
         // NAMED, one pair per song, in BOTH views: the fix is an action on the server
         // (a rescan, or a look at the file), so the user needs WHICH songs - before
         // this they were only in journalctl.
@@ -29149,6 +29172,49 @@ mod tests {
         // The arithmetic the line now promises: held + coming + given-up == resident.
         assert_eq!(0 + 7 + 3, 10, "the three clauses account for every resident song");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_badge_head_and_store_albums_count_the_same_held_songs() {
+        // Task 01m886zg: live, the badge said "all 409 songs" while `store albums`
+        // listed 422. The 13 were held entries OUTSIDE the favourites line (an
+        // unstarred album the demote path keeps). Both now derive from the index.
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let dir = store_tmpdir("store-one-truth");
+        let store = open_store(&dir);
+        h.set_audio_store(store.clone());
+        let fav: Vec<Song> = (0..2).map(|i| store_song(&format!("f{i}"), 100)).collect();
+        for s in &fav {
+            commit_into(&store, s);
+        }
+        commit_into(&store, &store_song("kept", 100));
+
+        let mut input = crate::store::PassInput::new(crate::store::PassMode::Full, 1_000_000);
+        input.configured_max = 1_000_000;
+        input.budget_source = crate::store::BudgetSource::FreeSpace;
+        input.entries = store.entries();
+        input.pins = Some(crate::store::PinSet::of_songs(fav));
+        let status = crate::store::plan_pass_with_status(&input).1.expect("publishes");
+        assert_eq!((status.cached_tracks, status.entries), (2, 3));
+        store.publish_status_for_test(status);
+
+        let pairs = pairs_of(h.handle(MpdCommand::Status).await);
+        let badge = pairs.iter().find(|(k, _)| k == "X-Store").map(|(_, v)| v.clone()).expect("badge");
+        assert!(badge.starts_with("all 2 songs + 1 more on disk, "), "{badge}");
+        assert_eq!(
+            hypodj_client_badge_head(&badge),
+            "all 2 songs + 1 more on disk",
+            "still ONE head clause"
+        );
+        let pairs = pairs_of(h.handle(crate::mpd::parse("store albums")).await);
+        let head = pairs.iter().find(|(k, _)| k == "OfflineSummary").map(|(_, v)| v.clone()).expect("head");
+        assert!(head.ends_with("(3 songs)"), "store albums counts the same 3: {head}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The badge's first ", "-separated clause, the way the clients split it.
+    fn hypodj_client_badge_head(line: &str) -> &str {
+        line.split(", ").next().unwrap_or("")
     }
 
     #[tokio::test]

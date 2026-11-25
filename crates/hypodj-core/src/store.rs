@@ -179,6 +179,12 @@ const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// disk.
 const DOWNLOAD_SIZE_SLACK: u64 = 64 * 1024;
 
+/// The largest original accepted on a served `Content-Length` that disagrees with
+/// the server's index (task 01m86ehm). A stale index can be wildly SMALL (a row
+/// recorded a few MiB into a copy), so no ratio of it is a usable bound; this is an
+/// absolute ceiling well above any real track, so a lying header cannot fill a disk.
+const STALE_INDEX_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// First retry delay for an id whose download failed, doubled per consecutive
 /// failure up to [`DOWNLOAD_BACKOFF_MAX`]. In memory only: the pass cadence IS the
 /// retry schedule, and a restart is allowed to try again immediately.
@@ -420,6 +426,14 @@ pub struct Fingerprint {
     /// this leg of the verdict rather than forcing a re-download.
     #[serde(default)]
     pub created: Option<String>,
+    /// The size the server's INDEX reported at commit, recorded ONLY when it was not
+    /// the length the server actually served (task 01m86ehm). Navidrome's quick scan
+    /// re-reads a file only when its mtime moved forward, never when its size did, so
+    /// a row indexed mid-copy keeps a stale size forever. The served bytes (`size`)
+    /// are what landed; this is the stale index number, kept so the verdict does not
+    /// read the server's unchanged stale row as drift and re-download every pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed: Option<u64>,
 }
 
 /// The per-song commit record. Its atomic appearance IS the commit; see
@@ -524,6 +538,9 @@ pub struct IndexEntry {
     pub size: u64,
     /// The server `created` leg of the fingerprint, when known.
     pub created: Option<String>,
+    /// The server index's (stale) size when it disagreed with the served bytes at
+    /// commit; see [`Fingerprint::indexed`].
+    pub indexed: Option<u64>,
     pub pinned: bool,
     pub stale: bool,
     /// In-memory only: de-offered by [`AudioStore::lookup`], bytes kept until a
@@ -703,6 +720,7 @@ pub fn scan_dir(root: &Path) -> io::Result<DirScan> {
                     suffix: sc.fingerprint.suffix.clone(),
                     size: sc.fingerprint.size,
                     created: sc.fingerprint.created.clone(),
+                    indexed: sc.fingerprint.indexed,
                     pinned: sc.pinned,
                     stale: sc.stale,
                     suspect: false,
@@ -1453,6 +1471,10 @@ pub struct StoreStatus {
     /// Songs the server's index MIS-SIZES, by name. Not retried and not counted in
     /// `given_up`: the fix is a server rescan, so the surface names WHICH songs.
     pub size_disagreements: Vec<SizeDisagreement>,
+    /// Held songs whose bytes were accepted on the served length while the server's
+    /// index still reports a different (stale) size - task 01m86ehm. They play; the
+    /// count says the SERVER needs a full rescan, which nothing here can trigger.
+    pub stale_index: usize,
     pub waiting: StoreWaiting,
 }
 
@@ -1639,7 +1661,11 @@ fn fingerprint_verdict(entry: &IndexEntry, server: &Song) -> Verdict {
     let (Some(size), Some(suffix)) = (server.size, server.suffix.as_deref()) else {
         return Verdict::Unknown;
     };
-    if size != entry.size || sanitize_suffix(Some(suffix)) != entry.suffix {
+    // The served bytes OR the stale index size they were accepted against: a server
+    // still reporting the stale number has not changed the file, and one now reporting
+    // the served length has merely caught up with it (task 01m86ehm).
+    let same_size = size == entry.size || entry.indexed == Some(size);
+    if !same_size || sanitize_suffix(Some(suffix)) != entry.suffix {
         return Verdict::Differ;
     }
     // The `created` leg only votes when BOTH sides have one; one-sided absence is
@@ -2694,6 +2720,18 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
 
     // ── The self-description, published only when the pin set was authoritative.
     let status = frontier.as_ref().map(|front| {
+        // Held entries whose server row STILL reports the stale index size they were
+        // accepted against. Per unique pinned id (`pin_song`), so an id in two groups
+        // counts once; a server that has caught up (now reports the served length)
+        // drops out of the count with no download.
+        let stale_index = pin_song
+            .iter()
+            .filter(|(id, p)| {
+                by_id.get(**id).is_some_and(|e| {
+                    e.indexed.is_some() && p.size.is_some() && p.size == e.indexed
+                })
+            })
+            .count();
         let mut cached_tracks = 0usize;
         let mut pending_tracks = 0usize;
         let mut pending_bytes = 0u64;
@@ -2731,6 +2769,7 @@ pub fn plan_pass_with_status(input: &PassInput) -> (Vec<StoreAction>, Option<Sto
             frontier: front.ranked_groups(),
             given_up: 0,
             size_disagreements: Vec::new(),
+            stale_index,
             waiting: if !writes_allowed {
                 StoreWaiting::ReserveBreached
             } else if input.paused {
@@ -3171,6 +3210,22 @@ impl AudioStore {
         pinned: bool,
         now_unix: u64,
     ) -> io::Result<PathBuf> {
+        self.commit_served(song, tmp, pinned, now_unix, None)
+    }
+
+    /// [`commit`](Self::commit) with the length the server actually SERVED, when the
+    /// downloader proved one (body length == declared `Content-Length`) that differs
+    /// from the index's `song.size`. The gate is then the served length, and the
+    /// stale index size is recorded in [`Fingerprint::indexed`] (task 01m86ehm).
+    /// `None`, or a served length equal to the index, is the ordinary commit.
+    pub fn commit_served(
+        &self,
+        song: &Song,
+        tmp: &Path,
+        pinned: bool,
+        now_unix: u64,
+        served: Option<u64>,
+    ) -> io::Result<PathBuf> {
         if !is_storable_id(&song.id.0) {
             let _ = std::fs::remove_file(tmp);
             return Err(io::Error::new(
@@ -3180,12 +3235,16 @@ impl AudioStore {
         }
         // No server-reported size means no commit gate, and without the gate a
         // truncated download would commit as valid. Refuse rather than trust.
-        let Some(size) = song.size.filter(|s| *s > 0) else {
+        let Some(index_size) = song.size.filter(|s| *s > 0) else {
             let _ = std::fs::remove_file(tmp);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("no server-reported size for {:?}; refusing to commit", song.id.0),
             ));
+        };
+        let (size, indexed) = match served.filter(|n| *n > 0 && *n != index_size) {
+            Some(n) => (n, Some(index_size)),
+            None => (index_size, None),
         };
         let got = std::fs::metadata(tmp)?.len();
         if got != size {
@@ -3227,6 +3286,7 @@ impl AudioStore {
                 size,
                 suffix: suffix.clone(),
                 created: song.created.clone(),
+                indexed,
             },
             song: song.clone(),
         };
@@ -3248,6 +3308,7 @@ impl AudioStore {
                 suffix,
                 size,
                 created: song.created.clone(),
+                indexed,
                 pinned,
                 stale: false,
                 suspect: false,
@@ -4071,7 +4132,6 @@ async fn fetch_original(
     tmp: &Path,
     expected: u64,
 ) -> Result<u64, DownloadError> {
-    let cap = expected.saturating_add(DOWNLOAD_SIZE_SLACK);
     let mut resp = tokio::time::timeout(DOWNLOAD_CHUNK_TIMEOUT, http.get(url).send())
         .await
         .map_err(|_| "download: timed out connecting".to_string())?
@@ -4079,13 +4139,28 @@ async fn fetch_original(
     if !resp.status().is_success() {
         return Err(format!("download: HTTP {}", resp.status()).into());
     }
-    // A declared length that already disagrees is a wasted transfer: refuse before
-    // a single byte lands.
-    if let Some(len) = resp.content_length() {
-        if len != expected {
+    // THE SERVED LENGTH IS THE AUTHORITY when the server declares one (task
+    // 01m86ehm). Navidrome's quick scan re-reads a file only when its mtime moved
+    // forward, never when its size did, so a row indexed mid-copy by an
+    // mtime-preserving copier keeps a stale `size` forever while the file it serves is
+    // whole. Gating on the index made those songs permanently absent from the mirror;
+    // gating on `Content-Length` still catches every truncation (the body must reach
+    // exactly the declared end) and the caller records the stale index.
+    //
+    // Bounded by [`STALE_INDEX_MAX_BYTES`] so a lying header still cannot fill the
+    // disk. The cost, named: admission reserved the INDEX size, so a stale-indexed
+    // song may overshoot the budget by the difference until the next pass evicts.
+    let declared = resp.content_length();
+    if let Some(len) = declared {
+        if len != expected && (len == 0 || len > STALE_INDEX_MAX_BYTES) {
             return Err(DownloadError::SizeDisagreement { indexed: expected, served: Some(len) });
         }
     }
+    let target = declared.unwrap_or(expected);
+    let cap = match declared {
+        Some(len) => len,
+        None => expected.saturating_add(DOWNLOAD_SIZE_SLACK),
+    };
     let mut file = File::create(tmp).map_err(|e| format!("download: creating temp: {e}"))?;
     let mut written: u64 = 0;
     loop {
@@ -4103,9 +4178,16 @@ async fn fetch_original(
     }
     file.flush().map_err(|e| format!("download: flushing temp: {e}"))?;
     // A CLEAN end of body (a dropped connection is an error from `chunk()` above, not
-    // a `None`) that is not the indexed length: the server served a whole file of a
-    // different size than it indexed.
-    if written != expected {
+    // a `None`) that is not the target length. With a declared length that is a short
+    // body - a transient. Without one, the index is the only gate there is: the
+    // server served a whole file of a different size than it indexed.
+    if written != target {
+        if declared.is_some() {
+            return Err(format!(
+                "download: body ended at {written} of {target} declared bytes"
+            )
+            .into());
+        }
         return Err(DownloadError::SizeDisagreement { indexed: expected, served: Some(written) });
     }
     Ok(written)
@@ -4795,14 +4877,35 @@ async fn download_and_commit<P: PinSource>(
     pinned: bool,
 ) -> Result<PathBuf, DownloadError> {
     let tmp = store.tmp_path();
-    if let Err(e) = source.fetch(song, &tmp).await {
-        let doomed = tmp.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(&doomed)).await;
-        return Err(e);
-    }
-    let (s, song, tmp2) = (store.clone(), song.clone(), tmp.clone());
-    match tokio::task::spawn_blocking(move || s.commit(&song, &tmp2, pinned, now_unix())).await {
-        Ok(Ok(path)) => Ok(path),
+    let served = match source.fetch(song, &tmp).await {
+        Ok(n) => n,
+        Err(e) => {
+            let doomed = tmp.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(&doomed)).await;
+            return Err(e);
+        }
+    };
+    let indexed = song.size;
+    let (s, song2, tmp2) = (store.clone(), song.clone(), tmp.clone());
+    match tokio::task::spawn_blocking(move || {
+        s.commit_served(&song2, &tmp2, pinned, now_unix(), Some(served))
+    })
+    .await
+    {
+        Ok(Ok(path)) => {
+            if indexed.is_some_and(|i| i != served) {
+                // ONCE per commit, naming the song: the mirror is right, the server's
+                // index is not, and only a full rescan of the server corrects it.
+                tracing::warn!(
+                    id = %song.id.0, title = %song.title,
+                    artist = song.artist.as_deref().unwrap_or(""),
+                    indexed = indexed.unwrap_or(0), served,
+                    "store: kept a download whose served length disagrees with the \
+                     server's index; the index is stale (a full server rescan fixes it)"
+                );
+            }
+            Ok(path)
+        }
         // `commit` removes the temp itself on every refusal, so there is nothing
         // left to clean here.
         Ok(Err(e)) => Err(DownloadError::Transient(e.to_string())),
@@ -4960,6 +5063,7 @@ mod tests {
             suffix: "flac".into(),
             size,
             created: Some("2024-05-01T12:00:00Z".into()),
+            indexed: None,
             pinned: false,
             stale: false,
             suspect: false,
@@ -4987,6 +5091,7 @@ mod tests {
                 size,
                 suffix,
                 created: s.created.clone(),
+                indexed: None,
             },
             song: s.clone(),
         };
@@ -5179,6 +5284,7 @@ mod tests {
                 size: 22_548_990,
                 suffix: "flac".into(),
                 created: Some("2024-05-01T12:34:56.000Z".into()),
+                indexed: None,
             },
             song: song("so-1", 22_548_990, "flac", Some("2024-05-01T12:34:56.000Z")),
         }
@@ -5222,7 +5328,7 @@ mod tests {
         sparse.played = None;
         let sc = Sidecar {
             content_type: None,
-            fingerprint: Fingerprint { size: 1024, suffix: "mp3".into(), created: None },
+            fingerprint: Fingerprint { size: 1024, suffix: "mp3".into(), created: None, indexed: None },
             song: sparse.clone(),
             ..sample_sidecar()
         };
@@ -5253,14 +5359,14 @@ mod tests {
         assert!(sidecar_from_toml(no_song).is_none());
         // A zero-size fingerprint would let an EMPTY file pass the length check.
         let sc = Sidecar {
-            fingerprint: Fingerprint { size: 0, suffix: "flac".into(), created: None },
+            fingerprint: Fingerprint { size: 0, suffix: "flac".into(), created: None, indexed: None },
             ..sample_sidecar()
         };
         assert!(sidecar_from_toml(&sidecar_to_toml(&sc)).is_none(), "zero size");
         // A tampered suffix that would escape the store directory.
         for bad in ["../../etc/passwd", "toml", "FLAC", "a/b", ""] {
             let sc = Sidecar {
-                fingerprint: Fingerprint { size: 10, suffix: bad.into(), created: None },
+                fingerprint: Fingerprint { size: 10, suffix: bad.into(), created: None, indexed: None },
                 ..sample_sidecar()
             };
             assert!(sidecar_from_toml(&sidecar_to_toml(&sc)).is_none(), "suffix {bad:?}");
@@ -10108,5 +10214,112 @@ content_type = "audio/flac"
         cat.set_starred(Starred { songs: Vec::new(), albums: Vec::new(), artists: Vec::new() });
         tokio::time::advance(PIN_SET_MEMO_TTL + Duration::from_secs(1)).await;
         assert_eq!(exp.pins().await.expect("expired").groups.len(), 0);
+    }
+
+    // ── task 01m86ehm: the served length, not a stale index, gates a download ──
+
+    /// A one-shot local HTTP server: answers the first request with `head` then
+    /// `body`, then closes. Returns its URL. A REAL socket, so reqwest's own
+    /// Content-Length handling is what the test exercises.
+    async fn serve_once(head: String, body: Vec<u8>) -> Option<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let addr = l.local_addr().ok()?;
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = l.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        Some(format!("http://{addr}/rest/download"))
+    }
+
+    fn http_client() -> Option<reqwest::Client> {
+        std::panic::catch_unwind(reqwest::Client::new).ok()
+    }
+
+    #[tokio::test]
+    async fn a_served_length_that_disagrees_with_a_stale_index_is_accepted() {
+        // The live case: the index says 12 (recorded mid-copy), the server serves
+        // the whole 40-byte file and declares 40. The old gate refused it forever.
+        let Some(http) = http_client() else { return };
+        let body = vec![b'f'; 40];
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n".to_string();
+        let Some(url) = serve_once(head, body.clone()).await else { return };
+        let dir = unowned_tmpdir("stale-index-fetch");
+        let tmp = dir.join("t.part");
+        let got = fetch_original(&http, &url, &tmp, 12).await.expect("accepted on Content-Length");
+        assert_eq!(got, 40);
+        assert_eq!(std::fs::read(&tmp).expect("temp"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_body_short_of_its_declared_length_is_still_refused() {
+        // The served-length gate must still catch truncation: declared 40, sent 20.
+        let Some(http) = http_client() else { return };
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n".to_string();
+        let Some(url) = serve_once(head, vec![b'f'; 20]).await else { return };
+        let dir = unowned_tmpdir("stale-index-short");
+        let err = fetch_original(&http, &url, &dir.join("t.part"), 12)
+            .await
+            .expect_err("a truncated body never passes");
+        assert!(matches!(err, DownloadError::Transient(_)), "truncation is transient: {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn with_no_declared_length_the_index_is_still_the_gate() {
+        // No Content-Length (close-delimited body): there is no served authority, so
+        // a body that is not the indexed size stays a named size disagreement.
+        let Some(http) = http_client() else { return };
+        let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string();
+        let Some(url) = serve_once(head, vec![b'f'; 40]).await else { return };
+        let dir = unowned_tmpdir("stale-index-nolen");
+        let err = fetch_original(&http, &url, &dir.join("t.part"), 12)
+            .await
+            .expect_err("no authority but the index");
+        assert_eq!(err, DownloadError::SizeDisagreement { indexed: 12, served: Some(40) });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_index_commit_survives_a_rescan_and_is_not_drift_or_counted_once_fixed() {
+        let dir = tmpdir("stale-index-commit");
+        let s = store(&dir, 1 << 30);
+        let indexed = song("so-st", 12, "flac", Some("2024-05-01T12:00:00Z"));
+        let tmp = s.tmp_path();
+        std::fs::write(&tmp, vec![b'x'; 40]).expect("temp");
+        s.commit_served(&indexed, &tmp, true, 1_700_000_000, Some(40)).expect("commit on served");
+        let sc = s.read_sidecar(&sid("so-st")).expect("sidecar");
+        assert_eq!(sc.fingerprint.size, 40, "the gate and stat check are the served bytes");
+        assert_eq!(sc.fingerprint.indexed, Some(12), "the stale index number is recorded");
+        drop(s);
+        // A reopen (the directory scan) keeps it valid: length matches `size`.
+        let s = store(&dir, 1 << 30);
+        let e = s.entries().into_iter().find(|e| e.id.0 == "so-st").expect("still held");
+        assert_eq!((e.size, e.indexed), (40, Some(12)));
+        // The server still reports the stale 12: NOT drift, counted as a stale index.
+        assert_eq!(fingerprint_verdict(&e, &indexed), Verdict::Equal);
+        let mut input = PassInput::new(PassMode::Full, 1 << 30);
+        input.entries = vec![e.clone()];
+        input.pins = Some(PinSet::of_songs(vec![indexed.clone()]));
+        let (plan, status) = plan_pass_with_status(&input);
+        assert!(dls(&plan).is_empty(), "no re-download for a stale index: {plan:?}");
+        assert_eq!(status.expect("status").stale_index, 1);
+        // The server is rescanned and now reports 40: still Equal, and no longer counted.
+        let fixed = song("so-st", 40, "flac", Some("2024-05-01T12:00:00Z"));
+        assert_eq!(fingerprint_verdict(&e, &fixed), Verdict::Equal);
+        input.pins = Some(PinSet::of_songs(vec![fixed]));
+        let (plan, status) = plan_pass_with_status(&input);
+        assert!(dls(&plan).is_empty());
+        assert_eq!(status.expect("status").stale_index, 0);
+        // A real change (a third size) is still drift.
+        let changed = song("so-st", 99, "flac", Some("2024-05-01T12:00:00Z"));
+        assert_eq!(fingerprint_verdict(&e, &changed), Verdict::Differ);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
