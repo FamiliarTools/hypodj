@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="coal" cx="52" cy="82" r="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F6B577"/>
+      <stop offset="1" stop-color="#C17A2F"/>
+    </radialGradient>
+  </defs>
+  <rect x="12" y="20" width="104" height="96" rx="48" fill="#0b0806"/>
+  <rect x="12" y="14" width="104" height="96" rx="48" fill="#1a120a"/>
+  <rect x="66" y="28" width="9" height="58" rx="4.5" fill="#FAF6F0"/>
+  <path d="M 70 28 C 88 34 96 44 92 62 C 88 52 82 48 74 46 Z" fill="#FAF6F0"/>
+  <ellipse cx="56" cy="84" rx="20" ry="15" transform="rotate(-22 56 84)" fill="url(#coal)"/>
+</svg>

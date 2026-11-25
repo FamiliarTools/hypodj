@@ -1,5 +1,7 @@
 # hypodj - The DJ Underneath
 
+<img src="crates/hypodj-search/data/icons/hicolor/scalable/apps/hypodj.svg" alt="HypoDJ icon: an ember-lit record" width="96">
+
 A single Rust daemon that speaks the **MPD text protocol** to clients (ncmpcpp,
 mpc, its own tools) and is itself an **OpenSubsonic client + mpv audio player**.
 It replaced a mopidy + mopidy-subidy Python stack in one process: MPD commands in,

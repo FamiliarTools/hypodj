@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <radialGradient id="glow" cx="64" cy="58" r="24" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F6B577"/>
+      <stop offset="0.6" stop-color="#E9914A"/>
+      <stop offset="1" stop-color="#C17A2F"/>
+    </radialGradient>
+  </defs>
+  <!-- depth edge: the HIG's thin lower side -->
+  <circle cx="64" cy="66" r="54" fill="#0b0806"/>
+  <circle cx="64" cy="60" r="54" fill="#1a120a"/>
+  <circle cx="64" cy="60" r="43" fill="none" stroke="#33251a" stroke-width="2"/>
+  <circle cx="64" cy="60" r="34" fill="none" stroke="#33251a" stroke-width="2"/>
+  <path d="M 26 46 A 41 41 0 0 1 50 22" fill="none" stroke="#6a5038" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="64" cy="60" r="22" fill="url(#glow)"/>
+  <circle cx="64" cy="60" r="5" fill="#1a120a"/>
+</svg>

@@ -100,6 +100,12 @@ rustPlatform.buildRustPackage {
     install -Dm644 $d/tech.familiartools.HypoDJ.SearchProvider.ini \
       $out/share/gnome-shell/search-providers/tech.familiartools.HypoDJ.SearchProvider.ini
     install -Dm644 $d/hypodj.desktop $out/share/applications/hypodj.desktop
+    # The app icon (docs/design/logo): one id, hypodj, shared by every HypoDJ
+    # desktop surface (dj-gui entry, search provider results, the GTK djg).
+    install -Dm644 $d/icons/hicolor/scalable/apps/hypodj.svg \
+      $out/share/icons/hicolor/scalable/apps/hypodj.svg
+    install -Dm644 $d/icons/hicolor/symbolic/apps/hypodj-symbolic.svg \
+      $out/share/icons/hicolor/symbolic/apps/hypodj-symbolic.svg
     substituteInPlace $out/share/applications/hypodj.desktop \
       --replace-fail "Exec=dj-gui" "Exec=$out/bin/dj-gui"
     install -Dm644 $d/tech.familiartools.HypoDJ.SearchProvider.service \
