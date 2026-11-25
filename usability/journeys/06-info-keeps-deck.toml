@@ -1,0 +1,37 @@
+id = "info-keeps-deck"
+goal = "Read the details of the song in the queue without losing sight of what is playing."
+start = "{state}"
+states = ["online"]
+min_steps = 2          # music already on; open the Queue view, open Info on the row
+step_budget = 4
+script = [
+  "mpd findadd album \"Held Harbour\" ; play",
+  "wait 4",
+  "key 1",
+  "key i",
+  "wait 3",
+  "snap info-open",
+]
+
+[[check]]
+name = "the info card is open"
+severity = "S1"
+screen_require_any = ["i closes"]
+
+[[check]]
+name = "the playing title and the transport word stay on the top rows with Info open"
+severity = "S0"
+sizes = ["80x24", "60x20"]
+# findadd queues the album in search order, so the title is matched as a set.
+screen_require_re = ["\\A(?:[^\\n]*\\n){0,2}[^\\n]*(Low Tide|Harbour Lights|Moorings)  Fixture Band", "\\A(?:[^\\n]*\\n){0,3}[^\\n]*playing ·"]
+
+[[check]]
+name = "the playing title heads the wide rail with Info open"
+severity = "S0"
+sizes = ["129x40"]
+screen_require_re = ["(?m)^ (\\S+ )?(Low Tide|Harbour Lights|Moorings)(  Fixture Band| {2,})"]
+
+[[check]]
+name = "the transport word on screen matches the daemon with Info open, at every size"
+severity = "S0"
+transport_matches = true

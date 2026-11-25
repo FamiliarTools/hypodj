@@ -46,10 +46,19 @@ moves like a physical fader, not a step function.
 A ratatui terminal jukebox, pure MPD/TCP (no libmpv), event-driven via the
 daemon's idle-push socket with worker-thread IO so the UI never blocks on network.
 
-- Now-playing card with dithered album-art cover, up-next preview, and a physical
-  volume fader
-- Five screens (`F1`-`F5`): Queue / Albums / Playlists / DJ / Search - the DJ
-  screen is a natural-language Claude Code DJ pane beside the queue (shown above)
+- The Deck: a now-playing strip that nothing covers - cover, title, artist and
+  album, the transport line with a physical volume fader, the next song with
+  whether it is on disk, and every held timer or plan in words. At 110 columns and
+  wider it becomes a rail on the left with a bigger cover. Info, help, the heard
+  ledger, the journal, the row menu and the confirm all open in the body below it,
+  so what is playing stays in sight while you dig
+- One body view at a time, switched with `Tab` / `Shift`+`Tab` or `1`-`5`: Queue /
+  Albums / Lists / DJ / Find (`F1`-`F5` still work for this release). The view line
+  steps down to first letters on a narrow terminal and always keeps the server word
+- The cover is drawn only for the album it was fetched for: skip into an album whose
+  cover has not arrived (or cannot, the server being gone) and the deck shows the
+  album's neutral swatch, never the last album's cover
+- (The screenshots above predate the Deck layout.)
 - Vim-like navigation: `j`/`k`, `g`/`G`, scrolloff; `Shift`+`P` jumps the Queue
   cursor to the currently-playing song
 - `r` starts an endless radio from the row under the cursor - a song, an album, an

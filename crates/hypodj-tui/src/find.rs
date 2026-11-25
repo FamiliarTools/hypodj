@@ -6,9 +6,8 @@
 //! `run_search`, `search_jump`, `search_step`, `search_origin`, `last_search` and
 //! `highlight_query` are ALL already the vim-style `/` cursor jump over rows that
 //! are already loaded. Two things called "search" in one file would be unreadable,
-//! so the code says Find throughout. The tab strip says `[F5]Search` because that
-//! is the word a user reaches for; the divergence is deliberate and is one line in
-//! [`crate::ui`].
+//! so the code says Find throughout, and so does the view line (`Find`, view 5),
+//! matching the `find>` prompt the view opens on.
 //!
 //! ## What it is
 //!

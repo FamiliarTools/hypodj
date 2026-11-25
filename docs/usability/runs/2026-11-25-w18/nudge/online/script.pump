@@ -1,0 +1,13 @@
+exec python3 -I /tmp/hypodj-usability-2029460/mpdsend.py 'findadd album "Held Harbour" ; play'
+wait 4
+key >
+wait 2
+snap skipped
+say more like this
+key y
+wait 4
+snap more-like-this
+say stop after this album
+key y
+wait 2
+snap stop-after-album

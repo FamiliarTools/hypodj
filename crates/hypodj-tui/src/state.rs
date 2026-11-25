@@ -334,8 +334,20 @@ pub enum Screen {
     Playlists,
     Dj,
     /// The library query surface. Named Find in code because every `Search`
-    /// identifier is already the `/` cursor jump; the tab strip says Search.
+    /// identifier is already the `/` cursor jump; the view line says Find.
     Find,
+}
+
+impl Screen {
+    /// The view order the view line draws and Tab walks.
+    pub const ORDER: [Screen; 5] =
+        [Screen::Queue, Screen::Albums, Screen::Playlists, Screen::Dj, Screen::Find];
+
+    /// The view `step` places along [`Screen::ORDER`], wrapping.
+    pub fn cycle(self, step: i32) -> Screen {
+        let i = Self::ORDER.iter().position(|s| *s == self).unwrap_or(0) as i32;
+        Self::ORDER[(i + step).rem_euclid(Self::ORDER.len() as i32) as usize]
+    }
 }
 
 /// One row in a browse list. `uri` is the server browse path (`album/<id>`,
@@ -844,6 +856,19 @@ pub struct TuiState {
     /// dedicated connection when the track changes). `None` for a stream, missing
     /// art, or a fetch/decode failure - the art panel then shows a placeholder.
     pub art: Option<crate::art::AlbumArt>,
+    /// The album the held `art` was fetched for (album name, then album artist), set
+    /// when a cover is ADOPTED (album uri, else album name; then artist). The deck draws the cover only while this names the
+    /// album on screen: a skip into another album whose fetch has not landed (or never
+    /// will, the server being gone) shows the neutral swatch, never the last album's
+    /// cover under the new title. Within one album the cover is held, so a track
+    /// change inside it never blinks.
+    pub art_album: Option<(Option<String>, Option<String>)>,
+    /// Set by the first F1-F5 press, so the "Tab replaces the F-keys" note is said
+    /// once per session.
+    pub fkey_hinted: bool,
+    /// The plans the daemon holds, from the last snapshot. The deck says each one
+    /// that `status` does not already say (the sleep / wind-down / wake features).
+    pub held_plans: Vec<hypodj_client::model::HeldPlan>,
     /// The active cursor saved when `/` is pressed, so Esc can restore it after a
     /// non-destructive jump-to-match search.
     pub search_origin: usize,
@@ -1094,6 +1119,9 @@ impl Default for TuiState {
             refresh_dirty: false,
             epoch: 0,
             art_req_key: None,
+            art_album: None,
+            fkey_hinted: false,
+            held_plans: Vec::new(),
             card_art: None,
             card_art_key: None,
             anim_secs: 0.0,
@@ -1332,15 +1360,44 @@ impl TuiState {
     }
 
     /// Map a key to an Intent (or pure state change). The dispatch is per-mode.
+    /// The album identity the deck names right now, the key [`TuiState::art_album`]
+    /// is compared against.
+    pub fn album_identity(&self) -> (Option<String>, Option<String>) {
+        (self.now.album_uri.clone().or_else(|| self.now.album.clone()), self.now.artist.clone())
+    }
+
+    /// The cover to draw for what is playing, or `None` for the neutral swatch: the
+    /// held art only while it belongs to the album on screen. What is drawn belongs to
+    /// what is named.
+    pub fn art_for_now(&self) -> Option<&crate::art::AlbumArt> {
+        let art = self.art.as_ref()?;
+        let id = self.album_identity();
+        let named = id.0.is_some() || id.1.is_some();
+        match &self.art_album {
+            Some(held) if named && *held == id => Some(art),
+            // A stream (no album) keeps the per-uri key the fetch already enforces.
+            Some((None, None)) if !named => Some(art),
+            _ => None,
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
         // Any keypress dismisses a stale banner; the action below may set a new one.
         self.clear_status();
-        match self.mode {
+        let fkey = self.mode == Mode::Normal && matches!(key.code, KeyCode::F(1..=5));
+        let out = match self.mode {
             Mode::Normal => self.key_normal(key),
             Mode::Command => self.key_command(key),
             Mode::Search => self.key_search(key),
             Mode::Confirm => self.key_confirm(key),
+        };
+        // The F-keys are the old view names, kept for one release. The first press
+        // says once what replaces them; every later press is silent.
+        if fkey && !self.fkey_hinted && self.status_msg.is_none() {
+            self.fkey_hinted = true;
+            self.set_status("Tab or 1-5 switch views now; F1-F5 retire next release");
         }
+        out
     }
 
     fn key_normal(&mut self, key: KeyEvent) -> Option<Intent> {
@@ -1424,10 +1481,13 @@ impl TuiState {
         // half it falls straight through to the shared bindings, so every global key
         // behaves exactly as it does on the other screens.
         if self.screen == Screen::Find {
+            // Tab is the query/results focus toggle on this view, never the next view,
+            // whichever half it just moved focus to.
+            let tab = key.code == KeyCode::Tab;
             if let Some(intent) = self.key_find(key) {
                 return Some(intent);
             }
-            if self.find.focus == Focus::Query {
+            if tab || self.find.focus == Focus::Query {
                 return None;
             }
         }
@@ -1472,6 +1532,8 @@ impl TuiState {
             Act::ScreenAlbums => self.switch_screen(Screen::Albums),
             Act::ScreenPlaylists => self.switch_screen(Screen::Playlists),
             Act::ScreenDj => self.switch_screen(Screen::Dj),
+            Act::ViewNext => self.switch_screen(self.screen.cycle(1)),
+            Act::ViewPrev => self.switch_screen(self.screen.cycle(-1)),
             Act::Down => {
                 self.move_selection(1);
                 None
@@ -2687,11 +2749,18 @@ impl TuiState {
         if let Some(act) = keymap::match_key(key, self.screen) {
             use keymap::Act;
             match act {
+                // A digit is query text; only a non-character key (F-key, Shift-Tab)
+                // switches from here. Tab stays the query/results focus toggle.
                 Act::ScreenQueue
                 | Act::ScreenAlbums
                 | Act::ScreenPlaylists
                 | Act::ScreenDj
-                | Act::ScreenFind => return self.apply_act(act),
+                | Act::ScreenFind
+                | Act::ViewPrev
+                    if !matches!(key.code, KeyCode::Char(_)) =>
+                {
+                    return self.apply_act(act)
+                }
                 Act::HelpToggle if self.find.query.is_empty() => return self.apply_act(act),
                 _ => {}
             }
@@ -2786,11 +2855,17 @@ impl TuiState {
         if let Some(act) = keymap::match_key(key, self.screen) {
             use keymap::Act;
             match act {
+                // A digit is ask-line text; only a non-character key (F-key, Tab,
+                // Shift-Tab) switches from here.
                 Act::ScreenQueue
                 | Act::ScreenAlbums
                 | Act::ScreenPlaylists
                 | Act::ScreenDj
-                | Act::ScreenFind => {
+                | Act::ScreenFind
+                | Act::ViewNext
+                | Act::ViewPrev
+                    if !matches!(key.code, KeyCode::Char(_)) =>
+                {
                     return self.apply_act(act);
                 }
                 Act::HelpToggle if self.dj_input.is_empty() => {
@@ -2940,6 +3015,38 @@ mod tests {
 
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn tab_and_digits_walk_the_views_and_the_f_keys_say_once_that_they_are_going() {
+        let mut s = TuiState::new();
+        assert_eq!(s.screen, Screen::Queue);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.screen, Screen::Albums, "Tab is the next view");
+        s.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(s.screen, Screen::Queue, "Shift-Tab the previous");
+        s.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(s.screen, Screen::Find, "and it wraps");
+        s.screen = Screen::Queue;
+        s.handle_key(ch('3'));
+        assert_eq!(s.screen, Screen::Playlists, "a digit jumps");
+        // The old names still work, and the first one says so once.
+        s.handle_key(key(KeyCode::F(2)));
+        assert_eq!(s.screen, Screen::Albums);
+        assert!(s.status_msg.as_deref().is_some_and(|m| m.contains("Tab")), "{:?}", s.status_msg);
+        s.handle_key(key(KeyCode::F(1)));
+        assert_eq!(s.screen, Screen::Queue);
+        assert_eq!(s.status_msg, None, "said once, not every press");
+        // On the DJ view a digit is part of the sentence, not a jump.
+        s.handle_key(key(KeyCode::F(4)));
+        s.handle_key(ch('3'));
+        assert_eq!(s.screen, Screen::Dj);
+        assert_eq!(s.dj_input, "3");
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.screen, Screen::Find, "Tab leaves the DJ view");
+        // On Find a digit is query text too.
+        s.handle_key(ch('5'));
+        assert_eq!(s.find.query, "5");
     }
 
     #[test]

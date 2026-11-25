@@ -29,6 +29,10 @@ pub enum Act {
     ScreenPlaylists,
     ScreenDj,
     ScreenFind,
+    /// Cycle the body view forward / back (Tab / Shift-Tab), the Deck's way between
+    /// views; F1-F5 stay as aliases for one release.
+    ViewNext,
+    ViewPrev,
     SectionNext,
     SectionPrev,
     Down,
@@ -173,12 +177,15 @@ use KeyMatch::{Char, Code, Ctrl};
 
 /// The one table. Every current normal-mode binding lives here exactly once.
 pub const KEYMAP: &[Binding] = &[
-    // View.
-    Binding { matchers: &[Code(KeyCode::F(1))], keys: "F1", group: View, scope: Scope::Global, act: ScreenQueue, help: "Queue screen" },
-    Binding { matchers: &[Code(KeyCode::F(2))], keys: "F2", group: View, scope: Scope::Global, act: ScreenAlbums, help: "Albums screen" },
-    Binding { matchers: &[Code(KeyCode::F(3))], keys: "F3", group: View, scope: Scope::Global, act: ScreenPlaylists, help: "Playlists screen" },
-    Binding { matchers: &[Code(KeyCode::F(4))], keys: "F4", group: View, scope: Scope::Global, act: ScreenDj, help: "DJ (Claude Code) screen" },
-    Binding { matchers: &[Code(KeyCode::F(5))], keys: "F5", group: View, scope: Scope::Global, act: ScreenFind, help: "Search screen (library query)" },
+    // View. Tab / Shift-Tab cycle, 1-5 jump; the F-keys are the old names, kept for
+    // one release (the first press says so once).
+    Binding { matchers: &[Code(KeyCode::Tab)], keys: "tab", group: View, scope: Scope::Global, act: ViewNext, help: "next view" },
+    Binding { matchers: &[Code(KeyCode::BackTab)], keys: "S-tab", group: View, scope: Scope::Global, act: ViewPrev, help: "previous view" },
+    Binding { matchers: &[Char('1'), Code(KeyCode::F(1))], keys: "1 / F1", group: View, scope: Scope::Global, act: ScreenQueue, help: "Queue" },
+    Binding { matchers: &[Char('2'), Code(KeyCode::F(2))], keys: "2 / F2", group: View, scope: Scope::Global, act: ScreenAlbums, help: "Albums" },
+    Binding { matchers: &[Char('3'), Code(KeyCode::F(3))], keys: "3 / F3", group: View, scope: Scope::Global, act: ScreenPlaylists, help: "Lists (playlists)" },
+    Binding { matchers: &[Char('4'), Code(KeyCode::F(4))], keys: "4 / F4", group: View, scope: Scope::Global, act: ScreenDj, help: "DJ (ask in words)" },
+    Binding { matchers: &[Char('5'), Code(KeyCode::F(5))], keys: "5 / F5", group: View, scope: Scope::Global, act: ScreenFind, help: "Find (library query)" },
     // Navigation.
     Binding { matchers: &[Char('j'), Code(KeyCode::Down), Ctrl('n')], keys: "j / down / C-n", group: Navigation, scope: Scope::Global, act: Down, help: "move cursor down" },
     Binding { matchers: &[Char('k'), Code(KeyCode::Up), Ctrl('p')], keys: "k / up / C-p", group: Navigation, scope: Scope::Global, act: Up, help: "move cursor up" },

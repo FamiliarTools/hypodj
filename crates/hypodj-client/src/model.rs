@@ -573,6 +573,65 @@ pub fn group_blocks_on(pairs: &[(String, String)], start: &str) -> Vec<Vec<(Stri
     blocks
 }
 
+/// One plan the daemon is holding, from `plan list`. `what` is absent on a daemon
+/// older than the pair; `next_fire` is set for a deadline plan only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldPlan {
+    pub id: u64,
+    pub origin: String,
+    pub what: Option<String>,
+    pub when: String,
+    pub next_fire: Option<u64>,
+}
+
+impl HeldPlan {
+    /// A daemon feature (sleep, wind-down, wake) that `status` already reports in
+    /// its own words; saying it again from the plan list would say it twice.
+    pub fn is_feature(&self) -> bool {
+        matches!(self.origin.as_str(), "sleep" | "winddown" | "wake")
+    }
+
+    /// `stop playback in 39 min` / `stop playback after the current album ends`: the
+    /// hold in words, with a deadline counted down from `now_unix` rather than the
+    /// span it was armed with.
+    pub fn sentence(&self, now_unix: u64) -> String {
+        let when = match self.next_fire {
+            Some(at) if at >= now_unix => {
+                let left = at - now_unix;
+                if left >= 3600 {
+                    format!("in {}h {:02}m", left / 3600, (left % 3600) / 60)
+                } else if left >= 60 {
+                    format!("in {} min", left.div_ceil(60))
+                } else {
+                    format!("in {left}s")
+                }
+            }
+            _ => self.when.clone(),
+        };
+        match &self.what {
+            Some(w) => format!("{w} {when}"),
+            None => format!("a plan, {when}"),
+        }
+    }
+}
+
+/// Parse a `plan list` response. A record starts at `plan_id`; one with an id that
+/// does not parse is dropped.
+pub fn parse_plan_list(pairs: &[(String, String)]) -> Vec<HeldPlan> {
+    group_blocks_on(pairs, "plan_id")
+        .iter()
+        .filter_map(|b| {
+            Some(HeldPlan {
+                id: find(b, "plan_id")?.parse().ok()?,
+                origin: find(b, "origin").unwrap_or("").to_string(),
+                what: find(b, "what").map(str::to_string),
+                when: find(b, "when").unwrap_or("").to_string(),
+                next_fire: find(b, "next_fire").and_then(|v| v.parse().ok()),
+            })
+        })
+        .collect()
+}
+
 /// One `journal` entry as the daemon reported it, newest first on the wire.
 ///
 /// `did` is the daemon's own `PlanOutcome::render()`. It is the ONLY string any
@@ -686,6 +745,24 @@ pub fn undo_badge(entries: &[JournalEntry], key: char) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plan_list_parses_into_held_sentences() {
+        let pairs: Vec<(String, String)> = [
+            ("plan_id", "1"), ("origin", "mpd"), ("when", "in 40m"), ("next_fire", "10000"), ("what", "stop playback"),
+            ("plan_id", "2"), ("origin", "mpd"), ("when", "after the current album ends"),
+            ("plan_id", "3"), ("origin", "sleep"), ("when", "in 30m"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let plans = parse_plan_list(&pairs);
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].sentence(10000 - 39 * 60 - 1), "stop playback in 40 min");
+        assert_eq!(plans[0].sentence(9990), "stop playback in 10s");
+        assert_eq!(plans[1].sentence(0), "a plan, after the current album ends", "an older daemon sends no what");
+        assert!(plans[2].is_feature() && !plans[0].is_feature());
+    }
+
     use super::*;
 
     fn p(pairs: &[(&str, &str)]) -> Vec<(String, String)> {

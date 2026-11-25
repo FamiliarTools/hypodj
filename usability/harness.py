@@ -53,6 +53,16 @@ FIXTURE = {
     "Stream Summit": ("Fixture Band", False, ["Ascent", "Thin Air", "Ridge Line"]),
 }
 TRACK_SECS = 120
+# Albums with an embedded cover (a generated test card), so a journey can tell a
+# drawn cover from the swatch: the cover-truth journey plays this one, then skips
+# into an album whose cover cannot be fetched.
+COVERED = {"Held Harbour"}
+# Filler albums AFTER the named ones in name order (so every journey's `j` counts
+# still land where they did), one short track each: enough rows that an 80x24 Albums
+# view has to show how many it can fit.
+FILLER_SECS = 20
+for _n in range(1, 17):
+    FIXTURE[f"Tidewater {_n:02d}"] = ("Filler Band", False, [f"Slack Water {_n:02d}"])
 
 
 def log(*a):
@@ -99,17 +109,26 @@ def set_net(state, work):
 # ---------------------------------------------------------------- fixture + server
 
 def make_fixture(music):
+    cover = music / "cover-card.png"
+    if not cover.exists():
+        music.mkdir(parents=True, exist_ok=True)
+        sh("ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
+           "testsrc2=size=256x256:duration=1", "-frames:v", "1", str(cover))
     for album, (artist, _, titles) in FIXTURE.items():
         d = music / artist / album
         d.mkdir(parents=True, exist_ok=True)
+        secs = FILLER_SECS if album.startswith("Tidewater") else TRACK_SECS
         for i, title in enumerate(titles, 1):
             out = d / f"{i:02d} {title}.mp3"
             if out.exists():
                 continue
             freq = 220 + 40 * i + (0 if FIXTURE[album][1] else 300)
+            art = (["-i", str(cover), "-map", "0:a", "-map", "1:v", "-c:v", "png",
+                    "-disposition:v:0", "attached_pic", "-id3v2_version", "3"]
+                   if album in COVERED else [])
             sh(
                 "ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi",
-                "-i", f"sine=frequency={freq}:duration={TRACK_SECS}",
+                "-i", f"sine=frequency={freq}:duration={secs}", *art,
                 "-b:a", "48k", "-metadata", f"title={title}", "-metadata", f"artist={artist}",
                 "-metadata", f"album_artist={artist}", "-metadata", f"album={album}",
                 "-metadata", f"track={i}", "-metadata", "date=2026", str(out),
@@ -292,12 +311,30 @@ def seed_store(bins, work):
 
 # ---------------------------------------------------------------- journeys
 
+MPDSEND = """import socket, sys
+s = socket.create_connection(("127.0.0.1", %d), timeout=20)
+f = s.makefile("rwb"); f.readline()
+for cmd in sys.argv[1].split(" ; "):
+    f.write((cmd + "\\n").encode()); f.flush()
+    for raw in f:
+        if raw in (b"OK\\n",) or raw.startswith(b"ACK"):
+            sys.stderr.write(cmd + ": " + raw.decode()); break
+""" % MPD_PORT
+
+
 def render_script(spec, state, work):
     out = []
     for line in spec["script"]:
         line = line.replace("{state}", state)
         if line.startswith("net "):
             out.append("exec " + net_cmd(line.split(None, 1)[1].strip(), work))
+        elif line.startswith("mpd "):
+            # The world before the listener touches the UI (music already on): sent on
+            # the daemon's socket, not through dj-gui, and not counted as a step.
+            helper = work / "mpdsend.py"
+            helper.write_text(MPDSEND)
+            arg = line.split(None, 1)[1].replace("'", "'\\''")
+            out.append(f"exec python3 -I {helper} '{arg}'")
         else:
             out.append(line)
     return "\n".join(out) + "\n"
@@ -347,14 +384,17 @@ def judge(spec, state, outdir, steps):
     results = []
     last = steps[-1]["n"]
 
-    def frames(n):
-        return {sz: (outdir / f"{n:03d}.{sz}.txt").read_text() for sz in ("129x40", "80x24")}
+    def frames(n, sizes):
+        # Every size the driver rendered (older runs carry two, newer three), or only
+        # the ones a check names.
+        found = {p.name.split(".")[1]: p for p in sorted(outdir.glob(f"{n:03d}.*x*.txt"))}
+        return {sz: p.read_text() for sz, p in found.items() if not sizes or sz in sizes}
 
     for chk in spec.get("check", []):
         if state not in chk.get("when", STATES):
             continue
         n = last if chk.get("at", "last") == "last" else int(chk["at"])
-        fr = frames(n)
+        fr = frames(n, chk.get("sizes"))
         truth = json.loads((outdir / f"{n:03d}.truth.json").read_text())
         notes, ok = [], True
         conds = [eval_truth(e, truth) for e in chk.get("if_truth", [])]
@@ -387,6 +427,18 @@ def judge(spec, state, outdir, steps):
                 if w.lower() in low:
                     ok = False
                     notes.append(f"{sz}: forbidden {w!r} on screen")
+            for rx in chk.get("screen_forbid_re", []):
+                m = re.search(rx, text, re.I | re.S)
+                if m:
+                    ok = False
+                    notes.append(f"{sz}: forbidden /{rx}/ matched {m.group(0)[:40]!r}")
+            if "count_re" in chk:
+                # [regex, min]: at least `min` LINES of the frame match.
+                rx, want = chk["count_re"]
+                got = sum(1 for line in text.splitlines() if re.search(rx, line, re.I))
+                if got < want:
+                    ok = False
+                    notes.append(f"{sz}: {got} lines match /{rx}/, want >= {want}")
         for expr in chk.get("truth", []):
             good, why = eval_truth(expr, truth)
             ok &= good
@@ -394,7 +446,8 @@ def judge(spec, state, outdir, steps):
                 notes.append(f"truth {expr!r} failed ({why})")
         results.append({"check": chk["name"], "step": n, "pass": ok, "notes": notes,
                         "severity": chk.get("severity", "")})
-    scripted = sum(1 for s in steps if s["step"].startswith(("key", "type")))
+    # A `say` is one sentence on the `:` line: one input, as a listener counts it.
+    scripted = sum(1 for s in steps if s["step"].startswith(("key", "type", "say")))
     results.append({"check": f"steps {scripted} within budget {spec['step_budget']}",
                     "step": last, "pass": scripted <= spec["step_budget"], "notes": [], "severity": "S2"})
     hung = [s["n"] for s in steps if not s["settled"]]
@@ -439,7 +492,9 @@ def run_journey(bins, spec, state, work, seed, outroot):
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
-    date = datetime.date.today().isoformat()
+    # HYPODJ_RUN_NAME names the run folder (e.g. 2026-11-25-w18), so a new run never
+    # overwrites a dated run already committed for the same day.
+    date = os.environ.get("HYPODJ_RUN_NAME") or datetime.date.today().isoformat()
     outroot = REPO / "docs" / "usability" / "runs" / date
     if sys.argv[1] == "--rejudge":
         # Re-apply the current specs' checks to recorded frames + truth; no world.

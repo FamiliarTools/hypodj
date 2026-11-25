@@ -1,0 +1,40 @@
+id = "glance"
+goal = "One look, no key: what is playing, what comes next, whether the server is there, and what is being held for you."
+# Music is put on and the timer armed while online; then the state holds.
+start = "online"
+states = ["online", "blocked", "no_network"]
+min_steps = 2          # the timer: one sentence and its confirm; the glance takes no key
+step_budget = 3
+script = [
+  "mpd findadd album \"Held Harbour\" ; play",
+  "wait 4",
+  "say stop in 20 minutes",
+  "key y",
+  "net {state}",
+  "wait 12",
+  "snap the-glance",
+  "key 2",
+  "wait 6",
+  "snap albums",
+]
+
+[[check]]
+name = "at 80x24 the current song, the next song, the server word and the timer are on one frame"
+at = 7
+severity = "S0"
+sizes = ["80x24", "60x20"]
+# findadd queues the album in search order, so the titles are matched as a set.
+screen_require_re = ["(Low Tide|Harbour Lights|Moorings)  Fixture Band", "next  (Low Tide|Harbour Lights|Moorings)", "server (online|unreachable)|no network", "held  stop playback in \\d+ min"]
+
+[[check]]
+name = "at 80x24 the Albums view shows at least 16 album rows"
+when = ["online"]
+severity = "S1"
+sizes = ["80x24"]
+count_re = ["(on disk|stream only)\\s*$", 16]
+
+[[check]]
+name = "the view line is whole words or whole letters and ends in the server word, never clipped"
+severity = "S1"
+sizes = ["80x24", "60x20"]
+screen_require_re = ["(?m)^ (Queue  Albums  Lists  DJ  Find|Q A L D F) +(server online|server unreachable|no network)$"]

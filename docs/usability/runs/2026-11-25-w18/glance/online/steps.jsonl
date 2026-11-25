@@ -1,0 +1,11 @@
+{"n":0,"step":"start","t_ms":643,"settled":true,"settle_ms":632}
+{"n":1,"step":"exec python3 -I /tmp/hypodj-usability-2029460/mpdsend.py 'findadd album \"Held Harbour\" ; play'","t_ms":1438,"settled":true,"settle_ms":756,"exit":0}
+{"n":2,"step":"wait 4","t_ms":6100,"settled":true,"settle_ms":629}
+{"n":3,"step":"say stop in 20 minutes","t_ms":6741,"settled":true,"settle_ms":632}
+{"n":4,"step":"key y","t_ms":7384,"settled":true,"settle_ms":630}
+{"n":5,"step":"exec nft delete table inet hjblock 2>/dev/null; ip addr replace 10.77.0.1/24 dev srv0 2>/dev/null; echo online > /tmp/hypodj-usability-2029460/world","t_ms":8017,"settled":true,"settle_ms":604,"exit":0}
+{"n":6,"step":"wait 12","t_ms":20661,"settled":true,"settle_ms":632}
+{"n":7,"step":"snap the-glance","t_ms":21275,"settled":true,"settle_ms":605}
+{"n":8,"step":"key 2","t_ms":21920,"settled":true,"settle_ms":631}
+{"n":9,"step":"wait 6","t_ms":28588,"settled":true,"settle_ms":632}
+{"n":10,"step":"snap albums","t_ms":29201,"settled":true,"settle_ms":603}

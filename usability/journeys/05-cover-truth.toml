@@ -1,0 +1,46 @@
+id = "cover-truth"
+goal = "Skip from an album with a cover into one whose cover cannot be fetched (the server just went): what is drawn must belong to what is named."
+# Timeline: online while the covered album plays and the next album is queued and
+# mirrored; then the server goes and the listener skips into the next album.
+start = "online"
+states = ["blocked", "no_network"]
+min_steps = 8          # open Albums, pick, play, move, enqueue, then one skip key
+step_budget = 8        # three times across the album boundary
+script = [
+  "key F2",
+  "wait 6",
+  "key j",
+  "key Enter",
+  "key j",
+  "key Space",
+  "wait 10",
+  "snap cover-drawn",
+  "net {state}",
+  "key >",
+  "key >",
+  "key >",
+  "wait 3",
+  "snap after-the-skip",
+]
+
+[[check]]
+name = "setup: the covered album plays and its cover is drawn in cells"
+at = 8
+severity = "S1"
+truth = ["status.state == play", "currentsong.Album == Held Harbour"]
+screen_require_re = ["[\U0001FB00-\U0001FB3B▌▐]"]
+
+[[check]]
+name = "setup: the skip landed in the next album and it plays (from disk)"
+severity = "S1"
+truth = ["currentsong.Album == Stream Summit", "status.state == play"]
+
+[[check]]
+name = "after the skip the screen names the new song"
+severity = "S0"
+screen_require_any = ["Ascent"]
+
+[[check]]
+name = "no cell of the previous album's cover remains under the new title"
+severity = "S0"
+screen_forbid_re = ["[\U0001FB00-\U0001FB3B▌▐]"]

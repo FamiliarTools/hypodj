@@ -1,0 +1,41 @@
+id = "nudge"
+goal = "With music already on and dj-gui just opened: skip, ask for more like this, and stop after this album, each as one input."
+start = "{state}"
+states = ["online"]
+# Skip is one key; each spoken nudge is one sentence plus the `y` every action asks.
+min_steps = 5
+step_budget = 5
+script = [
+  "mpd findadd album \"Held Harbour\" ; play",
+  "wait 4",
+  "key >",
+  "wait 2",
+  "snap skipped",
+  "say more like this",
+  "key y",
+  "wait 4",
+  "snap more-like-this",
+  "say stop after this album",
+  "key y",
+  "wait 2",
+  "snap stop-after-album",
+]
+
+[[check]]
+name = "one key skipped to the next song"
+at = 5
+severity = "S0"
+truth = ["status.song == 1"]
+screen_require_re = ["> 2\\. "]
+
+[[check]]
+name = "one sentence queued more like this (the queue grew past the album)"
+at = 9
+severity = "S1"
+truth = ["status.playlistlength != 3"]
+
+[[check]]
+name = "one sentence armed stop after this album, and the deck says it is held"
+severity = "S0"
+# The rail wraps its words, so the sentence is matched across line breaks.
+screen_require_re = ["held\\s+stop\\s+playback\\s+after\\s+the\\s+current\\s+album\\s+ends"]

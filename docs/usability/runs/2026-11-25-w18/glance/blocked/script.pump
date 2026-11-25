@@ -1,0 +1,10 @@
+exec python3 -I /tmp/hypodj-usability-2029460/mpdsend.py 'findadd album "Held Harbour" ; play'
+wait 4
+say stop in 20 minutes
+key y
+exec nft delete table inet hjblock 2>/dev/null; ip addr replace 10.77.0.1/24 dev srv0 2>/dev/null; nft -f /tmp/hypodj-usability-2029460/block.nft; echo blocked > /tmp/hypodj-usability-2029460/world
+wait 12
+snap the-glance
+key 2
+wait 6
+snap albums

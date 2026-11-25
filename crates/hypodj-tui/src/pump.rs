@@ -4,7 +4,7 @@
 //! `dispatch`, `apply_inbound` - against the real daemon named by the usual
 //! `MPD_HOST`/`MPD_PORT` resolution, but with no terminal: keys come from a script,
 //! and after each step the driver waits for the async workers to SETTLE, then dumps
-//! the rendered frame at 129x40 and 80x24 (ratatui `TestBackend`, so no PTY and no
+//! the rendered frame at 129x40, 80x24 and 60x20 (ratatui `TestBackend`, so no PTY and no
 //! display) plus a JSON of daemon truth read on its own socket.
 //!
 //! This is Approach A (docs/product/agent-driven-surface-tests-2026-10-06.md)
@@ -19,13 +19,15 @@
 //!                  Right, PageUp, PageDown, Home, End, Backspace, Space, F1..F12,
 //!                  or C-<char> for Ctrl
 //! type <text>      every char of <text> as its own key
+//! say <text>       one sentence on the `:` line: `:`, every char, Enter. ONE input
+//!                  as a listener counts it (a journey budget counts it once)
 //! wait <secs>      let real time pass (drop timers are wall-clock), then settle
 //! exec <cmd>       run `sh -c <cmd>` (the harness flips connectivity this way)
 //! snap <label>     settle and dump without sending anything
 //! ```
 //!
-//! Every step, including `exec`, produces `NNN.129x40.txt`, `NNN.80x24.txt` and
-//! `NNN.truth.json` in `<outdir>`, plus one line in `<outdir>/steps.jsonl`.
+//! Every step, including `exec`, produces `NNN.129x40.txt`, `NNN.80x24.txt`,
+//! `NNN.60x20.txt` and `NNN.truth.json` in `<outdir>`, plus one line in `<outdir>/steps.jsonl`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,9 +44,9 @@ use super::{
     update_sigil, worker, Intent, TuiState,
 };
 
-/// The two frame sizes every step is rendered at: the 129-column rule and the
-/// classic minimum terminal.
-const SIZES: [(u16, u16); 2] = [(129, 40), (80, 24)];
+/// The frame sizes every step is rendered at: the 129-column rule (the wide rail),
+/// the classic minimum terminal, and a small split pane.
+const SIZES: [(u16, u16); 3] = [(129, 40), (80, 24), (60, 20)];
 /// Settled = no inbound message for this long.
 const QUIET: Duration = Duration::from_millis(600);
 /// Give up settling after this long and record `settled: false` - a screen that
@@ -115,6 +117,12 @@ fn parse_script(text: &str) -> Result<Vec<Step>, String> {
                 line.to_string(),
                 rest.chars().map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)).collect(),
             ),
+            "say" => Step::Keys(line.to_string(), {
+                let mut k = vec![KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)];
+                k.extend(rest.chars().map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+                k.push(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                k
+            }),
             "wait" => Step::Wait(rest.trim().parse().map_err(|_| format!("line {}: bad wait", n + 1))?),
             "exec" => Step::Exec(rest.to_string()),
             "snap" => Step::Snap(rest.to_string()),
@@ -335,8 +343,12 @@ mod tests {
 
     #[test]
     fn script_parses_every_verb_and_rejects_unknowns() {
-        let s = parse_script("# c\nkey Enter\nkey C-c\nkey G\ntype ab\nwait 1.5\nexec true\nsnap x\n").unwrap();
-        assert_eq!(s.len(), 7);
+        let s = parse_script("# c\nkey Enter\nkey C-c\nkey G\ntype ab\nwait 1.5\nexec true\nsnap x\nsay skip\n").unwrap();
+        assert_eq!(s.len(), 8);
+        match &s[7] {
+            Step::Keys(_, k) => assert_eq!(k.len(), 6, "colon, four chars, Enter"),
+            _ => panic!("say"),
+        }
         match &s[1] {
             Step::Keys(_, k) => assert_eq!(k[0], KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             _ => panic!("ctrl key"),

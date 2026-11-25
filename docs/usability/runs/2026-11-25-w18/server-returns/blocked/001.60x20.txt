@@ -1,0 +1,20 @@
+nothing playing
+press : and say what to play, or Tab to browse albums
+
+ Queue  Albums  Lists  DJ  Find              checking server
+Albums
+loading albums...
+
+
+
+
+
+
+
+
+
+
+
+
+
+Tab or 1-5 switch views now; F1-F5 retire next release

@@ -1,0 +1,6 @@
+exec python3 -I /tmp/hypodj-usability-2029460/mpdsend.py 'findadd album "Held Harbour" ; play'
+wait 4
+key 1
+key i
+wait 3
+snap info-open

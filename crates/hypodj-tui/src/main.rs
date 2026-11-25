@@ -688,6 +688,7 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
             // wants any more is dropped rather than cancelled - a superseded fetch
             // completes, costs nothing, and is discarded here.
             if art_want(&state.now) == Some(key.clone()) {
+                state.art_album = art.as_ref().map(|_| state.album_identity());
                 state.art = art;
             } else if state.card_art_key.as_ref() == Some(&key.0) {
                 // The card's own cover. Keyed so a reply for a card that has since
@@ -749,10 +750,11 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
                 Err(reason) => state.find.phase = crate::find::Phase::Failed(reason),
             }
         }
-        RespKind::Snapshot { now, queue, version, undo } => {
+        RespKind::Snapshot { now, queue, version, undo, plans } => {
             // The footer offer rides the snapshot, so it can never be older than the
             // frame it is drawn on.
             state.undo_offer = undo;
+            state.held_plans = plans;
             let server_back = server_returned(state.now.server.as_deref(), now.server.as_deref());
             // Any change of the server word re-reads the WHOLE queue once: each row's
             // "on disk" / "stream only" rides `playlistinfo`, and a song the mirror
@@ -968,14 +970,16 @@ fn update_sigil(state: &mut TuiState) {
         return;
     }
     let identity = sigil::album_identity(&state.now);
-    let has_art = state.art.is_some();
+    // Only a cover that belongs to THIS album may colour its sigil: the held cover of
+    // the album before would tint the new album's mark with the old one's palette.
+    let has_art = state.art_for_now().is_some();
     if let Some(s) = &state.sigil {
         // Up to date: same album, and not still waiting to upgrade to a real palette.
         if s.identity == identity && (s.has_palette || !has_art) {
             return;
         }
     }
-    let palette = state.art.as_ref().map(|a| &a.palette);
+    let palette = state.art_for_now().map(|a| &a.palette);
     state.sigil = Some(sigil::Sigil::build(
         &identity,
         palette,
@@ -1199,6 +1203,7 @@ mod tests {
             queue: None,
             version: None,
             undo: None,
+            plans: Vec::new(),
         };
         let row = |uri: &str| state::BrowseRow {
             label: uri.into(),

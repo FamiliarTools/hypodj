@@ -1,0 +1,14 @@
+key F2
+wait 6
+key j
+key Enter
+key j
+key Space
+wait 10
+snap cover-drawn
+exec nft delete table inet hjblock 2>/dev/null; ip addr replace 10.77.0.1/24 dev srv0 2>/dev/null; nft -f /tmp/hypodj-usability-2029460/block.nft; echo blocked > /tmp/hypodj-usability-2029460/world
+key >
+key >
+key >
+wait 3
+snap after-the-skip

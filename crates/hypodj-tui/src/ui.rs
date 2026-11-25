@@ -23,43 +23,63 @@ use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState}
 /// bar.
 const MIN_WAVE_CELLS: usize = 16;
 
-/// Rows to give the Now Playing pane, scaled to the terminal height.
-///
-/// The art slot is whatever is left after the pane's text rows, and pane size is the
-/// DOMINANT term in cover fidelity - measured PSNR against the source rises faster with
-/// area than with any glyph upgrade (plain half-blocks at 30x15 beat sextants at 12x6).
-/// So take the extra rows where they exist and stay out of the way where they do not: a
-/// short terminal keeps exactly the historical 12, because on 24 rows a bigger pane
-/// leaves the queue list unusable, and a cover is worth less than seeing what is playing
-/// next.
-fn now_playing_h(total: u16) -> u16 {
-    match total {
-        0..=29 => 12,
-        30..=39 => 15,
-        _ => 18,
-    }
+/// Columns at which the deck stops being a strip on top and becomes a rail on the
+/// left with a real cover: below this a 28-column rail costs the list its titles.
+const RAIL_MIN_W: u16 = 110;
+/// The rail's width when the terminal is wide enough for one.
+const RAIL_W: u16 = 34;
+
+/// The regions of one frame, decided once so every drawer, popup and test agrees on
+/// where the deck is and where the body is.
+pub(crate) struct Regions {
+    /// The now-playing instrument: a strip across the top, or a rail on the left.
+    pub deck: Rect,
+    /// Whether `deck` is the wide-terminal rail.
+    pub rail: bool,
+    /// The view line: view names on the left, the server word on the right.
+    pub views: Rect,
+    /// The one body view, and every drawer and popup that opens over it.
+    pub body: Rect,
+    /// The bottom line: the `:` input, a status sentence, or the idle wave.
+    pub bar: Rect,
 }
 
-/// Draw the full jukebox: the screen-tab row, the active list
-/// (Queue/Albums/Playlists), then the Now Playing pane (album art + up-next
-/// preview), and the command/confirm line. Now Playing sits BELOW the list, just
-/// above the command box.
+/// THE DECK GEOMETRY. One instrument that no overlay ever covers, one view line, one
+/// body that swaps, one bottom line. Pure, so the layout is testable without drawing.
+pub(crate) fn regions(area: Rect, state: &TuiState) -> Regions {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let (main, bar) = (rows[0], rows[1]);
+    if area.width >= RAIL_MIN_W {
+        let cols = Layout::horizontal([Constraint::Length(RAIL_W), Constraint::Min(20)]).split(main);
+        let right = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(cols[1]);
+        return Regions { deck: cols[0], rail: true, views: right[0], body: right[1], bar };
+    }
+    let strip_h = deck_lines(state, area.width.saturating_sub(strip_cover_cols(state)) as usize, false)
+        .len()
+        .clamp(3, 6) as u16;
+    let v = Layout::vertical([
+        Constraint::Length(strip_h),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(main);
+    Regions { deck: v[0], rail: false, views: v[1], body: v[2], bar }
+}
+
+/// Draw the Deck: the now-playing instrument (a strip, or a rail on a wide terminal),
+/// the view line, ONE body view, and the bottom line. Info, help, heard, the journal,
+/// the row menu and the confirm all open in the BODY, so the title, the transport and
+/// the next song stay in sight while the listener digs.
 pub fn render(f: &mut Frame, state: &TuiState) {
     // Decided BEFORE anything is drawn, because the art is painted early in this
     // function and the generation has to be right by the time it is: an overlay that
     // closed since the last frame must re-send the image on THIS frame, not on the one
-    // after it. See `TuiState::sixel_gen`.
-    //
-    // Deliberately keyed on "an overlay was open" rather than on the popup rect actually
-    // intersecting the art: the popups are centered and the art sits in the now-playing
-    // pane, so they overlap in the ordinary layout, and the cost of being wrong is one
-    // extra image re-send on close - against a cover that stays punched full of holes
-    // until the track changes if the test is ever wrong the other way.
+    // after it. See `TuiState::sixel_gen`. The overlays now open in the body, away from
+    // the deck's cover, but the pin stays: a resize can still bring them together, and
+    // the cost of keeping it is one image re-send on close.
     let overlay_drawn = state.menu.is_some()
         || state.help_open
         || state.heard_open
-        // The card joins this disjunction or it punches a permanent silhouette out of a
-        // sixel cover - a bug already fixed once here for the other overlays.
         || state.card.is_some()
         || (state.mode == Mode::Confirm && state.screen != Screen::Dj);
     if overlay_drawn {
@@ -67,86 +87,58 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     } else if state.sixel_covered.replace(false) {
         state.sixel_gen.set(!state.sixel_gen.get());
     }
-    // A blank top and bottom margin row give the frame breathing room; the bottom
-    // bar is a single borderless row (thin + less prominent than the old 3-row
-    // bordered box), living as a dim ambient wave when idle.
-    let chunks = Layout::vertical([
-        Constraint::Length(1),  // top breathing margin (blank)
-        Constraint::Length(1),  // screen tabs
-        Constraint::Min(3),     // active list
-        Constraint::Length(now_playing_h(f.area().height)),
-        Constraint::Length(1),  // command / search / status / ambient wave (thin)
-        Constraint::Length(1),  // bottom breathing margin (blank)
-    ])
-    .split(f.area());
-
-    render_tabs(f, chunks[1], state.screen, state.now.server.as_deref());
-    let list_area = chunks[2];
-    match state.screen {
-        Screen::Queue => render_queue(f, list_area, state),
-        Screen::Find => render_find(f, list_area, state),
-        Screen::Albums => render_browse(f, list_area, &state.albums, state, true),
-        Screen::Playlists => render_browse(f, list_area, &state.playlists, state, false),
-        // The DJ View shares the top region: Queue on the left, the Claude Code
-        // intelligence pane on the right, a straight ~50/50 split (MVP).
-        Screen::Dj => {
-            let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(list_area);
-            render_queue(f, cols[0], state);
-            render_dj(f, cols[1], state);
-        }
+    let r = regions(f.area(), state);
+    if r.rail {
+        render_rail(f, r.deck, state);
+    } else {
+        render_strip(f, r.deck, state);
     }
-    render_now(f, chunks[3], state);
-    // A status sentence longer than the bar BORROWS the blank bottom breathing row
-    // rather than growing the layout: the row is already reserved and already empty, so
-    // nothing moves - which is the same reason Confirm renders as a popup instead of a
-    // taller bar. Two rows is what it takes to hold a mark sentence WITH its tape
-    // clause; at 60 columns the clause is the whole tail, and a bar that clipped it
-    // announced a capture the human never learned about.
-    let bar = chunks[4];
+    render_tabs(f, r.views, state.screen, state.now.server.as_deref());
+    let body = r.body;
+    match state.screen {
+        Screen::Queue => render_queue(f, body, state),
+        Screen::Find => render_find(f, body, state),
+        Screen::Albums => render_browse(f, body, &state.albums, state, true),
+        Screen::Playlists => render_browse(f, body, &state.playlists, state, false),
+        // The DJ view is the whole body now: the queue it used to sit beside is one
+        // Tab away, and the next song is already on the deck.
+        Screen::Dj => render_dj(f, body, state),
+    }
+    // A status sentence longer than the bar BORROWS the body's last row rather than
+    // growing the layout, so nothing moves. Two rows hold a mark sentence WITH its tape
+    // clause; at 60 columns the clause is the whole tail.
+    let bar = r.bar;
     let status_area = match &state.status_msg {
         Some(msg)
             if state.mode == Mode::Normal
                 && status_lines(msg, bar.width as usize, 2).len() > 1 =>
         {
-            Rect { height: 2, ..bar }.intersection(f.area())
+            Rect { y: bar.y.saturating_sub(1), height: 2, ..bar }.intersection(f.area())
         }
         _ => bar,
     };
+    if status_area.height > 1 {
+        f.render_widget(Clear, status_area);
+    }
     render_command(f, status_area, state);
-    // Confirm is a small centered popup over the list/now region so the thin bottom
-    // bar never grows (no layout jump when toggling modes). On the DJ (chat) screen
-    // the confirm is rendered INLINE in the chat scrollback (pushed by enter_confirm),
-    // so no popup - the y/N prompt reads as part of the conversation.
+    // Confirm is a small popup in the body so the bottom bar never grows. On the DJ
+    // screen the confirm is INLINE in the chat scrollback (pushed by enter_confirm).
     if state.mode == Mode::Confirm && state.screen != Screen::Dj {
-        render_confirm_popup(f, list_area, state);
+        render_confirm_popup(f, body, state);
     }
-    // The heard/tape read-back: a normal-mode modal over the FULL frame, because a
-    // ledger row carries a time, a title, a url and its tape annotation and the list
-    // region cannot hold that. Below the help overlay so `?` still wins.
+    // The drawers share the body: heard / journal, then the info card, then the row
+    // menu, then help, in the order their keys are intercepted in `key_normal`.
     if state.heard_open {
-        render_heard_overlay(f, f.area(), state);
+        render_heard_overlay(f, body, state);
     }
-    // The info card, in the same band as the heard panel and for the same reason: its
-    // keys are intercepted in `key_normal` after heard's, so it must draw after it too.
     if state.card.is_some() {
-        render_info_card(f, f.area(), state);
+        render_info_card(f, body, state);
     }
-    // The row context menu sits ABOVE the confirm popup and the heard panel - its keys
-    // are intercepted FIRST in `key_normal`, so it must also be the one the eye sees
-    // first - and BELOW the help overlay, which cannot be open at the same time anyway
-    // since `open_menu` closes it (and the heard panel with it). It gets the FULL frame
-    // as its region, like the help overlay and unlike the two-line confirm: eight rows
-    // plus a heading and a border ring do not fit the list band on a 24-row terminal
-    // (`now_playing_h` takes 12 of them), and a menu that silently truncates its last
-    // row - `remove from queue` - is worse than one that overlaps the pane below.
     if let Some(menu) = &state.menu {
-        render_menu(f, f.area(), menu, state);
+        render_menu(f, body, menu, state);
     }
-    // The `?` help overlay sits above everything else (a normal-mode modal). It gets
-    // the FULL frame as its region so the two-column table has room to breathe.
     if state.help_open {
-        render_help_overlay(f, f.area(), state);
+        render_help_overlay(f, body, state);
     }
 }
 
@@ -555,7 +547,7 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
     // the wrapping were applied made the box exactly as tall as the unwrapped row count
     // - so ten rows of art filled it and pushed every fact out of sight. The box has to
     // be measured against what will actually be drawn in it.
-    let h = (lines.len() as u16 + 2).min(region.height.saturating_sub(2)).max(3);
+    let h = (lines.len() as u16 + 2).min(region.height).max(3);
     let popup = Rect {
         x: region.x + region.width.saturating_sub(w) / 2,
         y: region.y + region.height.saturating_sub(h) / 2,
@@ -793,37 +785,23 @@ fn hit_style() -> Style {
     Style::default().underline().bold()
 }
 
-/// A one-line tab strip: the active screen is REVERSED, the rest dim. The music
-/// server's reachability rides the right end in words ("server online", "server
-/// unreachable", "no network"), because it decides what every other pane can do and
-/// was otherwise said nowhere: online, blackholed and unroutable drew the same frame.
+/// The view line: the five view names on the left, the server word on the right
+/// ("server online", "server unreachable", "no network"), because reachability
+/// decides what every other surface can do.
+///
+/// BUDGETED, never clipped. The names step down from whole words to first letters
+/// (`Q A L D F`) when the words do not fit beside the server word, and the server word
+/// itself is never what gives. The current view is the reversed one.
 fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen, server: Option<&str>) {
-    let labels = [
-        (Screen::Queue, "[F1]Queue"),
-        (Screen::Albums, "[F2]Albums"),
-        (Screen::Playlists, "[F3]Playlists"),
-        (Screen::Dj, "[F4]DJ"),
-        // The tab says Search because that is the word a user reaches for; the code
-        // says Find because every `Search` identifier is already the `/` cursor jump.
-        (Screen::Find, "[F5]Search"),
-    ];
-    let mut spans = Vec::new();
-    for (i, (s, label)) in labels.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        let style = if *s == screen {
-            Style::default().reverse()
-        } else {
-            Style::default().quiet()
-        };
-        spans.push(Span::styled(*label, style));
-    }
-    if let Some((words, bad)) = server.map(server_words) {
+    let words = server.map(server_words);
+    let server_w = words.as_ref().map_or(0, |(w, _)| w.chars().count() + 2);
+    let width = area.width as usize;
+    let mut spans = view_spans(screen, width.saturating_sub(server_w));
+    if let Some((words, bad)) = words {
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let room = (area.width as usize).saturating_sub(used);
-        // Two cells of air at least, and never truncated into a half-word: a clipped
-        // "server unrea" is worse than the tab row alone.
+        let room = width.saturating_sub(used);
+        // Never truncated into a half-word: a clipped "server unrea" is worse than the
+        // view names alone, and the names already stepped down to make this room.
         if room >= words.chars().count() + 2 {
             spans.push(Span::raw(" ".repeat(room - words.chars().count())));
             let style = if bad { Style::default().bold() } else { Style::default().quiet() };
@@ -831,6 +809,47 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen, serve
         }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The view names that fit in `room` cells: whole words, else first letters, else the
+/// current view's name alone. Each form is whole, so a label is never cut mid-word.
+fn view_spans(screen: Screen, room: usize) -> Vec<Span<'static>> {
+    let name = |s: Screen| match s {
+        Screen::Queue => "Queue",
+        Screen::Albums => "Albums",
+        Screen::Playlists => "Lists",
+        Screen::Dj => "DJ",
+        // The code says Find because every `Search` identifier is already the `/`
+        // cursor jump; the line says Find too, the word the `find>` prompt uses.
+        Screen::Find => "Find",
+    };
+    let build = |short: bool| -> Vec<Span<'static>> {
+        let mut spans = vec![Span::raw(" ")];
+        for (i, s) in Screen::ORDER.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(if short { " " } else { "  " }));
+            }
+            let label = if short { name(*s)[..1].to_string() } else { name(*s).to_string() };
+            let style = if *s == screen { Style::default().reverse() } else { Style::default().quiet() };
+            spans.push(Span::styled(label, style));
+        }
+        spans
+    };
+    let width = |v: &[Span]| v.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let full = build(false);
+    if width(&full) <= room {
+        return full;
+    }
+    let short = build(true);
+    if width(&short) <= room {
+        return short;
+    }
+    let alone = vec![Span::raw(" "), Span::styled(name(screen).to_string(), Style::default().reverse())];
+    if width(&alone) <= room {
+        return alone;
+    }
+    // Narrower still: the server word keeps the line, and the view names give way.
+    Vec::new()
 }
 
 /// The terminal window/tab title for the current now-playing snapshot, emitted via
@@ -862,13 +881,235 @@ fn sanitize_title(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// The Now Playing pane: the current track (album art + title/artist/album) on the
-/// left, a compact 3-track up-next preview on the right.
-fn render_now(f: &mut Frame, area: Rect, state: &TuiState) {
-    let cols = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(area);
-    render_current(f, cols[0], state);
-    render_next_up(f, cols[1], state);
+/// Columns the strip's cover takes (plus a one-cell gap), sized to be square at the
+/// strip's three rows. Zero when nothing is playing, so an empty deck is all words.
+fn strip_cover_cols(state: &TuiState) -> u16 {
+    if deck_is_empty(&state.now) {
+        return 0;
+    }
+    square_art_cols(3, state.sixel_cell_px) + 1
+}
+
+/// Nothing to name: stopped, or no song identity at all.
+fn deck_is_empty(np: &NowPlaying) -> bool {
+    np.state.as_deref() == Some("stop")
+        || (np.title.is_none() && np.artist.is_none() && np.album.is_none())
+}
+
+/// THE DECK'S WORDS, shared by the strip and the rail so the two shapes can never say
+/// different things: what is playing, the transport line, why it stopped, what comes
+/// next, and one line per hold (timer, armed plan) and field pull. A line that has
+/// nothing to say is not drawn, so a resting deck reserves no row for it.
+fn deck_lines(state: &TuiState, width: usize, rail: bool) -> Vec<Line<'static>> {
+    let np = &state.now;
+    let quiet = hypodj_style::ratatui::style_for(hypodj_style::Role::InkQuiet, state.term_bg, state.truecolor);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let holds = hypodj_client::spoken::armed_hold(&np.armed);
+    // WHY the deck is not playing what it should, drawn loud and WRAPPED to two rows
+    // so the reason is never the part the edge cuts off.
+    let error_lines = |lines: &mut Vec<Line<'static>>| {
+        if let Some(e) = &np.error {
+            for row in status_lines(e, width.max(8), 2) {
+                lines.push(Line::from(Span::styled(row, Style::default().bold())));
+            }
+        }
+    };
+    if deck_is_empty(np) {
+        lines.push(Line::from(Span::styled("nothing playing", Style::default().bold())));
+        error_lines(&mut lines);
+        if np.error.is_none() {
+            // The one empty state a new user meets, so it says the act, not the keys
+            // to navigate to it.
+            lines.push(Line::from(Span::styled(
+                "press : and say what to play, or Tab to browse albums",
+                quiet,
+            )));
+        }
+        if let Some(m) = np.modes.label() {
+            lines.push(Line::from(Span::styled(format!("modes: {m}"), quiet)));
+        }
+    } else {
+        let (headline, station) = stream_headline(np);
+        let mut head = Vec::new();
+        // A heart marks a Subsonic favorite. U+2665 is East-Asian-Width ambiguous, so
+        // U+FE0E forces a single cell. Ember: a kept item. There is no red.
+        if np.starred {
+            head.push(Span::styled(
+                "\u{2665}\u{FE0E} ",
+                Style::default().fg(hypodj_style::ratatui::ember_color(state.term_bg, state.truecolor)),
+            ));
+        }
+        head.push(Span::styled(headline, Style::default().bold()));
+        // Who and from where, after the title: the title is what the edge must never
+        // take, so it goes first and the rest yields. The artist keeps full weight;
+        // a PLACEHOLDER artist ("Various Artists") says less than the album beside
+        // it, so it drops to the album's dim level - still shown, since the tag is
+        // what the server says.
+        let dim = Style::default().quiet();
+        let mut sep = "  ";
+        // The rail is narrow and tall: each of who and from where gets its own line
+        // there instead of wrapping mid-phrase.
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        if rail {
+            lines.push(Line::from(std::mem::take(&mut head)));
+            for (text, style) in [
+                (station.clone(), dim),
+                (np.artist.clone(), np.artist.as_deref().map_or(dim, |a| if is_placeholder_artist(a) { dim } else { Style::default() })),
+                (np.album.clone(), dim),
+            ] {
+                if let Some(t) = text {
+                    rows.push(Line::from(Span::styled(t, style)));
+                }
+            }
+        }
+        let station = if rail { None } else { station };
+        if let Some(st) = station {
+            head.push(Span::styled(format!("{sep}{st}"), dim));
+            sep = " \u{00b7} ";
+        }
+        if let Some(a) = np.artist.as_deref().filter(|_| !rail) {
+            head.push(Span::styled(sep.to_string(), dim));
+            head.push(Span::styled(a.to_string(), if is_placeholder_artist(a) { dim } else { Style::default() }));
+            sep = " \u{00b7} ";
+        }
+        if let Some(al) = np.album.as_deref().filter(|_| !rail) {
+            head.push(Span::styled(format!("{sep}{al}"), dim));
+        }
+        if !rail {
+            lines.push(Line::from(head));
+        }
+        lines.extend(rows);
+        lines.push(Line::from(Span::styled(
+            status_line(np, state.live_elapsed(std::time::Instant::now()), width),
+            quiet,
+        )));
+        error_lines(&mut lines);
+    }
+    if let Some(next) = next_line(state) {
+        lines.push(next);
+    }
+    for a in &holds {
+        lines.extend(hypodj_style::ratatui::render(a, state.term_bg, state.truecolor));
+    }
+    // Every other plan held for the listener, in the daemon's words, counted down.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for p in state.held_plans.iter().filter(|p| !p.is_feature()) {
+        lines.push(Line::from(vec![
+            Span::styled("held  ", Style::default().quiet()),
+            Span::raw(p.sentence(now_unix)),
+        ]));
+    }
+    if let Some(fl) = field_hud(&np.field) {
+        lines.push(Line::from(Span::styled(fl, Style::default().quiet())));
+    }
+    // The just-finished hint: the one ambient line no other surface shows, since the
+    // track has left the queue. Off the DJ view only (the DJ view owns that voice).
+    // A playing deck already names its track, so only a resting one carries it.
+    if let Some(hint) = np.hint.as_ref().filter(|_| np.error.is_none() && deck_is_empty(np)) {
+        if state.screen != Screen::Dj && hint_earns_line(&hint.kind) {
+            lines.push(Line::from(Span::styled(hint.phrase(), Style::default().quiet())));
+        }
+    }
+    lines
+}
+
+/// `next  <title> · <artist> · on disk · +N more`: the song after this one, with its
+/// availability in words (decision b) from the daemon's per-row `X-Offline`, so the
+/// glance answers "will the next one play with the server gone". The continuation
+/// station when the queue ends into radio; nothing when nothing follows.
+fn next_line(state: &TuiState) -> Option<Line<'static>> {
+    let start = state.now.song.map(|c| c + 1).unwrap_or(0);
+    let lead = Span::styled("next  ", Style::default().quiet());
+    if let Some(it) = state.queue.iter().find(|it| it.pos >= start) {
+        let mut spans = vec![lead, Span::raw(it.title.clone())];
+        let mut tail = Vec::new();
+        if let Some(a) = it.artist.as_deref().filter(|a| Some(*a) != state.now.artist.as_deref()) {
+            tail.push(a.to_string());
+        }
+        if let Some((_, v)) = it.details.iter().find(|(k, _)| k == "X-Offline") {
+            tail.push(if v == "1" { "on disk" } else { "stream only" }.to_string());
+        }
+        let after = state.queue.iter().filter(|q| q.pos > it.pos).count();
+        if after > 0 {
+            tail.push(format!("+{after} more"));
+        }
+        if !tail.is_empty() {
+            spans.push(Span::styled(format!(" \u{00b7} {}", tail.join(" \u{00b7} ")), Style::default().quiet()));
+        }
+        return Some(Line::from(spans));
+    }
+    if let Some(station) = &state.now.continuation {
+        return Some(Line::from(vec![lead, Span::styled(format!("radio: {station}"), Style::default().quiet())]));
+    }
+    None
+}
+
+/// The cover slot: the cover fetched for THIS album, else the album's sigil (no image
+/// protocol), else a neutral placeholder. Never the previous album's cover: a skip
+/// whose fetch has not landed shows the swatch until it does.
+fn render_cover(f: &mut Frame, rect: Rect, state: &TuiState) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let (cols, rows) = (rect.width as usize, rect.height as usize);
+    match state.art_for_now() {
+        Some(a)
+            if render_sixel_art(
+                f,
+                rect,
+                a,
+                state.sixel_cell_px,
+                state.sixel_gen.get(),
+                &state.sixel_held,
+                state.sixel_covered.get(),
+            ) => {}
+        Some(a) => f.render_widget(Paragraph::new(a.lines(cols, rows)), rect),
+        None => match (&state.sigil, state.image_protocol) {
+            (Some(sig), crate::album_color::ImageProtocol::None) => {
+                f.render_widget(Paragraph::new(sig.lines(cols, rows)), rect)
+            }
+            _ => f.render_widget(art_placeholder(&state.now), rect),
+        },
+    }
+}
+
+/// The narrow deck: a strip across the top, cover on the left, words beside it.
+fn render_strip(f: &mut Frame, area: Rect, state: &TuiState) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let cover_w = strip_cover_cols(state).min(area.width / 3);
+    if cover_w > 1 {
+        let rect = Rect { x: area.x, y: area.y, width: cover_w - 1, height: area.height.min(3) };
+        render_cover(f, rect, state);
+    }
+    let text = Rect { x: area.x + cover_w, width: area.width - cover_w, ..area };
+    let lines = deck_lines(state, text.width as usize, false);
+    f.render_widget(Paragraph::new(lines), text);
+}
+
+/// The wide deck: a rail on the left with a square cover on top and the same words
+/// under it, wrapped rather than clipped (the rail is narrow by design).
+fn render_rail(f: &mut Frame, area: Rect, state: &TuiState) {
+    // One column of air either side of the rail's words.
+    let inner = Rect { x: area.x + 1, width: area.width.saturating_sub(3), ..area };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let mut y = inner.y;
+    if !deck_is_empty(&state.now) {
+        let rows = square_art_rows(inner.width, state.sixel_cell_px).min(inner.height / 2);
+        let cols = square_art_cols(rows, state.sixel_cell_px).min(inner.width);
+        if rows > 0 {
+            render_cover(f, Rect { x: inner.x, y, width: cols, height: rows }, state);
+            y += rows + 1;
+        }
+    }
+    let text = Rect { y, height: (inner.y + inner.height).saturating_sub(y), ..inner };
+    let lines = deck_lines(state, text.width as usize, true);
+    f.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), text);
 }
 
 /// The now-playing HEADLINE and optional STATION sub-line for the current pane (task
@@ -895,212 +1136,6 @@ pub fn stream_headline(np: &NowPlaying) -> (String, Option<String>) {
     .unwrap_or_else(|| "(unknown)".to_string());
     let station = np.name.as_deref().filter(|n| *n != headline).map(str::to_string);
     (headline, station)
-}
-
-/// Left of Now Playing: the dithered album art with title/artist/album beneath it.
-fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
-    let np = &state.now;
-    let block = Block::default().borders(Borders::ALL).title("Now Playing");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let holds = hypodj_client::spoken::armed_hold(&np.armed);
-    // The active latent-field pull, as its own subtle line (the quietest voice),
-    // mirroring the armed HUD: present ONLY when a pull is active, so a resting field
-    // reserves no row and never jumps the layout.
-    let field_line = field_hud(&np.field);
-    let stopped = np.state.as_deref() == Some("stop");
-    let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
-    if stopped || empty {
-        // A stopped deck can still hold an armed wake alarm or a held pull - surface
-        // them as subtle lines so the machine's hold stays visible. Field is the last,
-        // quietest line.
-        let mut lines = vec![Line::from("nothing playing")];
-        // WHY, when the deck stopped because a song could not be fetched: the daemon's
-        // `error` sentence, drawn loud, and it REPLACES the "just finished" hint below,
-        // which would otherwise claim the failed song played.
-        if let Some(e) = &np.error {
-            lines.push(Line::from(Span::styled(e.clone(), Style::default().bold())));
-        }
-        // THE ONE EMPTY STATE A NEW USER MEETS, so it is the one place a way forward
-        // has to be written down. Every route out of it is a function key nothing on
-        // screen explains, and the only pointer to the keymap is a dim `? help` in the
-        // far corner of the bottom bar. Two verbs cost one dim line.
-        lines.push(Line::from(Span::styled(
-            "F5 to search, F4 to ask the DJ",
-            hypodj_style::ratatui::style_for(
-                hypodj_style::Role::InkQuiet,
-                state.term_bg,
-                state.truecolor,
-            ),
-        )));
-        // The modes still decide what the next play does, so a stopped deck says them.
-        if let Some(m) = np.modes.label() {
-            lines.push(Line::from(Span::styled(
-                format!("modes: {m}"),
-                hypodj_style::ratatui::style_for(
-                    hypodj_style::Role::InkQuiet,
-                    state.term_bg,
-                    state.truecolor,
-                ),
-            )));
-        }
-        for a in &holds {
-            lines.extend(hypodj_style::ratatui::render(a, state.term_bg, state.truecolor));
-        }
-        if let Some(fl) = &field_line {
-            lines.push(Line::from(Span::styled(
-                fl.clone(),
-                Style::default().quiet(),
-            )));
-        }
-        // The ambient context hint is the last, faintest line: a stopped deck still
-        // surfaces what the DJ would seed from. Exactly ONE faint hint line per screen:
-        // on Screen::Dj the DJ pane owns the full "btw, DJ knows" voice, so the card
-        // stays silent (never both at once); off the DJ screen the card is the owner
-        // and shows the bare phrase. An up-next hint never draws here either - the
-        // always-visible "Up Next" pane already lists that track (see hint_earns_line).
-        if let Some(hint) = np.hint.as_ref().filter(|_| np.error.is_none()) {
-            if state.screen != Screen::Dj && hint_earns_line(&hint.kind) {
-                lines.push(Line::from(Span::styled(
-                    hint.phrase(),
-                    Style::default().quiet(),
-                )));
-            }
-        }
-        f.render_widget(Paragraph::new(lines), inner);
-        return;
-    }
-
-    // For a raw stream the daemon puts the station/show in `Name` and the now-playing
-    // (if any) in `Title`; an unnamed stream's `Title` is just its URL. Derive the
-    // headline (station name when `Title` is only the URL) and an optional station
-    // sub-line (task lq54isr) so the pane shows a proper name, not the raw URL.
-    let (headline, station_line) = stream_headline(np);
-    // Reserve up to 4 base rows at the bottom for title/artist/album + the playback
-    // status line (state | volume fader | position), plus one per optional station line
-    // and HUD line (armed, then field); the rest is art. Reserving no row when a line is
-    // absent is what keeps the layout from jumping when it vanishes at rest.
-    let extra = station_line.is_some() as u16
-        + holds.len() as u16
-        + field_line.is_some() as u16;
-    let text_h = (4u16 + extra).min(inner.height);
-    // The art takes what the text does not - but NEVER more rows than it can be square
-    // in. Beyond that the width clamp below stops widening it, so the extra rows only
-    // stretch the cover vertically while pushing the metadata down into a four-row
-    // footnote under a distorted image. Capping here means a tall pane leaves calm
-    // space under the card instead, and the art stays the shape the cover actually is.
-    let square_rows = square_art_rows(inner.width, state.sixel_cell_px);
-    let art_h = inner.height.saturating_sub(text_h).min(square_rows);
-    if art_h > 0 {
-        // Keep the art roughly square: each cell renders 2 vertical pixels, so a
-        // square cover is about (rows*2) columns wide. Clamp to the pane width.
-        let art_rows = art_h as usize;
-        // The 2:1 constant encodes the HALF-BLOCK aspect (two vertical pixels per
-        // cell). A sixel image is drawn at native pixels, so its square-ish width comes
-        // from the real cell aspect instead; using 2:1 there would letterbox it.
-        let art_cols = match state.sixel_cell_px {
-            Some((cw, ch)) if cw > 0 => (art_rows * ch as usize / cw as usize).min(inner.width as usize),
-            _ => (art_rows * 2).min(inner.width as usize),
-        };
-        let art_area = Rect { x: inner.x, y: inner.y, width: art_cols as u16, height: art_h };
-        match &state.art {
-            // A real cover is always preferred. Sixel when the terminal can draw it,
-            // else the cell renderers.
-            Some(a) if render_sixel_art(f, art_area, a, state.sixel_cell_px, state.sixel_gen.get(), &state.sixel_held, state.sixel_covered.get()) => {}
-            Some(a) => f.render_widget(Paragraph::new(a.lines(art_cols, art_rows)), art_area),
-            // No cover: draw the deterministic album sigil when no inline-image
-            // protocol is available (the image-less fallback for the art slot); else a
-            // plain placeholder. The sigil degrades to a hash-only identicon with no
-            // cover palette (built neutral in update_sigil).
-            None => match (&state.sigil, state.image_protocol) {
-                (Some(sig), crate::album_color::ImageProtocol::None) => {
-                    f.render_widget(Paragraph::new(sig.lines(art_cols, art_rows)), art_area)
-                }
-                _ => f.render_widget(art_placeholder(np), art_area),
-            },
-        }
-    }
-
-    let text_area = Rect {
-        x: inner.x,
-        y: inner.y + art_h,
-        width: inner.width,
-        height: text_h,
-    };
-    let title_span = Span::styled(headline, Style::default().bold());
-    // A heart marks a Subsonic favorite. U+2665 is East-Asian-Width ambiguous, so it
-    // is followed by U+FE0E (text-presentation selector) to force a single cell on
-    // emoji-presentation terminals (else the title shifts and the border corrupts).
-    // Prepended only when starred, so the layout is unchanged otherwise.
-    // Ember: a kept item, fitted to the room. There is no red.
-    let title_line = if np.starred {
-        Line::from(vec![
-            Span::styled(
-                "\u{2665}\u{FE0E} ",
-                Style::default().fg(hypodj_style::ratatui::ember_color(state.term_bg, state.truecolor)),
-            ),
-            title_span,
-        ])
-    } else {
-        Line::from(title_span)
-    };
-    let mut lines = vec![title_line];
-    // The station name as a subtle second line when it is not already the headline
-    // (a stream with a real now-playing title shows "<station>" beneath it).
-    if let Some(station) = station_line {
-        lines.push(Line::from(Span::styled(
-            station,
-            Style::default().quiet(),
-        )));
-    }
-    if let Some(artist) = np.artist.as_deref() {
-        // A PLACEHOLDER artist is not information, so it does not get an information
-        // weight: `Various Artists` was rendering at full brightness as the second-most
-        // prominent thing on the card while saying strictly less than the album under
-        // it. Dimmed to the album's level, the eye goes to the two lines that identify
-        // the music. Still shown - the tag is what the server says, and hiding it would
-        // be a different claim.
-        let style = if is_placeholder_artist(artist) {
-            Style::default().quiet()
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(Span::styled(artist.to_string(), style)));
-    }
-    if let Some(album) = np.album.as_deref() {
-        lines.push(Line::from(Span::styled(
-            album.to_string(),
-            Style::default().quiet(),
-        )));
-    }
-    // Playback status: state | volume fader | N of M | M:SS.
-    lines.push(Line::from(Span::styled(
-        status_line(
-            np,
-            state.live_elapsed(std::time::Instant::now()),
-            text_area.width as usize,
-        ),
-        hypodj_style::ratatui::style_for(
-            hypodj_style::Role::InkQuiet,
-            state.term_bg,
-            state.truecolor,
-        ),
-    )));
-    for a in &holds {
-        lines.extend(hypodj_style::ratatui::render(a, state.term_bg, state.truecolor));
-    }
-    // The field pull is the last, faintest line - the quietest voice in the pane.
-    if let Some(fl) = field_line {
-        lines.push(Line::from(Span::styled(
-            fl,
-            Style::default().quiet(),
-        )));
-    }
-    f.render_widget(Paragraph::new(lines), text_area);
 }
 
 /// The rows the art may occupy and still be SQUARE inside `width` columns. Past this
@@ -1167,75 +1202,6 @@ fn art_placeholder(_np: &NowPlaying) -> Paragraph<'static> {
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL))
         .style(Style::default().quiet())
-}
-
-/// Right of Now Playing: a compact preview of the next 3 queued tracks, each a
-/// bold title over a dim artist line - a smaller echo of the current-track card.
-fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
-    let block = Block::default().borders(Borders::ALL).title("Up Next");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    // The next tracks are those after the current song index, in queue order.
-    let start = state.now.song.map(|c| c + 1).unwrap_or(0);
-    let mut lines: Vec<Line> = Vec::new();
-    let mut count = 0;
-    // The artist carried down from the row above, so a run of the same one is said
-    // once. Three rows reading `Various Artists` under three different titles spent the
-    // pane's whole sub-line budget on a word the reader had already discounted.
-    let mut previous_artist: Option<&str> = None;
-    for it in state.queue.iter().skip(start) {
-        if count >= 3 {
-            break;
-        }
-        // `next` then `then`, NOT the absolute queue position. `2.` was the row's index
-        // in the whole queue, so the pane opened on a number that is neither first nor
-        // meaningful out of context - and it sat beside the card's own `track 1 of 5`,
-        // inviting the reading that this list was ranked or that a row was missing. The
-        // words are the same ones the continuation hint already uses ("then: <station>").
-        let lead = if count == 0 { "next" } else { "then" };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{lead}  "), Style::default().quiet()),
-            Span::styled(it.title.clone(), Style::default().bold()),
-        ]));
-        // Availability in words (decision b), from the daemon's per-row `X-Offline`.
-        // It rides the artist sub-line so a long title can never clip it away.
-        let avail = it.details.iter().find(|(k, _)| k == "X-Offline").map(|(_, v)| {
-            if v == "1" { "on disk" } else { "stream only" }
-        });
-        let artist = it.artist.as_deref().filter(|a| previous_artist != Some(*a));
-        let sub = match (artist, avail) {
-            (Some(a), Some(w)) => Some(format!("      {a} · {w}")),
-            (Some(a), None) => Some(format!("      {a}")),
-            (None, Some(w)) => Some(format!("      {w}")),
-            (None, None) => None,
-        };
-        if let Some(sub) = sub {
-            lines.push(Line::from(Span::styled(sub, Style::default().quiet())));
-        }
-        previous_artist = it.artist.as_deref();
-        lines.push(Line::from(""));
-        count += 1;
-    }
-    if lines.is_empty() {
-        // What is true (nothing is queued) rather than where the cursor is (the end of
-        // a list), plus the one gesture that fills it.
-        lines.push(Line::from(Span::styled(
-            "nothing queued",
-            Style::default().quiet(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "F5 to search, F4 to ask the DJ",
-            hypodj_style::ratatui::style_for(
-                hypodj_style::Role::InkQuiet,
-                state.term_bg,
-                state.truecolor,
-            ),
-        )));
-    }
-    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// "[playing|paused|stopped] · vol [==#--] V% · track N of M · M:SS / M:SS".
@@ -1497,6 +1463,7 @@ mod tests {
         s.now.cover = Some("https://is1.example/hq.jpg".into());
         let pal = Palette { vibrant: [220, 40, 40], muted: [80, 30, 30], swatches: vec![[220, 40, 40]] };
         s.art = Some(crate::art::AlbumArt::for_test(pal));
+        s.art_album = Some(s.album_identity());
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(
             out.contains('\u{2588}'),
@@ -1764,7 +1731,7 @@ mod tests {
         s.now.song = Some(0);
         s.now.playlistlength = Some(5);
         s.now.duration = Some(434.0);
-        let out = render_to_lines_sized(&s, 120, 40).join("\n");
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(out.contains("vol [======#-----] 56%"), "the fader is named:\n{out}");
         assert!(out.contains("track 1 of 5"), "the position is named:\n{out}");
         assert!(out.contains("7:14 total"), "the duration is named:\n{out}");
@@ -1775,24 +1742,27 @@ mod tests {
         // The stopped card is the first thing a fresh install shows, and every way out
         // of it is a function key. Before, the only pointer anywhere on screen was a dim
         // `? help` in the opposite corner.
+        // The way out is the ACT (say it, or browse), not the function keys that used
+        // to be the only route and are going away.
         let s = TuiState::new();
         let out = render_to_lines_sized(&s, 100, 40).join("\n");
         assert!(out.contains("nothing playing"), "the state is named:\n{out}");
-        assert!(out.contains("F5 to search, F4 to ask the DJ"), "and a way out:\n{out}");
-        // The same two verbs on the empty Up Next, which is the OTHER empty pane on the
-        // same screen - one wording, learned once.
-        assert!(out.contains("nothing queued"), "the queue pane is honest too:\n{out}");
+        assert!(out.contains("press : and say what to play"), "and a way out:\n{out}");
+        assert!(!out.contains("F5"), "no retired key is taught:\n{out}");
+        // The empty queue says the same act, one wording, learned once.
+        assert!(out.contains("Queue - empty"), "the queue is honest too:\n{out}");
         assert!(!out.contains("end of queue"), "not a cursor position:\n{out}");
     }
 
     #[test]
-    fn up_next_leads_with_next_then_then_and_says_a_repeated_artist_once() {
-        // `2.` was the row's absolute queue index: the pane opened on a number that is
-        // neither first nor meaningful beside the card's own `track 1 of 5`. And a
-        // compilation put `Various Artists` under all three rows, spending the pane's
-        // whole sub-line budget on a word the reader discounts on sight.
+    fn the_deck_names_the_next_song_once_and_counts_the_rest() {
+        // The deck carries ONE next song, by title, with how many follow - the queue
+        // view is where the rest are listed. An artist the deck already names (the one
+        // playing) is not said again; a CHANGE of artist always is.
         let mut s = TuiState::new();
         s.now.state = Some("play".into());
+        s.now.title = Some("Playing".into());
+        s.now.artist = Some("Various Artists".into());
         s.now.song = Some(0);
         let item = |pos: usize, title: &str, artist: &str| hypodj_client::model::QueueItem {
             pos,
@@ -1801,7 +1771,7 @@ mod tests {
             uri: Some(format!("song/{pos}")),
             album_uri: None,
             artist_uri: None,
-            details: Vec::new(),
+            details: vec![("X-Offline".into(), "1".into())],
         };
         s.queue = vec![
             item(0, "Playing", "Various Artists"),
@@ -1809,24 +1779,83 @@ mod tests {
             item(2, "Third", "Various Artists"),
             item(3, "Fourth", "C418"),
         ];
-        // The right half of the frame is the Up Next pane; the Queue screen on the left
-        // is a navigable list and keeps its own numbering and its own repeats.
-        let rows = render_to_lines_sized(&s, 120, 40);
-        let out: String = rows
-            .iter()
-            .map(|r| r.chars().skip(62).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(out.contains("next  Second"), "the first row leads with `next`:\n{out}");
-        assert!(out.contains("then  Third"), "and the rest with `then`:\n{out}");
-        // (The Queue SCREEN still numbers its own rows - a list you navigate has
-        // positions. The preview pane is not one, which is the distinction.)
-        assert_eq!(
-            out.matches("Various Artists").count(),
-            1,
-            "a repeated artist is said once, not once per row:\n{out}"
-        );
-        assert!(out.contains("C418"), "but a CHANGE of artist is always said:\n{out}");
+        let rows = render_to_lines_sized(&s, 80, 24);
+        let next = rows.iter().take(4).find(|r| r.contains("next  ")).cloned().unwrap_or_default();
+        assert!(next.contains("next  Second \u{b7} on disk \u{b7} +2 more"), "title, availability, count:\n{}", rows.join("\n"));
+        assert!(!next.contains("Various Artists"), "the playing artist is not said twice:\n{next}");
+        s.queue[1].artist = Some("C418".into());
+        let rows = render_to_lines_sized(&s, 80, 24);
+        let next = rows.iter().take(4).find(|r| r.contains("next  ")).cloned().unwrap_or_default();
+        assert!(next.contains("next  Second \u{b7} C418"), "a change of artist is said:\n{next}");
+    }
+
+    /// What is drawn belongs to what is named: the held cover of the album before is
+    /// never drawn under the next album's title while that album's own fetch is out
+    /// (or will never land, the server being gone). Inside one album the cover holds.
+    #[test]
+    fn a_skip_into_another_album_never_draws_the_last_albums_cover() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Low Tide".into());
+        s.now.artist = Some("Fixture Band".into());
+        s.now.album = Some("Held Harbour".into());
+        s.art = Some(crate::art::AlbumArt::for_test_solid([200, 40, 40]));
+        s.art_album = Some(s.album_identity());
+        let cover = |s: &TuiState| render_to_lines_sized(s, 80, 24)[0].chars().take(6).collect::<String>();
+        assert!(cover(&s).contains('\u{2588}'), "the album's own cover is drawn: {:?}", cover(&s));
+        // The next track of the SAME album: the cover holds, no blink.
+        s.now.title = Some("Moorings".into());
+        assert!(cover(&s).contains('\u{2588}'), "held inside the album: {:?}", cover(&s));
+        // Into another album, its fetch still out: the swatch, never the old cover.
+        s.now.title = Some("Ascent".into());
+        s.now.album = Some("Stream Summit".into());
+        assert!(!cover(&s).contains('\u{2588}'), "the old cover is gone: {:?}", cover(&s));
+        assert!(s.art.is_some(), "it is the drawing that is gated, the fetch path is untouched");
+    }
+
+    /// The view line steps down whole (words, then letters, then nothing) and the
+    /// server word is the last thing on it to go.
+    #[test]
+    fn the_view_line_steps_down_and_keeps_the_server_word() {
+        let mut s = TuiState::new();
+        s.now.server = Some("unreachable".into());
+        let line = |w: u16| render_to_lines_sized(&s, w, 24)[3].trim_end().to_string();
+        assert!(line(80).starts_with(" Queue  Albums  Lists  DJ  Find"), "{:?}", line(80));
+        assert!(line(80).ends_with("server unreachable"), "{:?}", line(80));
+        assert!(line(60).ends_with("server unreachable"), "{:?}", line(60));
+        assert!(line(40).starts_with(" Q A L D F"), "letters at 40: {:?}", line(40));
+        assert!(line(40).ends_with("server unreachable"), "{:?}", line(40));
+        assert_eq!(line(24).trim(), "server unreachable", "names give way first: {:?}", line(24));
+        for w in [24u16, 40, 60, 80] {
+            assert!(!line(w).contains("server unrea") || line(w).contains("server unreachable"), "never clipped at {w}");
+        }
+    }
+
+    /// The Deck gives the list the rows: at the classic 80x24, a long queue shows at
+    /// least 16 rows (the bordered two-box layout showed 6).
+    #[test]
+    fn at_80x24_the_list_gets_at_least_sixteen_rows() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Song 1".into());
+        s.now.song = Some(0);
+        s.queue = (0..40)
+            .map(|pos| hypodj_client::model::QueueItem {
+                pos,
+                title: format!("Song {}", pos + 1),
+                artist: None,
+                uri: Some(format!("song/{pos}")),
+                album_uri: None,
+                artist_uri: None,
+                details: Vec::new(),
+            })
+            .collect();
+        let rows = render_to_lines_sized(&s, 80, 24);
+        let list = rows.iter().filter(|r| r.contains(". Song ")).count();
+        assert!(list >= 16, "{list} list rows:\n{}", rows.join("\n"));
+        // And the instrument is still on top: title, transport and next together.
+        let top = rows[..3].join("\n");
+        assert!(top.contains("Song 1") && top.contains("playing") && top.contains("next  Song 2"), "{top}");
     }
 
     #[test]
@@ -1907,14 +1936,16 @@ mod tests {
         s.now.title = Some("Something Else".into());
         // A cover is held for what is PLAYING, and must be untouched by the card.
         s.art = Some(crate::art::AlbumArt::for_test_solid([10, 20, 30]));
+        s.art_album = Some(s.album_identity());
         s.card = Some(vec![("title".into(), "Heroes".into())]);
         s.card_art = Some(crate::art::AlbumArt::for_test_solid([200, 40, 40]));
 
         let out = render_to_lines_sized(&s, 129, 40).join("\n");
         assert!(out.contains("Info"), "the card is drawn:\n{out}");
         assert!(out.contains("Heroes"), "with its rows:\n{out}");
-        // The pane keeps its ONE meaning - no "Preview" title anywhere any more.
-        assert!(out.contains("Now Playing"), "the pane is still itself:\n{out}");
+        // The deck keeps its ONE meaning - it still names what is playing beside the
+        // card, and no "Preview" title appears anywhere.
+        assert!(out.contains("Something Else"), "the deck is still itself:\n{out}");
         assert!(!out.contains("Preview"), "the preview title is gone:\n{out}");
         assert!(s.art.is_some(), "the card never touches the playing cover");
         // On a tall terminal the card simply GROWS to fit the cover, so it does not
@@ -2217,7 +2248,7 @@ mod tests {
         s.help_open = true;
         // Height sized to hold EVERY row at once (grows with the keymap; the scrolling
         // behaviour on a real terminal is the next test's job, not this one's).
-        let out = render_to_lines_sized(&s, 120, 64).join("\n");
+        let out = render_to_lines_sized(&s, 120, 80).join("\n");
         // A group header and a couple of known binding descriptions are present, all
         // derived from keymap::grouped (so the overlay can never drift).
         assert!(out.contains("View"), "group header rendered:\n{out}");
@@ -2566,6 +2597,7 @@ mod tests {
         // A vivid album palette -> the waveform is colored via the INFO policy.
         let pal = Palette { vibrant: [220, 40, 40], muted: [80, 30, 30], swatches: vec![[220, 40, 40]] };
         s.art = Some(crate::art::AlbumArt::for_test(pal.clone()));
+        s.art_album = Some(s.album_identity());
         let expect = info_color(pal.vibrant, s.term_bg, true);
         let colors = render_fg_colors(&s, 60, 24);
         assert!(
@@ -2863,7 +2895,7 @@ mod tests {
         let mut s = TuiState::new();
         s.screen = crate::state::Screen::Find;
         let out = render_to_lines(&s).join("\n");
-        assert!(out.contains("[F5]Search"), "Find tab in the strip:\n{out}");
+        assert!(out.contains("Find"), "Find is on the view line:\n{out}");
         assert!(out.contains("find>"), "the query prompt is drawn:\n{out}");
         assert!(
             out.contains("type a query and press enter"),
@@ -3020,13 +3052,14 @@ mod tests {
         s.push_dj_log("> fade out".into());
         let out = render_to_lines(&s).join("\n");
         // The DJ pane title, the phase line, the ask> input, and the logged query.
-        assert!(out.contains("DJ - Claude Code"), "DJ pane titled:\n{out}");
+        assert!(out.contains("DJ - ask in words"), "DJ view titled:\n{out}");
         assert!(out.contains("thinking..."), "phase line drawn:\n{out}");
         assert!(out.contains("ask>"), "input prompt drawn:\n{out}");
         assert!(out.contains("> fade out"), "scrollback shows the query:\n{out}");
-        // The DJ tab is in the strip and the Queue still shares the top region.
-        assert!(out.contains("[F4]DJ"), "DJ tab present:\n{out}");
-        assert!(out.contains("Queue"), "Queue shares the split:\n{out}");
+        // The DJ view is on the view line, and the queue it used to share the
+        // region with is one Tab away (its name is on the same line).
+        assert!(out.contains(" DJ "), "DJ on the view line:\n{out}");
+        assert!(out.contains("Queue"), "Queue named on the view line:\n{out}");
     }
 
     #[test]
@@ -3457,9 +3490,18 @@ mod tests {
 }
 
 fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
-    let block = Block::default().borders(Borders::ALL).title("Queue");
+    let (head, area) = body_header(area);
+    let n = state.queue.len();
+    let title = match n {
+        // The deck above already says how to fill it; the header says only what is.
+        0 => "Queue - empty".to_string(),
+        1 => "Queue - 1 song".to_string(),
+        n => format!("Queue - {n} songs"),
+    };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(title, Style::default().quiet()))), head);
     let current = state.now.song;
     let query = state.highlight_query();
+    let width = area.width as usize;
     let mut items: Vec<ListItem> = state
         .queue
         .iter()
@@ -3471,28 +3513,33 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
             };
             // Mark the current song row.
             let marker = if current == Some(it.pos) { "> " } else { "  " };
-            let mut spans = vec![Span::raw(format!("{marker}{}. ", it.pos + 1))];
+            let lead = format!("{marker}{}. ", it.pos + 1);
+            // Availability in words (decision b) as a right-aligned column, from the
+            // daemon's per-row `X-Offline`; absent when the daemon did not say.
+            let avail = it.details.iter().find(|(k, _)| k == "X-Offline").map(|(_, v)| {
+                if v == "1" { "on disk" } else { "stream only" }
+            });
+            let mut spans = vec![Span::raw(lead.clone())];
             spans.extend(match_spans(&label, query, Style::default(), hit_style()));
+            if let Some(w) = avail {
+                push_column(&mut spans, lead.chars().count() + label.chars().count(), w, width);
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
     // Standing CONTINUATION-radio queue-tail hint: when continuation is ARMED the
     // daemon names the station, so draw a faint "then: <station>" row AFTER the last
-    // real queue entry - the future made visible BEFORE the drain handoff
-    // (anti-surprise). Mirrors the faint, unobtrusive register of the ambient line.
+    // real queue entry - the future made visible BEFORE the drain handoff.
     if let Some(station) = &state.now.continuation {
         items.push(ListItem::new(Line::from(Span::styled(
             format!("   then: {station}"),
             Style::default().quiet(),
         ))));
     }
-    let list = List::new(items).block(block).highlight_style(
-        Style::default().reverse(),
-    );
+    let list = List::new(items).highlight_style(Style::default().reverse());
     let mut ls = ListState::default();
     if !state.queue.is_empty() {
-        // Inner list height (area minus the top/bottom border rows).
-        let h = area.height.saturating_sub(2) as usize;
+        let h = area.height as usize;
         let off = crate::state::scroll_offset(state.selected, state.queue.len(), h, state.offset.get());
         // Persist the derived offset for the next frame, then force it onto the
         // ListState (ratatui would otherwise recompute its own scroll).
@@ -3501,6 +3548,23 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
         ls.select(Some(state.selected));
     }
     f.render_stateful_widget(list, area, &mut ls);
+}
+
+/// Split a body region into its one-line header and the rows under it. The body is
+/// borderless: a box costs two rows of a 24-row terminal and says only "this is a
+/// list", which the rows already say.
+fn body_header(area: Rect) -> (Rect, Rect) {
+    let head = Rect { height: area.height.min(1), ..area };
+    let rest = Rect { y: area.y + head.height, height: area.height - head.height, ..area };
+    (head, rest)
+}
+
+/// Right-align `word` as a quiet column after a row whose text already used `used`
+/// cells, two cells of air at least. When the row is too long the column still
+/// follows it, so the edge clips the words before it clips the title.
+fn push_column(spans: &mut Vec<Span<'static>>, used: usize, word: &str, width: usize) {
+    let pad = width.saturating_sub(used + word.chars().count() + 1).max(2);
+    spans.push(Span::styled(format!("{}{word}", " ".repeat(pad)), Style::default().quiet()));
 }
 
 /// Render a browse screen (Albums/Playlists): the active `Browse.rows` in a List,
@@ -3513,8 +3577,13 @@ fn render_browse(
     state: &TuiState,
     markers: bool,
 ) {
-    let block = Block::default().borders(Borders::ALL).title(browse.title.clone());
+    let (head, area) = body_header(area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(browse.title.clone(), Style::default().quiet()))),
+        head,
+    );
     let query = state.highlight_query();
+    let width = area.width as usize;
     // Queue-marker lookups (Albums screen only): album/<id> -> distinct queued song
     // ids for the full/partial gutter, plus the flat queued-uri set for the song
     // rows of an opened album.
@@ -3539,11 +3608,10 @@ fn render_browse(
             };
             let mut spans = vec![Span::raw(format!("{glyph} "))];
             spans.extend(match_spans(&r.label, query, Style::default(), hit_style()));
-            if r.is_dir {
-                spans.push(Span::raw("/"));
-            }
+            // An album row says whether it plays offline, as a right-aligned column.
+            // No trailing `/` on directories: that was the filesystem speaking.
             if let Some(words) = availability_words(browse, r) {
-                spans.push(Span::styled(format!("  {words}"), Style::default().quiet()));
+                push_column(&mut spans, 2 + r.label.chars().count(), &words, width);
             }
             ListItem::new(Line::from(spans))
         })
@@ -3554,17 +3622,14 @@ fn render_browse(
         let p = Paragraph::new(Line::from(Span::styled(
             "loading albums...",
             Style::default().quiet(),
-        )))
-        .block(block);
+        )));
         f.render_widget(p, area);
         return;
     }
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().reverse());
+    let list = List::new(items).highlight_style(Style::default().reverse());
     let mut ls = ListState::default();
     if !browse.rows.is_empty() {
-        let h = area.height.saturating_sub(2) as usize;
+        let h = area.height as usize;
         let off = crate::state::scroll_offset(browse.selected, browse.rows.len(), h, browse.offset.get());
         browse.offset.set(off);
         *ls.offset_mut() = off;
@@ -3593,9 +3658,11 @@ fn availability_words(browse: &Browse, r: &crate::state::BrowseRow) -> Option<St
 /// spinner + phase row while a call is in flight, and the "ask>" NL input row.
 /// The spinner rides the shared anim_secs clock; no token typewriter in the MVP.
 fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
-    let block = Block::default().borders(Borders::ALL).title("DJ - Claude Code");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let (head, inner) = body_header(area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled("DJ - ask in words, Esc leaves", Style::default().quiet()))),
+        head,
+    );
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -3926,7 +3993,7 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 // Waveform color: an album swatch run through the INFO policy (>= 3:1
                 // vs the detected bg, hue-preserving), replacing the flat DIM styling.
                 // No cover -> stay DIM (no album hue to honor).
-                let wave_style = match &state.art {
+                let wave_style = match state.art_for_now() {
                     Some(a) => {
                         let c = hypodj_style::ratatui::info_color(
                             a.palette.vibrant,
@@ -4287,6 +4354,7 @@ mod sixel_render_tests {
         let mut s = TuiState::new();
         s.sixel_cell_px = Some((8, 17));
         s.art = Some(crate::art::AlbumArt::for_test_solid([10, 20, 30]));
+        s.art_album = Some(s.album_identity());
         s.now.title = Some("The Peacocks".into());
         s.now.state = Some("play".into());
         terminal.draw(|f| render(f, &s)).unwrap();
@@ -4346,6 +4414,7 @@ mod sixel_render_tests {
         let mut s = TuiState::new();
         s.sixel_cell_px = Some((8, 17));
         s.art = Some(art());
+        s.art_album = Some(s.album_identity());
         s.now.title = Some("Future Proof".into());
         s.now.state = Some("play".into());
 
@@ -4412,6 +4481,7 @@ mod sixel_render_tests {
         s.now.state = Some("play".into());
         s.now.title = Some("A".into());
         s.art = Some(art());
+        s.art_album = Some(s.album_identity());
 
         let payload_of = |t: &Terminal<TestBackend>| -> Option<String> {
             t.backend().buffer().content().iter()
@@ -4440,6 +4510,7 @@ mod sixel_render_tests {
 
         // The track advances while the menu is still up: a DIFFERENT cover.
         s.art = Some(crate::art::AlbumArt::for_test_solid([20, 40, 220]));
+        s.art_album = Some(s.album_identity());
         terminal.draw(|f| render(f, &s)).unwrap();
         assert_eq!(
             under_popup,
@@ -4467,6 +4538,7 @@ mod sixel_render_tests {
         s.now.state = Some("play".into());
         s.now.title = Some("A".into());
         s.art = Some(art());
+        s.art_album = Some(s.album_identity());
         let payload_of = |t: &Terminal<TestBackend>| -> Option<String> {
             t.backend().buffer().content().iter()
                 .map(|c| c.symbol().to_string())
@@ -4490,9 +4562,11 @@ mod sixel_render_tests {
         ));
         terminal.draw(|f| render(f, &s)).unwrap();
 
-        // The terminal is resized with the popup still up.
-        terminal.backend_mut().resize(100, 40);
-        terminal.resize(Rect::new(0, 0, 100, 40)).unwrap();
+        // The terminal is resized with the popup still up, wide enough that the deck
+        // becomes the rail and the cover changes size (a strip-to-strip resize keeps
+        // the strip's cover geometry, so its pin would rightly still hold).
+        terminal.backend_mut().resize(129, 40);
+        terminal.resize(Rect::new(0, 0, 129, 40)).unwrap();
         terminal.draw(|f| render(f, &s)).unwrap();
         assert_ne!(
             payload_of(&terminal).as_deref(),

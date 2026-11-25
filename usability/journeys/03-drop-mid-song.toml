@@ -59,7 +59,7 @@ transport_matches = true
 # Not "Up Next lies": the store mirrors the queue window (store.rs, reason=Window)
 # within seconds of the enqueue, so these songs WERE on disk when the server went.
 # Decision (b) still asks every row to say so in words while the server is gone.
-name = "Up Next states availability in words while the server is gone (decision b)"
+name = "the next song states availability in words while the server is gone (decision b)"
 at = 11
 when = ["blocked", "no_network"]
 severity = "S1"
@@ -90,11 +90,13 @@ severity = "S1"
 truth = ["playlistinfo[Title=Thin Air].X-Offline == 1"]
 
 [[check]]
-name = "Up Next says the mirrored song is on disk (no stale 'stream only')"
+# The next song now rides ONE line on the deck (`next  Thin Air · on disk`) where
+# the old Up Next pane put the words on the line under the title.
+name = "the deck says the mirrored next song is on disk (no stale 'stream only')"
 at = 11
 when = ["blocked", "no_network"]
 severity = "S1"
-screen_require_re = ["Thin Air[^\\n]*\\n[^\\n]*on disk"]
+screen_require_re = ["Thin Air[^\\n]*on disk"]
 
 [[check]]
 # A blocked server makes a stream connect HANG rather than fail. Within a bounded

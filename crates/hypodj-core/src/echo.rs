@@ -191,7 +191,8 @@ pub fn describe_when(trigger: &RawTrigger) -> String {
     }
 }
 
-fn describe_action(raw: &RawPlan) -> String {
+/// The human WHAT clause of a plan ("stop playback", "fade OUT over 30s").
+pub fn describe_action(raw: &RawPlan) -> String {
     match &raw.action {
         Action::Fade(FadeIntentIr::Out { secs: s }) => format!("fade OUT over {}", human_dur(*s)),
         Action::Fade(FadeIntentIr::In { secs: s }) => format!("fade IN over {}", human_dur(*s)),

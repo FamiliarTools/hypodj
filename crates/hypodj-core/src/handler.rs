@@ -2352,6 +2352,9 @@ pub const PAIR_WAKE: &str = "wake";
 pub const PAIR_ORIGIN: &str = "origin";
 pub const PAIR_WHEN: &str = "when";
 pub const PAIR_NEXT_FIRE: &str = "next_fire";
+/// `plan list`: what a held plan will do, in words, so a client can say what is held
+/// for the listener rather than only when.
+pub const PAIR_WHAT: &str = "what";
 pub const PAIR_NL_ANSWER: &str = "nl_answer";
 /// One held album's worded row in `store albums` / the offline answer.
 pub const PAIR_OFFLINE_ALBUM: &str = "OfflineAlbum";
@@ -5798,7 +5801,8 @@ impl HypodjHandler {
                     b = b
                         .pair(PAIR_PLAN_ID, id.0.to_string())
                         .pair(PAIR_ORIGIN, raw.origin.clone())
-                        .pair(PAIR_WHEN, crate::echo::describe_when(&raw.trigger));
+                        .pair(PAIR_WHEN, crate::echo::describe_when(&raw.trigger))
+                        .pair(PAIR_WHAT, crate::echo::describe_action(&raw));
                     // The armed deadline as a unix epoch second (deadline plans
                     // only): what a recurring plan will fire at NEXT, so its
                     // re-arm and restore are observable from the wire.

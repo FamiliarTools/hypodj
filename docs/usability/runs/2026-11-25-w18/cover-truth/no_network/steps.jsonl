@@ -1,0 +1,15 @@
+{"n":0,"step":"start","t_ms":644,"settled":true,"settle_ms":633}
+{"n":1,"step":"key F2","t_ms":1284,"settled":true,"settle_ms":631}
+{"n":2,"step":"wait 6","t_ms":7954,"settled":true,"settle_ms":632}
+{"n":3,"step":"key j","t_ms":8568,"settled":true,"settle_ms":605}
+{"n":4,"step":"key Enter","t_ms":9332,"settled":true,"settle_ms":754}
+{"n":5,"step":"key j","t_ms":9950,"settled":true,"settle_ms":607}
+{"n":6,"step":"key Space","t_ms":10617,"settled":true,"settle_ms":656}
+{"n":7,"step":"wait 10","t_ms":21303,"settled":true,"settle_ms":633}
+{"n":8,"step":"snap cover-drawn","t_ms":21921,"settled":true,"settle_ms":605}
+{"n":9,"step":"exec nft delete table inet hjblock 2>/dev/null; ip addr replace 10.77.0.1/24 dev srv0 2>/dev/null; ip addr del 10.77.0.1/24 dev srv0; echo no_network > /tmp/hypodj-usability-2029460/world","t_ms":22560,"settled":true,"settle_ms":606,"exit":0}
+{"n":10,"step":"key >","t_ms":23224,"settled":true,"settle_ms":653}
+{"n":11,"step":"key >","t_ms":24496,"settled":true,"settle_ms":1262}
+{"n":12,"step":"key >","t_ms":25766,"settled":true,"settle_ms":1260}
+{"n":13,"step":"wait 3","t_ms":29419,"settled":true,"settle_ms":630}
+{"n":14,"step":"snap after-the-skip","t_ms":30036,"settled":true,"settle_ms":604}

@@ -147,6 +147,9 @@ pub enum RespKind {
         /// rather than a poll of its own because it expires on world drift - the
         /// same events that make the snapshot stale make the offer stale.
         undo: Option<String>,
+        /// The plans the daemon holds (`plan list`), read on every refresh for the
+        /// same reason as `undo`: a fired or cancelled plan bumps no queue version.
+        plans: Vec<hypodj_client::model::HeldPlan>,
     },
     Confirm(Pending),
     /// One reply. A confirm carries every plan; a later part does not replace
@@ -888,11 +891,12 @@ fn do_refresh(conn: &mut MpdConn, known_version: Option<u64>) -> Result<RespKind
     // or a transport move, neither of which bumps the playlist version, so gating the
     // badge on the queue version would leave a dead offer on screen.
     let undo = undo_offer(conn)?;
+    let plans = held_plans(conn)?;
     if version.is_some() && version == known_version {
-        return Ok(RespKind::Snapshot { now, queue: None, version, undo });
+        return Ok(RespKind::Snapshot { now, queue: None, version, undo, plans });
     }
     let queue = cmd(conn, "playlistinfo")?;
-    Ok(RespKind::Snapshot { now, queue: Some(parse_queue(&queue)), version, undo })
+    Ok(RespKind::Snapshot { now, queue: Some(parse_queue(&queue)), version, undo, plans })
 }
 
 /// The footer's retraction offer, or None. An ACK is swallowed on purpose - an older
@@ -903,6 +907,16 @@ fn undo_offer(conn: &mut MpdConn) -> Result<Option<String>, Fail> {
     match conn.command("journal") {
         Ok(pairs) => Ok(undo_badge(&parse_journal(&pairs), 'u')),
         Err(MpdError::Ack(_)) => Ok(None),
+        Err(_) => Err(Fail::Down),
+    }
+}
+
+/// The held plans, or none. An ACK is swallowed like `undo_offer`'s (an older daemon,
+/// a refused verb): a missing held line must never cost the now-playing frame.
+fn held_plans(conn: &mut MpdConn) -> Result<Vec<hypodj_client::model::HeldPlan>, Fail> {
+    match conn.command("plan list") {
+        Ok(pairs) => Ok(hypodj_client::model::parse_plan_list(&pairs)),
+        Err(MpdError::Ack(_)) => Ok(Vec::new()),
         Err(_) => Err(Fail::Down),
     }
 }
