@@ -105,6 +105,22 @@ pub fn scroll_offset(sel: usize, n: usize, h: usize, prev: usize) -> usize {
     off.min(max_off)
 }
 
+/// The pane title for a fetched listing. A title that is still the raw path means
+/// nobody on screen could name the level (a "go to album" from a queue row, or a
+/// back-step to a drilled album), and an opaque `album/<id>` header says nothing to a
+/// human. An album listing names itself: every song row carries the album's `Album`
+/// pair, so the first one is the title. Anything else keeps what it was given.
+pub fn listing_title(path: &str, title: String, pairs: &[(String, String)]) -> String {
+    if title != path || !path.starts_with("album/") {
+        return title;
+    }
+    pairs
+        .iter()
+        .find(|(k, v)| k == "Album" && !v.trim().is_empty())
+        .map(|(_, v)| v.clone())
+        .unwrap_or(title)
+}
+
 /// Group a server browse pair list into rows. A `directory:` pair starts a dir row
 /// (label refined by a following `Album`/`Artist`/`Genre` value, else the path
 /// tail); a `file:` pair starts a song row (label from `Title`, with ` - <artist>`
@@ -5176,6 +5192,28 @@ mod tests {
         s.handle_key(ctrl('p'));
         assert_eq!(s.menu.as_ref().unwrap().selected, 0);
         assert_eq!(s.selected, 0, "and never the queue underneath");
+    }
+
+    /// An album listing whose title is still its raw path names itself from the
+    /// `Album` pair every song row carries (the live `lsinfo album/<id>` shape).
+    #[test]
+    fn an_unnamed_album_listing_takes_its_title_from_the_album_pair() {
+        let pairs: Vec<(String, String)> = [
+            ("file", "song/6lwfyStSzzVhdW6HZ2WJdJ"),
+            ("Title", "The Peacocks"),
+            ("Artist", "Aruan Ortiz"),
+            ("Album", "Junjo"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let p = "album/0R99v5y8Ta6qQroEdhZXY6";
+        assert_eq!(listing_title(p, p.into(), &pairs), "Junjo");
+        // A title someone already chose is kept, and non-album paths are left alone.
+        assert_eq!(listing_title(p, "Junjo (row)".into(), &pairs), "Junjo (row)");
+        assert_eq!(listing_title("artist/x", "artist/x".into(), &pairs), "artist/x");
+        // An empty album listing has nothing to say; keep the path rather than invent.
+        assert_eq!(listing_title(p, p.into(), &[]), p);
     }
 
     #[test]
