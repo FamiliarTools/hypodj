@@ -474,7 +474,13 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
     // enormous measure, which is unreadable. 76 columns is a comfortable line for
     // running text, and a card of short label/value rows still shrinks to fit.
     const CARD_MAX_W: u16 = 76;
-    let w = (widest as u16 + 4)
+    // The cover is part of the content, so the card is at least as wide as a SQUARE
+    // cover of ART_ROWS rows. Sizing from the text alone let a short card (one title
+    // row) clamp the cover's columns while its rows stayed fixed - a squashed image.
+    const ART_ROWS: usize = 10;
+    let art_want = square_art_cols(ART_ROWS as u16, state.sixel_cell_px) as usize;
+    let content_w = if state.card_art.is_some() { widest.max(art_want) } else { widest };
+    let w = (content_w as u16 + 4)
         .min(CARD_MAX_W)
         .min(region.width.saturating_sub(2))
         .max(20);
@@ -504,10 +510,10 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
     // sixel surface COVERED while one is open precisely so a popup does not punch holes
     // in an inline image. Drawing a second sixel from inside that overlay would fight
     // the mechanism protecting it.
+    // Square on screen: real cell pixels under sixel, the ~2:1 cell ratio otherwise.
+    // Only a terminal narrower than the cover itself still clamps it.
+    let art_cols = art_want.min(full_w);
     if let Some(a) = &state.card_art {
-        const ART_ROWS: usize = 10;
-        // Half-block/sextant cells are about 2:1, so twice the rows is roughly square.
-        let art_cols = (ART_ROWS * 2).min(full_w);
         // Centred over the card's width, so a narrow thumb does not sit oddly left.
         let pad = " ".repeat(full_w.saturating_sub(art_cols) / 2);
         for row in a.lines(art_cols, ART_ROWS) {
@@ -573,6 +579,41 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
         Paragraph::new(lines).block(block).style(base).scroll((scroll, 0)),
         popup,
     );
+
+    // THE SAME COVER AT THE SAME FIDELITY AS NOW PLAYING. The cell art above is 20x10
+    // sextant cells, about 40x30 effective pixels, which read as coarse blocks right
+    // beside a native-pixel sixel cover of the same album. So when the terminal draws
+    // sixel, the cell art is painted OVER with a sixel of the card's own cover, anchored
+    // to exactly the rect those cells occupy. The cells stay the fallback and the
+    // layout: nothing else on the card moves.
+    //
+    // Only while the whole cover is in view. A sixel is cell-anchored and cannot be
+    // clipped by a scroll, so once `j` scrolls the top rows away the cell art takes the
+    // rect back, and since those cells change from skipped to drawn, the diff overwrites
+    // the image pixels. This is a second image inside the overlay, not under it: the
+    // Now Playing cover stays pinned and covered exactly as before, and its own re-send
+    // on close is untouched.
+    if let Some(a) = &state.card_art {
+        if scroll == 0 && inner_h as usize >= ART_ROWS {
+            let inner_x = popup.x + 1;
+            let rect = Rect {
+                x: inner_x + (full_w.saturating_sub(art_cols) / 2) as u16,
+                y: popup.y + 1,
+                width: art_cols as u16,
+                height: ART_ROWS as u16,
+            };
+            let _ = paint_sixel(f, rect, a, state.sixel_cell_px);
+        }
+    }
+}
+
+/// Columns that make `rows` rows of art SQUARE on screen. The inverse of
+/// [`square_art_rows`], with the same aspect source.
+fn square_art_cols(rows: u16, cell_px: Option<(u16, u16)>) -> u16 {
+    match cell_px {
+        Some((cw, ch)) if cw > 0 => rows.saturating_mul(ch) / cw,
+        _ => rows * 2,
+    }
 }
 
 /// The `?` help overlay: a centered, bordered popup laid out in two columns from the
@@ -4095,33 +4136,10 @@ fn render_sixel_art(
     held: &std::cell::RefCell<Option<crate::state::SixelHeld>>,
     covered: bool,
 ) -> bool {
-    use crate::art::{art_mode, ArtMode};
-
-    let mode = art_mode();
-    if matches!(mode, ArtMode::Sextant | ArtMode::Half) {
-        return false;
-    }
-    let Some((cw, ch)) = cell_px else {
+    let Some(payload) = sixel_payload(f, rect, art, cell_px) else {
         return false;
     };
-    if cw == 0 || ch == 0 || rect.width < 2 || rect.height < 1 {
-        return false;
-    }
-
-    // An image wider than the screen is TRUNCATED by the terminal rather than scaled,
-    // and one whose last row is the bottom row scrolls the whole alternate screen.
-    // Refusing is better than either.
-    let area = f.area();
-    if rect.x + rect.width > area.width || rect.y + rect.height >= area.height {
-        return false;
-    }
-
-    let px_w = rect.width as u32 * cw as u32;
-    let px_h = rect.height as u32 * ch as u32;
-    let payload = art.sixel(px_w, px_h);
-    if payload.is_empty() {
-        return false;
-    }
+    let cw_ch = cell_px.unwrap_or((0, 0));
 
     // A trailing SGR reset when the generation is flipped: it renders as nothing at all,
     // and its only job is to make this frame's symbol differ from the one the diff
@@ -4139,7 +4157,7 @@ fn render_sixel_art(
     // over the popup to boot. There is no correct sixel to send under a popup, so fall
     // back to the cell renderer until it closes; the close frame flips the generation
     // and re-sends a payload encoded for the new geometry.
-    let geometry = (rect, (cw, ch));
+    let geometry = (rect, cw_ch);
     let pinned = match (covered, held.borrow().as_ref()) {
         (true, Some(h)) if h.geometry == geometry => Some(h.payload.clone()),
         (true, Some(_)) => return false,
@@ -4153,7 +4171,55 @@ fn render_sixel_art(
     if !covered {
         *held.borrow_mut() = Some(crate::state::SixelHeld { geometry, payload: symbol.clone() });
     }
-    let payload = symbol;
+    write_sixel_cells(f, rect, symbol);
+    true
+}
+
+/// The sixel payload for `art` at `rect`'s native pixel size, or `None` when sixel is
+/// off, the cell size is unknown, or the rect would be truncated or scroll the screen.
+fn sixel_payload(
+    f: &Frame,
+    rect: Rect,
+    art: &crate::art::AlbumArt,
+    cell_px: Option<(u16, u16)>,
+) -> Option<std::sync::Arc<str>> {
+    use crate::art::{art_mode, ArtMode};
+
+    if matches!(art_mode(), ArtMode::Sextant | ArtMode::Half) {
+        return None;
+    }
+    let (cw, ch) = cell_px?;
+    if cw == 0 || ch == 0 || rect.width < 2 || rect.height < 1 {
+        return None;
+    }
+    // An image wider than the screen is TRUNCATED by the terminal rather than scaled,
+    // and one whose last row is the bottom row scrolls the whole alternate screen.
+    // Refusing is better than either.
+    let area = f.area();
+    if rect.x + rect.width > area.width || rect.y + rect.height >= area.height {
+        return None;
+    }
+    let payload = art.sixel(rect.width as u32 * cw as u32, rect.height as u32 * ch as u32);
+    (!payload.is_empty()).then_some(payload)
+}
+
+/// Draw an unpinned sixel (the info card's cover) into `rect`; false leaves the cells
+/// as the caller drew them.
+fn paint_sixel(
+    f: &mut Frame,
+    rect: Rect,
+    art: &crate::art::AlbumArt,
+    cell_px: Option<(u16, u16)>,
+) -> bool {
+    let Some(payload) = sixel_payload(f, rect, art, cell_px) else {
+        return false;
+    };
+    write_sixel_cells(f, rect, payload.to_string());
+    true
+}
+
+/// Put `payload` in `rect`'s top-left cell and blank-and-skip every other cell of it.
+fn write_sixel_cells(f: &mut Frame, rect: Rect, payload: String) {
     let buf = f.buffer_mut();
     for y in rect.y..rect.y + rect.height {
         for x in rect.x..rect.x + rect.width {
@@ -4168,7 +4234,6 @@ fn render_sixel_art(
             }
         }
     }
-    true
 }
 
 #[cfg(test)]
@@ -4176,6 +4241,68 @@ mod sixel_render_tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn payloads(t: &Terminal<TestBackend>) -> Vec<(u16, u16, String)> {
+        let buf = t.backend().buffer();
+        let w = buf.area.width;
+        buf.content()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.symbol().starts_with("\x1bP"))
+            .map(|(i, c)| ((i as u16) % w, (i as u16) / w, c.symbol().to_string()))
+            .collect()
+    }
+
+    /// The info card's cover must be drawn at the SAME fidelity as Now Playing.
+    ///
+    /// Reported from a live screenshot: the `i` card on "Loro" showed the Junjo cover
+    /// as coarse blocks while the Now Playing cover beside it was sharp, because the
+    /// card always used the sextant cell renderer (20x10 cells, ~40x30 effective
+    /// pixels). With sixel available the card now carries its own native-pixel sixel,
+    /// encoded from the card's art, placed inside the popup - and the Now Playing
+    /// image stays pinned to the payload already on screen.
+    #[test]
+    fn the_info_card_cover_is_a_sixel_when_the_terminal_draws_sixel() {
+        let mut terminal = Terminal::new(TestBackend::new(129, 40)).unwrap();
+        let mut s = TuiState::new();
+        s.sixel_cell_px = Some((8, 17));
+        s.art = Some(crate::art::AlbumArt::for_test_solid([10, 20, 30]));
+        s.now.title = Some("The Peacocks".into());
+        s.now.state = Some("play".into());
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let np = payloads(&terminal);
+        assert_eq!(np.len(), 1, "only the Now Playing cover before the card opens");
+
+        s.card = Some(vec![("title".into(), "Loro".into())]);
+        s.card_art = Some(crate::art::AlbumArt::for_test_solid([200, 40, 40]));
+        terminal.draw(|f| render(f, &s)).unwrap();
+        let all = payloads(&terminal);
+        assert_eq!(all.len(), 2, "the card adds its own sixel: {:?}", all.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>());
+        let card = all.iter().find(|p| (p.0, p.1) != (np[0].0, np[0].1)).expect("a second anchor");
+        assert_ne!(card.2, np[0].2, "encoded from the card's art, not the playing cover");
+        let still = all.iter().find(|p| (p.0, p.1) == (np[0].0, np[0].1)).unwrap();
+        assert_eq!(still.2, np[0].2, "Now Playing stays pinned while the card is up");
+        // Square on real cell pixels: 10 rows of 17px wants 21 columns of 8px, and the
+        // payload is encoded at exactly that native size.
+        assert!(card.2.contains("\"1;1;168;170"), "a square 168x170 px card cover, even on a one-row card");
+    }
+
+    /// Scrolled, the cover is partly out of view and a cell-anchored sixel cannot be
+    /// clipped, so the cell art takes the rect back.
+    #[test]
+    fn a_scrolled_info_card_falls_back_to_cell_art() {
+        let mut terminal = Terminal::new(TestBackend::new(129, 16)).unwrap();
+        let mut s = TuiState::new();
+        s.sixel_cell_px = Some((8, 17));
+        s.card = Some((0..12).map(|i| (format!("k{i}"), format!("v{i}"))).collect());
+        s.card_art = Some(crate::art::AlbumArt::for_test_solid([200, 40, 40]));
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert!(s.card_scroll.max.get() > 0, "the card scrolls at this height");
+        assert_eq!(payloads(&terminal).len(), 1, "unscrolled: the cover is a sixel");
+        s.card_scroll.scroll = 1;
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert!(payloads(&terminal).is_empty(), "scrolled: no sixel inside the card");
+    }
 
     fn art() -> crate::art::AlbumArt {
         crate::art::AlbumArt::for_test_solid([200, 60, 60])

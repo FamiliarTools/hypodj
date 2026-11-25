@@ -793,6 +793,7 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
         Req::Browse { target, command, path, title, restore_sel } => match conn.command(&command) {
             Ok(pairs) => {
                 let rows = state::parse_browse(&pairs);
+                let title = state::listing_title(&path, title, &pairs);
                 send(RespKind::Browse { target, rows, path, title, restore_sel, held: None });
                 false
             }

@@ -533,7 +533,7 @@ fn browse_into(tx: &Sender<Req>, state: &mut TuiState, path: String) {
         state.find.drill.selected = 0;
         state.find.drill.offset.set(0);
         state.find.drill.path = path.clone();
-        state.find.drill.title = browse_title(&path);
+        state.find.drill.title = drill_title(state, &path);
         let title = state.find.drill.title.clone();
         let _ = tx.send(Req::Browse {
             target,
@@ -548,10 +548,10 @@ fn browse_into(tx: &Sender<Req>, state: &mut TuiState, path: String) {
         Some(b) => (b.path.clone(), b.selected),
         None => return,
     };
+    let title = drill_title(state, &path);
     if let Some(b) = state.active_browse() {
         b.stack.push((cur_path, cur_sel));
     }
-    let title = browse_title(&path);
     let _ = tx.send(Req::Browse {
         target,
         command: format!("lsinfo {}", quote_arg(&path)),
@@ -575,6 +575,23 @@ fn browse_back(tx: &Sender<Req>, state: &mut TuiState) {
         title,
         restore_sel: Some(sel),
     });
+}
+
+/// Title for a level being ENTERED: the label of the row the user drilled from, when
+/// one on screen names `path`, so a drilled album reads "Junjo" and not its opaque
+/// `album/<id>` uri. Entries that come from elsewhere (a menu "go to album" off a queue
+/// row) have no such row and keep the path, which the worker then replaces from the
+/// listing itself - see [`state::listing_title`].
+fn drill_title(state: &mut TuiState, path: &str) -> String {
+    let from_hits = (state.screen == Screen::Find)
+        .then(|| state.find.hits.rows.iter().find(|r| r.uri == path).map(|r| r.label.clone()))
+        .flatten();
+    let from_rows = || {
+        state
+            .active_browse()
+            .and_then(|b| b.rows.iter().find(|r| r.is_dir && r.uri == path).map(|r| r.label.clone()))
+    };
+    from_hits.or_else(from_rows).unwrap_or_else(|| browse_title(path))
 }
 
 /// Display title for a browse path (the Albums root gets a friendly label).
@@ -1022,6 +1039,32 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use state::Pending;
+
+    /// A drilled album is titled by its NAME, never its opaque uri. Reported from a
+    /// live screenshot whose Albums pane header read "album/0R99v..." over Junjo's
+    /// tracks: `browse_title` returned the path verbatim for every non-root level.
+    #[test]
+    fn drilling_an_album_row_titles_the_pane_with_the_rows_label() {
+        let (tx, rx) = mpsc::channel::<Req>();
+        let mut state = TuiState::new();
+        state.screen = Screen::Albums;
+        state.albums.rows = state::parse_browse(&[
+            ("directory".into(), "album/0R99v5y8Ta6qQroEdhZXY6".into()),
+            ("Album".into(), "Junjo".into()),
+        ]);
+        browse_into(&tx, &mut state, "album/0R99v5y8Ta6qQroEdhZXY6".into());
+        match rx.try_recv().unwrap() {
+            Req::Browse { title, .. } => assert_eq!(title, "Junjo"),
+            _ => panic!("expected a browse request"),
+        }
+        // No row on screen names it (a "go to album" off a queue row): the request
+        // keeps the path, and the worker names it from the listing.
+        browse_into(&tx, &mut state, "album/elsewhere".into());
+        match rx.try_recv().unwrap() {
+            Req::Browse { title, .. } => assert_eq!(title, "album/elsewhere"),
+            _ => panic!("expected a browse request"),
+        }
+    }
 
     #[test]
     fn every_handler_shape_renders_through_apply_resp() {
