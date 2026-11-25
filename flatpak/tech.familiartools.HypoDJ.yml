@@ -1,0 +1,36 @@
+# DRAFT, UNTESTED: the Flatpak for djg (crates/hypodj-gtk). Nothing has built or run
+# this yet. Before it can build offline, generate cargo-sources.json from Cargo.lock
+# with flatpak-builder-tools' flatpak-cargo-generator.py and commit it beside this.
+#
+# djg talks to a hypodj daemon over MPD/TCP on 127.0.0.1:6600 (HYPODJ_HOST /
+# HYPODJ_PORT override), so the sandbox needs only the network; the daemon itself
+# (libmpv, the offline store) stays outside the Flatpak.
+id: tech.familiartools.HypoDJ
+runtime: org.gnome.Platform
+runtime-version: "49"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: djg
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/djg/cargo
+    CARGO_BUILD_JOBS: "4"
+modules:
+  - name: djg
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release -p hypodj-gtk --bin djg
+      - install -Dm755 target/release/djg /app/bin/djg
+      - install -Dm644 crates/hypodj-gtk/data/tech.familiartools.HypoDJ.desktop /app/share/applications/tech.familiartools.HypoDJ.desktop
+    sources:
+      - type: dir
+        path: ..
+      - cargo-sources.json

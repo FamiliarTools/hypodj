@@ -7,6 +7,7 @@
 //! Terminal IO (OSC 11, DA1) stays in the TUI. This crate is pure.
 
 pub mod ansi;
+pub mod gtk_css;
 mod color;
 pub mod spoken;
 mod tokens;

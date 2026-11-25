@@ -19,7 +19,7 @@
         pkgs = import nixpkgs {
           inherit system;
           config.allowUnfreePredicate = p:
-            builtins.elem (nixpkgs.lib.getName p) [ "hypodj" "hypodj-clients" ];
+            builtins.elem (nixpkgs.lib.getName p) [ "hypodj" "hypodj-clients" "hypodj-gtk" ];
         };
 
         # The released semver, read from the workspace manifest so the derivation
@@ -55,6 +55,8 @@
         # The client bins (djc + dj + dj-gui) - libmpv-free, so a separate, lighter
         # derivation that a workstation can install without pulling mpv.
         packages.hypodj-clients = pkgs.callPackage ./nix/clients.nix { inherit buildInfo cargoVersion; };
+        # djg, the GNOME app: GTK4 + libadwaita over hypodj-client, no libmpv.
+        packages.hypodj-gtk = pkgs.callPackage ./nix/gtk.nix { inherit buildInfo cargoVersion; };
         # The default local NL model for an `llm-llama` daemon (HYPODJ_NL_MODEL):
         # Qwen2.5-1.5B-Instruct Q4_K_M, the official Qwen GGUF, Apache-2.0, ~1.1 GB.
         # A fixed-output fetch, so the file is only downloaded when this is built.
@@ -80,6 +82,10 @@
         apps.dj-gui = {
           type = "app";
           program = "${self.packages.${system}.hypodj-clients}/bin/dj-gui";
+        };
+        apps.djg = {
+          type = "app";
+          program = "${self.packages.${system}.hypodj-gtk}/bin/djg";
         };
         apps.default = self.apps.${system}.dj;
 
@@ -111,6 +117,9 @@
             # link-light and does not yet depend on it, but the devshell ships it
             # so adding the dep in Phase 1 is a one-line change that will link.
             pkgs.mpv-unwrapped
+            # djg (crates/hypodj-gtk): GTK4 + libadwaita, found through pkg-config.
+            pkgs.gtk4
+            pkgs.libadwaita
             # NOTE: no openssl. opensubsonic 0.3 pulls reqwest 0.13 with
             # default-features=false + "rustls" (verified in its Cargo.toml), so
             # TLS is aws-lc-rs/rustls, not OpenSSL. Adding openssl here would be a

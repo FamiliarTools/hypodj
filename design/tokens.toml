@@ -1,5 +1,5 @@
 # HypoDJ design tokens: single source of truth. See docs/design/tokens.md.
-# Status: proposed (2026-11-23).
+# Status: bound 2026-11-24 with the arena edits (room = OS, one instrument).
 
 [room]
 ink_primary_min_contrast = 7.0

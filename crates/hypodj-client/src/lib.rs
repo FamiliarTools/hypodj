@@ -3,6 +3,7 @@
 //! stamps a per-connection owner_key, so `nl confirm`/`nl cancel` only work on the
 //! SAME socket that ran the translate). Model-free: std::net + thiserror only.
 
+pub mod art;
 pub mod config;
 pub mod grounding;
 pub mod model;
