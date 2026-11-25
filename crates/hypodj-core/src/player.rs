@@ -1394,6 +1394,13 @@ impl MpvPlayer {
             // writes continuously, forever, on a 91-percent-full disk and on battery, to
             // buy a bound obtainable by capping bytes.
             init.set_property("demuxer-max-bytes", "150MiB")?;
+            // A BOUNDED STALL. A blackholed server (dead VPN, captive portal: packets
+            // dropped, not refused) makes a stream connect or read HANG rather than
+            // fail, and mpv's default 60 s timeout left the deck reporting "playing
+            // 0:00" over silence for a minute. Past this many seconds with no bytes the
+            // open fails, which surfaces as the ordinary errored end: the advance walks
+            // on (an on-disk entry plays) and `status` says why in its `error` key.
+            init.set_property("network-timeout", STREAM_STALL_SECS)?;
             match out {
                 AudioOut::Null => {
                     init.set_property("ao", "null")?;
@@ -2297,6 +2304,11 @@ pub(crate) struct DeckProbe {
 /// and 0.06 dropped audio constantly, 0.1 and up never did); every gain change waits
 /// behind it, so smaller is more responsive.
 const AUDIO_BUFFER_SECS: f64 = 0.1;
+
+/// mpv `network-timeout`: how long a stream may deliver NO bytes (connect included)
+/// before its load counts as failed. Long enough for a slow server's first byte,
+/// short enough that a blocked one is named within a quarter minute, not a minute.
+const STREAM_STALL_SECS: f64 = 15.0;
 
 /// How far AHEAD of the playback position a gain change is anchored, in stream
 /// seconds: past everything mpv has already decoded (its audio buffer plus up to one

@@ -163,22 +163,28 @@ fn truth(host: &str, port: u16, world_file: Option<&Path>) -> String {
         .unwrap_or_else(|| "null".into());
     let t0 = Instant::now();
     let conn = MpdConn::connect(host, port);
-    let (status, current, store) = match conn {
+    let (status, current, store, queue) = match conn {
         Ok(mut c) => {
             let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-            (c.command("status"), c.command("currentsong"), c.command("store"))
+            (
+                c.command("status"),
+                c.command("currentsong"),
+                c.command("store"),
+                c.command("playlistinfo"),
+            )
         }
         Err(e) => {
             let err = || Err(MpdError::Io(e.to_string()));
-            (err(), err(), err())
+            (err(), err(), err(), err())
         }
     };
     format!(
-        "{{\"world\":{world},\"truth_ms\":{},\"status\":{},\"currentsong\":{},\"store\":{},\"daemon_connectivity\":{}}}",
+        "{{\"world\":{world},\"truth_ms\":{},\"status\":{},\"currentsong\":{},\"store\":{},\"playlistinfo\":{},\"daemon_connectivity\":{}}}",
         t0.elapsed().as_millis(),
         pairs_json(&status),
         pairs_json(&current),
         pairs_json(&store),
+        pairs_json(&queue),
         js("not exposed by any daemon verb"),
     )
 }

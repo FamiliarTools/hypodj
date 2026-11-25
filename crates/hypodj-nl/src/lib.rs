@@ -306,12 +306,12 @@ mod tests {
     #[test]
     fn unparseable_in_or_at_tail_punts_never_immediate() {
         let c = ctx(Some("s1"), 5);
-        // A misheard "in <x>" tail must PUNT (NotUnderstood), NEVER silently
-        // downgrade to an Immediate stop.
-        assert_eq!(tr("stop in a bit", &c).unwrap_err(), NlError::NotUnderstood);
+        // A misheard "in <x>" tail must PUNT, NEVER silently downgrade to an
+        // Immediate stop; a VAGUE one ("a bit") refuses with a say-when hint.
+        assert_eq!(tr("stop in a bit", &c).unwrap_err(), NlError::Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30".into()));
         // A misheard "at <x>" tail likewise.
         assert_eq!(tr("stop at noonish", &c).unwrap_err(), NlError::NotUnderstood);
-        assert_eq!(tr("pause at whenever", &c).unwrap_err(), NlError::NotUnderstood);
+        assert!(matches!(tr("pause at whenever", &c), Err(NlError::Ambiguous(_))));
         // Sanity: a plain command with no in/at tail is still Immediate, and a
         // WELL-FORMED tail still parses.
         assert_eq!(
@@ -852,7 +852,7 @@ mod tests {
             assert_eq!(span(u), want, "{u}");
         }
         // A word quantity with no unit is still not a duration: never guess a span.
-        assert!(matches!(tr("stop in a bit", &c), Err(NlError::NotUnderstood)));
+        assert!(matches!(tr("stop in a bit", &c), Err(NlError::Ambiguous(_))));
         assert!(matches!(tr("pause in a couple", &c), Err(NlError::NotUnderstood)));
         assert!(matches!(tr("pause in two days", &c), Err(NlError::NotUnderstood)));
     }
@@ -918,7 +918,7 @@ mod tests {
             ("", Err(NlError::NotUnderstood)),
             ("do a barrel roll", Err(NlError::NotUnderstood)),
             ("fade the last track", Err(NlError::NotUnderstood)),
-            ("stop in a bit", Err(NlError::NotUnderstood)),
+            ("stop in a bit", Err(NlError::Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30".into()))),
             ("pause in 2 days", Err(NlError::NotUnderstood)),
             ("sleep timer", Err(NlError::Ambiguous("sleep for how long?".into()))),
             ("repeat and shuffle", Err(NlError::Ambiguous("more than one playback mode named".into()))),

@@ -15,7 +15,7 @@ pause	trigger immediate action pause once
 stop after this album	trigger album action stop once
 stop after this track	trigger after action stop once
 pause in 10 minutes	trigger in 600 action pause once
-stop in a bit	ERR NotUnderstood
+stop in a bit	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
 pause in 2 days	ERR NotUnderstood
 something calmer	RawPlan { version: 1, trigger: Immediate, action: Enqueue { selector: Calmer(SongId("song-42")), count: 5 }, once: true, origin: "" }
 5 more like this	RawPlan { version: 1, trigger: Immediate, action: Enqueue { selector: Similar(SongId("song-42")), count: 5 }, once: true, origin: "" }
@@ -71,3 +71,20 @@ never allow remixes again	ERR Ambiguous("\"never\" negates the ask; say what to 
 don't fade out	ERR Ambiguous("\"don't\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
 don't stop	ERR Ambiguous("\"don't\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")")
 do a barrel roll	ERR NotUnderstood
+# Vague time (01m86mer): a deferral that does not say when refuses with a hint, never arms NOW.
+stop sometime later	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+fade out soon	ERR Ambiguous("say when, e.g. fade out in 20 minutes or fade out at 23:30")
+stop later	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+pause later	ERR Ambiguous("say when, e.g. pause in 20 minutes or pause at 23:30")
+fade out later	ERR Ambiguous("say when, e.g. fade out in 20 minutes or fade out at 23:30")
+stop soon	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+pause in a while	ERR Ambiguous("say when, e.g. pause in 20 minutes or pause at 23:30")
+stop after a while	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+fade out in a little while	ERR Ambiguous("say when, e.g. fade out in 20 minutes or fade out at 23:30")
+stop eventually	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+pause shortly	ERR Ambiguous("say when, e.g. pause in 20 minutes or pause at 23:30")
+stop at some point	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+fade out sometime	ERR Ambiguous("say when, e.g. fade out in 20 minutes or fade out at 23:30")
+stop later on	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+wind down soon	ERR Ambiguous("say when, e.g. wind down in 20 minutes or wind down at 23:30")
+fade in later	ERR Ambiguous("say when, e.g. fade in in 20 minutes or fade in at 23:30")

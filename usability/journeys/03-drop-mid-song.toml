@@ -26,6 +26,10 @@ script = [
   "snap after-the-buffered-song-ends",
   "wait 115",
   "snap when-the-unfetched-song-is-due",
+  "wait 20",
+  "snap half-a-minute-after-due",
+  "wait 60",
+  "snap ninety-seconds-after-due",
 ]
 
 [[check]]
@@ -73,5 +77,45 @@ screen_require_any = ["unreachable", "not on disk", "stream only", "could not", 
 [[check]]
 name = "when a song that was never fetched is due: transport word matches the daemon"
 at = 15
+severity = "S0"
+transport_matches = true
+
+[[check]]
+# Daemon truth, not the screen: Thin Air was mirrored (reason=Window) while the
+# server was still there, so losing the server must not lose that fact.
+name = "a song mirrored before the drop is still on disk per the daemon (never evicted offline)"
+at = 11
+when = ["blocked", "no_network"]
+severity = "S1"
+truth = ["playlistinfo[Title=Thin Air].X-Offline == 1"]
+
+[[check]]
+name = "Up Next says the mirrored song is on disk (no stale 'stream only')"
+at = 11
+when = ["blocked", "no_network"]
+severity = "S1"
+screen_require_re = ["Thin Air[^\\n]*\\n[^\\n]*on disk"]
+
+[[check]]
+# A blocked server makes a stream connect HANG rather than fail. Within a bounded
+# time the daemon must stop pretending: not 'playing' a song it cannot fetch.
+name = "half a minute after an unfetchable song is due, the daemon no longer claims it plays"
+at = 17
+when = ["blocked", "no_network"]
+severity = "S0"
+truth = ["status.elapsed != 0.000"]
+if_truth = ["status.state == play"]
+
+[[check]]
+name = "half a minute after an unfetchable song is due, the screen says why it is not playing"
+at = 17
+when = ["blocked", "no_network"]
+severity = "S1"
+if_truth = ["status.state != play"]
+screen_require_re = ["could(n't| not) (play|fetch|stream)[^\\n]*Ridge Line|Ridge Line[^\\n]*(not on disk|unreachable|could(n't| not))"]
+
+[[check]]
+name = "transport word matches the daemon ninety seconds after due"
+at = 19
 severity = "S0"
 transport_matches = true

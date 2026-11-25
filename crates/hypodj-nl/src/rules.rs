@@ -766,6 +766,7 @@ fn fade_immediate(
     ctx: &NlContext,
 ) -> Result<RawPlan, NlError> {
     let fi = tv.iter().position(|t| *t == "fade").ok_or(NlError::NotUnderstood)?;
+    vague_time(tv, if tv.get(fi + 1) == Some(&"in") { "fade in" } else { "fade out" })?;
     // Skip the explicit direction word so "fade in 20 minutes" reads "in" as the
     // DIRECTION, not a trigger preposition.
     let mut rest_start = fi + 1;
@@ -809,6 +810,25 @@ fn fade_immediate(
     Ok(plan(trigger, Action::Fade(dir), true))
 }
 
+/// A VAGUE time ("stop sometime later", "fade out soon", "pause in a bit") names
+/// a deferral without saying when. Dropping the vague word would arm the action
+/// NOW, the opposite of what was asked, and guessing a span would invent one; so it
+/// refuses as Ambiguous (a specific answer that does NOT fall through to the model,
+/// which could guess too) with a hint that says how to say when.
+fn vague_time(tv: &[&str], verb: &str) -> Result<(), NlError> {
+    const VAGUE: &[&str] = &[
+        "later", "soon", "sometime", "eventually", "shortly", "bit", "while", "awhile",
+        "whenever", "momentarily", "presently", "someday",
+    ];
+    let some_point = tv.windows(2).any(|w| w == ["some", "point"]);
+    if some_point || tv.iter().any(|t| VAGUE.contains(t)) {
+        return Err(NlError::Ambiguous(format!(
+            "say when, e.g. {verb} in 20 minutes or {verb} at 23:30"
+        )));
+    }
+    Ok(())
+}
+
 // ── stop / pause ──────────────────────────────────────────────────────────────
 
 fn stop_pause(
@@ -831,6 +851,12 @@ fn boundary_or_time(
     text: &str,
     ctx: &NlContext,
 ) -> Result<RawTrigger, NlError> {
+    let verb = match tv.first() {
+        Some(&"pause") => "pause",
+        Some(&"stop") => "stop",
+        _ => "wind down",
+    };
+    vague_time(tv, verb)?;
     if low.contains("after this album") {
         return Ok(RawTrigger::AlbumBoundary { track: TrackSel::Current });
     }

@@ -304,18 +304,34 @@ def render_script(spec, state, work):
 
 
 def truth_get(truth, path):
+    # `playlistinfo[Title=Thin Air].X-Offline` picks one queue row (rows start at
+    # `file`) by a field, then a key inside it; plain `status.state` is a flat lookup.
+    m = re.fullmatch(r"(\w+)\[([^=\]]+)=([^\]]*)\]\.(.+)", path)
     src, _, key = path.partition(".")
+    if m:
+        src, fk, fv, key = m.groups()
     block = truth.get(src) or {}
     if not block.get("ok"):
         return None
-    for k, v in block.get("pairs", []):
+    pairs = block.get("pairs", [])
+    if m:
+        rows, row = [], None
+        for k, v in pairs:
+            if k == "file":
+                row = {}
+                rows.append(row)
+            if row is not None:
+                row.setdefault(k, v)
+        pick = [r for r in rows if r.get(fk) == fv]
+        return pick[0].get(key) if pick else None
+    for k, v in pairs:
         if k == key:
             return v
     return None
 
 
 def eval_truth(expr, truth):
-    m = re.fullmatch(r"\s*(\S+)\s*(==|!=|~|exists|absent)\s*(.*?)\s*", expr)
+    m = re.fullmatch(r"\s*(\S+(?:\[[^\]]*\]\.\S+)?)\s*(==|!=|~|exists|absent)\s*(.*?)\s*", expr)
     if not m:
         return False, f"bad expr {expr!r}"
     path, op, want = m.groups()
@@ -363,6 +379,10 @@ def judge(spec, state, outdir, steps):
             if req_any and not any(w.lower() in low for w in req_any):
                 ok = False
                 notes.append(f"{sz}: none of {req_any} on screen")
+            for rx in chk.get("screen_require_re", []):
+                if not re.search(rx, text, re.I | re.S):
+                    ok = False
+                    notes.append(f"{sz}: no match for /{rx}/ on screen")
             for w in chk.get("screen_forbid", []):
                 if w.lower() in low:
                     ok = False

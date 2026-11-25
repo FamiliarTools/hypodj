@@ -100,6 +100,10 @@ pub struct NowPlaying {
     /// `unknown`). `None` from a daemon that does not report it. See
     /// [`server_words`] for how it reads.
     pub server: Option<String>,
+    /// Why the last entry did not play, from the standard MPD `error` status key
+    /// (e.g. "could not play X: not on disk and the server is unreachable").
+    /// `None` while nothing has failed since the last sound.
+    pub error: Option<String>,
     /// How many times the SERVER records this user playing the current track, from the
     /// daemon's non-standard `X-Plays` pair on `currentsong`.
     ///
@@ -394,6 +398,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         continuation: parse_continuation(status),
         store: find(status, "X-Store").map(str::to_string),
         server: find(status, "X-Server").map(str::to_string),
+        error: find(status, "error").map(str::to_string),
         // Absent pair -> None, never a fabricated zero: the daemon emits these only
         // when the server actually has a record.
         plays: find(current, "X-Plays").and_then(|v| v.parse().ok()),

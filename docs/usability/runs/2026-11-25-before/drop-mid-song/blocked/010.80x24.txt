@@ -1,0 +1,24 @@
+
+[F1]Queue  [F2]Albums  [F3]Playlists  [F4]DJ  [F5]Search      server unreachable
+┌Albums────────────────────────────────────────────────────────────────────────┐
+│  Smart lists (newest, recent, ...)/                                          │
+│  Held Harbour/  on disk                                                      │
+│# Stream Summit/  stream only                                                 │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌Now Playing─────────────────────────────┐┌Up Next─────────────────────────────┐
+│╱╱╱╱╱╱╱╱╲╱╱╲                            ││next  Thin Air                      │
+│╲╲╱╲╲╲╱╱╱╱╱╲                            ││      Fixture Band · stream only    │
+│╱╱╱╱╱╱╱╱╲╲╲╱                            ││                                    │
+│╱╱╲╲╲╱╲╲╲╱╱╱                            ││then  Ridge Line                    │
+│╲╲╱╱╱╱╱╱╲╲╲╱                            ││      stream only                   │
+│╱╱╱╱╱╱╲╲╲╱╱╱                            ││                                    │
+│Ascent                                  ││                                    │
+│Fixture Band                            ││                                    │
+│Stream Summit                           ││                                    │
+│playing · track 1 of 3 · 0:58 / 2:00    ││                                    │
+└────────────────────────────────────────┘└────────────────────────────────────┘
+▅▆▇▇▇▇▇▆▆▅▄▄▄▃▃▃▄▄▅▅▅▅▅▅▅▄▃▃▂▂▂▂▂▃▄▅▅▆▇▇▇▇▇▆▆▅▅▄▄▃  offline: all 3 songs  ? help
+

@@ -3236,6 +3236,13 @@ pub struct HypodjHandler {
     /// two samples racing in cannot both see the edge. Never persisted; ids are
     /// monotonic within a session, so a stale value cannot false-match a later entry.
     audible_qid: AtomicU64,
+    /// WHY THE LAST ENTRY DID NOT PLAY, as one sentence for the standard MPD `error`
+    /// status key: set when a REMOTE entry ends errored (a stream that would not open,
+    /// or one that stalled past the player's network timeout), cleared by the first
+    /// frame of sound from anything ([`Self::note_playback_progress`]). Without it a
+    /// song the server could not deliver read as "just finished", which is the one
+    /// thing it did not do. A short std lock, never held across an await.
+    play_failure: Mutex<Option<String>>,
     /// SERIALISES the whole `station add` read-verdict-write (task 4i3s3ry). A
     /// `tokio::sync::Mutex` - not `std` - because it is HELD ACROSS `.await`, which is
     /// exactly what a std mutex may never be and exactly what this needs: the
@@ -3756,6 +3763,7 @@ impl HypodjHandler {
             consecutive_eof_failures: AtomicU32::new(0),
             walk_origin_qid: AtomicU64::new(0),
             audible_qid: AtomicU64::new(0),
+            play_failure: Mutex::new(None),
             station_write: tokio::sync::Mutex::new(()),
         }
     }
@@ -10241,6 +10249,35 @@ impl HypodjHandler {
         }
     }
 
+    /// Record why a REMOTE entry did not play, in words a listener can act on: the
+    /// reason is read off the server's reachability, because that is what decides
+    /// whether trying again later can help. Shown through the MPD `error` status key.
+    fn note_play_failure(&self, title: Option<&str>) {
+        let reach = self
+            .server_reach
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|r| r.snapshot().0)
+            .unwrap_or(crate::reach::Reach::Unknown);
+        let why = match reach {
+            crate::reach::Reach::Unreachable => "not on disk and the server is unreachable",
+            crate::reach::Reach::NoNetwork => "not on disk and there is no network",
+            crate::reach::Reach::Error => "the server answered with an error",
+            _ => "the stream failed",
+        };
+        let msg = match title {
+            Some(t) => format!("could not play {t}: {why}"),
+            None => format!("could not play: {why}"),
+        };
+        *self.play_failure.lock().unwrap() = Some(msg);
+    }
+
+    /// The `error` status pair while a play failure stands (see [`Self::play_failure`]).
+    fn play_failure_pairs(&self) -> Option<(&'static str, String)> {
+        self.play_failure.lock().unwrap().clone().map(|m| ("error", m))
+    }
+
     /// Fold this EOF into the consecutive-failure run and return the run's new length.
     /// A natural (non-errored) EOF is a track that PLAYED, so it clears the run
     /// outright - which is what keeps one dead track in a healthy queue costing exactly
@@ -10293,6 +10330,9 @@ impl HypodjHandler {
     /// swap turns the per-sample stream into a single edge, and only that edge takes the
     /// short `State` lock. `None` (a position with no identity) stamps nothing.
     pub fn note_playback_progress(&self, qid: Option<QueueId>) {
+        if self.play_failure.lock().unwrap().is_some() {
+            *self.play_failure.lock().unwrap() = None;
+        }
         if self.consecutive_eof_failures.load(Ordering::Relaxed) != 0 {
             self.consecutive_eof_failures.store(0, Ordering::Relaxed);
         }
@@ -12185,7 +12225,7 @@ impl HypodjHandler {
         // was itself the active continuation stream - the ONE-SHOT re-entrancy guard
         // - and (b) whether the queue is GENUINELY exhausted (true drain) vs a
         // `single`-mode stop that left tracks queued.
-        let (finishing_is_continuation, true_drain, pausing) = {
+        let (finishing_is_continuation, true_drain, pausing, ended_title) = {
             let mut st = self.state.lock().unwrap();
             // THE STALE-EOF RULE. The declared head moved on after this entry was
             // loaded (a skip crossfading away from it, a dip heading elsewhere), so its
@@ -12234,8 +12274,21 @@ impl HypodjHandler {
             let finishing_is_continuation = st.continuation_active.is_some()
                 && st.current().and_then(|i| st.queue.get(i)).map(|it| it.id)
                     == st.continuation_active;
-            (finishing_is_continuation, st.is_true_drain(), pausing)
+            // The entry that ended: the head, or (no head latched) the row carrying the
+            // event's own song id, which is what the deck says it was playing.
+            let ended_title = st
+                .current()
+                .and_then(|i| st.queue.get(i))
+                .or_else(|| {
+                    let id = ev.song.as_ref()?;
+                    st.queue.iter().find(|it| matches!(&it.entry, QueueEntry::Song(s) if &s.id == id))
+                })
+                .map(|it| it.entry.title().to_string());
+            (finishing_is_continuation, st.is_true_drain(), pausing, ended_title)
         };
+        if ev.errored && !ev.was_local {
+            self.note_play_failure(ended_title.as_deref());
+        }
         // THE FUSE, checked BEFORE plan_next (which mutates the queue under `consume`):
         // count the unbroken run of errored ends WITH NO AUDIO IN BETWEEN (any live
         // position tick re-arms it through note_playback_progress, so a track that
@@ -14324,6 +14377,11 @@ impl MpdHandler for HypodjHandler {
                     b = b.pair(k, v);
                 }
                 for (k, v) in self.server_status_pairs() {
+                    b = b.pair(k, v);
+                }
+                // The standard MPD key for "the last play failed, and why"; ncmpcpp
+                // already shows it. Present only while the failure stands.
+                if let Some((k, v)) = self.play_failure_pairs() {
                     b = b.pair(k, v);
                 }
                 b.build()
@@ -29558,6 +29616,37 @@ mod tests {
             "a suspect mark kicks LIGHT: the replacement needs no getStarred2"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A REMOTE entry that ends errored (the server could not deliver it) is named in
+    /// the standard `error` status key with the reason read off reachability, and the
+    /// first sound from anything clears it.
+    #[tokio::test]
+    async fn an_errored_remote_end_says_why_until_sound_returns() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let reach = Arc::new(crate::reach::ServerReach::new(tokio::time::Instant::now()));
+        reach.record(crate::reach::Reach::Unreachable, tokio::time::Instant::now());
+        h.set_server_reach(reach);
+        let mut song = store_song("s-remote", 16);
+        song.title = "Ridge Line".into();
+        h.enqueue_song_for_test(song.clone()).await;
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "error"), None, "no failure, no key");
+        h.advance_on_eof(EofSignal {
+            song: Some(song.id.clone()),
+            errored: true,
+            was_local: false,
+            ..EofSignal::default()
+        })
+        .await;
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(
+            pair(&status, "error"),
+            Some("could not play Ridge Line: not on disk and the server is unreachable")
+        );
+        h.note_playback_progress(None);
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "error"), None, "sound clears it");
     }
 
     #[tokio::test]

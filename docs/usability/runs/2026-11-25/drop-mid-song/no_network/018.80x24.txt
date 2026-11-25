@@ -1,0 +1,24 @@
+
+[F1]Queue  [F2]Albums  [F3]Playlists  [F4]DJ  [F5]Search              no network
+┌Albums────────────────────────────────────────────────────────────────────────┐
+│  Smart lists (newest, recent, ...)/                                          │
+│  Held Harbour/  on disk                                                      │
+│# Stream Summit/  stream only                                                 │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌Now Playing─────────────────────────────┐┌Up Next─────────────────────────────┐
+│nothing playing                         ││next  Ascent                        │
+│could not play Ridge Line: not on disk a││      Fixture Band · on disk        │
+│F5 to search, F4 to ask the DJ          ││                                    │
+│                                        ││then  Thin Air                      │
+│                                        ││      on disk                       │
+│                                        ││                                    │
+│                                        ││then  Ridge Line                    │
+│                                        ││      stream only                   │
+│                                        ││                                    │
+│                                        ││                                    │
+└────────────────────────────────────────┘└────────────────────────────────────┘
+▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  offline: all 3 songs  ? help
+

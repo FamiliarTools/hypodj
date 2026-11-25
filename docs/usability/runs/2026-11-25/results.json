@@ -1,0 +1,564 @@
+[
+ {
+  "journey": "connected",
+  "goal": "Find out whether the music server is reachable right now.",
+  "state": "online",
+  "results": [
+   {
+    "check": "screen says the server is reachable",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "daemon itself answers (the UI talks to a live daemon)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "steps 0 within budget 1",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "connected",
+  "goal": "Find out whether the music server is reachable right now.",
+  "state": "blocked",
+  "results": [
+   {
+    "check": "screen says the server is NOT reachable",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "daemon itself answers (the UI talks to a live daemon)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "steps 0 within budget 1",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "connected",
+  "goal": "Find out whether the music server is reachable right now.",
+  "state": "no_network",
+  "results": [
+   {
+    "check": "screen says the server is NOT reachable",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "daemon itself answers (the UI talks to a live daemon)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "steps 0 within budget 1",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 2,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "offline-album",
+  "goal": "Browse your albums and play one that is downloaded to this machine.",
+  "state": "online",
+  "results": [
+   {
+    "check": "album list states availability in words (on disk / stream only)",
+    "step": 3,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "the held album is playing (daemon truth)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "the screen names what is playing",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 3 within budget 6",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "offline-album",
+  "goal": "Browse your albums and play one that is downloaded to this machine.",
+  "state": "blocked",
+  "results": [
+   {
+    "check": "album list states availability in words (on disk / stream only)",
+    "step": 3,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "the held album is playing (daemon truth)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "the screen names what is playing",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 3 within budget 6",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "offline-album",
+  "goal": "Browse your albums and play one that is downloaded to this machine.",
+  "state": "no_network",
+  "results": [
+   {
+    "check": "album list states availability in words (on disk / stream only)",
+    "step": 3,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "the held album is playing (daemon truth)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "the screen names what is playing",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 3 within budget 6",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "drop-mid-song",
+  "goal": "You are listening to a song streamed from the server when the server drops. Understand what happened and what still plays.",
+  "state": "online",
+  "results": [
+   {
+    "check": "setup: a streamed (not held) song was playing before the drop",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "control: no false alarm while online",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "screen transport word matches the daemon (no stale 'playing')",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "when a song that was never fetched is due: transport word matches the daemon",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "transport word matches the daemon ninety seconds after due",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 4 within budget 4",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "drop-mid-song",
+  "goal": "You are listening to a song streamed from the server when the server drops. Understand what happened and what still plays.",
+  "state": "blocked",
+  "results": [
+   {
+    "check": "setup: a streamed (not held) song was playing before the drop",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "within 10s the screen says the server is gone",
+    "step": 9,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "screen transport word matches the daemon (no stale 'playing')",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "Up Next states availability in words while the server is gone (decision b)",
+    "step": 11,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "when a song that was never fetched is due: still playing, or the screen says why not",
+    "step": 15,
+    "pass": true,
+    "na": true,
+    "severity": "S1",
+    "notes": [
+     "n/a: precondition false (status.state='play')"
+    ]
+   },
+   {
+    "check": "when a song that was never fetched is due: transport word matches the daemon",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "a song mirrored before the drop is still on disk per the daemon (never evicted offline)",
+    "step": 11,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "Up Next says the mirrored song is on disk (no stale 'stream only')",
+    "step": 11,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "half a minute after an unfetchable song is due, the daemon no longer claims it plays",
+    "step": 17,
+    "pass": true,
+    "na": true,
+    "severity": "S0",
+    "notes": [
+     "n/a: precondition false (status.state='stop')"
+    ]
+   },
+   {
+    "check": "half a minute after an unfetchable song is due, the screen says why it is not playing",
+    "step": 17,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "transport word matches the daemon ninety seconds after due",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 4 within budget 4",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "drop-mid-song",
+  "goal": "You are listening to a song streamed from the server when the server drops. Understand what happened and what still plays.",
+  "state": "no_network",
+  "results": [
+   {
+    "check": "setup: a streamed (not held) song was playing before the drop",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": ""
+   },
+   {
+    "check": "within 10s the screen says the server is gone",
+    "step": 9,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "screen transport word matches the daemon (no stale 'playing')",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "Up Next states availability in words while the server is gone (decision b)",
+    "step": 11,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "when a song that was never fetched is due: still playing, or the screen says why not",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "when a song that was never fetched is due: transport word matches the daemon",
+    "step": 15,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "a song mirrored before the drop is still on disk per the daemon (never evicted offline)",
+    "step": 11,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "Up Next says the mirrored song is on disk (no stale 'stream only')",
+    "step": 11,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "half a minute after an unfetchable song is due, the daemon no longer claims it plays",
+    "step": 17,
+    "pass": true,
+    "na": true,
+    "severity": "S0",
+    "notes": [
+     "n/a: precondition false (status.state='stop')"
+    ]
+   },
+   {
+    "check": "half a minute after an unfetchable song is due, the screen says why it is not playing",
+    "step": 17,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "transport word matches the daemon ninety seconds after due",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S0"
+   },
+   {
+    "check": "steps 4 within budget 4",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 19,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "server-returns",
+  "goal": "Your albums were showing only what is on disk because the server was gone; the server comes back. See the full library again without doing anything.",
+  "state": "blocked",
+  "results": [
+   {
+    "check": "setup: the Albums pane is the on-disk fallback while the server is gone",
+    "step": 3,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "after the server returns, the Albums pane lists the server's albums again unasked",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "steps 1 within budget 1",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ },
+ {
+  "journey": "server-returns",
+  "goal": "Your albums were showing only what is on disk because the server was gone; the server comes back. See the full library again without doing anything.",
+  "state": "no_network",
+  "results": [
+   {
+    "check": "setup: the Albums pane is the on-disk fallback while the server is gone",
+    "step": 3,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "after the server returns, the Albums pane lists the server's albums again unasked",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S1"
+   },
+   {
+    "check": "steps 1 within budget 1",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   },
+   {
+    "check": "every step settled (sign of life within 12s)",
+    "step": 6,
+    "pass": true,
+    "notes": [],
+    "severity": "S2"
+   }
+  ]
+ }
+]
