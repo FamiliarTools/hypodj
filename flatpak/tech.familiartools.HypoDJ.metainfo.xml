@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>tech.familiartools.HypoDJ</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>FSL-1.1-MIT</project_license>
+  <name>HypoDJ</name>
+  <summary>Your music, played by a DJ that asks before it acts</summary>
+  <developer id="tech.familiartools">
+    <name>FamiliarTools</name>
+  </developer>
+  <description>
+    <p>
+      HypoDJ is the GNOME desktop front end for the hypodj daemon, a music player
+      that streams your OpenSubsonic library (Navidrome and friends) and speaks the
+      MPD protocol.
+    </p>
+    <p>
+      The app shows what is playing, the queue and search, and controls playback and
+      volume. It is a thin client: it needs a hypodj daemon running on the same
+      machine or reachable over the network (127.0.0.1:6600 by default, overridable
+      with HYPODJ_HOST and HYPODJ_PORT).
+    </p>
+  </description>
+  <launchable type="desktop-id">tech.familiartools.HypoDJ.desktop</launchable>
+  <url type="homepage">https://github.com/FamiliarTools/hypodj</url>
+  <url type="bugtracker">https://github.com/FamiliarTools/hypodj/issues</url>
+  <url type="vcs-browser">https://github.com/FamiliarTools/hypodj</url>
+  <categories>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.3.0" date="2026-11-25"/>
+  </releases>
+</component>
