@@ -314,6 +314,9 @@ fn rules_body(
     if let Some(plans) = allow_again(text) {
         return Ok(plans);
     }
+    if let Some(plans) = instrumental(&wdv) {
+        return Ok(plans);
+    }
     if let Some(plans) = curate(text, ctx)? {
         return Ok(plans);
     }
@@ -366,6 +369,57 @@ fn one(p: RawPlan) -> Result<Vec<RawPlan>, NlError> {
 }
 
 // ── favorites / modes / sleep ────────────────────────────────────────────────
+
+/// Vocal-family content words: "no <one of these>" asks for instrumental music.
+const VOICE_WORDS: &[&str] =
+    &["vocals", "vocal", "voices", "voice", "singing", "singer", "singers", "lyrics"];
+
+/// Every word an instrumental ask may carry. A CLOSED set on purpose: "play the
+/// instrumental version of so what" names a title, and "no vocals, more energy"
+/// mixes in an axis hypodj cannot select on yet, so anything outside it falls
+/// through to the other rules (and to the honest not-yet in [`curate`]).
+const INSTRUMENTAL_FRAME: &[&str] = &[
+    "play", "put", "on", "queue", "add", "enqueue", "append", "start", "give", "me", "some",
+    "something", "only", "just", "no", "without", "instrumental", "instrumentals", "music",
+    "tracks", "track", "songs", "song", "stuff", "please", "a", "few", "couple", "of", "up",
+];
+
+/// "no vocals" / "instrumental only" / "queue 3 instrumentals" -> one immediate
+/// [`Selector::Instrumental`] selection, which the daemon fills from MEASURED
+/// P(voice) only. A queue verb appends; anything else (a bare "no vocals" included)
+/// is a request to HEAR it, so it plays now. `None` when the utterance is not one.
+/// Does the instrumental rule own this utterance? For [`crate::daemon_first`].
+pub fn is_instrumental_ask(utterance: &str) -> bool {
+    let wd = words(utterance);
+    let wdv: Vec<&str> = wd.iter().map(String::as_str).collect();
+    instrumental(&wdv).is_some()
+}
+
+fn instrumental(wv: &[&str]) -> Option<Vec<RawPlan>> {
+    let instr = wv.iter().any(|w| matches!(*w, "instrumental" | "instrumentals"));
+    let no_voice = wv.windows(2).any(|p| matches!(p[0], "no" | "without") && VOICE_WORDS.contains(&p[1]));
+    if !(instr || no_voice) {
+        return None;
+    }
+    let framed = wv.iter().all(|w| {
+        INSTRUMENTAL_FRAME.contains(w) || VOICE_WORDS.contains(w) || w.parse::<u32>().is_ok()
+    });
+    // A voice word that is not negated ("instrumental with vocals") contradicts the ask.
+    let stray_voice = wv
+        .iter()
+        .enumerate()
+        .any(|(i, w)| VOICE_WORDS.contains(w) && !(i > 0 && matches!(wv[i - 1], "no" | "without")));
+    if !framed || stray_voice {
+        return None;
+    }
+    let count = leading_count(wv).unwrap_or(DEFAULT_ENQUEUE_COUNT);
+    let selector = Selector::Instrumental;
+    let action = match wv.first().copied() {
+        Some("queue" | "add" | "enqueue" | "append") => Action::Enqueue { selector, count },
+        _ => Action::PlayNow { selector, count },
+    };
+    Some(vec![plan(RawTrigger::Immediate, action, true)])
+}
 
 /// "play my favorites" -> PlayNow{Starred}; "queue|add my favorites" ->
 /// Enqueue{Starred} (append-only); "shuffle my favorites" -> random ON, then
@@ -565,7 +619,7 @@ fn curate(text: &str, ctx: &NlContext) -> Result<Option<Vec<RawPlan>>, NlError> 
         .any(|p| low.starts_with(p));
     if content && refining {
         return Err(NlError::Unresolvable(
-            "that refinement needs audio-content metadata (vocals, energy, motion) hypodj does not have yet - see task iwwy04x".into(),
+            "hypodj can select on vocals alone (say \"no vocals\"), not yet on energy, motion or more vocals - see task iwwy04x".into(),
         ));
     }
     let mut body = None;

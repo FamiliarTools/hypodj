@@ -555,6 +555,13 @@ impl FeatureStore for FileFeatureStore {
         self.reload_in_background();
     }
 
+    fn measured_voices(&self) -> Vec<(String, f32)> {
+        self.snapshot()
+            .iter()
+            .filter_map(|(id, ff)| ff.scalars.voice.map(|v| (id.clone(), v)))
+            .collect()
+    }
+
     fn measured_coverage(&self, mirror: Option<&[IndexEntry]>) -> Option<Coverage> {
         let snap = self.snapshot();
         let Some(entries) = mirror else {

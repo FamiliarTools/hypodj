@@ -472,7 +472,7 @@ fn nl_handshake(
         // A QUESTION goes straight to the daemon, which answers it from live state.
         // Claude only emits actions, so handed "what's offline" it can only say
         // "do nothing" (or fail) - the daemon's question grammar must come first.
-        if pin.prefer_claude() && !hypodj_nl::is_question(phrase) && hypodj_nl::cc::cc_available() {
+        if pin.prefer_claude() && !hypodj_nl::daemon_first(phrase) && hypodj_nl::cc::cc_available() {
             match cc_nl_handshake(conn, phrase)? {
                 true => return Ok(()),
                 // The CC call failed (spawn/parse/no-DSL); fall through to the daemon.

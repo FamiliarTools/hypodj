@@ -430,7 +430,7 @@ fn dispatch(
             // confirm); Claude only emits actions, so it would turn "what's offline"
             // into "do nothing". The one question grammar decides.
             #[cfg(feature = "cc")]
-            Intent::Cc(phrase) if hypodj_nl::is_question(&phrase) => {
+            Intent::Cc(phrase) if hypodj_nl::daemon_first(&phrase) => {
                 state.dj_phase = None;
                 let _ = tx.send(Req::Nl(phrase));
             }

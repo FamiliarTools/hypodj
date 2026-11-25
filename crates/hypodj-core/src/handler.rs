@@ -36,6 +36,7 @@ use crate::cache::TtlLru;
 use crate::clock::TokioClock;
 use crate::config::{ContinuationMode, FadeConfig, StreamConfig};
 use crate::executor::PendingPlan;
+use crate::features::VOICE_INSTRUMENTAL_BELOW;
 use crate::fade::{
     min_deliberate_dur, run_fade, Curve, FadeError, FadeOutcome,
     FadeProgress, FadeSpec, FadeTarget, StartleBounds,
@@ -2518,6 +2519,34 @@ fn selector_phrase(sel: &Selector) -> String {
         Selector::Calmer(_) => "calmer tracks".to_string(),
         Selector::Exact(_) => "those tracks".to_string(),
         Selector::Starred => "your favorites".to_string(),
+        Selector::Instrumental => "instrumental tracks".to_string(),
+    }
+}
+
+/// The ids measured as instrumental (P(voice) below the design threshold), in a
+/// fresh random order per call so a repeated ask does not replay the same picks.
+fn instrumental_ids(voices: &[(String, f32)]) -> Vec<String> {
+    let rs = RandomState::new();
+    let mut ids: Vec<String> = voices
+        .iter()
+        .filter(|(_, v)| *v < VOICE_INSTRUMENTAL_BELOW)
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.sort_by_key(|id| rs.hash_one(id));
+    ids
+}
+
+/// Why "no vocals" found nothing, with the measured coverage behind it: hypodj only
+/// calls a song instrumental when it has HEARD it, so the honest answer names how
+/// much of the library has been analysed rather than guessing from titles.
+fn no_instrumental_reason(measured: usize) -> String {
+    if measured == 0 {
+        "no songs are analysed for vocals yet, so none can be picked as instrumental (the audio-features batch has not measured any)".to_string()
+    } else {
+        format!(
+            "none of the {measured} {} analysed for vocals is instrumental (voice below {VOICE_INSTRUMENTAL_BELOW})",
+            if measured == 1 { "song" } else { "songs" }
+        )
     }
 }
 
@@ -5159,6 +5188,37 @@ impl HypodjHandler {
                 store.refresh();
                 calmer_rerank(store.as_ref(), &seed, pool, want)
             }
+            Selector::Instrumental => {
+                let store = self.feature_store();
+                store.refresh();
+                let voices = store.measured_voices();
+                let ids = instrumental_ids(&voices);
+                if ids.is_empty() {
+                    return Err(no_instrumental_reason(voices.len()));
+                }
+                // Fetch in a fresh random order, re-checking each fetched song
+                // against the store: a file that describes other bytes than the
+                // song now on the server is not a measurement of it. Bounded so a
+                // stale-heavy store cannot turn one ask into a library crawl.
+                let excludes = self.held_excludes();
+                let mut out = Vec::new();
+                for id in ids.iter().take(want.saturating_mul(2).saturating_add(8)) {
+                    if out.len() >= want {
+                        break;
+                    }
+                    let Ok(song) = self.client.song(&SongId(id.clone())).await else { continue };
+                    let measured = store
+                        .features(&song)
+                        .is_some_and(|f| f.measured && f.voice.is_some_and(|v| v < VOICE_INSTRUMENTAL_BELOW));
+                    if measured && !drop_excluded(&excludes, vec![song.clone()]).is_empty() {
+                        out.push(song);
+                    }
+                }
+                if out.is_empty() {
+                    return Err(no_instrumental_reason(voices.len()));
+                }
+                self.behavior_rerank(out)
+            }
         };
         // THE REWEIGHT HOOK: the single seam P4 HEURISTIC candidate selection
         // funnels through. It ALSO owns setting the latent-field pull, because a pull
@@ -5199,7 +5259,9 @@ impl HypodjHandler {
             Selector::Similar(_) | Selector::SimilarToCurrent | Selector::Radio => {
                 self.pull_rerank(songs)
             }
-            Selector::Exact(_) | Selector::Genre(_) | Selector::Starred => songs,
+            Selector::Exact(_) | Selector::Genre(_) | Selector::Starred | Selector::Instrumental => {
+                songs
+            }
         };
         let n = songs.len();
         for s in songs {
@@ -32055,7 +32117,12 @@ mod features_consumer_tests {
                     let songs: Vec<String> = ["a", "b", "c", "d"].iter().map(|i| child(i)).collect();
                     format!(r#""similarSongs2":{{"song":[{}]}}"#, songs.join(","))
                 } else if path.contains("getSong") {
-                    format!(r#""song":{}"#, child("seed"))
+                    // Echo the asked id, so a by-id fetch returns THAT song.
+                    let id = path
+                        .split(['?', '&'])
+                        .find_map(|kv| kv.strip_prefix("id="))
+                        .unwrap_or("seed");
+                    format!(r#""song":{}"#, child(id))
                 } else {
                     String::new()
                 };
@@ -32074,6 +32141,10 @@ mod features_consumer_tests {
     }
 
     fn write_features(dir: &std::path::Path, id: &str, arousal: f32) {
+        write_scalars(dir, id, Scalars { arousal: Some(arousal), ..Default::default() });
+    }
+
+    fn write_scalars(dir: &std::path::Path, id: &str, scalars: Scalars) {
         let ff = FeatureFile {
             schema: FEATURES_SCHEMA,
             song_id: id.into(),
@@ -32083,7 +32154,7 @@ mod features_consumer_tests {
                 version: EXTRACTOR_VERSION.into(),
                 models: vec!["deam-msd-musicnn-2".into()],
             },
-            scalars: Scalars { arousal: Some(arousal), ..Default::default() },
+            scalars,
             embedding: None,
             timeline: Timeline::default(),
         };
@@ -32092,6 +32163,97 @@ mod features_consumer_tests {
             &serde_json::to_vec(&ff).unwrap(),
         )
         .unwrap();
+    }
+
+    fn queued_ids(h: &HypodjHandler) -> Vec<String> {
+        h.state
+            .lock()
+            .unwrap()
+            .queue
+            .iter()
+            .filter_map(|it| match &it.entry {
+                QueueEntry::Song(s) => Some(s.id.0.clone()),
+                QueueEntry::Stream { .. } => None,
+            })
+            .collect()
+    }
+
+    fn connect_fake() -> Option<HypodjHandler> {
+        let url = fake_subsonic()?;
+        let cfg = ServerConfig { url, username: "u".into(), password: "p".into(), client_name: "test".into() };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => Arc::new(c),
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return None;
+            }
+        };
+        let (player, _events) = NullPlayer::spawn();
+        Some(HypodjHandler::new(client, player))
+    }
+
+    /// "No vocals" picks ONLY songs whose measured P(voice) is under the design
+    /// threshold - the uncertain band and the voiced song stay out, and an
+    /// unanalysed song is never a candidate - through `run_action_outcome`, so the
+    /// append is journaled and undo takes it back.
+    #[tokio::test]
+    async fn instrumental_action_picks_only_measured_instrumentals_and_is_journaled() {
+        let Some(h) = connect_fake() else { return };
+        let dir = std::env::temp_dir().join(format!("hypodj-feat-instr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, voice) in [("i1", 0.02), ("i2", 0.34), ("unsure", 0.5), ("sung", 0.9)] {
+            write_scalars(&dir, id, Scalars { arousal: Some(4.0), voice: Some(voice), ..Default::default() });
+        }
+        // Measured energy but no voice head: not evidence of anything.
+        write_features(&dir, "novoice", 4.0);
+        h.set_feature_store(Arc::new(FileFeatureStore::open(dir.clone())));
+
+        let action = Action::Enqueue { selector: Selector::Instrumental, count: 5 };
+        let out = h.run_action_outcome(&action, "mcp:test").await;
+        assert!(matches!(out, PlanOutcome::Added { n: 2, .. }), "{out:?}");
+        let mut ids = queued_ids(&h);
+        ids.sort();
+        assert_eq!(ids, vec!["i1", "i2"], "only voice < 0.35 qualifies");
+
+        match h.handle(MpdCommand::Journal).await {
+            MpdResponse::Pairs(p) => assert!(
+                p.iter().any(|(k, v)| k == "jorigin" && v == "mcp:test"),
+                "the action is journaled: {p:?}"
+            ),
+            other => panic!("expected Pairs, got {other:?}"),
+        }
+        assert!(!matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert!(h.state.lock().unwrap().queue.is_empty(), "undo took the rows back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With nothing measured as instrumental the action FAILS naming the coverage,
+    /// never padding with guesses: zero analysed, then some analysed but all voiced.
+    #[tokio::test]
+    async fn instrumental_action_without_measurements_says_how_many_are_analysed() {
+        let Some(h) = connect_fake() else { return };
+        let action = Action::PlayNow { selector: Selector::Instrumental, count: 5 };
+        // The default metadata store measures nothing.
+        let out = h.run_action_outcome(&action, "mcp:test").await;
+        match &out {
+            PlanOutcome::Failed(m) => assert!(m.contains("no songs are analysed for vocals"), "{m}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let dir = std::env::temp_dir().join(format!("hypodj-feat-voiced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, voice) in [("v1", 0.8), ("v2", 0.6), ("v3", 0.97)] {
+            write_scalars(&dir, id, Scalars { arousal: Some(4.0), voice: Some(voice), ..Default::default() });
+        }
+        h.set_feature_store(Arc::new(FileFeatureStore::open(dir.clone())));
+        let out = h.run_action_outcome(&action, "mcp:test").await;
+        assert_eq!(
+            out.render(),
+            format!("{RESULT_FAILED}none of the 3 songs analysed for vocals is instrumental (voice below 0.35)")
+        );
+        assert!(queued_ids(&h).is_empty(), "nothing guessed into the queue");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

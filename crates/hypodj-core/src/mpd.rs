@@ -1002,6 +1002,7 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "genre" => (Selector::Genre(toks.get(2)?.clone()), 3),
                 "similar_current" => (Selector::SimilarToCurrent, 2),
                 "starred" => (Selector::Starred, 2),
+                "instrumental" => (Selector::Instrumental, 2),
                 _ => return None,
             };
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
@@ -1015,6 +1016,7 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "genre" => (Selector::Genre(toks.get(2)?.clone()), 3),
                 "similar_current" => (Selector::SimilarToCurrent, 2),
                 "starred" => (Selector::Starred, 2),
+                "instrumental" => (Selector::Instrumental, 2),
                 _ => return None,
             };
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);

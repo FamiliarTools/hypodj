@@ -74,6 +74,7 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::Genre(g) => format!("action enqueue genre {} {count}", dsl_value(g)?),
             Selector::SimilarToCurrent => format!("action enqueue similar_current {count}"),
             Selector::Starred => format!("action enqueue starred {count}"),
+            Selector::Instrumental => format!("action enqueue instrumental {count}"),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -85,6 +86,7 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::Genre(g) => format!("action playnow genre {} {count}", dsl_value(g)?),
             Selector::SimilarToCurrent => format!("action playnow similar_current {count}"),
             Selector::Starred => format!("action playnow starred {count}"),
+            Selector::Instrumental => format!("action playnow instrumental {count}"),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -212,6 +214,7 @@ pub fn describe_action(raw: &RawPlan) -> String {
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
                 Selector::Starred => "favorite (starred) tracks".to_string(),
+                Selector::Instrumental => "measured-instrumental tracks".to_string(),
             };
             format!("add {count} {sel} to the END of the queue (append-only)")
         }
@@ -243,6 +246,7 @@ pub fn describe_action(raw: &RawPlan) -> String {
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
                 Selector::Starred => "favorite (starred) tracks".to_string(),
+                Selector::Instrumental => "measured-instrumental tracks".to_string(),
             };
             format!("play {count} {sel} NOW (enqueue + start playback)")
         }
@@ -528,6 +532,8 @@ mod tests {
         // The starred (favorites) selector round-trips for enqueue and playnow.
         assert_round_trip(&imm(Action::Enqueue { selector: Selector::Starred, count: 20 }));
         assert_round_trip(&imm(Action::PlayNow { selector: Selector::Starred, count: 20 }));
+        assert_round_trip(&imm(Action::Enqueue { selector: Selector::Instrumental, count: 5 }));
+        assert_round_trip(&imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 }));
         // PlayNow (library enqueue-then-start) round-trips its query/genre/radio DSL.
         assert_round_trip(&imm(Action::PlayNow {
             selector: Selector::Query("at the door".into()),

@@ -81,6 +81,14 @@ pub trait FeatureStore: Send + Sync {
     fn measured_coverage(&self, _mirror: Option<&[crate::store::IndexEntry]>) -> Option<Coverage> {
         None
     }
+
+    /// Every song id this store holds a MEASURED P(voice) for, with that value. The
+    /// pool behind "no vocals": the metadata heuristic cannot hear, so it holds none.
+    /// Ids only; a caller still checks the file describes the bytes it plays
+    /// ([`TrackFeatures::measured`] on the fetched song).
+    fn measured_voices(&self) -> Vec<(String, f32)> {
+        Vec::new()
+    }
 }
 
 /// The default, in-daemon [`FeatureStore`]: derives features purely from the

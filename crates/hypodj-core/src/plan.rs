@@ -35,6 +35,14 @@ use crate::model::{AlbumId, SongId};
 /// acceptable bounded hole in an otherwise fully-bounded IR.
 pub const MAX_ENQUEUE: u32 = 100;
 
+/// Longest "in N" delay a [`RawTrigger::SpanElapsed`] may ask for: one day. The span
+/// used to clamp to the FADE length cap (`fade.max_dur_secs`, 30 min by default),
+/// which was never a design constraint on a timer delay - it was the nearest bound
+/// at hand when the trigger landed (5e5e816) - and it silently armed "stop in 40
+/// minutes" as 30. A delay is now honored as asked up to this cap and REFUSED past
+/// it with [`PlanError::SpanTooLong`], never quietly shortened.
+pub const MAX_SPAN_SECS: f64 = 24.0 * 3600.0;
+
 /// The origins the DAEMON stamps on the plans it arms for the convenience
 /// sleep/winddown/wake features, so its own single active instance of a feature
 /// is identifiable in the registry (replace/cancel/status).
@@ -737,6 +745,12 @@ pub enum Selector {
     /// The user's starred (favorited) songs, resolved server-side at EXECUTE time
     /// from the live star set. Carries no id, so it is model-safe.
     Starred,
+    /// "No vocals" / "instrumental only": songs whose MEASURED P(voice) is below
+    /// [`crate::features::VOICE_INSTRUMENTAL_BELOW`], drawn from the feature store
+    /// at EXECUTE time. Never guessed from titles or genres: an unanalysed song is
+    /// not a candidate, and when none qualify the action fails naming how many
+    /// songs are measured. Carries no id, so it is model-safe.
+    Instrumental,
 }
 
 /// The numeric clamps, sourced from the SAME [`FadeConfig`] knobs the fade
@@ -804,6 +818,8 @@ pub enum PlanError {
     Unsupported(String),
     #[error("bad action for trigger")]
     Untimed,
+    #[error("a timer can be at most {} hours away; {} minutes was asked", MAX_SPAN_SECS as u64 / 3600, .asked_secs / 60)]
+    SpanTooLong { asked_secs: u64 },
 }
 
 /// The pure ARMED plan: concrete data only, NEVER serialized. The RAII
@@ -927,10 +943,13 @@ fn clamp_secs_field(s: f64, bounds: &PlanBounds) -> f64 {
     }
 }
 
+/// Floor a span at the slew minimum. NO upper clamp: an over-long span is refused
+/// in [`validate`] (see [`MAX_SPAN_SECS`]), because shortening a timer the user
+/// named is a silent lie about when it fires.
 fn clamp_span(s: f64, bounds: &PlanBounds) -> f64 {
     let lo = bounds.min_dur.as_secs_f64();
     if s.is_finite() {
-        s.clamp(lo, bounds.max_secs)
+        s.max(lo)
     } else {
         lo
     }
@@ -1068,7 +1087,11 @@ pub fn validate(
         }
 
         RawTrigger::SpanElapsed { secs } => {
-            let dur = Duration::try_from_secs_f64(clamp_span(*secs, bounds))
+            let span = clamp_span(*secs, bounds);
+            if span > MAX_SPAN_SECS {
+                return Err(PlanError::SpanTooLong { asked_secs: span.min(u64::MAX as f64) as u64 });
+            }
+            let dur = Duration::try_from_secs_f64(span)
                 .unwrap_or(bounds.min_dur);
             Ok(Resolved::OnDeadline(now + dur))
         }
@@ -1345,20 +1368,25 @@ mod tests {
             Action::PlayNow { count, .. } => assert_eq!(count, MAX_ENQUEUE),
             other => panic!("got {other:?}"),
         }
-        // SpanElapsed secs clamps into [min_dur, max_dur].
+        // SpanElapsed is honored AS ASKED past the fade cap (40 min arms 40 min,
+        // not the 30 min fade max) and refused loudly past MAX_SPAN_SECS.
         let snap = snap5(0);
-        let r = validate(
-            &clamp_raw(&raw(RawTrigger::SpanElapsed { secs: 1e9 }), &b),
-            &snap,
-            now(),
-            civil(),
-            &b,
-        )
-        .unwrap();
-        match r {
-            Resolved::OnDeadline(_) => {}
+        assert!(b.max_secs < 2400.0, "the regression needs a span past the fade cap");
+        let n = now();
+        let arm = |secs: f64| {
+            validate(&clamp_raw(&raw(RawTrigger::SpanElapsed { secs }), &b), &snap, n, civil(), &b)
+        };
+        match arm(2400.0).unwrap() {
+            Resolved::OnDeadline(at) => assert_eq!(at, n + Duration::from_secs(2400)),
             other => panic!("expected OnDeadline, got {other:?}"),
         }
+        match arm(MAX_SPAN_SECS).unwrap() {
+            Resolved::OnDeadline(at) => assert_eq!(at, n + Duration::from_secs(86400)),
+            other => panic!("expected OnDeadline, got {other:?}"),
+        }
+        let err = arm(1e9).unwrap_err();
+        assert!(matches!(err, PlanError::SpanTooLong { .. }), "{err:?}");
+        assert!(err.to_string().contains("at most 24 hours"), "{err}");
     }
 
     // The comfort ceiling now bounds the fade target VOLUME (the single field that

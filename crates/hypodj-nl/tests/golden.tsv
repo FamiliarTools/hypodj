@@ -63,7 +63,7 @@ no Prince	ERR Ambiguous("no artist \"Prince\" in the queue or library")
 no the	ERR NotUnderstood
 no jazz	ERR Ambiguous("no artist \"jazz\" in the queue or library")
 no thanks	ERR NotUnderstood
-no vocals please	ERR Unresolvable("that refinement needs audio-content metadata (vocals, energy, motion) hypodj does not have yet - see task iwwy04x")
+no vocals please	trigger immediate action playnow instrumental 5 once
 allow remixes again	trigger immediate action allow remixes once
 clear filters	trigger immediate action allow all once
 bring Daft Punk back	trigger immediate action allow artist "Daft Punk" once
@@ -101,3 +101,11 @@ stop after the while loop	ERR NotUnderstood
 fade out soon after this track	ERR Ambiguous("say when, e.g. fade out in 20 minutes or fade out at 23:30")
 stop in a few minutes	ERR Ambiguous("say how many, e.g. stop in 5 minutes")
 stop soon after this track	trigger after action stop once
+stop in 40 minutes	trigger in 2400 action stop once
+stop in 2 hours	trigger in 7200 action stop once
+fade out in 45 minutes	trigger in 2700 action fade out 30 once
+no vocals	trigger immediate action playnow instrumental 5 once
+only instrumentals	trigger immediate action playnow instrumental 5 once
+queue some instrumental music	trigger immediate action enqueue instrumental 5 once
+play the instrumental version of so what	ERR NotUnderstood
+no vocals and more energy	ERR Unresolvable("hypodj can select on vocals alone (say \"no vocals\"), not yet on energy, motion or more vocals - see task iwwy04x")

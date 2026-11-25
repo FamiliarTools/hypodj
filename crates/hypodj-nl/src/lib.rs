@@ -88,6 +88,14 @@ pub fn is_question(utterance: &str) -> bool {
     RulesTranslator.query(utterance).is_some()
 }
 
+/// Must this utterance skip any client-side translator and go to the daemon `nl`?
+/// A question (see [`is_question`]), or an ask only the daemon's measured features
+/// can answer ("no vocals"): a client translator has no selector for it and would
+/// guess a free-text "instrumental" query instead of reading P(voice).
+pub fn daemon_first(utterance: &str) -> bool {
+    is_question(utterance) || rules::is_instrumental_ask(utterance)
+}
+
 /// Is this plan "do nothing"? A translator's way of saying it did not understand,
 /// which a client must report as a miss - never offer for confirmation.
 pub fn is_noop(raw: &hypodj_core::plan::RawPlan) -> bool {
@@ -97,6 +105,16 @@ pub fn is_noop(raw: &hypodj_core::plan::RawPlan) -> bool {
 #[cfg(test)]
 mod question_tests {
     use super::*;
+
+    #[test]
+    fn instrumental_asks_go_to_the_daemon_first() {
+        for u in ["no vocals", "instrumental only", "queue 3 instrumentals", "what's offline"] {
+            assert!(daemon_first(u), "{u}");
+        }
+        for u in ["play some jazz", "play the instrumental version of so what", "more vocals", "stop soon-ish"] {
+            assert!(!daemon_first(u), "{u}");
+        }
+    }
     use hypodj_core::nl::NlQuery;
 
     #[test]
@@ -774,7 +792,7 @@ mod tests {
             assert_eq!(got.len(), 1, "{u}");
             assert_eq!(j(&got[0]), j(want), "{u}");
         }
-        for u in ["no voices", "no vocals please", "more motion", "less energy", "only instrumentals"] {
+        for u in ["more motion", "less energy", "more vocals", "no vocals and more energy"] {
             match tr(u, &c) {
                 Err(NlError::Unresolvable(m)) => assert!(m.contains("iwwy04x"), "{u}: {m}"),
                 other => panic!("{u}: must answer not-yet, got {other:?}"),
@@ -911,6 +929,11 @@ mod tests {
             ("repeat this", ok(vec![mode(PlayMode::Repeat, true), mode(PlayMode::Single, true)])),
             ("single mode", ok(vec![mode(PlayMode::Single, true)])),
             ("consume", ok(vec![mode(PlayMode::Consume, true)])),
+            ("no vocals", ok(vec![imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 })])),
+            ("instrumental only", ok(vec![imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 })])),
+            ("play something instrumental", ok(vec![imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 })])),
+            ("queue 3 instrumental tracks", ok(vec![imm(Action::Enqueue { selector: Selector::Instrumental, count: 3 })])),
+            ("music without singing please", ok(vec![imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 })])),
             ("play my favorites", ok(vec![imm(Action::PlayNow { selector: Selector::Starred, count: 20 })])),
             ("queue my favorites", ok(vec![imm(Action::Enqueue { selector: Selector::Starred, count: 20 })])),
             ("wind down", ok(vec![imm(Action::Fade(FadeIntentIr::ToFloor { secs: 300.0 }))])),

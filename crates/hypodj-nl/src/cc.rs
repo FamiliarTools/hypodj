@@ -325,7 +325,7 @@ const CLAUDE_TIMEOUT: Duration = Duration::from_secs(45);
 /// with [`DJ_SYSTEM_PROMPT`] (REPLACES the default Claude Code prompt with the tiny DJ
 /// framing), `--exclude-dynamic-system-prompt-sections` (drop cwd/env/git/memory),
 /// `--tools ""` (zero built-in tools), `--max-turns 1` (no agent tool loop),
-/// `--max-budget-usd` (cost cap), and a hard [`CLAUDE_TIMEOUT`] wall-clock kill so a
+/// `--model` + `--max-budget-usd` (see [`cc_limits`]), and a hard [`CLAUDE_TIMEOUT`] wall-clock kill so a
 /// stalled child degrades to a loud miss instead of hanging the client. On ANY failure
 /// returns a readable error - the caller surfaces a loud miss / falls back to the
 /// daemon path, never a fabricated plan.
@@ -333,6 +333,39 @@ const CLAUDE_TIMEOUT: Duration = Duration::from_secs(45);
 /// `--json-schema` takes the schema INLINE (not a path), so [`schema_json`] is passed
 /// straight as the arg value. `< /dev/null` (empty stdin via `Stdio::null`) means an
 /// auth/interactive prompt cannot block waiting on input - it fails fast instead.
+/// Default model for the translate call. Measured 2026-11-25 on the real grounded
+/// prompt for "stop soon-ish" (system prompt + schema + 40 genres, ~6.7k tokens, all
+/// a cold 1h cache WRITE on a one-shot call): the account default Opus cost $0.0548,
+/// over the old hard-coded $0.05 cap, so plain asks failed with "Reached maximum
+/// budget"; Sonnet $0.0274, Haiku $0.0014, all three emitting the same plan. The
+/// translator emits one flat JSON object against a schema with worked examples, so
+/// it does not need the strongest model; Sonnet halves the spend and keeps headroom
+/// for the harder queue-edit asks. Override with `HYPODJ_CC_MODEL`.
+pub const DEFAULT_CC_MODEL: &str = "sonnet";
+
+/// Default `--max-budget-usd` per call: ~3.6x the measured Sonnet cold-cache cost and
+/// still ~1.8x the measured Opus cost, so a model override does not silently trip
+/// it. Override with `HYPODJ_CC_MAX_BUDGET_USD` (a positive finite number).
+pub const DEFAULT_CC_MAX_BUDGET_USD: f64 = 0.10;
+
+/// The model and budget a call runs with, from the two env knobs. A malformed or
+/// non-positive budget is refused loudly rather than silently replaced.
+pub fn cc_limits(model: Option<&str>, budget: Option<&str>) -> Result<(String, f64), String> {
+    let model = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(DEFAULT_CC_MODEL)
+        .to_string();
+    let budget = match budget.map(str::trim).filter(|b| !b.is_empty()) {
+        None => DEFAULT_CC_MAX_BUDGET_USD,
+        Some(b) => match b.parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => v,
+            _ => return Err(format!("HYPODJ_CC_MAX_BUDGET_USD={b:?} is not a positive number of dollars")),
+        },
+    };
+    Ok((model, budget))
+}
+
 pub fn run_claude(
     utterance: &str,
     queue_len: usize,
@@ -340,9 +373,15 @@ pub fn run_claude(
     ctx: &LibraryContext,
 ) -> Result<RawPlan, String> {
     let prompt = build_prompt(utterance, queue_len, is_playing, ctx);
+    let (model, budget) = cc_limits(
+        std::env::var("HYPODJ_CC_MODEL").ok().as_deref(),
+        std::env::var("HYPODJ_CC_MAX_BUDGET_USD").ok().as_deref(),
+    )?;
     let mut child = Command::new("claude")
         .arg("-p")
         .arg(&prompt)
+        .arg("--model")
+        .arg(&model)
         .arg("--output-format")
         .arg("json")
         .arg("--json-schema")
@@ -356,7 +395,7 @@ pub fn run_claude(
         .arg("--max-turns")
         .arg("1")
         .arg("--max-budget-usd")
-        .arg("0.05")
+        .arg(budget.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -420,6 +459,16 @@ pub fn run_claude(
 mod tests {
     use super::*;
     use hypodj_core::plan::{Action, FadeIntentIr};
+
+    #[test]
+    fn cc_limits_default_override_and_refuse() {
+        assert_eq!(cc_limits(None, None).unwrap(), ("sonnet".to_string(), 0.10));
+        assert_eq!(cc_limits(Some(" haiku "), Some("0.02")).unwrap(), ("haiku".to_string(), 0.02));
+        assert_eq!(cc_limits(Some(""), Some("")).unwrap(), ("sonnet".to_string(), 0.10));
+        for bad in ["0", "-1", "nan", "inf", "five"] {
+            assert!(cc_limits(None, Some(bad)).unwrap_err().contains("HYPODJ_CC_MAX_BUDGET_USD"), "{bad}");
+        }
+    }
 
     #[test]
     fn a_failed_run_names_the_envelope_reason_not_the_exit_status() {
