@@ -1,0 +1,20 @@
+[package]
+name = "hypodj-gtk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "djg - the GNOME-native (GTK4 + libadwaita) HypoDJ app"
+
+# A thin client like dj-mcp and dj-search-provider: hypodj-client over MPD/TCP and
+# the hypodj-style tokens. It must NEVER depend on hypodj-core (libmpv).
+[[bin]]
+name = "djg"
+path = "src/main.rs"
+
+[dependencies]
+hypodj-client = { path = "../hypodj-client" }
+hypodj-style = { path = "../hypodj-style" }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+async-channel = "2"

@@ -1,6 +1,7 @@
 # HypoDJ design tokens
 
-Status: proposed (HypoDJ Lead, 2026-11-23). Not yet bound by Guilherme.
+Status: bound with the 2026-11-24 arena edits (Memoria task 01m8678): the room
+is the OS, HypoDJ owns one warm instrument. First proposed 2026-11-23.
 
 ## What makes HypoDJ, HypoDJ
 
@@ -27,7 +28,33 @@ CLI, TUI and GUI at parity, and what keeps `djc` legible to agents.
 ## Token tiers
 
 Tokens are **roles and policies**, not a fixed palette. Each surface resolves a
-role through its own adapter (ratatui, egui, ANSI or plain text).
+role through its own adapter (ratatui, GTK4 CSS, Qt palette, ANSI or plain text).
+
+### 0. The room and the instrument (GUI shells)
+
+In a GUI the room is the OS: libadwaita (`AdwStyleManager`) or Qt (`QPalette`),
+including dark, high contrast and the system accent. HypoDJ never repaints the
+window, the header bar, the lists or the accent.
+
+HypoDJ owns exactly ONE material surface, the now-playing **instrument**
+(cover, title, transport, volume):
+
+| Token | Rule |
+|---|---|
+| `instrument.ground` | The cover's average colour held at OKLCH L 0.20 (dark room) or 0.94 (light room), chroma at most 0.045. No cover: warm neutral `#110e0c` (dark) or warm paper `#f3eee6` (light). Never `#000` or `#fff`. |
+| `instrument.ink` | `ink.primary` and `ink.quiet`, fitted against the ground, not the room. |
+| `instrument.ember` | Ember fitted against the ground to its 3:1 floor (the fit moves it darker on the warm-paper ground, where the raw value is under 3:1). Only via the named state class `.ember`; it never redefines the global accent. |
+| `instrument.depth` | Depth lives on the controls (stock buttons, a card on the cover), not on a painted gradient. |
+| `instrument.motion` | Breathing (2 to 2.5 s) only, and off under reduced motion. |
+| high contrast | The instrument drops its tint and becomes the plain room; ember becomes bold words. |
+
+GTK scoping, verified against the libadwaita docs (css-variables,
+styles-and-appearance): the room variables are declared once and the colours
+derived from them (the standalone `--accent-color`) do not recompute when a
+subtree overrides a base colour - the docs require overriding the derived ones
+too. So the instrument uses its own `--hypodj-*` custom properties on the
+`.instrument` node and never redefines a room variable. Adapter:
+`hypodj_style::gtk_css`.
 
 ### 1. Room (detected, never chosen)
 
@@ -98,9 +125,9 @@ detents, the same detents as the server.
 
 | Token | Rule |
 |---|---|
-| `type.face` | One monospace face. TUI: the terminal's own. GUI: JetBrains Mono. Monospace because HypoDJ is terminal-native and the GUI is the same instrument. |
+| `type.face` | TUI: the terminal's own face. GUI: the host UI font (Adwaita Sans / the Qt platform font), with the host monospace only where alignment carries meaning (times, counts in columns). No bundled face. |
 | `type.weights` | Regular and bold only. Emphasis is bold, reverse or underline, as in the TUI today. |
-| `grid.cell` | The terminal cell is the unit. The GUI maps 1 cell to 8 px wide, so layouts transfer. |
+| `grid.cell` | TUI only: the terminal cell is the unit. GUI shells use the host's spacing, not a cell grid. |
 | `glyph.sigil` | Truchet diagonals from the album hash, the HypoDJ mark for "no cover". |
 
 ### 7. Voice
@@ -122,7 +149,10 @@ candidate for it.
 - `design/tokens.toml` is the single source of truth for values.
 - A small `hypodj-style` crate holds the roles, the contrast policies (moved out of
   `hypodj-tui/src/album_color.rs`) and the motion constants (read from `FadeConfig`).
-- Adapters: ratatui (TUI), egui (GUI), ANSI or plain (CLI, plain when not a TTY or
-  when `NO_COLOR` is set). No surface defines a colour of its own.
-- Parity test: every state above renders with its words on every surface, and the
+- Adapters: ratatui (TUI), GTK4 CSS (`gtk_css`, the djg instrument), Qt
+  QPalette/QML (planned), ANSI or plain (CLI, plain when not a TTY or when
+  `NO_COLOR` is set). The older egui adapter remains for its feature but no shell
+  uses it. No surface defines a colour of its own.
+- Parity test: every state above renders with its words on every surface (CLI,
+  TUI, and both GUI shells), and the
   CLI output is identical with colour on and off apart from escape codes.

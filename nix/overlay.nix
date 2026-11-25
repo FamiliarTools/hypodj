@@ -14,4 +14,8 @@ final: prev: {
   hypodj-clients = final.callPackage ./clients.nix {
     cargoVersion = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
   };
+  # djg, the GNOME app (GTK4 + libadwaita, no libmpv).
+  hypodj-gtk = final.callPackage ./gtk.nix {
+    cargoVersion = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
+  };
 }
