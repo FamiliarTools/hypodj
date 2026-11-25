@@ -14269,6 +14269,10 @@ impl MpdHandler for HypodjHandler {
         match cmd {
             // ── status / metadata ──────────────────────────────────────────
             MpdCommand::Ping => MpdResponse::ok(),
+            MpdCommand::ClearError => {
+                *self.play_failure.lock().unwrap() = None;
+                MpdResponse::ok()
+            }
 
             MpdCommand::Status => {
                 let (vol, qlen, cur, ver, random, repeat, single, consume, skipping) = {
@@ -15300,7 +15304,7 @@ impl MpdHandler for HypodjHandler {
             // ── capability probes ──────────────────────────────────────────
             MpdCommand::Commands => {
                 let cmds = [
-                    "add", "addid", "albumart", "binarylimit", "clear",
+                    "add", "addid", "albumart", "binarylimit", "clear", "clearerror",
                     "commands", "count", "currentsong", "delete", "fade", "find", "findadd",
                     "getvol", "idle",
                     "list", "listall", "listallinfo", "listplaylistinfo",
@@ -29647,6 +29651,28 @@ mod tests {
         h.note_playback_progress(None);
         let status = h.handle(MpdCommand::Status).await;
         assert_eq!(pair(&status, "error"), None, "sound clears it");
+    }
+
+    /// `clearerror` is the MPD verb for dismissing the `error` key: it must answer OK
+    /// (not ACK unknown) and the key must be gone afterwards.
+    #[tokio::test]
+    async fn clearerror_dismisses_a_standing_play_failure() {
+        let Some((h, _rx)) = handler_with_null_player() else { return };
+        let song = store_song("s-remote", 16);
+        h.enqueue_song_for_test(song.clone()).await;
+        h.advance_on_eof(EofSignal {
+            song: Some(song.id.clone()),
+            errored: true,
+            was_local: false,
+            ..EofSignal::default()
+        })
+        .await;
+        let status = h.handle(MpdCommand::Status).await;
+        assert!(pair(&status, "error").is_some(), "the failure stands");
+        let resp = h.handle(crate::mpd::parse("clearerror")).await;
+        assert!(matches!(resp, MpdResponse::Pairs(ref p) if p.is_empty()), "clearerror answers OK: {resp:?}");
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "error"), None, "clearerror clears it");
     }
 
     #[tokio::test]

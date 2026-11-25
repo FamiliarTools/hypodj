@@ -197,6 +197,11 @@ fn snapshot(c: &mut MpdConn, msgs: &mut Vec<Msg>) -> Result<(), MpdError> {
     Ok(())
 }
 
+/// The `Id` an `addid` answered with (an album's first row), if any.
+fn play_uri_id(added: &[(String, String)]) -> Option<&str> {
+    hypodj_client::model::find(added, "Id").filter(|v| v.parse::<u64>().is_ok())
+}
+
 fn handle(c: &mut MpdConn, req: Req, msgs: &mut Vec<Msg>) -> Result<(), MpdError> {
     match req {
         Req::Refresh => snapshot(c, msgs),
@@ -208,11 +213,13 @@ fn handle(c: &mut MpdConn, req: Req, msgs: &mut Vec<Msg>) -> Result<(), MpdError
             snapshot(c, msgs)
         }
         Req::PlayUri(uri) => {
-            let before: usize = hypodj_client::model::find(&c.command("status")?, "playlistlength")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            c.command(&format!("add {}", quote_arg(&uri)))?;
-            c.command(&format!("play {before}"))?;
+            // `addid` then `playid`: the daemon names the row it added, so an add from
+            // another connection between the two cannot make us start the wrong one
+            // (reading playlistlength first and then `play N` could).
+            let added = c.command(&format!("addid {}", quote_arg(&uri)))?;
+            if let Some(id) = play_uri_id(&added) {
+                c.command(&format!("playid {id}"))?;
+            }
             snapshot(c, msgs)
         }
         Req::Ask(text) => ask(c, &text, msgs),
@@ -320,4 +327,53 @@ fn albums(c: &mut MpdConn) -> Result<Msg, MpdError> {
         )),
     };
     Ok(Msg::Albums { rows, note })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+
+    /// A fake MPD on a loopback socket that records every command line and answers
+    /// `addid` with `Id: 7` and a `playlistlength` of 3 in `status`, everything else OK.
+    fn fake_mpd() -> Option<(u16, Arc<Mutex<Vec<String>>>)> {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let port = l.local_addr().ok()?.port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            let Ok((sock, _)) = l.accept() else { return };
+            let mut w = sock.try_clone().expect("clone");
+            let _ = w.write_all(b"OK MPD 0.23.0\n");
+            for line in BufReader::new(sock).lines() {
+                let Ok(line) = line else { return };
+                let reply = if line.starts_with("addid") {
+                    "Id: 7\nOK\n"
+                } else if line == "status" {
+                    "playlistlength: 3\nOK\n"
+                } else {
+                    "OK\n"
+                };
+                seen.lock().unwrap().push(line);
+                if w.write_all(reply.as_bytes()).is_err() {
+                    return;
+                }
+            }
+        });
+        Some((port, log))
+    }
+
+    /// PlayUri must start the row the daemon says it added (`playid <Id>`), never a
+    /// position read before the add: a concurrent add would make that the wrong row.
+    #[test]
+    fn play_uri_starts_the_added_id_not_a_position() {
+        let Some((port, log)) = fake_mpd() else { return };
+        let mut c = MpdConn::connect("127.0.0.1", port).expect("connect");
+        let mut msgs = Vec::new();
+        handle(&mut c, Req::PlayUri("song/s-1".into()), &mut msgs).expect("handled");
+        let log = log.lock().unwrap().clone();
+        assert!(log.iter().any(|l| l == "playid 7"), "{log:?}");
+        assert!(!log.iter().any(|l| l.starts_with("play ") || l.starts_with("add ")), "{log:?}");
+    }
 }

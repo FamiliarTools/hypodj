@@ -729,6 +729,8 @@ fn set_fade_secs(dir: FadeIntentIr, secs: f64) -> FadeIntentIr {
 
 /// "fade the Nth track [counting current as 1st]" -> QueuePosition + Fade.
 fn fade_track(tv: &[&str], low: &str) -> Result<RawPlan, NlError> {
+    // "fade out soon after this track": a vague deferral, not an ordinal.
+    vague_time(tv, low, "fade out")?;
     // The ordinal right before "track"/"song".
     let n = tv
         .windows(2)
@@ -766,7 +768,7 @@ fn fade_immediate(
     ctx: &NlContext,
 ) -> Result<RawPlan, NlError> {
     let fi = tv.iter().position(|t| *t == "fade").ok_or(NlError::NotUnderstood)?;
-    vague_time(tv, if tv.get(fi + 1) == Some(&"in") { "fade in" } else { "fade out" })?;
+    vague_time(tv, low, if tv.get(fi + 1) == Some(&"in") { "fade in" } else { "fade out" })?;
     // Skip the explicit direction word so "fade in 20 minutes" reads "in" as the
     // DIRECTION, not a trigger preposition.
     let mut rest_start = fi + 1;
@@ -815,18 +817,55 @@ fn fade_immediate(
 /// NOW, the opposite of what was asked, and guessing a span would invent one; so it
 /// refuses as Ambiguous (a specific answer that does NOT fall through to the model,
 /// which could guess too) with a hint that says how to say when.
-fn vague_time(tv: &[&str], verb: &str) -> Result<(), NlError> {
+///
+/// Tokens are NORMALISED first (edge punctuation off, hyphen parts split, an "-ish"
+/// suffix dropped) so "soon-ish", "soonish" and "soon." cannot slip past as unknown
+/// filler and arm NOW. "bit" and "while" are vague only as "a bit" / "a while" (so
+/// "the while loop" is not a deferral). A vague word beside a PRECISE anchor this
+/// verb can honour ("at 5", "in 20 minutes", "after this track" for stop/pause)
+/// does not refuse: the precise anchor is what gets armed. "later than <time>" is
+/// a bound, not a time, so it gets a hint naming the exact form instead.
+fn vague_time(tv: &[&str], low: &str, verb: &str) -> Result<(), NlError> {
     const VAGUE: &[&str] = &[
-        "later", "soon", "sometime", "eventually", "shortly", "bit", "while", "awhile",
-        "whenever", "momentarily", "presently", "someday",
+        "later", "soon", "sometime", "eventually", "shortly", "awhile", "whenever",
+        "momentarily", "presently", "someday",
     ];
-    let some_point = tv.windows(2).any(|w| w == ["some", "point"]);
-    if some_point || tv.iter().any(|t| VAGUE.contains(t)) {
-        return Err(NlError::Ambiguous(format!(
-            "say when, e.g. {verb} in 20 minutes or {verb} at 23:30"
-        )));
+    let norm: Vec<String> = tv
+        .iter()
+        .flat_map(|t| t.split(['-', '\u{2010}', '\u{2011}', '\u{2012}']))
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .map(|t| match t.strip_suffix("ish") {
+            Some(stem) if stem.len() >= 3 => stem.to_string(),
+            _ => t.to_string(),
+        })
+        .collect();
+    let nv: Vec<&str> = norm.iter().map(String::as_str).collect();
+    let vague = nv.windows(2).any(|w| {
+        w == ["some", "point"] || (matches!(w[0], "a" | "little") && matches!(w[1], "bit" | "while"))
+    }) || nv.iter().any(|t| VAGUE.contains(t));
+    if !vague {
+        return Ok(());
     }
-    Ok(())
+    // A bound ("later than 11pm", "no later than 23:00") is not a moment.
+    if let Some(p) = nv.windows(2).position(|w| w == ["later", "than"]) {
+        if parse_clock(&nv, p + 2, low).is_some() {
+            return Err(NlError::Ambiguous(format!(
+                "say the exact time, e.g. {verb} at 23:00"
+            )));
+        }
+    }
+    let precise = tv.iter().enumerate().any(|(i, t)| match *t {
+        "at" => parse_clock(tv, i + 1, low).is_some(),
+        "in" => parse_dur(tv, i + 1).is_some(),
+        _ => false,
+    }) || (verb != "fade out" && verb != "fade in" && low.contains("after this"));
+    if precise {
+        return Ok(());
+    }
+    Err(NlError::Ambiguous(format!(
+        "say when, e.g. {verb} in 20 minutes or {verb} at 23:30"
+    )))
 }
 
 // ── stop / pause ──────────────────────────────────────────────────────────────
@@ -856,7 +895,7 @@ fn boundary_or_time(
         Some(&"stop") => "stop",
         _ => "wind down",
     };
-    vague_time(tv, verb)?;
+    vague_time(tv, low, verb)?;
     if low.contains("after this album") {
         return Ok(RawTrigger::AlbumBoundary { track: TrackSel::Current });
     }
@@ -875,11 +914,27 @@ fn boundary_or_time(
             .ok_or_else(|| NlError::Ambiguous("a repeating plan needs a time of day (at HH:MM)".into()))?;
         return at_trigger(tv, p, low, ctx).ok_or(NlError::NotUnderstood);
     }
-    if let Some(p) = tv.iter().position(|t| *t == "in") {
-        let (secs, _) = parse_dur(tv, p + 1).ok_or(NlError::NotUnderstood)?;
-        return Ok(RawTrigger::SpanElapsed { secs });
-    }
     let at = tv.iter().position(|t| *t == "at");
+    if let Some(p) = tv.iter().position(|t| *t == "in") {
+        match parse_dur(tv, p + 1) {
+            Some((secs, _)) => return Ok(RawTrigger::SpanElapsed { secs }),
+            // "in a while" beside "at 5": vague_time let it through because the
+            // clock is the precise anchor, so arm that, not a guessed span.
+            None if at.is_some() => {}
+            // "in a few minutes": a span whose count was left vague.
+            // Only with a unit after it: a bare "in a couple" is no span at all.
+            None if (matches!(tv.get(p + 1..p + 3), Some(["a", "few" | "couple"]))
+                && tv.get(p + 3).is_some_and(|u| unit_secs(u).is_some()))
+                || (matches!(tv.get(p + 1), Some(&"few" | &"several" | &"some"))
+                    && tv.get(p + 2).is_some_and(|u| unit_secs(u).is_some())) =>
+            {
+                return Err(NlError::Ambiguous(format!(
+                    "say how many, e.g. {verb} in 5 minutes"
+                )));
+            }
+            None => return Err(NlError::NotUnderstood),
+        }
+    }
     // A recurrence ("every day", "on weekdays") names a time-of-day schedule: it
     // needs an "at <time>", and must never degrade to a one-shot "in"/Immediate.
     if recurrence(tv).is_some() && at.is_none() {

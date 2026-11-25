@@ -88,3 +88,16 @@ fade out sometime	ERR Ambiguous("say when, e.g. fade out in 20 minutes or fade o
 stop later on	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
 wind down soon	ERR Ambiguous("say when, e.g. wind down in 20 minutes or wind down at 23:30")
 fade in later	ERR Ambiguous("say when, e.g. fade in in 20 minutes or fade in at 23:30")
+# Vague time normalised (w16): -ish / hyphen / punctuation variants still refuse.
+stop soon-ish	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+stop soonish	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+pause laterish	ERR Ambiguous("say when, e.g. pause in 20 minutes or pause at 23:30")
+fade out soon-ish	ERR Ambiguous("say when, e.g. fade out in 20 minutes or fade out at 23:30")
+stop soon.	ERR Ambiguous("say when, e.g. stop in 20 minutes or stop at 23:30")
+# Vague word beside a precise time (w16): the precise time wins, or a specific hint.
+stop later than 11pm	ERR Ambiguous("say the exact time, e.g. stop at 23:00")
+stop at 5 in a while	trigger at 2026-07-16T05:00:00+00:00 action stop once
+stop after the while loop	ERR NotUnderstood
+fade out soon after this track	ERR Ambiguous("say when, e.g. fade out in 20 minutes or fade out at 23:30")
+stop in a few minutes	ERR Ambiguous("say how many, e.g. stop in 5 minutes")
+stop soon after this track	trigger after action stop once

@@ -64,6 +64,8 @@ pub enum MpdCommand {
     CurrentSong,
     /// `ping` - no-op keepalive.
     Ping,
+    /// `clearerror` - clear the standing `error` status key (a play failure).
+    ClearError,
     /// `idle [subsystems...]` - long-poll until a subsystem changes.
     Idle(Vec<String>),
     /// `noidle` - cancel a pending idle immediately.
@@ -1476,6 +1478,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "stats" => MpdCommand::Stats,
         "currentsong" => MpdCommand::CurrentSong,
         "ping" => MpdCommand::Ping,
+        "clearerror" => MpdCommand::ClearError,
         "idle" => MpdCommand::Idle(args.clone()),
         "noidle" => MpdCommand::NoIdle,
         "play" => MpdCommand::Play(arg(0).and_then(|s| s.parse().ok())),
@@ -1837,6 +1840,7 @@ mod parse_tests {
     fn parses_core_commands() {
         assert!(matches!(parse("status"), MpdCommand::Status));
         assert!(matches!(parse("ping"), MpdCommand::Ping));
+        assert!(matches!(parse("clearerror"), MpdCommand::ClearError));
         assert!(matches!(parse("play 3"), MpdCommand::Play(Some(3))));
         assert!(matches!(parse("play"), MpdCommand::Play(None)));
         assert!(matches!(parse("setvol 42"), MpdCommand::SetVol(42)));

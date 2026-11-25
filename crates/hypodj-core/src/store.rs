@@ -4152,7 +4152,9 @@ async fn fetch_original(
     // song may overshoot the budget by the difference until the next pass evicts.
     let declared = resp.content_length();
     if let Some(len) = declared {
-        if len != expected && (len == 0 || len > STALE_INDEX_MAX_BYTES) {
+        // Only a LARGER served length can be a stale index: a mid-copy scan can
+        // only undercount the file. A smaller one is a truncated or wrong file.
+        if len != expected && (len < expected || len == 0 || len > STALE_INDEX_MAX_BYTES) {
             return Err(DownloadError::SizeDisagreement { indexed: expected, served: Some(len) });
         }
     }
@@ -10254,6 +10256,21 @@ content_type = "audio/flac"
         let got = fetch_original(&http, &url, &tmp, 12).await.expect("accepted on Content-Length");
         assert_eq!(got, 40);
         assert_eq!(std::fs::read(&tmp).expect("temp"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_served_length_smaller_than_the_index_is_refused() {
+        // A mid-copy index can only undercount, so a served 12 against an indexed 40
+        // is a short file, never a stale index: it must not be committed.
+        let Some(http) = http_client() else { return };
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n".to_string();
+        let Some(url) = serve_once(head, vec![b'f'; 12]).await else { return };
+        let dir = unowned_tmpdir("stale-index-smaller");
+        let err = fetch_original(&http, &url, &dir.join("t.part"), 40)
+            .await
+            .expect_err("a smaller served length is never accepted");
+        assert_eq!(err, DownloadError::SizeDisagreement { indexed: 40, served: Some(12) });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

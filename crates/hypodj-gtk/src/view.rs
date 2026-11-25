@@ -232,16 +232,30 @@ pub fn store_short(line: &str) -> Option<String> {
     if head == "nothing being mirrored" {
         return Some("nothing on disk".into());
     }
-    if let Some(rest) = head.strip_prefix("all ") {
-        return Some(format!("all {rest} on disk"));
-    }
     let (counts, coming) = match head.split_once(" - ") {
         Some((c, m)) => (c, m.strip_suffix(" still coming")),
         None => (head.as_str(), None),
     };
-    let counts = match counts.strip_suffix(" songs").or_else(|| counts.strip_suffix(" song")) {
-        Some(c) if c.contains(" of ") => format!("{c} on disk"),
-        _ => return Some(head.clone()),
+    // The held-beyond suffix (" + 13 more on disk") rides the counts: lift it off so
+    // the count forms below match, then put it back after "on disk" as " + 13 more".
+    let (counts, more) = match counts.split_once(" + ") {
+        Some((c, m)) => match m.strip_suffix(" more on disk") {
+            Some(n) if n.parse::<u64>().is_ok() => (c, Some(n)),
+            _ => return Some(head.clone()),
+        },
+        None => (counts, None),
+    };
+    let more = more.map(|n| format!(" + {n} more")).unwrap_or_default();
+    let counts = if let Some(rest) = counts.strip_prefix("all ") {
+        if coming.is_some() {
+            return Some(head.clone());
+        }
+        format!("all {rest} on disk{more}")
+    } else {
+        match counts.strip_suffix(" songs").or_else(|| counts.strip_suffix(" song")) {
+            Some(c) if c.contains(" of ") => format!("{c} on disk{more}"),
+            _ => return Some(head.clone()),
+        }
     };
     Some(match coming {
         Some(n) => format!("{counts}, {n} downloading"),
@@ -367,6 +381,17 @@ mod tests {
         assert_eq!(store_short("all 409 songs, 15.9 GiB").as_deref(), Some("all 409 songs on disk"));
         assert_eq!(store_short("318 of 347 songs, 12.1 of 16.0 GiB").as_deref(), Some("318 of 347 on disk"));
         assert_eq!(store_short("nothing being mirrored").as_deref(), Some("nothing on disk"));
+        // Every daemon head form, including the held-beyond " + N more on disk" badge.
+        for (badge, want) in [
+            ("all 2 songs + 1 more on disk, 0.1 GiB", "all 2 songs on disk + 1 more"),
+            ("1 of 3 songs + 1 more on disk - 2 still coming [##..], 0.1 of 0.1 GiB", "1 of 3 on disk + 1 more, 2 downloading"),
+            ("1 of 3 songs + 1 more on disk, 0.1 of 0.1 GiB", "1 of 3 on disk + 1 more"),
+            ("0 of 10 songs - 7 still coming [..], 0.0 of 1.0 GiB", "0 of 10 on disk, 7 downloading"),
+            ("1 of 1 song", "1 of 1 on disk"),
+            ("3 songs on disk, 0.1 GiB", "3 songs on disk"),
+        ] {
+            assert_eq!(store_short(badge).as_deref(), Some(want), "{badge}");
+        }
         let down = status(Some("unreachable"), None);
         assert!(down.problem);
         assert_eq!(down.label, "Server unreachable");
