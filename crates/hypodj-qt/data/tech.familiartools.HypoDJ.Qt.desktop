@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=HypoDJ
+Name=HypoDJ (Qt)
 GenericName=Music Player
 Comment=Your music, played by a DJ that asks before it acts
 Exec=djq
