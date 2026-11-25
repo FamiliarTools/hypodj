@@ -1,0 +1,29 @@
+[package]
+name = "hypodj-qt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "djq - the Qt 6 / QML HypoDJ app (cxx-qt)"
+
+# A thin client like djg: hypodj-app (the shared view models and socket worker) over
+# hypodj-client, plus the hypodj-style tokens. It must NEVER depend on hypodj-core
+# (libmpv). Binding choice: docs/gui/qt.md.
+[[bin]]
+name = "djq"
+path = "src/main.rs"
+
+[dependencies]
+hypodj-app = { path = "../hypodj-app" }
+hypodj-client = { path = "../hypodj-client" }
+hypodj-style = { path = "../hypodj-style" }
+async-channel = "2"
+serde_json = "1"
+cxx = "1"
+cxx-qt = "0.10"
+# Only the Qt modules the app uses. Never `qt_minimal` (qt-build-utils would
+# download Qt over the network).
+cxx-qt-lib = { version = "0.10", features = ["qt_gui", "qt_qml"] }
+
+[build-dependencies]
+cxx-qt-build = "0.10"

@@ -26,7 +26,7 @@ rustPlatform.buildRustPackage {
   cargoBuildFlags = [ "--bin" "djg" ];
   # The pure view models and the GTK CSS adapter. Neither needs a display.
   doCheck = true;
-  cargoTestFlags = [ "-p" "hypodj-gtk" ];
+  cargoTestFlags = [ "-p" "hypodj-gtk" "-p" "hypodj-app" ];
 
   preFixup = ''
     gappsWrapperArgs+=(--set-default HYPODJ_BUILD_INFO ${lib.escapeShellArg buildInfo})
