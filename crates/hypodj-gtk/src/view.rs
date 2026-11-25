@@ -196,17 +196,94 @@ pub fn search_hits(pairs: &[(String, String)]) -> Vec<Hit> {
     out
 }
 
-/// The header subtitle: the server in words, plus the store's compact badge.
-pub fn server_line(server: Option<&str>, store: Option<&str>) -> (String, bool) {
-    let (mut words, problem) = match server {
+/// The status control in the bottom bar: a short label, a symbolic icon, and the
+/// details its popover shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    /// "Online - 1 of 3 on disk, 2 downloading". Short enough to sit beside the
+    /// ask entry; it still ellipsizes rather than clipping.
+    pub label: String,
+    pub icon: &'static str,
+    /// True when the server is not usable: drawn as a banner too.
+    pub problem: bool,
+    /// The popover lines: the server in words, then the store's own sentence with
+    /// every clause the label had to drop.
+    pub details: Vec<String>,
+}
+
+/// Remove the daemon's fill gauge (` [...]`, a TUI glyph meter) from a clause. The
+/// GTK app says the same thing in words, so the glyphs never reach a GTK label.
+fn strip_gauge(clause: &str) -> String {
+    match clause.find(" [") {
+        Some(i) if clause.ends_with(']') => clause[..i].to_string(),
+        _ => clause.to_string(),
+    }
+}
+
+/// The store's head clause in GTK words: `1 of 3 songs - 2 still coming [..]` reads
+/// `1 of 3 on disk, 2 downloading`; `all 409 songs` reads `all 409 songs on disk`.
+/// An unrecognised head is kept as the daemon wrote it (minus any gauge): a label
+/// that says too much is read, one that silently drops the reason is trusted.
+pub fn store_short(line: &str) -> Option<String> {
+    let head = strip_gauge(line.split(", ").next()?.trim());
+    if head.is_empty() {
+        return None;
+    }
+    if head == "nothing being mirrored" {
+        return Some("nothing on disk".into());
+    }
+    if let Some(rest) = head.strip_prefix("all ") {
+        return Some(format!("all {rest} on disk"));
+    }
+    let (counts, coming) = match head.split_once(" - ") {
+        Some((c, m)) => (c, m.strip_suffix(" still coming")),
+        None => (head.as_str(), None),
+    };
+    let counts = match counts.strip_suffix(" songs").or_else(|| counts.strip_suffix(" song")) {
+        Some(c) if c.contains(" of ") => format!("{c} on disk"),
+        _ => return Some(head.clone()),
+    };
+    Some(match coming {
+        Some(n) => format!("{counts}, {n} downloading"),
+        None => counts,
+    })
+}
+
+pub fn status(server: Option<&str>, store: Option<&str>) -> Status {
+    let (words, problem) = match server {
         Some(s) => hypodj_client::model::server_words(s),
         None => ("connected".to_string(), false),
     };
-    if let Some(badge) = store.and_then(hypodj_client::model::store_badge_short) {
-        words.push_str(" - offline: ");
-        words.push_str(&badge);
+    let headline = match server {
+        Some("online") | None => "Online".to_string(),
+        Some("no-network") => "No network".to_string(),
+        Some("unreachable") => "Server unreachable".to_string(),
+        Some("error") => "Server error".to_string(),
+        Some("unknown") => "Checking server".to_string(),
+        Some(_) => {
+            let mut w = words.clone();
+            if let Some(f) = w.get_mut(0..1) {
+                f.make_ascii_uppercase();
+            }
+            w
+        }
+    };
+    let short = store.and_then(store_short);
+    let label = match &short {
+        Some(s) => format!("{headline} - {s}"),
+        None => headline,
+    };
+    let mut details = vec![words];
+    if let Some(line) = store {
+        let full: Vec<String> = line.split(", ").map(|c| strip_gauge(c.trim())).collect();
+        details.push(format!("Offline: {}", full.join(", ")));
     }
-    (words, problem)
+    Status {
+        label,
+        icon: if problem { "network-offline-symbolic" } else { "network-server-symbolic" },
+        problem,
+        details,
+    }
 }
 
 #[cfg(test)]
@@ -280,10 +357,19 @@ mod tests {
     }
 
     #[test]
-    fn server_line_speaks_words_and_flags_problems() {
-        assert_eq!(server_line(Some("online"), None), ("server online".into(), false));
-        let (w, bad) = server_line(Some("unreachable"), Some("318 of 347 songs, 12.1 of 16.0 GiB"));
-        assert!(bad);
-        assert_eq!(w, "server unreachable - offline: 318 of 347 songs");
+    fn status_is_short_words_with_no_tui_glyphs() {
+        let live = "1 of 3 songs - 2 still coming [\u{25c9}\u{25ce}\u{25ce}], 0.1 of 0.1 GiB, 301 songs left out";
+        let st = status(Some("online"), Some(live));
+        assert_eq!(st.label, "Online - 1 of 3 on disk, 2 downloading");
+        assert!(!st.problem);
+        assert!(st.details.iter().all(|d| !d.contains('[') && !d.contains('\u{25c9}')), "{:?}", st.details);
+        assert!(st.details[1].ends_with("301 songs left out"));
+        assert_eq!(store_short("all 409 songs, 15.9 GiB").as_deref(), Some("all 409 songs on disk"));
+        assert_eq!(store_short("318 of 347 songs, 12.1 of 16.0 GiB").as_deref(), Some("318 of 347 on disk"));
+        assert_eq!(store_short("nothing being mirrored").as_deref(), Some("nothing on disk"));
+        let down = status(Some("unreachable"), None);
+        assert!(down.problem);
+        assert_eq!(down.label, "Server unreachable");
+        assert_eq!(down.icon, "network-offline-symbolic");
     }
 }

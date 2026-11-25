@@ -36,4 +36,4 @@ D-Bus. Screens: `screens/`.
 - Album track rows show availability only once the daemon emits `X-Offline` on
   `lsinfo album/<id>`; the queue already does.
 - MPRIS / media keys come from the daemon; app-side breathing motion, AT-SPI audit,
-  appstream metadata and an app icon are follow-ups.
+  appstream metadata are follow-ups. The icon id is `hypodj` (agents/w16-logo).

@@ -27,6 +27,8 @@ struct App {
     stack: adw::ViewStack,
     banner: adw::Banner,
     server: gtk::Label,
+    server_icon: gtk::Image,
+    server_details: gtk::Label,
     // The instrument.
     instrument: gtk::Box,
     instrument_css: gtk::CssProvider,
@@ -54,6 +56,8 @@ struct App {
 }
 
 pub fn activate(app: &adw::Application) {
+    // The HypoDJ icon id (docs/design/logo); windows and the task switcher use it.
+    gtk::Window::set_default_icon_name("hypodj");
     let env = Env { get: &|k| std::env::var(k).ok() };
     let (host, port) = config::resolve(None, None, &env);
     let (out_tx, out_rx) = async_channel::unbounded::<Msg>();
@@ -236,9 +240,30 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
         .policy(adw::ViewSwitcherPolicy::Wide)
         .build();
     let header = adw::HeaderBar::builder().title_widget(&switcher).build();
+    // The status: icon + short words in a flat menu button; the popover carries
+    // the full server and store sentences the label had to drop.
     let server = gtk::Label::new(None);
-    server.add_css_class("dim-label");
     server.add_css_class("caption");
+    server.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    server.set_max_width_chars(40);
+    let server_icon = gtk::Image::from_icon_name("network-server-symbolic");
+    let server_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    server_content.append(&server_icon);
+    server_content.append(&server);
+    let server_details = label(&[]);
+    server_details.set_selectable(true);
+    server_details.set_max_width_chars(48);
+    server_details.set_margin_start(6);
+    server_details.set_margin_end(6);
+    server_details.set_margin_top(6);
+    server_details.set_margin_bottom(6);
+    let server_pop = gtk::Popover::builder().child(&server_details).build();
+    let server_button = gtk::MenuButton::builder()
+        .child(&server_content)
+        .popover(&server_pop)
+        .tooltip_text("Server and offline status")
+        .build();
+    server_button.add_css_class("flat");
 
     let banner = adw::Banner::new("");
     banner.set_revealed(false);
@@ -256,9 +281,7 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
     ask_bar.set_margin_start(12);
     ask_bar.set_margin_end(12);
     ask_bar.append(&ask);
-    server.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    server.set_max_width_chars(48);
-    ask_bar.append(&server);
+    ask_bar.append(&server_button);
     let switcher_bar = adw::ViewSwitcherBar::builder().stack(&stack).build();
     let reply_text = label(&[]);
     reply_text.set_selectable(true);
@@ -316,6 +339,7 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
     let bp = adw::Breakpoint::new(adw::BreakpointCondition::parse("max-width: 600sp").expect("static condition"));
     bp.add_setter(&switcher_bar, "reveal", Some(&true.to_value()));
     bp.add_setter(&header, "title-widget", Some(&None::<gtk::Widget>.to_value()));
+    // Narrow: the icon alone; the words stay one click away in the popover.
     bp.add_setter(&server, "visible", Some(&false.to_value()));
     bp.add_setter(&inner_pad, "orientation", Some(&gtk::Orientation::Vertical.to_value()));
     window.add_breakpoint(bp);
@@ -383,6 +407,8 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
         stack,
         banner,
         server,
+        server_icon,
+        server_details,
         instrument,
         instrument_css: css,
         cover,
@@ -455,7 +481,9 @@ impl App {
                 eprintln!("djg: down - {why}");
                 self.banner.set_title(&glib::markup_escape_text(&why));
                 self.banner.set_revealed(true);
-                self.server.set_text("not connected");
+                self.server.set_text("Not connected");
+                self.server_icon.set_icon_name(Some("network-offline-symbolic"));
+                self.server_details.set_text(&why);
             }
             Msg::Albums { rows, note } => self.albums(rows, note),
             Msg::Album { uri, title, rows } => self.album_page(&uri, &title, rows),
@@ -511,8 +539,11 @@ impl App {
     }
 
     fn now_playing(&self, now: &NowPlaying, queue: &[QueueItem]) {
-        let (words, problem) = view::server_line(now.server.as_deref(), now.store.as_deref());
-        self.server.set_text(&words);
+        let st = view::status(now.server.as_deref(), now.store.as_deref());
+        self.server.set_text(&st.label);
+        self.server_icon.set_icon_name(Some(st.icon));
+        self.server_details.set_text(&st.details.join("\n"));
+        let problem = st.problem;
         self.banner.set_revealed(problem);
         if problem {
             self.banner.set_title(&glib::markup_escape_text(&format!(
