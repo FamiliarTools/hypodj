@@ -38,6 +38,28 @@ pub fn render_outcome(
     ansi.render(&hypodj_client::spoken::from_reply(pairs, act))
 }
 
+/// `djc features`: the daemon's measured coverage, then what is known about the
+/// current track, saying plainly whether the numbers were MEASURED or guessed from
+/// metadata.
+pub fn render_features(pairs: &[(String, String)]) -> String {
+    let get = |k: &str| pairs.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+    let mut lines = vec![match get("X-Features") {
+        Some("off") | None => "audio features: off".to_string(),
+        Some(c) => format!("audio features: {c}"),
+    }];
+    if let Some(src) = get("X-FeatureSource") {
+        let mut l = format!("this track ({src}): energy {}", get("X-FeatureEnergy").unwrap_or("?"));
+        if let Some(v) = get("X-FeatureVoice") {
+            l.push_str(&format!(", voice {v}"));
+        }
+        if let Some(b) = get("X-FeatureBpm") {
+            l.push_str(&format!(", {b} bpm"));
+        }
+        lines.push(l);
+    }
+    lines.join("\n")
+}
+
 /// The line the binary prints for a daemon ACK.
 pub fn render_refusal(msg: &str, ansi: Ansi) -> String {
     ansi.render(&hypodj_client::spoken::refusal_ack(msg))
@@ -222,6 +244,25 @@ pub fn render_queue(pairs: &[(String, String)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn features_says_measured_or_metadata() {
+        let p = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        };
+        let measured = p(&[
+            ("X-Features", "7 of 422 analysed"),
+            ("X-FeatureSource", "measured"),
+            ("X-FeatureEnergy", "0.26"),
+            ("X-FeatureVoice", "0.01 instrumental"),
+            ("X-FeatureBpm", "139.6"),
+        ]);
+        assert_eq!(
+            super::render_features(&measured),
+            "audio features: 7 of 422 analysed\nthis track (measured): energy 0.26, voice 0.01 instrumental, 139.6 bpm"
+        );
+        assert_eq!(super::render_features(&p(&[("X-Features", "off")])), "audio features: off");
+    }
+
     use super::*;
     use hypodj_client::model::now_playing;
 

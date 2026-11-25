@@ -34,6 +34,20 @@ pub struct TrackFeatures {
     /// When `Some`, the `Similar` selector may re-rank by [`cosine_similarity`]
     /// over embeddings instead of the wire call. `None` for metadata-only stores.
     pub embedding: Option<Vec<f32>>,
+    /// P(voice) `0..=1` from a learned voice/instrumental head, when MEASURED
+    /// ([`crate::features`]). `None` for metadata-only features.
+    pub voice: Option<f32>,
+    /// Measured tempo, when the offline extractor found one.
+    pub bpm: Option<f32>,
+    /// `true` when `energy` came from audio analysis rather than the genre lexicon.
+    pub measured: bool,
+}
+
+impl TrackFeatures {
+    /// Metadata-shaped features: no measurement behind them.
+    pub fn heuristic(energy: f32, valence: f32) -> Self {
+        TrackFeatures { energy, valence, embedding: None, voice: None, bpm: None, measured: false }
+    }
 }
 
 /// The durable P4 hook. A source of per-song [`TrackFeatures`]. The default,
@@ -46,6 +60,16 @@ pub trait FeatureStore: Send + Sync {
     /// metadata store always yields `Some` (it can always score genre); a
     /// precomputed store yields `None` for a song it never extracted.
     fn features(&self, song: &Song) -> Option<TrackFeatures>;
+
+    /// Pick up new data from the backing source, when there is one. Cheap and
+    /// synchronous; the default (metadata) store has nothing to refresh.
+    fn refresh(&self) {}
+
+    /// How many songs carry MEASURED features, or `None` for a store that never
+    /// measures (the metadata heuristic).
+    fn measured_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The default, in-daemon [`FeatureStore`]: derives features purely from the
@@ -55,11 +79,7 @@ pub struct MetadataStore;
 
 impl FeatureStore for MetadataStore {
     fn features(&self, song: &Song) -> Option<TrackFeatures> {
-        Some(TrackFeatures {
-            energy: energy_score(song),
-            valence: valence_score(song),
-            embedding: None,
-        })
+        Some(TrackFeatures::heuristic(energy_score(song), valence_score(song)))
     }
 }
 
@@ -954,7 +974,7 @@ mod pull_tests {
     use crate::model::{Song, SongId};
 
     fn feat(energy: f32, valence: f32) -> TrackFeatures {
-        TrackFeatures { energy, valence, embedding: None }
+        TrackFeatures::heuristic(energy, valence)
     }
 
     // A store that reads energy/valence straight off a per-id lookup, so a test can

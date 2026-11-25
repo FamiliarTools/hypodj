@@ -20,6 +20,7 @@ pub mod echo;
 pub mod event;
 pub mod executor;
 pub mod fade;
+pub mod features;
 pub mod handler;
 pub mod heard;
 pub mod intelligence;

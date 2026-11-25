@@ -257,6 +257,20 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         return Ok(());
     }
 
+    // `features` (measured audio-feature coverage + the current track's) is
+    // intercepted for the same reason as `heard`: route knows no such verb, so it
+    // would reach the NL translator, which has no features action.
+    if parsed.words.first().is_some_and(|w| w == "features") && parsed.words.len() == 1 {
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        let pairs = conn.command("features")?;
+        println!("{}", render::render_features(&pairs));
+        return Ok(());
+    }
+
     // `store` is intercepted BEFORE route() for the third time and the same stated
     // reason: route knows no store verb at all, so every form of this - including the
     // bare one - would be handed to the NL translator, which has no store action.

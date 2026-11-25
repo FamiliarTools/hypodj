@@ -33,6 +33,11 @@ pub const CLI_VERBS: &[VerbSpec] = &[
         help: "the rest of the line as natural language",
     },
     VerbSpec {
+        word: "features",
+        args: &[],
+        help: "measured audio-feature coverage, this track included",
+    },
+    VerbSpec {
         word: "journal",
         args: &[],
         help: "what the daemon did, newest first",

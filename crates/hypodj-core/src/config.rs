@@ -43,6 +43,12 @@ pub struct Config {
     /// state dir. With no state dir it simply never opens.
     #[serde(default)]
     pub heard: HeardConfig,
+    /// MEASURED audio features ([`crate::features`]), written by the offline
+    /// `hypodj-mir` batch and only READ here. Optional; with no `[features]` section
+    /// the daemon reads `<state_dir>/features` when it exists and otherwise serves
+    /// the metadata heuristic exactly as before.
+    #[serde(default)]
+    pub features: FeaturesConfig,
     /// THE TAPE: retroactive audio capture off mpv's own demuxer cache ([`crate::tape`]),
     /// taken by the `mark` gesture. Optional; with no `[tape]` section it is ON with a
     /// 2 GiB rolling budget and lives beside `heard/` under the state dir. With no state
@@ -337,6 +343,24 @@ fn d_heard_dedupe_window_secs() -> u64 {
 /// MANUAL (not derived), the [`StoreConfig`] rule: a derived `Default` would give
 /// `enable = false, keep_sessions = 0` to everyone who never wrote the section, which
 /// is the exact opposite of the intent. The parity test below keeps this true.
+/// `[features]`: where the measured per-song feature files live.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeaturesConfig {
+    /// Master switch. Default TRUE; an absent directory is simply an empty store.
+    #[serde(default = "d_heard_enable")]
+    pub enable: bool,
+    /// `None` resolves to `<state_dir>/features`. Like `heard.dir`, it MUST NOT be
+    /// inside the offline store's directory (the reconciler sweeps unknown files).
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        FeaturesConfig { enable: true, dir: None }
+    }
+}
+
 impl Default for HeardConfig {
     fn default() -> Self {
         Self {

@@ -10,6 +10,9 @@
 # closure and is sufficient - only wav capture is used.
 , songrec
 , ffmpeg-headless
+# The classic Essentia extractor for hypodj-mir (bpm, key, beats, loudness); a
+# static 11 MB binary run as a child process.
+, essentia-extractor
 # DISPLAY-only enrichment (from flake.nix): the semver read from Cargo.toml and
 # the HYPODJ_BUILD_INFO grammar baked into the runtime env (the nix sandbox has
 # no .git, so this is what `hypodj --version` shows).
@@ -32,9 +35,9 @@ rustPlatform.buildRustPackage {
   # mpv.pc (for libmpv2-sys at build) + libmpv.so (DT_NEEDED at runtime).
   buildInputs = [ mpv-unwrapped ];
 
-  # Install only the daemon. probe/play-probe are live-server provers, not
-  # something a deployed service needs.
-  cargoBuildFlags = [ "--bin" "hypodj" ];
+  # Install the daemon and the offline feature batch (hypodj-mir). probe/play-probe
+  # are live-server provers, not something a deployed service needs.
+  cargoBuildFlags = [ "--bin" "hypodj" "--bin" "hypodj-mir" ];
 
   # Run only the cheap, offline hypodj-core tests (config parse + null-player
   # transitions). Scoping this keeps the check phase from compiling the
@@ -65,6 +68,12 @@ rustPlatform.buildRustPackage {
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
       --prefix PATH : ${lib.makeBinPath [ songrec ffmpeg-headless ]} \
       --set-default HYPODJ_BUILD_INFO ${lib.escapeShellArg buildInfo}
+    # hypodj-mir links hypodj-core (so libmpv) and runs Essentia's classic
+    # extractor as a CHILD process (AGPL, never linked). The learned-heads models
+    # are NOT here: they are the separate `mir-models` output (CC BY-NC-SA 4.0).
+    wrapProgram $out/bin/hypodj-mir \
+      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
+      --prefix PATH : ${lib.makeBinPath [ essentia-extractor ]}
   '';
 
   meta = {

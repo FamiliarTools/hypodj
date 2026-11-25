@@ -281,6 +281,19 @@ async fn main() -> anyhow::Result<()> {
         });
     let resume_enabled = state_dir.is_some();
 
+    // MEASURED AUDIO FEATURES. Read-only: the offline `hypodj-mir` batch writes
+    // `<dir>/<song_id>.json`; the daemon only loads them (and re-reads on change),
+    // so a song never analysed keeps the metadata heuristic.
+    if cfg.features.enable {
+        if let Some(dir) =
+            cfg.features.dir.clone().or_else(|| state_dir.as_ref().map(|d| d.join("features")))
+        {
+            let fs = hypodj_core::features::FileFeatureStore::open(dir.clone());
+            tracing::info!(dir = %dir.display(), measured = fs.count(), "audio features");
+            handler.set_feature_store(Arc::new(fs));
+        }
+    }
+
     // OFFLINE AUDIO STORE. Root: an explicit [store].dir wins, else
     // <state_dir>/store; with neither, the store is disabled with a warn (resume's
     // posture - never fatal). Opened and REGISTERED BEFORE resume::load/restore

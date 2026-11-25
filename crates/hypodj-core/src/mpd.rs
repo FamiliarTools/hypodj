@@ -281,6 +281,11 @@ pub enum MpdCommand {
     /// real MPD surface, which is what `ADVERTISED_MPD_VERSION` tracks. See
     /// [`crate::handler::HypodjHandler::identify`].
     Identify,
+    /// `features` - the MEASURED audio-feature coverage (`X-Features: N of M
+    /// analysed`, M = songs in the offline mirror) plus what is known about the
+    /// current track. Read-only. A hypodj extension, absent from `commands` like its
+    /// siblings. See [`crate::features`].
+    Features,
 
     /// `mark` / `mark this` / `mark previous` - the MARK GESTURE: record what is
     /// playing, and star it when it is owned.
@@ -1634,6 +1639,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "wake" => parse_wake(&args, line),
         "field" => parse_field(&args, line),
         "identify" => MpdCommand::Identify,
+        "features" => MpdCommand::Features,
         "mark" => parse_mark(&args, line),
         "heard" => parse_heard(&args, line),
         "store" => parse_store(&args, line),
@@ -1865,6 +1871,7 @@ mod parse_tests {
         // The `identify` custom verb (task f7vnd3i) parses to its own command, never
         // Unsupported, so dispatch cannot forget the on-demand recognition path.
         assert!(matches!(parse("identify"), MpdCommand::Identify));
+        assert!(matches!(parse("features"), MpdCommand::Features));
     }
 
     #[test]

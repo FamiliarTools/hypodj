@@ -3044,9 +3044,11 @@ pub struct HypodjHandler {
     /// selectors. Defaults to [`MetadataStore`] (pure genre/year heuristics). This
     /// is the durable seam: an Essentia-backed store returning real embeddings can
     /// swap in behind the same trait WITHOUT touching selector or wire code. Used
-    /// READ-ONLY via pure `features(...)` calls - no lock, never held across an
+    /// READ-ONLY via pure `features(...)` calls. The slot is a short std `Mutex`
+    /// only so the daemon can install the measured [`crate::features::FileFeatureStore`]
+    /// after construction; the `Arc` is cloned out and the lock never spans an
     /// `.await`.
-    store: Arc<dyn FeatureStore>,
+    store: Mutex<Arc<dyn FeatureStore>>,
     /// The latent-field FIRST SLICE: a small, decaying set of active PULLS biasing
     /// P4 candidate ranking. `FieldSource` with its wings folded
     /// (docs/design/latent-field-interface.md). Read/mutated under a SHORT std-`Mutex`
@@ -3721,7 +3723,7 @@ impl HypodjHandler {
             plans_path: Mutex::new(None),
             plans_save: Mutex::new(()),
             last_elapsed_ms: Arc::new(AtomicU64::new(0)),
-            store: Arc::new(MetadataStore),
+            store: Mutex::new(Arc::new(MetadataStore)),
             pulls: Mutex::new(PullField::new()),
             recognizing: AtomicBool::new(false),
             continuation_station: Mutex::new(None),
@@ -5150,7 +5152,12 @@ impl HypodjHandler {
                 // "Something calmer" must not re-enqueue the seed itself.
                 pool.retain(|s| &s.id != id);
                 let pool = drop_excluded(&self.held_excludes(), pool);
-                calmer_rerank(self.store.as_ref(), &seed, pool, want)
+                // Pick up anything the offline batch wrote since the last ask (one
+                // stat when nothing moved), so a calmer pick uses MEASURED energy
+                // as soon as a song is analysed.
+                let store = self.feature_store();
+                store.refresh();
+                calmer_rerank(store.as_ref(), &seed, pool, want)
             }
         };
         // THE REWEIGHT HOOK: the single seam P4 HEURISTIC candidate selection
@@ -5447,9 +5454,9 @@ impl HypodjHandler {
         // reference_features = the current track, or a neutral center (0.5, 0.5).
         let reference = self
             .current_song()
-            .and_then(|s| self.store.features(&s))
-            .unwrap_or(TrackFeatures { energy: 0.5, valence: 0.5, embedding: None });
-        pull_reweight(&field, now, self.store.as_ref(), &reference, songs)
+            .and_then(|s| self.feature_store().features(&s))
+            .unwrap_or(TrackFeatures::heuristic(0.5, 0.5));
+        pull_reweight(&field, now, self.feature_store().as_ref(), &reference, songs)
     }
 
     /// Dispatch a parsed `field` command: SET a pull, SEE the field, one-nudge
@@ -9713,6 +9720,53 @@ impl HypodjHandler {
             ("X-Server", r.label().to_string()),
             ("X-ServerSince", since.elapsed().as_secs().to_string()),
         ]
+    }
+
+    /// `features`: measured coverage over the offline mirror, then the current
+    /// track's features and whether they were MEASURED or guessed from metadata.
+    /// The honest-coverage posture: an unanalysed track says `metadata`, never a
+    /// number that looks measured.
+    fn features_status(&self) -> MpdResponse {
+        let store = self.feature_store();
+        store.refresh();
+        let mut b = MpdResponse::pairs();
+        let line = match (store.measured_count(), self.audio_store()) {
+            (None, _) => "off".to_string(),
+            (Some(n), Some(mirror)) => format!("{n} of {} analysed", mirror.entries().len()),
+            (Some(n), None) => format!("{n} analysed"),
+        };
+        b = b.pair("X-Features", line);
+        if let Some(song) = self.current_song() {
+            if let Some(f) = store.features(&song) {
+                b = b.pair("X-FeatureSource", if f.measured { "measured" } else { "metadata" });
+                b = b.pair("X-FeatureEnergy", format!("{:.2}", f.energy));
+                if let Some(v) = f.voice {
+                    let word = if v < crate::features::VOICE_INSTRUMENTAL_BELOW {
+                        "instrumental"
+                    } else if v <= 1.0 - crate::features::VOICE_INSTRUMENTAL_BELOW {
+                        "uncertain"
+                    } else {
+                        "vocal"
+                    };
+                    b = b.pair("X-FeatureVoice", format!("{v:.2} {word}"));
+                }
+                if let Some(bpm) = f.bpm {
+                    b = b.pair("X-FeatureBpm", format!("{bpm:.1}"));
+                }
+            }
+        }
+        b.build()
+    }
+
+    /// Install the per-song feature source (the daemon installs the measured
+    /// [`crate::features::FileFeatureStore`] at start; tests install fakes).
+    pub fn set_feature_store(&self, store: Arc<dyn FeatureStore>) {
+        *self.store.lock().unwrap() = store;
+    }
+
+    /// The feature source, CLONED OUT under a short lock.
+    pub(crate) fn feature_store(&self) -> Arc<dyn FeatureStore> {
+        self.store.lock().unwrap().clone()
     }
 
     pub fn set_audio_store(&self, store: Arc<AudioStore>) {
@@ -14567,6 +14621,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Wake(cmd) => self.handle_wake(cmd),
             MpdCommand::Field(cmd) => self.handle_field(cmd),
             MpdCommand::Identify => self.identify().await,
+            MpdCommand::Features => self.features_status(),
             MpdCommand::Mark(target) => self.mark(target).await,
             MpdCommand::Heard(q) => self.heard(q).await,
 
@@ -22827,7 +22882,7 @@ mod tests {
         };
         for verb in [
             "mark", "heard", "store", "identify", "knob", "nl", "plan", "continuation",
-            "radio", "station", "searchall", "field", "sleep", "winddown", "wake",
+            "radio", "station", "searchall", "field", "sleep", "winddown", "wake", "features",
         ] {
             assert!(
                 !listed.iter().any(|c| c == verb),
@@ -27195,11 +27250,7 @@ mod tests {
     struct FakeStore(std::collections::HashMap<String, f32>);
     impl crate::intelligence::FeatureStore for FakeStore {
         fn features(&self, song: &Song) -> Option<crate::intelligence::TrackFeatures> {
-            self.0.get(&song.id.0).map(|&e| crate::intelligence::TrackFeatures {
-                energy: e,
-                valence: 0.5,
-                embedding: None,
-            })
+            self.0.get(&song.id.0).map(|&e| crate::intelligence::TrackFeatures::heuristic(e, 0.5))
         }
     }
 
@@ -31939,5 +31990,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(wire.contains("Line1 OK Line2"), "{wire}");
         assert!(!wire.lines().any(|l| l == "OK" || l == "Line2"), "{wire}");
+    }
+}
+
+/// The measured-features CONSUMER end to end: a `Calmer` enqueue armed as a plan
+/// `Action` (so through `run_action_outcome`, journaled and retractable) ranks its
+/// pool by MEASURED energy from a real [`crate::features::FileFeatureStore`]
+/// directory, against a loopback fake Subsonic server. The fixture is chosen so the
+/// metadata heuristic alone would pick a different pair, so a pass proves the
+/// measured path is the one deciding.
+#[cfg(test)]
+mod features_consumer_tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::features::{
+        ExtractorInfo, FeatureFile, FileFeatureStore, Scalars, SourceKey, Timeline,
+        EXTRACTOR_NAME, EXTRACTOR_VERSION, FEATURES_SCHEMA,
+    };
+    use crate::player::NullPlayer;
+    use std::io::{Read, Write};
+
+    fn child(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","parent":"al","isDir":false,"title":"T {id}","album":"Al","artist":"Ar","size":10,"suffix":"flac","duration":200,"type":"music","isVideo":false}}"#
+        )
+    }
+
+    /// A one-thread HTTP/1.1 server answering getSong and getSimilarSongs2 (in
+    /// pool order a, b, c, d) for as many connections as arrive.
+    fn fake_subsonic() -> Option<String> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_string();
+                let inner = if path.contains("getSimilarSongs2") {
+                    let songs: Vec<String> = ["a", "b", "c", "d"].iter().map(|i| child(i)).collect();
+                    format!(r#""similarSongs2":{{"song":[{}]}}"#, songs.join(","))
+                } else if path.contains("getSong") {
+                    format!(r#""song":{}"#, child("seed"))
+                } else {
+                    String::new()
+                };
+                let sep = if inner.is_empty() { "" } else { "," };
+                let body = format!(
+                    r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1"{sep}{inner}}}}}"#
+                );
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        Some(format!("http://{addr}/"))
+    }
+
+    fn write_features(dir: &std::path::Path, id: &str, arousal: f32) {
+        let ff = FeatureFile {
+            schema: FEATURES_SCHEMA,
+            song_id: id.into(),
+            source: SourceKey { size: 10, suffix: "flac".into(), created: None },
+            extractor: ExtractorInfo {
+                name: EXTRACTOR_NAME.into(),
+                version: EXTRACTOR_VERSION.into(),
+                models: vec!["deam-msd-musicnn-2".into()],
+            },
+            scalars: Scalars { arousal: Some(arousal), ..Default::default() },
+            embedding: None,
+            timeline: Timeline::default(),
+        };
+        crate::resume::atomic_write_bytes(
+            &crate::features::file_path(dir, id),
+            &serde_json::to_vec(&ff).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn calmer_action_ranks_by_measured_energy_and_is_journaled() {
+        let Some(url) = fake_subsonic() else { return };
+        let cfg = ServerConfig {
+            url,
+            username: "u".into(),
+            password: "p".into(),
+            client_name: "test".into(),
+        };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => Arc::new(c),
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return;
+            }
+        };
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(client, player);
+
+        // Measured: seed 7.0 (energy 0.75); a is LOUD (8.0), b calm (2.0), c mid
+        // (4.0); d has no file and falls back to the metadata 0.5. With metadata
+        // alone every row ties at 0.5 and the id tiebreak would give [a, b].
+        let dir = std::env::temp_dir().join(format!("hypodj-feat-consumer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (id, a) in [("seed", 7.0), ("a", 8.0), ("b", 2.0), ("c", 4.0)] {
+            write_features(&dir, id, a);
+        }
+        let store = Arc::new(FileFeatureStore::open(dir.clone()));
+        h.set_feature_store(store);
+
+        let action = Action::Enqueue { selector: Selector::Calmer(SongId("seed".into())), count: 2 };
+        let out = h.run_action_outcome(&action, "mcp:test").await;
+        assert!(matches!(out, PlanOutcome::Added { n: 2, .. }), "{out:?}");
+        let ids: Vec<String> = h
+            .state
+            .lock()
+            .unwrap()
+            .queue
+            .iter()
+            .filter_map(|it| match &it.entry {
+                QueueEntry::Song(s) => Some(s.id.0.clone()),
+                QueueEntry::Stream { .. } => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["b", "c"], "calmest MEASURED first; the loud `a` is left out");
+
+        // The status verb reports the measured coverage.
+        match h.handle(MpdCommand::Features).await {
+            MpdResponse::Pairs(p) => assert!(
+                p.iter().any(|(k, v)| k == "X-Features" && v == "4 analysed"),
+                "{p:?}"
+            ),
+            other => panic!("expected Pairs, got {other:?}"),
+        }
+
+        // The enqueue went through the journal and can be retracted.
+        match h.handle(MpdCommand::Journal).await {
+            MpdResponse::Pairs(p) => assert!(
+                p.iter().any(|(k, v)| k == "jorigin" && v == "mcp:test"),
+                "the action is journaled: {p:?}"
+            ),
+            other => panic!("expected Pairs, got {other:?}"),
+        }
+        assert!(!matches!(h.handle(MpdCommand::Undo(None)).await, MpdResponse::Ack { .. }));
+        assert!(h.state.lock().unwrap().queue.is_empty(), "undo took the two rows back");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
