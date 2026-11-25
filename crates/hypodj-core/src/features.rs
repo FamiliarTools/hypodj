@@ -396,37 +396,46 @@ impl Inner {
         if dir_mtime.is_some() && st.dir_mtime == dir_mtime {
             return;
         }
+        let mut names: Vec<OsString> = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd.flatten().map(|e| e.file_name()).collect(),
+            Err(_) => Vec::new(),
+        };
+        // `readdir` racing a rename-over is allowed to return NEITHER the old nor
+        // the new entry (observed on btrfs: the replacing name lands at a new
+        // index past the stream's end while the old one is deleted). So a name the
+        // last scan held is never dropped on readdir's word alone: it is looked up
+        // by path, and only a failed `lstat` below means it is really gone.
+        let listed: std::collections::HashSet<OsString> = names.iter().cloned().collect();
+        names.extend(st.seen.keys().filter(|n| !listed.contains(*n)).cloned());
         let mut seen = HashMap::new();
-        if let Ok(rd) = std::fs::read_dir(&self.dir) {
-            for e in rd.flatten() {
-                let name = e.file_name();
-                let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
-                    continue;
-                };
-                // The name, NOT followed: a symlink, FIFO, socket or directory is
-                // never opened (read_bounded re-checks the opened descriptor).
-                let Ok(md) = std::fs::symlink_metadata(e.path()) else { continue };
-                if !md.file_type().is_file() {
-                    continue;
-                }
-                let (ino, len, mtime) = (md.ino(), md.len(), md.modified().ok());
-                let ff = match st.seen.remove(&name) {
-                    Some(old) if old.ino == ino && old.len == len && old.mtime == mtime => old.ff,
-                    _ => {
-                        self.reads.fetch_add(1, Ordering::Relaxed);
-                        read_file(&e.path())
-                        // Keyed by NAME, like hypodj-mir's own lookup: a file whose
-                        // stem is not its song id is not the answer for either id.
-                        .filter(|ff| ff.song_id == stem)
-                        .filter(|ff| ff.extractor.version == EXTRACTOR_VERSION)
-                        // A file with no energy-bearing value measures nothing the
-                        // daemon serves; it is not counted as analysed.
-                        .filter(|ff| ff.energy().is_some())
-                        .map(Arc::new)
-                    }
-                };
-                seen.insert(name, Seen { ino, len, mtime, ff });
+        for name in names {
+            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            let path = self.dir.join(&name);
+            // The name, NOT followed: a symlink, FIFO, socket or directory is
+            // never opened (read_bounded re-checks the opened descriptor).
+            let Ok(md) = std::fs::symlink_metadata(&path) else { continue };
+            if !md.file_type().is_file() {
+                continue;
             }
+            let (ino, len, mtime) = (md.ino(), md.len(), md.modified().ok());
+            let ff = match st.seen.remove(&name) {
+                Some(old) if old.ino == ino && old.len == len && old.mtime == mtime => old.ff,
+                _ => {
+                    self.reads.fetch_add(1, Ordering::Relaxed);
+                    read_file(&path)
+                    // Keyed by NAME, like hypodj-mir's own lookup: a file whose
+                    // stem is not its song id is not the answer for either id.
+                    .filter(|ff| ff.song_id == stem)
+                    .filter(|ff| ff.extractor.version == EXTRACTOR_VERSION)
+                    // A file with no energy-bearing value measures nothing the
+                    // daemon serves; it is not counted as analysed.
+                    .filter(|ff| ff.energy().is_some())
+                    .map(Arc::new)
+                }
+            };
+            seen.insert(name, Seen { ino, len, mtime, ff });
         }
         let map: HashMap<String, Arc<FeatureFile>> = seen
             .values()

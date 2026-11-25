@@ -19,7 +19,7 @@
         pkgs = import nixpkgs {
           inherit system;
           config.allowUnfreePredicate = p:
-            builtins.elem (nixpkgs.lib.getName p) [ "hypodj" "hypodj-clients" "hypodj-gtk" ];
+            builtins.elem (nixpkgs.lib.getName p) [ "hypodj" "hypodj-clients" "hypodj-gtk" "hypodj-qt" ];
         };
 
         # The released semver, read from the workspace manifest so the derivation
@@ -49,6 +49,8 @@
               (nixpkgs.lib.optional (biCount != null && biCount >= 0) "count=${toString biCount}")
               ++ [ "hash=${biHash}" "dirty=${if biDirty then "1" else "0"}" ]
             );
+        # The Qt prefix djq builds against (one qmake that sees qtdeclarative).
+        qtEnv = pkgs.qt6.env "hypodj-qt" [ pkgs.qt6.qtdeclarative ];
       in
       {
         packages.hypodj = pkgs.callPackage ./nix/package.nix { inherit buildInfo cargoVersion; };
@@ -57,6 +59,8 @@
         packages.hypodj-clients = pkgs.callPackage ./nix/clients.nix { inherit buildInfo cargoVersion; };
         # djg, the GNOME app: GTK4 + libadwaita over hypodj-client, no libmpv.
         packages.hypodj-gtk = pkgs.callPackage ./nix/gtk.nix { inherit buildInfo cargoVersion; };
+        # djq, the Qt app: Qt 6 / QML (cxx-qt) over hypodj-client, no libmpv.
+        packages.hypodj-qt = pkgs.callPackage ./nix/qt.nix { inherit buildInfo cargoVersion; };
         # The default local NL model for an `llm-llama` daemon (HYPODJ_NL_MODEL):
         # Qwen2.5-1.5B-Instruct Q4_K_M, the official Qwen GGUF, Apache-2.0, ~1.1 GB.
         # A fixed-output fetch, so the file is only downloaded when this is built.
@@ -108,6 +112,10 @@
           type = "app";
           program = "${self.packages.${system}.hypodj-gtk}/bin/djg";
         };
+        apps.djq = {
+          type = "app";
+          program = "${self.packages.${system}.hypodj-qt}/bin/djq";
+        };
         apps.default = self.apps.${system}.dj;
 
         devShells.default = pkgs.mkShell {
@@ -132,6 +140,10 @@
             # both packages never compile llama.cpp.
             pkgs.cmake
             pkgs.rustPlatform.bindgenHook
+            # djq (crates/hypodj-qt): cxx-qt-build finds Qt through ONE `qmake -query`
+            # prefix, so qmake comes from a qt6.env holding qtdeclarative next to
+            # qtbase (nixpkgs splits them). See nix/qt.nix.
+            qtEnv
           ];
           buildInputs = [
             # provides libmpv + mpv.pc for libmpv2 (Phase 1); the foundation is
@@ -141,6 +153,8 @@
             # djg (crates/hypodj-gtk): GTK4 + libadwaita, found through pkg-config.
             pkgs.gtk4
             pkgs.libadwaita
+            # djq: QtQuick links libGLX / libOpenGL (glvnd), which qt6.env does not carry.
+            pkgs.libGL
             # NOTE: no openssl. opensubsonic 0.3 pulls reqwest 0.13 with
             # default-features=false + "rustls" (verified in its Cargo.toml), so
             # TLS is aws-lc-rs/rustls, not OpenSSL. Adding openssl here would be a
@@ -149,6 +163,11 @@
           # Honor the hard build cap: never saturate the machine.
           CARGO_BUILD_JOBS = "2";
           PKG_CONFIG_PATH = "${pkgs.mpv-unwrapped.dev}/lib/pkgconfig";
+          QMAKE = "${qtEnv}/bin/qmake";
+          # A devshell-built djq finds its QML imports and platform plugins here
+          # (the package gets them from wrapQtAppsHook instead).
+          QML_IMPORT_PATH = "${qtEnv}/lib/qt-6/qml";
+          QT_PLUGIN_PATH = "${qtEnv}/lib/qt-6/plugins";
         };
       })
     // {

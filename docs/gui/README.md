@@ -20,7 +20,7 @@ A won: the daemon stamps a per-connection owner key, so `nl confirm` only works 
 the socket that ran the translate, and B would scatter IO (and its error words)
 across every view. Slow, stateless reads (art, search, the whole-library album
 listing) still get their own sockets so they can never delay a transport press.
-The words come from `hypodj-client` and `view.rs`, the same functions as the TUI.
+The words come from `hypodj-client` and `hypodj_app::view`, the same functions as the TUI.
 
 ## Proof
 
@@ -32,7 +32,7 @@ D-Bus. Screens: `screens/`.
 ## Not yet
 
 - Flatpak: `flatpak/tech.familiartools.HypoDJ.yml` is an untested draft.
-- The Qt shell.
+- The Qt shell is `djq` (`qt.md`); both shells share `crates/hypodj-app`.
 - Album track rows show availability only once the daemon emits `X-Offline` on
   `lsinfo album/<id>`; the queue already does.
 - MPRIS / media keys come from the daemon; app-side breathing motion, AT-SPI audit,

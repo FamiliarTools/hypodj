@@ -12,8 +12,8 @@
 //! same functions the TUI and `djc` use, so the three cannot disagree.
 
 mod ui;
-mod view;
-mod worker;
+
+use hypodj_app::{view, worker};
 
 use adw::prelude::*;
 

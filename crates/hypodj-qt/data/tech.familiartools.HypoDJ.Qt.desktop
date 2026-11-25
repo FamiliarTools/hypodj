@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=HypoDJ
+GenericName=Music Player
+Comment=Your music, played by a DJ that asks before it acts
+Exec=djq
+Icon=hypodj
+Terminal=false
+Categories=Audio;AudioVideo;Player;Qt;
+Keywords=music;dj;hypodj;player;
+StartupNotify=true
+StartupWMClass=djq

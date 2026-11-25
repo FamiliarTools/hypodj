@@ -1,0 +1,13 @@
+[package]
+name = "hypodj-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The toolkit-free half of the HypoDJ desktop apps (djg, djq): view models and the socket worker"
+
+# Shared by the GTK app (djg) and the Qt app (djq) so the two cannot disagree on a
+# word or a request. Over hypodj-client only: it must NEVER depend on hypodj-core.
+[dependencies]
+hypodj-client = { path = "../hypodj-client" }
+async-channel = "2"

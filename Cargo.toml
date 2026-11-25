@@ -12,7 +12,9 @@ members = [
     "crates/hypodj-search",
     "crates/hypodj-build-info",
     "crates/hypodj-style",
+    "crates/hypodj-app",
     "crates/hypodj-gtk",
+    "crates/hypodj-qt",
 ]
 
 [workspace.package]

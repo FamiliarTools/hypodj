@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 hypodj-client = { path = "../hypodj-client" }
+hypodj-app = { path = "../hypodj-app" }
 hypodj-style = { path = "../hypodj-style" }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }

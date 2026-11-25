@@ -8,6 +8,7 @@
 
 pub mod ansi;
 pub mod gtk_css;
+pub mod qt;
 mod color;
 pub mod spoken;
 mod tokens;
