@@ -878,6 +878,12 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         // them as subtle lines so the machine's hold stays visible. Field is the last,
         // quietest line.
         let mut lines = vec![Line::from("nothing playing")];
+        // WHY, when the deck stopped because a song could not be fetched: the daemon's
+        // `error` sentence, drawn loud, and it REPLACES the "just finished" hint below,
+        // which would otherwise claim the failed song played.
+        if let Some(e) = &np.error {
+            lines.push(Line::from(Span::styled(e.clone(), Style::default().bold())));
+        }
         // THE ONE EMPTY STATE A NEW USER MEETS, so it is the one place a way forward
         // has to be written down. Every route out of it is a function key nothing on
         // screen explains, and the only pointer to the keymap is a dim `? help` in the
@@ -916,7 +922,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         // stays silent (never both at once); off the DJ screen the card is the owner
         // and shows the bare phrase. An up-next hint never draws here either - the
         // always-visible "Up Next" pane already lists that track (see hint_earns_line).
-        if let Some(hint) = &np.hint {
+        if let Some(hint) = np.hint.as_ref().filter(|_| np.error.is_none()) {
             if state.screen != Screen::Dj && hint_earns_line(&hint.kind) {
                 lines.push(Line::from(Span::styled(
                     hint.phrase(),
@@ -3032,6 +3038,20 @@ mod tests {
             out.contains("just finished 303 (Ninajirachi Remix)"),
             "ambient hint drawn on the stopped pane:\n{out}"
         );
+    }
+
+    #[test]
+    fn a_failed_play_says_why_instead_of_just_finished() {
+        // The deck stopped because the song could not be fetched: the daemon's
+        // `error` sentence is on the card, and "just finished" (a claim it played) is not.
+        let mut s = TuiState::new();
+        s.now.state = Some("stop".into());
+        s.now.hint = Some(AmbientHint { kind: HintKind::JustFinished, title: "Ridge Line".into() });
+        s.now.error =
+            Some("could not play Ridge Line: not on disk and the server is unreachable".into());
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("could not play Ridge Line: not on disk"), "{out}");
+        assert!(!out.contains("just finished"), "{out}");
     }
 
     #[test]

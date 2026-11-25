@@ -1,0 +1,30 @@
+id = "server-returns"
+goal = "Your albums were showing only what is on disk because the server was gone; the server comes back. See the full library again without doing anything."
+# Timeline: the daemon starts with the server gone, Albums opens on the on-disk
+# fallback, then the server comes back while the pane stays open.
+start = "{state}"
+states = ["blocked", "no_network"]
+min_steps = 1          # open Albums; the refresh must come unasked
+step_budget = 1
+script = [
+  "key F2",
+  "wait 6",
+  "snap fallback",
+  "net online",
+  "wait 20",
+  "snap server-back",
+]
+
+[[check]]
+name = "setup: the Albums pane is the on-disk fallback while the server is gone"
+at = 3
+severity = "S1"
+screen_require_any = ["showing 1 album on disk", "on disk"]
+screen_forbid = ["Stream Summit"]
+
+[[check]]
+name = "after the server returns, the Albums pane lists the server's albums again unasked"
+severity = "S1"
+truth = ["status.X-Server == online"]
+screen_require_any = ["Stream Summit"]
+screen_forbid = ["showing 1 album on disk"]

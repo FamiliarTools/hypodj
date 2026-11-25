@@ -367,6 +367,10 @@ pub struct Browse {
     /// `held` cannot tell "nothing on disk" from "no store", and the second must not
     /// be rendered as "stream only".
     pub held_known: bool,
+    /// The uri the cursor was on when a refresh of THIS level was asked for without
+    /// a keypress (the server came back): the next listing puts the cursor back on
+    /// that row instead of row 0, so a refresh never moves what is under the hand.
+    pub keep_uri: Option<String>,
     /// Top visible row for the scrolloff viewport (see [`scroll_offset`]).
     pub offset: Cell<usize>,
 }
@@ -382,6 +386,7 @@ impl Browse {
             loaded: false,
             held: std::collections::HashMap::new(),
             held_known: false,
+            keep_uri: None,
             offset: Cell::new(0),
         }
     }

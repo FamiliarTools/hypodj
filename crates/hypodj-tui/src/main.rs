@@ -477,6 +477,33 @@ fn clear_refresh_gate(tx: &Sender<Req>, state: &mut TuiState) {
     }
 }
 
+/// Whether the daemon's `X-Server` just moved from a known not-online word to
+/// `online`. Only a KNOWN prior state counts: the first snapshot after connecting
+/// (`None` before) is not a return, it is the first look.
+fn server_returned(before: Option<&str>, after: Option<&str>) -> bool {
+    before.is_some_and(|b| b != "online") && after == Some("online")
+}
+
+/// The server came back: an Albums root that was listed while it was gone is the
+/// on-disk FALLBACK (or carries availability words from then), and nothing else
+/// would ever replace it, so list the root again. Only the root, and only once it
+/// was loaded: a drilled level is server data already, and an unvisited pane fetches
+/// fresh on first visit anyway. The cursor stays on the row it was on.
+fn refresh_albums_root(tx: &Sender<Req>, state: &mut TuiState) {
+    let b = &mut state.albums;
+    if !b.loaded || b.path != "albums/all" || !b.stack.is_empty() {
+        return;
+    }
+    b.keep_uri = b.rows.get(b.selected).map(|r| r.uri.clone());
+    let _ = tx.send(Req::Browse {
+        target: Screen::Albums,
+        command: "lsinfo albums/all".into(),
+        path: "albums/all".into(),
+        title: "Albums".into(),
+        restore_sel: None,
+    });
+}
+
 /// Switch to a screen: Queue just refreshes; a browse screen lazily fetches its root
 /// on first visit (the worker runs the lsinfo/listplaylists off the render path).
 fn show_screen(tx: &Sender<Req>, state: &mut TuiState, screen: Screen) {
@@ -709,6 +736,14 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             // The footer offer rides the snapshot, so it can never be older than the
             // frame it is drawn on.
             state.undo_offer = undo;
+            let server_back = server_returned(state.now.server.as_deref(), now.server.as_deref());
+            // Any change of the server word re-reads the WHOLE queue once: each row's
+            // "on disk" / "stream only" rides `playlistinfo`, and a song the mirror
+            // fetched after the last queue edit does not bump the playlist version, so
+            // the version gate would keep saying "stream only" at exactly the moment
+            // it matters - when the server goes and only what is on disk can play.
+            let server_moved =
+                state.now.server.is_some() && now.server.is_some() && state.now.server != now.server;
             match queue {
                 Some(q) => {
                     // An open context menu is a SNAPSHOT of one row, and a
@@ -724,6 +759,13 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
                     state.queue_version = version;
                 }
                 None => state.apply_now(now),
+            }
+            if server_back {
+                refresh_albums_root(tx, state);
+            }
+            if server_moved {
+                state.queue_version = None;
+                state.refresh_dirty = true;
             }
             clear_refresh_gate(tx, state);
         }
@@ -790,6 +832,11 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
                 if let Some(sel) = restore_sel {
                     if !b.rows.is_empty() {
                         b.selected = sel.min(b.rows.len() - 1);
+                    }
+                }
+                if let Some(uri) = b.keep_uri.take() {
+                    if let Some(i) = b.rows.iter().position(|r| r.uri == uri) {
+                        b.selected = i;
                     }
                 }
             }
@@ -1094,6 +1141,71 @@ mod tests {
             }
         }
         panic!("{needle:?} is not on screen:\n{text}");
+    }
+
+    /// The offline Albums fallback is replaced by the server's list the moment the
+    /// daemon reports the server back, with the cursor kept on its album; a snapshot
+    /// that stays offline, or the first look after connecting, asks for nothing.
+    #[test]
+    fn the_albums_fallback_relists_when_the_server_returns() {
+        use hypodj_client::model::NowPlaying;
+        let (tx, rx) = mpsc::channel::<Req>();
+        let mut state = TuiState::new();
+        let snap = |server: &str| RespKind::Snapshot {
+            now: NowPlaying { server: Some(server.into()), ..NowPlaying::default() },
+            queue: None,
+            version: None,
+            undo: None,
+        };
+        let row = |uri: &str| state::BrowseRow {
+            label: uri.into(),
+            uri: uri.into(),
+            is_dir: true,
+            song_count: Some(3),
+            artist: None,
+            album_uri: None,
+            artist_uri: None,
+        };
+        apply_resp(&tx, &mut state, snap("unreachable"));
+        state.albums.apply(vec![row("album/held")], "albums/all".into(), "Albums".into());
+        apply_resp(&tx, &mut state, snap("no-network"));
+        let reqs: Vec<Req> = rx.try_iter().collect();
+        assert!(!reqs.iter().any(|r| matches!(r, Req::Browse { .. })), "still offline");
+        // But the server word moved, so the whole queue (its on-disk words) is re-read.
+        assert!(
+            reqs.iter().any(|r| matches!(r, Req::Refresh { known_version: None })),
+            "a moved server word forces a full queue read"
+        );
+        apply_resp(&tx, &mut state, snap("online"));
+        let asked: Vec<_> = rx
+            .try_iter()
+            .filter_map(|r| match r {
+                Req::Browse { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked, vec!["albums/all".to_string()]);
+        // The server list lands with the held album second; the cursor follows it.
+        let held = Some(std::collections::HashMap::from([("album/held".to_string(), 3u32)]));
+        apply_resp(
+            &tx,
+            &mut state,
+            RespKind::Browse {
+                target: Screen::Albums,
+                rows: vec![row("album/a-stream"), row("album/held")],
+                path: "albums/all".into(),
+                title: "Albums".into(),
+                restore_sel: None,
+                held,
+            },
+        );
+        assert_eq!(state.albums.rows.len(), 2);
+        assert_eq!(state.albums.rows[state.albums.selected].uri, "album/held");
+        // Online to online is not a return.
+        apply_resp(&tx, &mut state, snap("online"));
+        assert!(!rx.try_iter().any(|r| matches!(r, Req::Browse { .. })));
+        // Nor is the first look: a fresh state has no prior word.
+        assert!(!server_returned(None, Some("online")));
     }
 
     #[test]

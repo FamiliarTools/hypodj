@@ -1,0 +1,20 @@
+{"n":0,"step":"start","t_ms":657,"settled":true,"settle_ms":627}
+{"n":1,"step":"key F2","t_ms":1326,"settled":true,"settle_ms":639}
+{"n":2,"step":"wait 2","t_ms":4003,"settled":true,"settle_ms":611}
+{"n":3,"step":"key j","t_ms":4638,"settled":true,"settle_ms":620}
+{"n":4,"step":"key j","t_ms":5276,"settled":true,"settle_ms":612}
+{"n":5,"step":"key Enter","t_ms":6036,"settled":true,"settle_ms":751}
+{"n":6,"step":"wait 5","t_ms":11724,"settled":true,"settle_ms":637}
+{"n":7,"step":"exec nft delete table inet hjblock 2>/dev/null; ip addr replace 10.77.0.1/24 dev srv0 2>/dev/null; nft -f /tmp/hypodj-usability-1134483/block.nft; echo blocked > /tmp/hypodj-usability-1134483/world","t_ms":12409,"settled":true,"settle_ms":607,"exit":0}
+{"n":8,"step":"wait 10","t_ms":23092,"settled":true,"settle_ms":635}
+{"n":9,"step":"snap ten-seconds-after","t_ms":23744,"settled":true,"settle_ms":627}
+{"n":10,"step":"wait 40","t_ms":64420,"settled":true,"settle_ms":633}
+{"n":11,"step":"snap fifty-seconds-after","t_ms":65086,"settled":true,"settle_ms":612}
+{"n":12,"step":"wait 75","t_ms":140749,"settled":true,"settle_ms":640}
+{"n":13,"step":"snap after-the-buffered-song-ends","t_ms":141380,"settled":true,"settle_ms":607}
+{"n":14,"step":"wait 115","t_ms":257032,"settled":true,"settle_ms":634}
+{"n":15,"step":"snap when-the-unfetched-song-is-due","t_ms":257658,"settled":true,"settle_ms":609}
+{"n":16,"step":"wait 20","t_ms":278318,"settled":true,"settle_ms":632}
+{"n":17,"step":"snap half-a-minute-after-due","t_ms":278951,"settled":true,"settle_ms":612}
+{"n":18,"step":"wait 60","t_ms":339609,"settled":true,"settle_ms":628}
+{"n":19,"step":"snap ninety-seconds-after-due","t_ms":340220,"settled":true,"settle_ms":604}

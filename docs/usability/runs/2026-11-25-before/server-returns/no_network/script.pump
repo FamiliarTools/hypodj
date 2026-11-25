@@ -1,0 +1,6 @@
+key F2
+wait 6
+snap fallback
+exec nft delete table inet hjblock 2>/dev/null; ip addr replace 10.77.0.1/24 dev srv0 2>/dev/null; echo online > /tmp/hypodj-usability-1134483/world
+wait 20
+snap server-back

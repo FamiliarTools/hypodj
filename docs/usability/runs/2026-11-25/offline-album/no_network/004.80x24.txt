@@ -1,0 +1,24 @@
+
+[F1]Queue  [F2]Albums  [F3]Playlists  [F4]DJ  [F5]Search              no network
+┌Albums - server unreachable, showing 1 album on disk──────────────────────────┐
+│# Held Harbour/  on disk                                                      │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌Now Playing─────────────────────────────┐┌Up Next─────────────────────────────┐
+│╱╱╱╲╲╱╱╱╱╲╲╲                            ││next  Harbour Lights                │
+│╱╱╲╱╱╲╲╲╲╱╱╲                            ││      Fixture Band · on disk        │
+│╱╱╲╲╲╲╲╲╲╲╲╲                            ││                                    │
+│╲╲╱╱╱╲╲╲╲╲╲╲                            ││then  Moorings                      │
+│╱╱╱╲╲╲╱╱╲╱╱╱                            ││      on disk                       │
+│╱╱╱╲╲╱╲╲╲╲╲╱                            ││                                    │
+│♥︎ Low Tide                              ││                                    │
+│Fixture Band                            ││                                    │
+│Held Harbour                            ││                                    │
+│playing · track 1 of 3 · 0:00 / 2:00    ││                                    │
+└────────────────────────────────────────┘└────────────────────────────────────┘
+▃▃▃▃▃▄▄▅▆▆▇▇▇▇▇▆▆▅▄▃▃▂▂▂▃▃▄▄▅▅▅▅▅▅▄▄▃▃▃▃▃▄▄▅▆▆  offline: 3 songs on disk  ? help
+
