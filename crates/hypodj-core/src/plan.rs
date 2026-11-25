@@ -41,7 +41,43 @@ pub const MAX_ENQUEUE: u32 = 100;
 /// at hand when the trigger landed (5e5e816) - and it silently armed "stop in 40
 /// minutes" as 30. A delay is now honored as asked up to this cap and REFUSED past
 /// it with [`PlanError::SpanTooLong`], never quietly shortened.
+/// The feature timers (`sleep in N`, `winddown in N`, an NL "in N") are held to
+/// the SAME cap through [`check_span`]: one bound for every relative timer.
 pub const MAX_SPAN_SECS: f64 = 24.0 * 3600.0;
+
+/// Refuse a relative delay past [`MAX_SPAN_SECS`] with the value actually asked.
+pub fn check_span(secs: f64) -> Result<(), PlanError> {
+    if secs > MAX_SPAN_SECS {
+        return Err(PlanError::SpanTooLong { asked_secs: secs });
+    }
+    Ok(())
+}
+
+/// A span in one unit family for a human message: "24 h", "24 h 0.5 s",
+/// "1 h 30 min". Both sides of the SpanTooLong message use it, so the cap and
+/// the asked value are always comparable and the asked value is never truncated
+/// to a coarser unit.
+pub fn fmt_span(secs: f64) -> String {
+    if !secs.is_finite() {
+        return format!("{secs} s");
+    }
+    let h = (secs / 3600.0).floor();
+    let rest = secs - h * 3600.0;
+    let m = (rest / 60.0).floor();
+    // Round to milliseconds, then trim, so 0.5 reads "0.5" and 7 reads "7".
+    let s = ((rest - m * 60.0) * 1000.0).round() / 1000.0;
+    let mut parts = Vec::new();
+    if h > 0.0 {
+        parts.push(format!("{h:.0} h"));
+    }
+    if m > 0.0 {
+        parts.push(format!("{m:.0} min"));
+    }
+    if s > 0.0 || parts.is_empty() {
+        parts.push(format!("{s} s"));
+    }
+    parts.join(" ")
+}
 
 /// The origins the DAEMON stamps on the plans it arms for the convenience
 /// sleep/winddown/wake features, so its own single active instance of a feature
@@ -818,8 +854,8 @@ pub enum PlanError {
     Unsupported(String),
     #[error("bad action for trigger")]
     Untimed,
-    #[error("a timer can be at most {} hours away; {} minutes was asked", MAX_SPAN_SECS as u64 / 3600, .asked_secs / 60)]
-    SpanTooLong { asked_secs: u64 },
+    #[error("a timer can be at most {} away; {} was asked", fmt_span(MAX_SPAN_SECS), fmt_span(*.asked_secs))]
+    SpanTooLong { asked_secs: f64 },
 }
 
 /// The pure ARMED plan: concrete data only, NEVER serialized. The RAII
@@ -1089,7 +1125,7 @@ pub fn validate(
         RawTrigger::SpanElapsed { secs } => {
             let span = clamp_span(*secs, bounds);
             if span > MAX_SPAN_SECS {
-                return Err(PlanError::SpanTooLong { asked_secs: span.min(u64::MAX as f64) as u64 });
+                return Err(PlanError::SpanTooLong { asked_secs: span });
             }
             let dur = Duration::try_from_secs_f64(span)
                 .unwrap_or(bounds.min_dur);
@@ -1386,7 +1422,14 @@ mod tests {
         }
         let err = arm(1e9).unwrap_err();
         assert!(matches!(err, PlanError::SpanTooLong { .. }), "{err:?}");
-        assert!(err.to_string().contains("at most 24 hours"), "{err}");
+        assert!(err.to_string().contains("at most 24 h away"), "{err}");
+        // The asked value is reported in full and in the cap's units, never
+        // truncated to a coarser unit (86400.5 s used to read "1440 minutes").
+        let err = arm(86400.5).unwrap_err();
+        assert_eq!(err, PlanError::SpanTooLong { asked_secs: 86400.5 });
+        assert_eq!(err.to_string(), "a timer can be at most 24 h away; 24 h 0.5 s was asked");
+        assert_eq!(fmt_span(5400.0), "1 h 30 min");
+        assert_eq!(fmt_span(0.0), "0 s");
     }
 
     // The comfort ceiling now bounds the fade target VOLUME (the single field that

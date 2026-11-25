@@ -76,5 +76,5 @@ the daemon, and it was the client order that skipped it.
   offered for confirmation; the CC failure names the envelope's reason in one line;
   the miss hint lists the questions and read verbs.
 
-Not done here: a `dj_offline` read tool for dj-mcp (the agent still cannot ask
-what is offline); it would be a plain read verb beside `dj_heard`.
+dj-mcp answers it too: `dj_offline` is a plain read of `store albums` beside
+`dj_heard`, outside the `Action` layer, so there is nothing to retract.

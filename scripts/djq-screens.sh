@@ -35,6 +35,8 @@ cleanup() {
   rm -rf "$TMP"
 }
 trap cleanup EXIT
+# A signal must still reach the EXIT trap, or the daemons outlive the script.
+trap "exit 1" INT TERM
 
 # Probe daemon config: the real [server] block (credentials stay in files), every
 # other section replaced. Lines are copied by section, never echoed.
@@ -119,5 +121,51 @@ shot ask-action playing "DJQ_ASK=play something calmer" DJQ_SETTLE=15
 # The chrome is whatever style the host sets: the same window under a dark host
 # style, where the instrument follows the room to its dark ground.
 shot playing-dark playing QT_QUICK_CONTROLS_STYLE=Material QT_QUICK_CONTROLS_MATERIAL_THEME=Dark
+
+# A second world: the music server unreachable (a dead loopback port, made-up
+# credentials - nothing secret is copied), the store a COPY of the first daemon's
+# mirror so the on-disk fallback has rows, and a [[stream]] with a very long name
+# queued so the long-title layout is on screen. Port 6695 (the first daemon also
+# holds 6692, its side channel at port + 1), never 6600.
+PORT2=6695
+mkdir -p "$TMP/store2" "$TMP/state2"
+cp -a "$TMP/store/." "$TMP/store2/" 2>/dev/null || true
+SLUG=an-extraordinarily-long-stream-path-that-a-queue-row-has-to-shorten-rather-than-overflow-the-window.mp3
+LONG="The Extraordinarily Long Name Of A Late Night Community Radio Stream That Never Ends - Live From The Harbour Wall Until Dawn"
+cat >"$TMP/config2.toml" <<EOC
+[server]
+url = "http://127.0.0.1:9"
+username = "nobody"
+password = "nothing"
+
+[mpd]
+bind = "127.0.0.1:$PORT2"
+
+[mpris]
+enable = false
+
+[store]
+enable = true
+dir = "$TMP/store2"
+max_bytes = 120000000
+
+[[stream]]
+url = "http://127.0.0.1:9/$SLUG"
+name = "$LONG"
+EOC
+env -i PATH="$PATH" HOME="$TMP/home" HYPODJ_AUDIO=null STATE_DIRECTORY="$TMP/state2" \
+  RUST_LOG=warn "$DAEMON" "$TMP/config2.toml" >"$TMP/daemon2.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 50); do
+  (exec 3<>/dev/tcp/127.0.0.1/$PORT2) 2>/dev/null && break
+  sleep 0.2
+done
+PORT=$PORT2
+mpc 'clear'
+mpc "add \"http://127.0.0.1:9/$SLUG\""
+mpc 'play 0'
+shot unreachable-playing playing DJQ_SETTLE=8
+shot unreachable-albums albums DJQ_SETTLE=12
+shot unreachable-narrow playing DJQ_WIDTH=360 DJQ_SETTLE=8
 
 echo "daemon log tail:"; tail -n 5 "$TMP/daemon.log" | sed 's/password=[^ &]*/password=REDACTED/g'

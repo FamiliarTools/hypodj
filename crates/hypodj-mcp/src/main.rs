@@ -2,7 +2,7 @@
 //!
 //! A stdio MCP server. It speaks JSON-RPC on stdin/stdout to one client (harn) and
 //! the MPD text protocol to one daemon (hypodj), and it is the ONLY thing an agent
-//! persona is given: thirteen tools, five of which only look.
+//! persona is given: fourteen tools, six of which only look.
 //!
 //! The claim it is built to make true is narrow and worth stating exactly. This is
 //! NOT a security boundary - the MPD socket has no authentication, `password` is not
@@ -211,7 +211,7 @@ mod tests {
         // The notification is answered with silence, not with an empty result.
         assert!(serve(&mut dj, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
         let list = serve(&mut dj, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
-        assert_eq!(list["result"]["tools"].as_array().map(|a| a.len()), Some(13));
+        assert_eq!(list["result"]["tools"].as_array().map(|a| a.len()), Some(14));
     }
 
     #[test]

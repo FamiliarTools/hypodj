@@ -34,6 +34,8 @@ ApplicationWindow {
         onShowPlaying: tabs.currentIndex = 0
         onSaid: replyCard.visible = true
         onAlbumOpened: albumsStack.depth < 2 ? albumsStack.push(albumPage) : null
+        // One plan waits at a time: the worker has already cancelled the plan this
+        // one supersedes, so the open dialog simply takes the newer token and body.
         onConfirmPlan: (token, body) => { planDialog.token = token; planDialog.body = body; planDialog.open() }
         onConfirmCommand: (command, question) => { clearDialog.command = command; clearDialog.title = question; clearDialog.open() }
     }

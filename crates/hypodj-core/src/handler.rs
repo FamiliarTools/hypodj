@@ -4619,9 +4619,11 @@ impl HypodjHandler {
     }
 
     /// A `WallClock` trigger `dur` from now, reduced from civil time exactly as a
-    /// raw `plan add trigger at ...` is (UNCLAMPED - the SpanElapsed clamp caps the
-    /// horizon at max_dur=30min, so a `sleep 1h` must use WallClock).
+    /// raw `plan add trigger at ...` is. Held to the same [`crate::plan::MAX_SPAN_SECS`]
+    /// cap as a client `SpanElapsed` (one cap for every relative timer), and
+    /// refused past it with the value asked.
     fn wallclock_in(dur: Duration) -> Result<RawTrigger, PlanError> {
+        crate::plan::check_span(dur.as_secs_f64())?;
         let delta =
             chrono::Duration::from_std(dur).map_err(|_| PlanError::OutOfBounds { field: "dur" })?;
         // checked_add_signed so a pathological duration returns OutOfBounds rather
@@ -4660,8 +4662,8 @@ impl HypodjHandler {
     }
 
     /// A feature's trigger as the singleton arms it: a relative span becomes a
-    /// wall-clock deadline measured from NOW (as `sleep 1h` is), which also keeps it
-    /// clear of the client-plan `max_dur` span clamp. Every other trigger (a track
+    /// wall-clock deadline measured from NOW (as `sleep 1h` is), under the same
+    /// 24 h relative-timer cap. Every other trigger (a track
     /// or album boundary, an absolute time, immediate) passes through.
     fn feature_trigger(trigger: RawTrigger) -> Result<RawTrigger, PlanError> {
         match trigger {
@@ -22115,9 +22117,21 @@ mod tests {
         }
     }
 
+    // The feature timers share the one 24 h relative-timer cap with a client
+    // `SpanElapsed`: `sleep in 25h`, `winddown in 25h` and an NL "in 25 hours"
+    // are refused with the asked value, never armed a day out. Pure (no handler).
+    #[test]
+    fn feature_timers_share_the_24h_cap() {
+        assert!(HypodjHandler::wallclock_in(Duration::from_secs(86_400)).is_ok());
+        let err = HypodjHandler::wallclock_in(Duration::from_secs_f64(86_400.5)).unwrap_err();
+        assert_eq!(err.to_string(), "a timer can be at most 24 h away; 24 h 0.5 s was asked");
+        let err = HypodjHandler::feature_trigger(RawTrigger::SpanElapsed { secs: 90_000.0 }).unwrap_err();
+        assert_eq!(err, PlanError::SpanTooLong { asked_secs: 90_000.0 });
+    }
+
     // An NL sleep / wind-down arms the daemon's OWN singleton, exactly like the
     // direct command: it supersedes the armed timer (never a second one), the
-    // `sleep` status surface sees it, and a span past the client-plan max_dur clamp
+    // `sleep` status surface sees it, and a span past the fade length cap
     // (30 min) is honoured in full.
     #[tokio::test]
     async fn nl_sleep_and_winddown_arm_the_reserved_singleton() {

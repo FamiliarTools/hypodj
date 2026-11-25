@@ -742,16 +742,44 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
         // every row can say "on disk" / "stream only", and a server that cannot be
         // reached still leaves the held albums browsable and playable instead of an
         // empty pane that reads "you have no albums".
+        //
+        // THE ON-DISK ROWS COME FIRST. `store albums` reads local sidecars and answers
+        // at once; the server listing can hang for the daemon's whole listing budget
+        // when the server is blocked (a dead VPN, a captive portal). So unless the
+        // daemon already says the server is online, the held albums are shown BEFORE
+        // the listing is asked, and the pane is never "loading" for longer than one
+        // local round trip. The listing then replaces them (or confirms them).
         Req::Browse { target, command, path, title, restore_sel } if path == "albums/all" => {
-            let listed = conn.command(&command);
             let held = match conn.command("store albums") {
                 Ok(p) => Some(held_albums(&p)),
                 Err(MpdError::Ack(_)) => None,
                 Err(_) => return true,
             };
-            let held_map = held.as_ref().map(|h| {
+            let held_map: Option<std::collections::HashMap<String, u32>> = held.as_ref().map(|h| {
                 h.iter().filter_map(|a| Some((a.uri.clone()?, a.songs))).collect()
             });
+            let server = match conn.command("status") {
+                Ok(p) => p.iter().find(|(k, _)| k == "X-Server").map(|(_, v)| v.clone()),
+                Err(MpdError::Ack(_)) => None,
+                Err(_) => return true,
+            };
+            let on_disk = held.as_deref().unwrap_or_default();
+            if server.as_deref() != Some("online") && !on_disk.is_empty() {
+                let lead = if server.as_deref() == Some("unknown") || server.is_none() {
+                    "asking the server"
+                } else {
+                    "server unreachable"
+                };
+                send(RespKind::Browse {
+                    target,
+                    rows: held_rows(on_disk),
+                    path: path.clone(),
+                    title: format!("{title} - {lead}, showing {} on disk", albums_word(on_disk.len())),
+                    restore_sel,
+                    held: held_map.clone(),
+                });
+            }
+            let listed = conn.command(&command);
             match listed {
                 Ok(pairs) => {
                     let rows = state::parse_browse(&pairs);
@@ -764,29 +792,9 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                     let title = if on_disk.is_empty() {
                         format!("{title} - could not list: {reason}")
                     } else {
-                        format!(
-                            "{title} - server unreachable, showing {} on disk",
-                            if on_disk.len() == 1 {
-                                "1 album".to_string()
-                            } else {
-                                format!("{} albums", on_disk.len())
-                            }
-                        )
+                        format!("{title} - server unreachable, showing {} on disk", albums_word(on_disk.len()))
                     };
-                    let rows = on_disk
-                        .iter()
-                        .filter_map(|a| {
-                            Some(BrowseRow {
-                                label: a.name.clone(),
-                                uri: a.uri.clone()?,
-                                is_dir: true,
-                                song_count: Some(a.songs),
-                                artist: None,
-                                album_uri: None,
-                                artist_uri: None,
-                            })
-                        })
-                        .collect();
+                    let rows = held_rows(&on_disk);
                     send(RespKind::Browse { target, rows, path, title, restore_sel, held: held_map });
                     false
                 }
@@ -807,6 +815,30 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             Err(_) => true,
         },
     }
+}
+
+/// "1 album" / "N albums".
+fn albums_word(n: usize) -> String {
+    if n == 1 { "1 album".to_string() } else { format!("{n} albums") }
+}
+
+/// The held albums as browse rows (an album with no uri cannot be opened, so it is
+/// not a row).
+fn held_rows(on_disk: &[HeldAlbum]) -> Vec<BrowseRow> {
+    on_disk
+        .iter()
+        .filter_map(|a| {
+            Some(BrowseRow {
+                label: a.name.clone(),
+                uri: a.uri.clone()?,
+                is_dir: true,
+                song_count: Some(a.songs),
+                artist: None,
+                album_uri: None,
+                artist_uri: None,
+            })
+        })
+        .collect()
 }
 
 /// One held album from `store albums`: its bare name, browse uri and how many of

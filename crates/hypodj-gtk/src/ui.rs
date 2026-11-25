@@ -52,6 +52,10 @@ struct App {
     search_entry: gtk::SearchEntry,
     // State the folds need.
     art_file: RefCell<Option<String>>,
+    /// The plan dialog on screen, if any. The worker keeps ONE plan pending and
+    /// cancels the one a newer plan supersedes, so the older dialog is closed here
+    /// rather than left answering for a token that is already gone.
+    plan_dialog: RefCell<Option<adw::AlertDialog>>,
     cover_avg: Cell<Option<[u8; 3]>>,
 }
 
@@ -427,6 +431,7 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
         search_status,
         search_entry,
         art_file: RefCell::new(None),
+        plan_dialog: RefCell::new(None),
         cover_avg: Cell::new(None),
     }
 }
@@ -521,6 +526,9 @@ impl App {
                         Req::Cancel(token.clone())
                     });
                 });
+                if let Some(old) = self.plan_dialog.replace(Some(d.clone())) {
+                    old.force_close();
+                }
                 d.present(Some(&self.window));
             }
             Msg::ConfirmCommand { command, question } => {

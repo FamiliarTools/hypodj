@@ -227,6 +227,13 @@ pub fn catalog() -> Vec<Value> {
             ),
         ),
         read(
+            "dj_offline",
+            "What plays offline: the albums the daemon's offline mirror holds, with how many \
+             songs of each are on disk. Read from the disk, so it answers even with the server \
+             unreachable. Pass an album's uri to dj_enqueue or dj_play_now to play it.",
+            s(json!({}), json!([])),
+        ),
+        read(
             "dj_journal",
             "The undo ring: the last actions the daemon executed, newest first, each with the \
              daemon's OWN description of what it did and whether it can still be retracted.",
@@ -338,6 +345,10 @@ fn run(dj: &mut Dj, origin: &str, name: &str, args: Value) -> Result<Value, Stri
         "dj_journal" => {
             decode::<NoArgs>(args)?;
             journal(dj)
+        }
+        "dj_offline" => {
+            decode::<NoArgs>(args)?;
+            offline(dj)
         }
         "dj_enqueue" => {
             let a = decode::<AddArgs>(args)?;
@@ -506,6 +517,40 @@ fn heard(dj: &mut Dj, limit: i64) -> Result<Value, String> {
         .map(|(_, v)| v.as_str())
         .collect();
     Ok(json!({"lines": lines}))
+}
+
+/// `store albums` is a plain read on the wire (no plan, no `Action`), so this tool
+/// sits beside `dj_heard` outside the retractable layer with nothing to retract.
+fn offline(dj: &mut Dj) -> Result<Value, String> {
+    let pairs = dj.read("store albums").map_err(|e| e.message())?;
+    Ok(parse_offline(&pairs))
+}
+
+/// The daemon's `store albums` rows: a headline (`OfflineSummary`) then, per album,
+/// `OfflineAlbum` (worded) followed by its uri (`-` for none), bare name and song
+/// count. A record starts at each `OfflineAlbum`.
+fn parse_offline(pairs: &[(String, String)]) -> Value {
+    let summary = pairs.iter().find(|(k, _)| k == "OfflineSummary").map(|(_, v)| v.clone());
+    let mut albums: Vec<serde_json::Map<String, Value>> = Vec::new();
+    for (k, v) in pairs {
+        let field = match k.as_str() {
+            "OfflineAlbum" => {
+                let mut m = serde_json::Map::new();
+                m.insert("line".into(), json!(v));
+                m.insert("uri".into(), Value::Null);
+                albums.push(m);
+                continue;
+            }
+            "OfflineAlbumUri" if v != "-" => ("uri", json!(v)),
+            "OfflineAlbumName" => ("name", json!(v)),
+            "OfflineAlbumSongs" => ("songs", json!(v.parse::<u64>().unwrap_or(0))),
+            _ => continue,
+        };
+        if let Some(a) = albums.last_mut() {
+            a.insert(field.0.into(), field.1);
+        }
+    }
+    json!({"summary": summary, "albums": albums})
 }
 
 fn journal(dj: &mut Dj) -> Result<Value, String> {
@@ -805,16 +850,16 @@ mod tests {
     }
 
     #[test]
-    fn the_catalog_is_thirteen_tools_with_honest_read_only_hints() {
+    fn the_catalog_is_fourteen_tools_with_honest_read_only_hints() {
         let c = catalog();
-        assert_eq!(c.len(), 13);
+        assert_eq!(c.len(), 14);
         let hint = |n: &str| {
             c.iter()
                 .find(|t| t["name"] == json!(n))
                 .unwrap_or_else(|| panic!("{n} missing"))["annotations"]["readOnlyHint"]
                 .clone()
         };
-        for r in ["dj_now", "dj_queue", "dj_search", "dj_heard", "dj_journal"] {
+        for r in ["dj_now", "dj_queue", "dj_search", "dj_heard", "dj_journal", "dj_offline"] {
             assert_eq!(hint(r), json!(true), "{r} issues no write verb");
         }
         for w in [
@@ -830,6 +875,27 @@ mod tests {
             assert_eq!(t["inputSchema"]["type"], json!("object"));
             assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
         }
+    }
+
+    #[test]
+    fn offline_rows_keep_each_albums_uri_and_count() {
+        let p = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let v = parse_offline(&[
+            p("OfflineSummary", "2 albums play offline (4 songs)"),
+            p("OfflineAlbum", "Held Harbour - 3 songs"),
+            p("OfflineAlbumUri", "album/a1"),
+            p("OfflineAlbumName", "Held Harbour"),
+            p("OfflineAlbumSongs", "3"),
+            p("OfflineAlbum", "Loose - 1 song"),
+            p("OfflineAlbumUri", "-"),
+            p("OfflineAlbumName", "Loose"),
+            p("OfflineAlbumSongs", "1"),
+        ]);
+        assert_eq!(v["summary"], json!("2 albums play offline (4 songs)"));
+        assert_eq!(v["albums"][0]["uri"], json!("album/a1"));
+        assert_eq!(v["albums"][0]["songs"], json!(3));
+        assert_eq!(v["albums"][1]["uri"], Value::Null, "`-` is no uri, not a uri named -");
+        assert_eq!(v["albums"][1]["name"], json!("Loose"));
     }
 
     #[test]

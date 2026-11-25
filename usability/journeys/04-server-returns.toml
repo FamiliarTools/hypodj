@@ -1,14 +1,16 @@
 id = "server-returns"
 goal = "Your albums were showing only what is on disk because the server was gone; the server comes back. See the full library again without doing anything."
 # Timeline: the daemon starts with the server gone, Albums opens on the on-disk
-# fallback, then the server comes back while the pane stays open.
+# fallback WITHIN 1 s (the held rows are sent before the server listing is asked;
+# it used to wait out the listing timeout, task 01m88mz1), then the server comes
+# back while the pane stays open.
 start = "{state}"
 states = ["blocked", "no_network"]
 min_steps = 1          # open Albums; the refresh must come unasked
 step_budget = 1
 script = [
   "key F2",
-  "wait 6",
+  "wait 1",
   "snap fallback",
   "net online",
   "wait 20",

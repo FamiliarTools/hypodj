@@ -103,6 +103,11 @@ fn command_thread(host: &str, port: u16, rx: Receiver<Req>, out: async_channel::
     let mut conn: Option<MpdConn> = None;
     // A request read ahead while coalescing refreshes, run next - never dropped.
     let mut ahead: Option<Req> = None;
+    // The ONE plan waiting on the user. A UI shows one confirm at a time, so a
+    // newer plan supersedes the older: the older token is cancelled on the daemon
+    // here, before the UI is handed the newer one, and can never be left pending
+    // behind a dialog that no longer shows it.
+    let mut pending: Option<String> = None;
     while let Some(req) = ahead.take().or_else(|| rx.recv().ok()) {
         // Coalesce a burst of idle wakes into one refresh.
         if matches!(req, Req::Refresh) {
@@ -173,6 +178,11 @@ fn command_thread(host: &str, port: u16, rx: Receiver<Req>, out: async_channel::
         }
         let c = conn.as_mut().expect("connected above");
         let mut msgs = Vec::new();
+        if let Req::Confirm(t) | Req::Cancel(t) = &req {
+            if pending.as_deref() == Some(t.as_str()) {
+                pending = None;
+            }
+        }
         match handle(c, req, &mut msgs) {
             Ok(()) => {}
             Err(MpdError::Ack(m)) => msgs.push(Msg::Say(spoken::refusal_ack(&m).text())),
@@ -181,10 +191,30 @@ fn command_thread(host: &str, port: u16, rx: Receiver<Req>, out: async_channel::
                 msgs.push(Msg::Down(format!("lost the player - {e}")));
             }
         }
+        if let Some(c) = conn.as_mut() {
+            supersede_pending(c, &mut pending, &msgs);
+        }
         for m in msgs {
             if out.send_blocking(m).is_err() {
                 return;
             }
+        }
+    }
+}
+
+/// One pending confirm at a time: when `msgs` hands the UI a new plan, cancel the
+/// one it replaces (best effort - an expired token is already gone) and remember
+/// the new one.
+fn supersede_pending(c: &mut MpdConn, pending: &mut Option<String>, msgs: &[Msg]) {
+    let Some(token) = msgs.iter().rev().find_map(|m| match m {
+        Msg::Confirm { token, .. } => Some(token.clone()),
+        _ => None,
+    }) else {
+        return;
+    };
+    if let Some(old) = pending.replace(token) {
+        if Some(&old) != pending.as_ref() {
+            let _ = c.command(&format!("nl cancel {old}"));
         }
     }
 }
@@ -375,5 +405,28 @@ mod tests {
         let log = log.lock().unwrap().clone();
         assert!(log.iter().any(|l| l == "playid 7"), "{log:?}");
         assert!(!log.iter().any(|l| l.starts_with("play ") || l.starts_with("add ")), "{log:?}");
+    }
+
+    fn plan(token: &str) -> Msg {
+        Msg::Confirm { token: token.into(), steps: vec![], note: None }
+    }
+
+    /// A second plan while the first is still waiting cancels the first on the
+    /// daemon: one pending confirm at a time, never an orphaned token.
+    #[test]
+    fn a_newer_plan_cancels_the_one_it_supersedes() {
+        let Some((port, log)) = fake_mpd() else { return };
+        let mut c = MpdConn::connect("127.0.0.1", port).expect("connect");
+        let mut pending = None;
+        supersede_pending(&mut c, &mut pending, &[plan("a")]);
+        assert_eq!(pending.as_deref(), Some("a"));
+        supersede_pending(&mut c, &mut pending, &[Msg::Say("x".into())]);
+        assert_eq!(pending.as_deref(), Some("a"), "a non-plan message keeps the pending one");
+        supersede_pending(&mut c, &mut pending, &[plan("b")]);
+        assert_eq!(pending.as_deref(), Some("b"));
+        // A ping round trip so the fake has logged every line before we read it.
+        c.command("ping").expect("ping");
+        let log = log.lock().unwrap().clone();
+        assert_eq!(log.iter().filter(|l| l.starts_with("nl cancel")).collect::<Vec<_>>(), ["nl cancel a"]);
     }
 }

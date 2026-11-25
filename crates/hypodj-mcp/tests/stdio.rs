@@ -85,6 +85,7 @@ fn respond(w: &mut Wire, line: &str) -> String {
         )
         .into(),
         "search" => "file: song/99\nTitle: Good Vibes\nArtist: Someone\nAlbum: An Album\nOK\n".into(),
+        "store" => "OfflineSummary: 1 album plays offline (3 songs)\nOfflineAlbum: Kind of Blue - 3 songs\nOfflineAlbumUri: album/kob\nOfflineAlbumName: Kind of Blue\nOfflineAlbumSongs: 3\nOK\n".into(),
         "heard" => "heard: 3 rows, this session\nheard: 18:02  Miles Davis - So What\nOK\n".into(),
         "journal" => {
             let mut s = String::new();
@@ -237,10 +238,10 @@ fn the_whole_surface_over_a_real_pipe() {
     let mut s = Server::start(d.port);
     handshake(&mut s);
 
-    // tools/list: thirteen, with the read-only hints harn's auto-approval trusts.
+    // tools/list: fourteen, with the read-only hints harn's auto-approval trusts.
     let list = s.call(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
     let hint = |n: &str| {
         tools
             .iter()
@@ -258,6 +259,13 @@ fn the_whole_surface_over_a_real_pipe() {
     assert_eq!(q["total"], 2);
     assert_eq!(q["items"][1]["qid"], 12);
     assert_eq!(q["items"][1]["title"], "So What");
+
+    // dj_offline is a plain `store albums` read: no plan, nothing journaled.
+    let (err, o, _) = s.tool("dj_offline", serde_json::json!({}));
+    assert!(!err);
+    assert_eq!(o["albums"][0]["uri"], "album/kob");
+    assert_eq!(o["albums"][0]["songs"], 3);
+    assert_eq!(hint("dj_offline"), Some(true));
 
     // RULE 3 + RULE 4, as a wire transcript: the multi-word value arrived as ONE
     // quoted token, the trigger is immediate, and the origin is the last thing on
