@@ -58,6 +58,14 @@ daemon's idle-push socket with worker-thread IO so the UI never blocks on networ
 - The cover is drawn only for the album it was fetched for: skip into an album whose
   cover has not arrived (or cannot, the server being gone) and the deck shows the
   album's neutral swatch, never the last album's cover
+- Albums is a COVER GRID: each album a square cover (drawn in cells, so any
+  terminal shows it) with its name and whether it is on disk under it. Arrows and
+  `j`/`k` move in two dimensions, `l` opens, `Enter` plays. An album with no cover -
+  or one whose cover has not arrived, or the server's stock placeholder - shows its
+  own deterministic sigil, so the grid stays readable offline
+- Find ranks its hits by precision first (an exact title or artist match always
+  leads), then by what you play and star, from the server's own counters - see
+  `docs/design/find-ranking.md`
 - (The screenshots above predate the Deck layout.)
 - Vim-like navigation: `j`/`k`, `g`/`G`, scrolloff; `Shift`+`P` jumps the Queue
   cursor to the currently-playing song

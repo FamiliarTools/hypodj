@@ -50,6 +50,11 @@ pub fn art_mode() -> ArtMode {
 /// hundred pixels on an ordinary layout - so 256 was itself becoming the ceiling.
 const THUMB: u32 = 512;
 
+/// Thumbnail edge for an Albums grid cell. A cell cover is at most ~16x8 cells, i.e.
+/// 32x24 sextant subcells, so 96 px keeps headroom while a few hundred cached covers
+/// stay in the tens of MB.
+pub const GRID_THUMB: u32 = 96;
+
 /// A decoded cover thumbnail, cached per track uri. Rendering downscales it to the
 /// current cell area every frame (cheap); the expensive fetch+decode happens once.
 pub struct AlbumArt {
@@ -69,11 +74,28 @@ impl AlbumArt {
     /// Fetch + decode the cover for `uri`; `None` when there is no art or anything
     /// fails (a missing cover must never break the UI).
     pub fn load(host: &str, port: u16, uri: &str) -> Option<AlbumArt> {
+        Self::load_sized(host, port, uri, THUMB)
+    }
+
+    /// [`load`](Self::load) at an explicit thumbnail edge (the Albums grid keeps many
+    /// covers alive at once, so it asks for [`GRID_THUMB`]).
+    pub fn load_sized(host: &str, port: u16, uri: &str, edge: u32) -> Option<AlbumArt> {
         let bytes = hypodj_client::art::fetch_albumart(host, port, uri)?;
-        let img = image::load_from_memory(&bytes).ok()?;
-        let thumb = img
-            .resize_exact(THUMB, THUMB, image::imageops::FilterType::Triangle)
-            .to_rgb8();
+        Self::from_bytes(&bytes, edge)
+    }
+
+    /// Decode already-fetched cover bytes to an `edge` px square thumbnail.
+    ///
+    /// A small edge (the grid) uses the fast box-sampled `thumbnail_exact` rather than
+    /// the triangle filter: a 96 px cell cover cannot show the difference, and a grid
+    /// decodes a screenful of covers back to back.
+    pub fn from_bytes(bytes: &[u8], edge: u32) -> Option<AlbumArt> {
+        let img = image::load_from_memory(bytes).ok()?;
+        let thumb = if edge < THUMB {
+            img.thumbnail_exact(edge, edge).to_rgb8()
+        } else {
+            img.resize_exact(edge, edge, image::imageops::FilterType::Triangle).to_rgb8()
+        };
         let palette = crate::album_color::extract_palette(&thumb);
         Some(AlbumArt { img: thumb, palette, sixel: std::cell::RefCell::new(None) })
     }

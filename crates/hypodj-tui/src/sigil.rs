@@ -109,8 +109,14 @@ pub fn album_identity(np: &NowPlaying) -> String {
 
 /// FNV-1a 64-bit hash of the identity, the PRNG seed.
 pub fn seed_of(s: &str) -> u64 {
+    seed_of_bytes(s.as_bytes())
+}
+
+/// FNV-1a 64-bit over raw bytes (also how the grid recognises one cover file served
+/// for many albums).
+pub fn seed_of_bytes(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for b in s.as_bytes() {
+    for b in bytes {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }

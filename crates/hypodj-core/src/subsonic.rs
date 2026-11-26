@@ -1077,6 +1077,8 @@ fn map_album(a: data::AlbumId3) -> Album {
         cover_art: a.cover_art,
         song_count: i64_to_u32(a.song_count.unwrap_or(0)),
         created: a.created,
+        play_count: a.play_count.map(i64_to_u32),
+        starred: a.starred.is_some(),
     }
 }
 

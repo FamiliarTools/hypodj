@@ -16001,6 +16001,11 @@ impl HypodjHandler {
     /// itself, which Navidrome accepts) -> cover bytes (cached) -> slice
     /// [offset..offset+binary_limit], clamping the final chunk.
     async fn albumart(&self, uri: &str, offset: usize) -> MpdResponse {
+        // An ALBUM row (the dj-gui cover grid): Navidrome's getCoverArt resolves an
+        // album id directly, so there is nothing to look up first.
+        if let Some(id) = uri.strip_prefix("album/").filter(|id| !id.is_empty()) {
+            return self.serve_cover(id, offset).await;
+        }
         let song_id = match song_id_from_uri(uri) {
             Some(id) => id,
             // Not a library `song/<id>`: a raw stream row. If the current stream
@@ -16226,8 +16231,11 @@ impl HypodjHandler {
     /// `searchall q` and `search any q` would return materially different song sets
     /// (the `any` arm spans exactly the modeled fields; Navidrome's full-text index
     /// is broader), so a client upgrading from one to the other would silently get a
-    /// different answer. With it, `searchall q` is a bounded prefix of `search any q`
-    /// and the upgrade is purely additive.
+    /// different answer. With it, `searchall q`'s songs are a bounded SUBSET of
+    /// `search any q` and the upgrade is purely additive.
+    ///
+    /// The order is NOT the server's: `find_rank` re-ranks each kind by precision,
+    /// then the server's own habit counters, then server order. Sets are unchanged.
     ///
     /// Results are query-specific and ephemeral: NEVER cached.
     async fn search_all(&self, args: Vec<String>) -> MpdResponse {
@@ -16246,11 +16254,15 @@ impl HypodjHandler {
             Ok(h) => h,
             Err(e) => return ack(ACK_ERROR_UNKNOWN, "searchall", &e.to_string()),
         };
-        let songs: Vec<_> = hits
+        let mut songs: Vec<_> = hits
             .songs
             .into_iter()
             .filter(|s| tag_matches(s, "any", &query, false))
             .collect();
+        // Same sets, re-ordered: precision first, then the server's own habit
+        // counters (starred, play counts), then server order. See `find_rank`.
+        let (mut artists, mut albums) = (hits.artists, hits.albums);
+        crate::find_rank::rank(&query, &mut artists, &mut albums, &mut songs);
 
         // The FOURTH result kind: the user's own saved internet radio stations, which
         // search3 does not index at all (Subsonic has no station-search endpoint), so
@@ -16283,8 +16295,8 @@ impl HypodjHandler {
         };
 
         MpdResponse::Pairs(search_all_pairs(
-            &hits.artists,
-            &hits.albums,
+            &artists,
+            &albums,
             stations.as_deref(),
             &songs,
         ))
@@ -18913,6 +18925,8 @@ mod tests {
             id: AlbumId(id.to_string()),
             name: format!("Album {id}"),
             created: None,
+            play_count: None,
+            starred: false,
             artist: artist.to_string(),
             artist_id: None,
             year: None,
@@ -25872,6 +25886,8 @@ mod tests {
             cover_art: None,
             song_count: 9,
             created: None,
+            play_count: None,
+            starred: false,
         }];
         let stations = vec![
             st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),

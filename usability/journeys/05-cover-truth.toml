@@ -15,9 +15,9 @@ step_budget = 8        # three times across the album boundary
 script = [
   "key F2",
   "wait 6",
-  "key j",
+  "key Right",
   "key Enter",
-  "key j",
+  "key Right",
   "key Space",
   "wait 10",
   "snap cover-drawn",
@@ -35,6 +35,8 @@ at = 8
 severity = "S1"
 truth = ["status.state == play", "currentsong.Album == Held Harbour"]
 screen_require_re = ["[\U0001FB00-\U0001FB3B▌▐]"]
+# The deck, not the Albums grid (which draws covers of its own).
+screen_region = "deck"
 
 [[check]]
 name = "setup: the skip landed in the next album and it plays (from disk)"
@@ -49,4 +51,7 @@ screen_require_any = ["Ascent"]
 [[check]]
 name = "no cell of the previous album's cover remains under the new title"
 severity = "S0"
+# The DECK's cells only: the Albums body is a cover grid, where Held Harbour's own cover
+# under its own name is correct and is not what this check is about.
+screen_region = "deck"
 screen_forbid_re = ["[\U0001FB00-\U0001FB3B▌▐]"]

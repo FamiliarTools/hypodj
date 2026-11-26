@@ -13,8 +13,8 @@ store_queue_ahead = 1
 script = [
   "key F2",
   "wait 2",
-  "key j",
-  "key j",
+  "key Right",
+  "key Right",
   "key Enter",
   "wait 5",
   "net {state}",

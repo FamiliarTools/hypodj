@@ -57,7 +57,7 @@ TRACK_SECS = 120
 # drawn cover from the swatch: the cover-truth journey plays this one, then skips
 # into an album whose cover cannot be fetched.
 COVERED = {"Held Harbour"}
-# Filler albums AFTER the named ones in name order (so every journey's `j` counts
+# Filler albums AFTER the named ones in name order (so every journey's `Right` counts
 # still land where they did), one short track each: enough rows that an 80x24 Albums
 # view has to show how many it can fit.
 FILLER_SECS = 20
@@ -224,6 +224,27 @@ def mpd(cmd, timeout=10):
             k, _, v = line.partition(": ")
             pairs.append((k, v))
         return dict(pairs)
+
+
+def split_regions(text):
+    """(deck, body) cells of a frame. The view-tab line is the landmark: on a strip
+    layout the deck is every row above it, on a rail layout every column left of it.
+    A frame with no view line is all body."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        c = line.find("Queue  ")
+        if c < 0:
+            continue
+        if c <= 2:
+            return "\n".join(lines[:i]), "\n".join(lines[i:])
+        return "\n".join(l[:c - 1] for l in lines), "\n".join(l[c - 1:] for l in lines)
+    return "", text
+
+
+def deck_region(text):
+    """Only the Deck: what a check about the NOW-PLAYING cover may look at, now that
+    the Albums body draws covers of its own."""
+    return split_regions(text)[0]
 
 
 def start_daemon(bins, run, store, queue_ahead=None):
@@ -414,6 +435,9 @@ def judge(spec, state, outdir, steps):
                     ok = False
                     notes.append(f"{sz}: daemon is stopped but screen shows {shown}")
         for sz, text in fr.items():
+            region = chk.get("screen_region")
+            if region in ("deck", "body"):
+                text = split_regions(text)[0 if region == "deck" else 1]
             low = text.lower()
             req_any = chk.get("screen_require_any", [])
             if req_any and not any(w.lower() in low for w in req_any):

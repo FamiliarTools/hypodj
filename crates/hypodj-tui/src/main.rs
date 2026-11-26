@@ -282,6 +282,7 @@ fn event_loop(
         // about one song and says which, so its art needs no disambiguating title the
         // way borrowing the now-playing pane did.
         request_card_art(&workers.art_tx, state);
+        request_grid_art(&workers.grid_art_tx, state);
         // Stamp where the cursor is, AFTER key dispatch and after inbound responses have
         // been applied, so it records the settled row for this frame rather than an
         // intermediate one. This is the whole dwell mechanism: no timer, no tick, no
@@ -625,6 +626,10 @@ fn drill_title(state: &mut TuiState, path: &str) -> String {
 fn browse_title(path: &str) -> String {
     if path == "list/newest" {
         "Albums (newest)".to_string()
+    } else if path == "albums/all" {
+        // The A-Z root, reached again by backing out of an album: the same title it
+        // opened with, never its path.
+        "Albums".to_string()
     } else {
         path.to_string()
     }
@@ -695,6 +700,10 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
                 // closed or moved to another row is dropped rather than drawn.
                 state.card_art = art;
             }
+        }
+        Inbound::GridArt { uri, art } => {
+            state.grid_pending.remove(&uri);
+            state.grid_art.insert(uri, art);
         }
         Inbound::Connected { epoch } => {
             state.epoch = epoch;
@@ -928,6 +937,34 @@ fn request_art(art_tx: &Sender<(String, Option<String>)>, state: &mut TuiState) 
 }
 
 
+
+/// Most grid covers kept decoded at once. At [`art::GRID_THUMB`] px one is ~27 KB, so
+/// this bounds the cache near 10 MB however long the library is scrolled.
+const GRID_ART_CAP: usize = 384;
+
+/// Ask the grid art worker for every visible Albums cell that has never been asked.
+///
+/// The renderer records what it showed; this diffs that against what is cached or in
+/// flight, so each cover is fetched once per session. Over the cap, every cover not on
+/// screen is dropped (they are cheap to ask again) rather than growing without bound.
+fn request_grid_art(tx: &Sender<String>, state: &mut TuiState) {
+    if state.screen != Screen::Albums {
+        return;
+    }
+    let visible = state.grid_visible.borrow().clone();
+    if state.grid_art.len() > GRID_ART_CAP {
+        let keep: std::collections::HashSet<&String> = visible.iter().collect();
+        state.grid_art.retain(|k, _| keep.contains(k));
+    }
+    for uri in visible {
+        if state.grid_art.contains_key(&uri) || state.grid_pending.contains(&uri) {
+            continue;
+        }
+        if tx.send(uri.clone()).is_ok() {
+            state.grid_pending.insert(uri);
+        }
+    }
+}
 
 /// Ask the art worker for the OPEN CARD's cover, at most once per card.
 ///
@@ -1522,6 +1559,32 @@ mod tests {
         // A coverless stream wants nothing; nothing playing wants nothing.
         assert_eq!(art_want(&np(Some("https://s/live"), None)), None);
         assert_eq!(art_want(&np(None, None)), None);
+    }
+
+    #[test]
+    fn backing_out_to_the_albums_root_titles_it_albums_not_its_path() {
+        assert_eq!(browse_title("albums/all"), "Albums");
+        assert_eq!(browse_title("list/newest"), "Albums (newest)");
+    }
+
+    #[test]
+    fn request_grid_art_asks_each_visible_album_once() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut state = TuiState::new();
+        state.screen = Screen::Albums;
+        *state.grid_visible.borrow_mut() = vec!["album/1".into(), "album/2".into()];
+        request_grid_art(&tx, &mut state);
+        request_grid_art(&tx, &mut state);
+        let asked: Vec<String> = rx.try_iter().collect();
+        assert_eq!(asked, ["album/1", "album/2"], "in flight is not asked again");
+        state.grid_pending.remove("album/1");
+        state.grid_art.insert("album/1".into(), None);
+        request_grid_art(&tx, &mut state);
+        assert_eq!(rx.try_iter().count(), 0, "an answered None is not asked again");
+        state.screen = Screen::Queue;
+        *state.grid_visible.borrow_mut() = vec!["album/9".into()];
+        request_grid_art(&tx, &mut state);
+        assert_eq!(rx.try_iter().count(), 0, "off the Albums tab nothing is asked");
     }
 
     #[test]

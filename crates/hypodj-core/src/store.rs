@@ -8499,6 +8499,8 @@ content_type = "audio/flac"
             cover_art: None,
             song_count: 1,
             created: created.map(|c| c.to_string()),
+            play_count: None,
+            starred: false,
         };
         let mut albums = vec![
             al("no-info", None, None),
@@ -9993,6 +9995,8 @@ content_type = "audio/flac"
             cover_art: None,
             song_count,
             created: created.map(str::to_string),
+            play_count: None,
+            starred: false,
         }
     }
 

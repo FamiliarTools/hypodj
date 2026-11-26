@@ -118,6 +118,10 @@ pub enum Inbound {
     /// back so the render thread can reject a late response for a since-changed key
     /// (task kmrhj8m). `art` is None on missing art / decode failure / a no-exist ACK.
     Art { key: (String, Option<String>), art: Option<AlbumArt> },
+    /// A grid-sized cover for one Albums grid cell (`album/<id>`), from the grid art
+    /// worker. `None` is a real answer (no cover, or the server is gone): the cell
+    /// keeps its sigil and the uri is not asked again this session.
+    GridArt { uri: String, art: Option<AlbumArt> },
     /// The command socket reconnected; epoch bumped. Followed by a catch-up Snapshot.
     Connected { epoch: u64 },
     /// The command socket dropped; the worker is reconnecting.
@@ -190,6 +194,9 @@ pub struct Workers {
     pub cc_tx: Sender<Req>,
     pub inbound_rx: Receiver<Inbound>,
     pub art_tx: Sender<(String, Option<String>)>,
+    /// The Albums grid's cover channel: one `album/<id>` per visible cell. Its own
+    /// thread, so a screenful of covers never queues in front of the deck's.
+    pub grid_art_tx: Sender<String>,
     /// The dedicated find worker's request channel (library queries).
     pub find_tx: Sender<Req>,
     pub info_tx: Sender<Req>,
@@ -226,6 +233,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
     let (req_tx, req_rx) = mpsc::channel::<Req>();
     let (in_tx, in_rx) = mpsc::channel::<Inbound>();
     let (art_tx, art_rx) = mpsc::channel::<(String, Option<String>)>();
+    let (grid_art_tx, grid_art_rx) = mpsc::channel::<String>();
     let stop = Arc::new(AtomicBool::new(false));
 
     // Command worker.
@@ -252,6 +260,13 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         let host = host.to_string();
         let in_tx_art = in_tx.clone();
         thread::spawn(move || art_worker(art_rx, in_tx_art, &host, port));
+    }
+
+    // Grid art worker: the same fetch over the same albumart verb, at grid size.
+    {
+        let host = host.to_string();
+        let in_tx_grid = in_tx.clone();
+        thread::spawn(move || grid_art_worker(grid_art_rx, in_tx_grid, &host, port));
     }
 
     // Dedicated FIND worker: opens a SHORT-LIVED socket per query, in the same shape
@@ -307,6 +322,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         cc_tx,
         inbound_rx: in_rx,
         art_tx,
+        grid_art_tx,
         find_tx,
         info_tx,
         more_tx,
@@ -1180,6 +1196,45 @@ fn art_worker(rx: Receiver<(String, Option<String>)>, tx: Sender<Inbound>, host:
     while let Ok(key) = rx.recv() {
         let art = AlbumArt::load(host, port, &key.0);
         if tx.send(Inbound::Art { key, art }).is_err() {
+            break;
+        }
+    }
+}
+
+/// The grid's cover worker: [`art_worker`]'s shape at [`crate::art::GRID_THUMB`] px, so a
+/// screen of albums costs a few hundred KB of thumbnails rather than a few MB.
+///
+/// It also recognises the SERVER'S PLACEHOLDER. Navidrome answers getCoverArt for an
+/// album with no art with its own stock image (a blue vinyl), so "no cover" arrives as a
+/// perfectly good picture, and a grid of identical vinyls says nothing. The rule: bytes
+/// served for two DIFFERENT albums are not either album's cover. Both cells then fall
+/// back to their sigil, which is distinct per album. The cost, named: two albums that
+/// genuinely share one cover file lose it in the grid (the deck still draws it).
+fn grid_art_worker(rx: Receiver<String>, tx: Sender<Inbound>, host: &str, port: u16) {
+    let mut first_by_hash: std::collections::HashMap<u64, String> = Default::default();
+    let mut shared: std::collections::HashSet<u64> = Default::default();
+    while let Ok(uri) = rx.recv() {
+        let bytes = hypodj_client::art::fetch_albumart(host, port, &uri);
+        let hash = bytes.as_deref().map(crate::sigil::seed_of_bytes);
+        let art = match hash {
+            Some(h) if shared.contains(&h) => None,
+            Some(h) => match first_by_hash.get(&h) {
+                Some(first) if first != &uri => {
+                    shared.insert(h);
+                    let first = first.clone();
+                    if tx.send(Inbound::GridArt { uri: first, art: None }).is_err() {
+                        break;
+                    }
+                    None
+                }
+                _ => {
+                    first_by_hash.insert(h, uri.clone());
+                    bytes.as_deref().and_then(|b| AlbumArt::from_bytes(b, crate::art::GRID_THUMB))
+                }
+            },
+            None => None,
+        };
+        if tx.send(Inbound::GridArt { uri, art }).is_err() {
             break;
         }
     }

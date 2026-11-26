@@ -8,7 +8,7 @@ step_budget = 6
 script = [
   "key F2",
   "wait 6",
-  "key j",
+  "key Right",
   "key Enter",
   "wait 4",
   "snap playing",

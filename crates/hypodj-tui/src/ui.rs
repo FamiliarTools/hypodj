@@ -102,7 +102,13 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     match state.screen {
         Screen::Queue => render_queue(f, body, state),
         Screen::Find => render_find(f, body, state),
-        Screen::Albums => render_browse(f, body, &state.albums, state, true),
+        Screen::Albums if state.albums.is_album_grid() && grid_fits(body) => {
+            render_album_grid(f, body, state)
+        }
+        Screen::Albums => {
+            state.albums.grid_cols.set(0);
+            render_browse(f, body, &state.albums, state, true)
+        }
         Screen::Playlists => render_browse(f, body, &state.playlists, state, false),
         // The DJ view is the whole body now: the queue it used to sit beside is one
         // Tab away, and the next song is already on the deck.
@@ -3724,6 +3730,141 @@ fn render_browse(
     }
     f.render_stateful_widget(list, area, &mut ls);
 }
+
+/// Cover rows per grid cell for a body `h` rows tall (`extra` caption rows beyond the
+/// name): two grid rows on screen where
+/// there is room, never under 3 (a sigil needs that much to read as one) nor over 8
+/// (past that a cell is a poster and the grid stops being a grid).
+fn grid_cover_rows(h: u16, extra: u16) -> u16 {
+    (h / 2).saturating_sub(2 + extra).clamp(3, 8)
+}
+
+/// The Albums tab as a COVER GRID: each album a square cover with its name under it,
+/// the cursor a reversed caption, and the grid scrolled by whole rows.
+///
+/// The cover is the decoded grid thumbnail in cells (sextants, or half-blocks under
+/// `HYPODJ_ART_CELLS=half`), which every terminal draws, so the grid needs no image
+/// protocol. Until a cover arrives, and for good when there is none or the server is
+/// gone, the cell shows the album's SIGIL: deterministic per album, so a coverless grid
+/// is still a grid of things you can tell apart rather than a wall of placeholders.
+fn render_album_grid(f: &mut Frame, area: Rect, state: &TuiState) {
+    let browse = &state.albums;
+    let (head, area) = body_header(area);
+    // The header names the album under the cursor IN FULL, because a caption is cut
+    // to its cell and the one album he is about to act on must never be a guess.
+    let mut title = browse.title.clone();
+    if let Some(r) = browse.rows.get(browse.selected) {
+        title.push_str(" \u{00b7} ");
+        title.push_str(&r.label);
+    }
+    let hint = "  arrows move \u{00b7} l open \u{00b7} Enter play";
+    if (area.width as usize) > title.chars().count() + hint.chars().count() + 4 {
+        title.push_str(hint);
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(title, Style::default().quiet()))),
+        head,
+    );
+    let avail_rows = u16::from(browse.held_known);
+    let rows = grid_cover_rows(area.height, avail_rows);
+    let cover_w = square_art_cols(rows, state.sixel_cell_px).max(1);
+    // A caption narrower than this names almost nothing, so a small cover sits
+    // centred in a cell at least this wide rather than the name shrinking with it.
+    let cap_w = cover_w.max(GRID_CAPTION_MIN);
+    let cell_w = cap_w + 2;
+    // Cover, caption, availability (when the store answered), one row of air.
+    let cell_h = rows + 2 + avail_rows;
+    let cols = ((area.width + 2) / cell_w).max(1) as usize;
+    browse.grid_cols.set(cols);
+    let n = browse.rows.len();
+    let grid_rows = n.div_ceil(cols);
+    let fit = ((area.height / cell_h) as usize).max(1);
+    let sel_row = browse.selected / cols;
+    let off = crate::state::scroll_offset(sel_row, grid_rows, fit, browse.offset.get());
+    browse.offset.set(off);
+
+    let bottom = area.y + area.height;
+    let album_map = state.queued_by_album();
+    let mut visible = Vec::new();
+    for gr in off..(off + fit).min(grid_rows) {
+        for gc in 0..cols {
+            let i = gr * cols + gc;
+            let Some(r) = browse.rows.get(i) else { break };
+            let x = area.x + gc as u16 * cell_w;
+            let y = area.y + (gr - off) as u16 * cell_h;
+            if x + cap_w.min(area.width) > area.x + area.width || y >= bottom {
+                continue;
+            }
+            let cap_w = cap_w.min(area.width);
+            let cover = Rect {
+                x: x + cap_w.saturating_sub(cover_w) / 2,
+                y,
+                width: cover_w.min(cap_w),
+                height: rows.min(bottom - y),
+            };
+            let lines = match state.grid_art.get(&r.uri).and_then(|a| a.as_ref()) {
+                Some(a) => a.lines(cover.width as usize, cover.height as usize),
+                None => crate::sigil::Sigil::build(&r.uri, None, state.term_bg, state.truecolor)
+                    .lines(cover.width as usize, cover.height as usize),
+            };
+            f.render_widget(Paragraph::new(lines), cover);
+            if r.uri.starts_with("album/") {
+                visible.push(r.uri.clone());
+            }
+            let cap_y = y + rows;
+            if cap_y >= bottom {
+                continue;
+            }
+            let glyph = if r.uri.starts_with("album/") {
+                let queued = album_map.get(&r.uri).map(|s| s.len()).unwrap_or(0);
+                queue_mark_glyph(album_mark(queued, r.song_count))
+            } else {
+                ' '
+            };
+            let name = if glyph == ' ' { r.label.clone() } else { format!("{glyph} {}", r.label) };
+            let cap = ellipsize_words(&name, cap_w as usize);
+            let (text, style) = if i == browse.selected {
+                let pad = (cap_w as usize).saturating_sub(cap.chars().count());
+                (format!("{cap}{}", " ".repeat(pad)), Style::default().reverse())
+            } else {
+                (cap, Style::default())
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, style))),
+                Rect { x, y: cap_y, width: cap_w, height: 1 },
+            );
+            // Whether it plays offline, in the same words the list used: the grid must
+            // not lose what the list said just because it draws covers.
+            if let Some(words) = availability_words(browse, r) {
+                if cap_y + 1 < bottom {
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            ellipsize_words(&words, cap_w as usize),
+                            Style::default().quiet(),
+                        ))),
+                        Rect { x, y: cap_y + 1, width: cap_w, height: 1 },
+                    );
+                }
+            }
+        }
+    }
+    *state.grid_visible.borrow_mut() = visible;
+}
+
+/// Does the body have room for the cover grid? Below this a grid shows a handful of
+/// albums where the list shows a screenful (the redesign's list-yield bar: at least
+/// 16 album rows at 80x24), so a small terminal keeps the dense list and a real-size
+/// one gets covers.
+fn grid_fits(body: Rect) -> bool {
+    body.width >= GRID_MIN_W && body.height >= GRID_MIN_H
+}
+
+/// Minimum body size for the cover grid, in cells.
+const GRID_MIN_W: u16 = 90;
+const GRID_MIN_H: u16 = 20;
+
+/// The narrowest a grid caption gets, in cells (see [`render_album_grid`]).
+const GRID_CAPTION_MIN: u16 = 14;
 
 /// An album dir row's availability in words (decision b): "on disk", "2 of 5 on
 /// disk" or "stream only". `None` for anything that is not an album row, or when

@@ -399,8 +399,13 @@ pub struct Browse {
     /// a keypress (the server came back): the next listing puts the cursor back on
     /// that row instead of row 0, so a refresh never moves what is under the hand.
     pub keep_uri: Option<String>,
-    /// Top visible row for the scrolloff viewport (see [`scroll_offset`]).
+    /// Top visible row for the scrolloff viewport (see [`scroll_offset`]). In grid
+    /// mode it counts GRID rows, not list rows.
     pub offset: Cell<usize>,
+    /// Columns the renderer last laid this level out in as a cover grid; 0 while it
+    /// is drawn as a list. Written by the renderer (it alone knows the pane width) and
+    /// read by the 2D cursor, the same split as `offset`.
+    pub grid_cols: Cell<usize>,
 }
 
 impl Browse {
@@ -416,7 +421,46 @@ impl Browse {
             held_known: false,
             keep_uri: None,
             offset: Cell::new(0),
+            grid_cols: Cell::new(0),
         }
+    }
+
+    /// Is this level a cover grid? Every row a directory and at least one an album:
+    /// the Albums A-Z root and the smart lists qualify, an opened album (songs) never.
+    pub fn is_album_grid(&self) -> bool {
+        !self.rows.is_empty()
+            && self.rows.iter().all(|r| r.is_dir)
+            && self.rows.iter().any(|r| r.uri.starts_with("album/"))
+    }
+
+    /// Move the grid cursor. `dx` steps through cells in reading order (so it wraps
+    /// rows, as a grid of covers does everywhere else); `dy` moves a whole row, and a
+    /// step down into a SHORTER last row lands on its last cell rather than doing
+    /// nothing, so the bottom of the grid is always reachable with `j`.
+    pub fn grid_move(&mut self, dx: i32, dy: i32) {
+        if self.rows.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let cols = self.grid_cols.get().max(1) as i64;
+        let last = self.rows.len() as i64 - 1;
+        let cur = self.selected as i64;
+        let next = if dy > 0 {
+            let down = cur + cols * dy as i64;
+            if down <= last {
+                down
+            } else if cur / cols < last / cols {
+                last
+            } else {
+                cur
+            }
+        } else if dy < 0 {
+            let up = cur + cols * dy as i64;
+            if up >= 0 { up } else { cur }
+        } else {
+            (cur + dx as i64).clamp(0, last)
+        };
+        self.selected = next as usize;
     }
 
     /// Replace the rows for a freshly-fetched level, resetting cursor + scroll.
@@ -908,6 +952,15 @@ pub struct TuiState {
     /// discipline).
     pub card_art: Option<crate::art::AlbumArt>,
     pub card_art_key: Option<String>,
+    /// Albums grid covers, `album/<id>` -> the decoded grid thumbnail, or `None` once
+    /// the fetch answered that there is none (the cell then keeps its sigil and is not
+    /// asked again). Absent = never asked.
+    pub grid_art: std::collections::HashMap<String, Option<crate::art::AlbumArt>>,
+    /// Uris asked of the grid worker and not yet answered, so a cell is asked once.
+    pub grid_pending: std::collections::HashSet<String>,
+    /// The album uris the last grid frame showed, in draw order: what the main loop
+    /// asks covers for. Written by the renderer, which alone knows what is visible.
+    pub grid_visible: RefCell<Vec<String>>,
     /// The ambient-visualizer clock, in seconds. The render loop advances this by
     /// the wall-clock frame delta ONLY while playback is `play` (so it freezes when
     /// paused/stopped) and writes it here before each draw; the idle bottom-bar wave
@@ -1123,6 +1176,9 @@ impl Default for TuiState {
             fkey_hinted: false,
             held_plans: Vec::new(),
             card_art: None,
+            grid_art: std::collections::HashMap::new(),
+            grid_pending: std::collections::HashSet::new(),
+            grid_visible: RefCell::new(Vec::new()),
             card_art_key: None,
             anim_secs: 0.0,
             spin_secs: 0.0,
@@ -1511,10 +1567,42 @@ impl TuiState {
         // removed from dispatch while a row still advertises it - so help and behavior
         // can never drift. Keys with no row (Backspace, a freed `f`) fall through to a
         // safe no-op.
+        if let Some(()) = self.key_grid(key) {
+            return None;
+        }
         if let Some(act) = keymap::match_key(key, self.screen) {
             return self.apply_act(act);
         }
         None
+    }
+
+    /// The Albums cover grid's 2D cursor: Left/Right step a cell, j/k and Up/Down a
+    /// row. Claimed HERE, before the keymap, because in the list Left/Right mean
+    /// back/drill and j/k move over `active_browse()` - and only the Albums browse is
+    /// ever moved, never the queue cursor. `h`/`l` keep their list meaning (back out,
+    /// open) and Enter still plays, so the grid changes how the cursor MOVES and
+    /// nothing about what a key DOES to an album.
+    fn key_grid(&mut self, key: KeyEvent) -> Option<()> {
+        // `grid_cols` is 0 whenever the last frame drew the LIST (a small terminal),
+        // and then these keys keep their list meaning.
+        if self.screen != Screen::Albums
+            || !self.albums.is_album_grid()
+            || self.albums.grid_cols.get() == 0
+        {
+            return None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let (dx, dy) = match key.code {
+            KeyCode::Left if !ctrl => (-1, 0),
+            KeyCode::Right if !ctrl => (1, 0),
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => (0, 1),
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => (0, -1),
+            KeyCode::Char('n') if ctrl => (0, 1),
+            KeyCode::Char('p') if ctrl => (0, -1),
+            _ => return None,
+        };
+        self.albums.grid_move(dx, dy);
+        Some(())
     }
 
     /// Execute a resolved [`keymap::Act`]. The ONE place a normal-mode binding turns
@@ -4303,6 +4391,91 @@ mod tests {
         assert_eq!(s.handle_key(ch('t')), None);
         assert!(s.help_open, "help still owns the keyboard");
         assert!(s.heard_open, "and the panel under it is untouched");
+    }
+
+    fn album_rows(n: usize) -> Vec<BrowseRow> {
+        (0..n)
+            .map(|i| BrowseRow {
+                label: format!("A{i}"),
+                uri: format!("album/{i}"),
+                is_dir: true,
+                song_count: Some(3),
+                artist: None,
+                album_uri: None,
+                artist_uri: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grid_cursor_moves_in_2d_and_never_touches_the_queue() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(11), item(22), item(33)]);
+        s.selected = 2;
+        s.screen = Screen::Albums;
+        s.albums.rows = album_rows(10); // 4 columns: rows of 4, 4, 2
+        s.albums.grid_cols.set(4);
+        assert!(s.albums.is_album_grid());
+        s.handle_key(key(KeyCode::Right));
+        assert_eq!(s.albums.selected, 1);
+        s.handle_key(ch('j'));
+        assert_eq!(s.albums.selected, 5, "j moves a whole row");
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.albums.selected, 9, "down into a shorter last row lands on its last cell");
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.albums.selected, 9, "the last row is the floor");
+        s.handle_key(ch('k'));
+        assert_eq!(s.albums.selected, 5);
+        s.handle_key(key(KeyCode::Up));
+        s.handle_key(key(KeyCode::Up));
+        assert_eq!(s.albums.selected, 1, "the first row is the ceiling");
+        s.handle_key(key(KeyCode::Left));
+        s.handle_key(key(KeyCode::Left));
+        assert_eq!(s.albums.selected, 0, "left clamps at the first cell");
+        s.albums.selected = 3;
+        s.handle_key(key(KeyCode::Right));
+        assert_eq!(s.albums.selected, 4, "right wraps to the next row, reading order");
+        assert_eq!(s.selected, 2, "the queue cursor never moved");
+    }
+
+    #[test]
+    fn a_list_drawn_albums_root_keeps_the_list_keys() {
+        // A small terminal draws the list (grid_cols 0): Right still opens, j still
+        // steps one row, exactly as before the grid existed.
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        s.albums.rows = album_rows(5);
+        s.handle_key(ch('j'));
+        assert_eq!(s.albums.selected, 1);
+        assert_eq!(s.handle_key(key(KeyCode::Right)), Some(Intent::BrowseInto("album/1".into())));
+    }
+
+    #[test]
+    fn grid_keeps_l_as_open_and_enter_as_play() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        s.albums.rows = album_rows(3);
+        s.albums.grid_cols.set(3);
+        s.albums.selected = 1;
+        // `l` still opens the album under the cursor, exactly as in the list.
+        let opened = s.handle_key(ch('l'));
+        assert_eq!(opened, Some(Intent::BrowseInto("album/1".into())));
+    }
+
+    #[test]
+    fn an_opened_album_is_a_list_not_a_grid() {
+        let mut b = Browse::new("album/1", "A1");
+        b.rows = vec![BrowseRow {
+            label: "Song".into(),
+            uri: "song/1".into(),
+            is_dir: false,
+            song_count: None,
+            artist: None,
+            album_uri: None,
+            artist_uri: None,
+        }];
+        assert!(!b.is_album_grid());
+        assert!(!Browse::new("albums/all", "Albums").is_album_grid(), "empty is not a grid");
     }
 
     #[test]

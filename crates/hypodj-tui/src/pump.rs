@@ -40,13 +40,20 @@ use ratatui::Terminal;
 use hypodj_client::mpd::{MpdConn, MpdError};
 
 use super::{
-    apply_inbound, dispatch, request_art, request_card_art, request_refresh, teardown,
+    apply_inbound, dispatch, request_art, request_card_art, request_grid_art, request_refresh,
+    teardown,
     update_sigil, worker, Intent, TuiState,
 };
 
-/// The frame sizes every step is rendered at: the 129-column rule (the wide rail),
-/// the classic minimum terminal, and a small split pane.
-const SIZES: [(u16, u16); 3] = [(129, 40), (80, 24), (60, 20)];
+/// The frame sizes every step is rendered at: the classic minimum terminal, a small
+/// split pane, and the 129-column rule (the wide rail).
+///
+/// The WIDE frame is drawn LAST on purpose. Some layout is size-dependent (the Albums
+/// cover grid needs room; a small terminal keeps the dense list), and the renderer
+/// records what it drew for the keys that follow - one state, three frames - so the
+/// last frame decides what the next key means. Last = widest makes a script's keys mean
+/// what they mean on a real full-size terminal.
+const SIZES: [(u16, u16); 3] = [(80, 24), (60, 20), (129, 40)];
 /// Settled = no inbound message for this long.
 const QUIET: Duration = Duration::from_millis(600);
 /// Give up settling after this long and record `settled: false` - a screen that
@@ -226,6 +233,12 @@ fn settle(workers: &worker::Workers, state: &mut TuiState) -> (bool, Duration) {
         }
         request_art(&workers.art_tx, state);
         request_card_art(&workers.art_tx, state);
+        // The grid records what it SHOWS while it draws, and nothing draws between
+        // steps here, so lay the largest frame out once to learn which covers to ask.
+        if state.screen == super::state::Screen::Albums {
+            let _ = frame_text(state, SIZES[2].0, SIZES[2].1);
+        }
+        request_grid_art(&workers.grid_art_tx, state);
         update_sigil(state);
         if got {
             last_msg = Instant::now();

@@ -97,6 +97,14 @@ pub struct Album {
     /// recent work rather than an arbitrary slice. `year` is the fallback when the
     /// server omits it.
     pub created: Option<String>,
+    /// How many times THIS user has played the album (wire `AlbumId3.play_count`),
+    /// `None` when the server has no play record. Same meaning as `Song::play_count`.
+    /// Carried for the Find ranking (`find_rank`), which reads only what the server
+    /// already sends on the search3 row - no extra round trip, no local history.
+    pub play_count: Option<u32>,
+    /// Whether the current user has starred the album (wire `starred` timestamp,
+    /// boolean here, as on `Artist`).
+    pub starred: bool,
 }
 
 /// A library track.

@@ -1,0 +1,69 @@
+id = "album-grid"
+goal = "Open Albums on a full-size terminal and find an album by its cover: the grid moves in two dimensions, never touches the queue, and opens what the cursor names."
+start = "online"
+states = ["online"]
+# Open Albums, two cells right, one row down, open it.
+min_steps = 5
+step_budget = 5
+script = [
+  "key 2",
+  "wait 8",
+  "snap grid",
+  "key Right",
+  "key Right",
+  "key j",
+  "snap moved",
+  "key l",
+  "wait 4",
+  "snap opened",
+]
+
+[[check]]
+name = "at 129x40 Albums is a cover grid: several albums named on one line"
+at = 3
+severity = "S1"
+sizes = ["129x40"]
+screen_region = "body"
+screen_require_re = ["Held Harbour +# Stream Summit|Held Harbour +Stream Summit"]
+
+[[check]]
+name = "the covered album's own cover is drawn in cells in the grid"
+at = 3
+severity = "S1"
+sizes = ["129x40"]
+screen_region = "body"
+screen_require_re = ["[\U0001FB00-\U0001FB3B]"]
+
+[[check]]
+name = "a coverless album still gets a picture: its sigil"
+at = 3
+severity = "S2"
+sizes = ["129x40"]
+screen_region = "body"
+screen_require_re = ["[╱╲]{6}"]
+
+[[check]]
+name = "at 80x24 the dense list stays (the grid needs room)"
+at = 3
+severity = "S1"
+sizes = ["80x24"]
+count_re = ["(on disk|stream only)\\s*$", 16]
+
+[[check]]
+name = "right, right, down lands on the album one row below Stream Summit, named in full"
+at = 7
+severity = "S0"
+sizes = ["129x40"]
+screen_require_re = ["Albums · Tidewater 05"]
+
+[[check]]
+name = "moving the grid never touched the queue"
+at = 7
+severity = "S0"
+truth = ["status.playlistlength == 0"]
+
+[[check]]
+name = "l opens the album the cursor named"
+severity = "S0"
+sizes = ["129x40"]
+screen_require_any = ["Slack Water 05"]
