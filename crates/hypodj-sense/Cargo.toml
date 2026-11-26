@@ -1,0 +1,23 @@
+[package]
+name = "hypodj-sense"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dj-sense"
+path = "src/main.rs"
+
+# The sensing process (docs/design/sensing-and-graph/design.md Part 1). Like
+# dj-mcp it never depends on hypodj-core: the daemon gains no camera code. This
+# first slice reads a VIDEO FILE only (ffmpeg decodes it), never a device.
+#
+# Face detector: rustface (pure-Rust SeetaFace funnel cascade, BSD-2-Clause, its
+# model a 1.2 MB file fetched by the flake). Chosen over ONNX (ort needs the
+# onnxruntime C++ runtime wired through Nix; tract is a large compile) and over
+# OpenCV (a C++ build plus bindgen) because it is pure Rust with two small deps,
+# so it builds in the Nix sandbox with nothing extra. Rayon is off: one core.
+[dependencies]
+rustface = { version = "0.1.7", default-features = false }
+anyhow.workspace = true
