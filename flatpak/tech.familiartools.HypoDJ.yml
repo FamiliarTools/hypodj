@@ -1,13 +1,13 @@
-# DRAFT, UNTESTED: the Flatpak for djg (crates/hypodj-gtk). Nothing has built or run
-# this yet. Before it can build offline, generate cargo-sources.json from Cargo.lock
-# with flatpak-builder-tools' flatpak-cargo-generator.py and commit it beside this.
+# The Flatpak for djg (crates/hypodj-gtk), the GNOME HypoDJ app. Build and run
+# instructions, and how to regenerate cargo-sources.json, are in flatpak/README.md.
 #
 # djg talks to a hypodj daemon over MPD/TCP on 127.0.0.1:6600 (HYPODJ_HOST /
-# HYPODJ_PORT override), so the sandbox needs only the network; the daemon itself
-# (libmpv, the offline store) stays outside the Flatpak.
+# HYPODJ_PORT override, e.g. `flatpak run --env=HYPODJ_PORT=6601 ...`), so the
+# sandbox needs only the network; the daemon itself (libmpv, the offline store)
+# stays outside the Flatpak.
 id: tech.familiartools.HypoDJ
 runtime: org.gnome.Platform
-runtime-version: "49"
+runtime-version: "51"
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -29,8 +29,21 @@ modules:
     build-commands:
       - cargo --offline build --release -p hypodj-gtk --bin djg
       - install -Dm755 target/release/djg /app/bin/djg
+      # The exported desktop file and icon must carry the app id; the in-sandbox
+      # `hypodj` icon stays too, since djg sets it as the default window icon.
       - install -Dm644 crates/hypodj-gtk/data/tech.familiartools.HypoDJ.desktop /app/share/applications/tech.familiartools.HypoDJ.desktop
+      - desktop-file-edit --set-icon=tech.familiartools.HypoDJ /app/share/applications/tech.familiartools.HypoDJ.desktop
+      - install -Dm644 crates/hypodj-search/data/icons/hicolor/scalable/apps/hypodj.svg /app/share/icons/hicolor/scalable/apps/tech.familiartools.HypoDJ.svg
+      - install -Dm644 crates/hypodj-search/data/icons/hicolor/symbolic/apps/hypodj-symbolic.svg /app/share/icons/hicolor/symbolic/apps/tech.familiartools.HypoDJ-symbolic.svg
+      - install -Dm644 crates/hypodj-search/data/icons/hicolor/scalable/apps/hypodj.svg /app/share/icons/hicolor/scalable/apps/hypodj.svg
+      - install -Dm644 flatpak/tech.familiartools.HypoDJ.metainfo.xml /app/share/metainfo/tech.familiartools.HypoDJ.metainfo.xml
     sources:
       - type: dir
         path: ..
+        skip:
+          - target
+          - .claude
+          - Screenshots
+          - usability
+          - docs
       - cargo-sources.json
