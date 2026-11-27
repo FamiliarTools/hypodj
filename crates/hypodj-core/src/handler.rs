@@ -16278,19 +16278,22 @@ impl HypodjHandler {
             Some(p) if p.starts_with("album/") => {
                 let id = p.trim_start_matches("album/").to_string();
                 let key = format!("album/{id}");
+                // Each track says whether the mirror holds it (index only, no stat),
+                // so a client can keep the held tracks playable while offline.
+                let store = self.audio_store();
                 if let Some(songs) = self.listings.get(&key) {
-                    return song_rows(&songs);
+                    return held_song_rows(&songs, store.as_deref());
                 }
                 match self.client.album_songs(&AlbumId(id.clone())).await {
                     Ok(songs) => {
                         self.listings.put(key, songs.clone());
-                        song_rows(&songs)
+                        held_song_rows(&songs, store.as_deref())
                     }
                     // Offline, the held songs of the album are still a true listing
                     // of what can be played - not cached, so the full album returns
                     // the moment the server does.
                     Err(e) => match self.offline_album_songs(&AlbumId(id)).await {
-                        Some(songs) => song_rows(&songs),
+                        Some(songs) => held_song_rows(&songs, store.as_deref()),
                         None => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
                     },
                 }
@@ -17300,6 +17303,19 @@ fn song_id_from_uri(uri: &str) -> Option<SongId> {
 }
 
 /// Serialize a slice of songs as browse `file:` rows.
+/// [`song_rows`] with `X-Offline: 1|0` after each song (index only, like
+/// [`held_pair`]). With no store nothing is added: unknown is never "stream only".
+fn held_song_rows(songs: &[Song], store: Option<&AudioStore>) -> MpdResponse {
+    let mut pairs = Vec::new();
+    for s in songs {
+        pairs.extend(browse_song_pairs(s));
+        if let Some(store) = store {
+            pairs.push(("X-Offline".to_string(), if store.holds(&s.id) { "1" } else { "0" }.to_string()));
+        }
+    }
+    MpdResponse::Pairs(pairs)
+}
+
 fn song_rows(songs: &[Song]) -> MpdResponse {
     let mut pairs = Vec::new();
     for s in songs {

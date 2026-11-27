@@ -27,6 +27,14 @@ impl AlbumRow {
     }
 }
 
+impl AlbumRow {
+    /// Whether any of the album is on disk (`None` = the store did not answer).
+    /// A partly held album counts: what it holds still plays offline.
+    pub fn on_disk(&self) -> Option<bool> {
+        self.held.map(|h| h > 0)
+    }
+}
+
 /// One song row (an album's tracks, or a search hit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SongRow {
@@ -35,6 +43,31 @@ pub struct SongRow {
     pub uri: String,
     /// "on disk" / "stream only" from the daemon's per-row `X-Offline`.
     pub availability: Option<&'static str>,
+}
+
+impl SongRow {
+    pub fn on_disk(&self) -> Option<bool> {
+        self.availability.map(|a| a == "on disk")
+    }
+}
+
+/// Whether the music server is unusable right now (unreachable, no network, error):
+/// the condition under which only what is on disk can play. Unknown or still
+/// checking is not down, so a fresh start never greys the whole library.
+pub fn server_down(server: Option<&str>) -> bool {
+    matches!(server, Some("unreachable" | "no-network" | "error"))
+}
+
+/// Whether a row stays active (playable, focusable). Online every row is; with the
+/// server down only rows the mirror is known to hold are. Unknown availability
+/// while down is inactive: activating it could only fail.
+pub fn row_active(down: bool, on_disk: Option<bool>) -> bool {
+    !down || on_disk == Some(true)
+}
+
+/// The on-disk answer for a queue row (Up Next), from its `X-Offline`.
+pub fn queue_on_disk(item: &QueueItem) -> Option<bool> {
+    find(&item.details, "X-Offline").map(|v| v == "1")
 }
 
 /// What a search hit is, which decides what activating it does.
@@ -352,6 +385,48 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].uri, "album/1");
         assert_eq!(rows[0].availability().as_deref(), Some("on disk"));
+    }
+
+    #[test]
+    fn offline_only_what_is_on_disk_stays_active() {
+        assert!(server_down(Some("unreachable")));
+        assert!(server_down(Some("no-network")));
+        assert!(!server_down(Some("online")));
+        assert!(!server_down(Some("unknown")));
+        assert!(!server_down(None));
+        // Online: everything is live, known or not.
+        for d in [Some(true), Some(false), None] {
+            assert!(row_active(false, d));
+        }
+        // Down: only what is known held.
+        assert!(row_active(true, Some(true)));
+        assert!(!row_active(true, Some(false)));
+        assert!(!row_active(true, None));
+
+        let held = p(&[
+            ("OfflineAlbum", "Kid A"),
+            ("OfflineAlbumUri", "album/1"),
+            ("OfflineAlbumSongs", "2"),
+        ]);
+        let listed = p(&[
+            ("directory", "album/1"),
+            ("X-SongCount", "10"),
+            ("directory", "album/2"),
+        ]);
+        let rows = albums(Some(&listed), Some(&held));
+        let active: Vec<_> = rows.iter().map(|r| row_active(true, r.on_disk())).collect();
+        assert_eq!(active, vec![true, false], "a partly held album still plays offline");
+        assert!(albums(Some(&listed), None).iter().all(|r| !row_active(true, r.on_disk())));
+
+        let tracks = songs(&p(&[
+            ("file", "song/1"),
+            ("X-Offline", "1"),
+            ("file", "song/2"),
+            ("X-Offline", "0"),
+            ("file", "song/3"),
+        ]));
+        let on: Vec<_> = tracks.iter().map(|t| t.on_disk()).collect();
+        assert_eq!(on, vec![Some(true), Some(false), None]);
     }
 
     #[test]

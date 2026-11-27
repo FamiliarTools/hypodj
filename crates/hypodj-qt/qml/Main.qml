@@ -17,7 +17,7 @@ ApplicationWindow {
     visible: true
 
     readonly property bool narrow: width < 600
-    readonly property var nowv: backend.now ? JSON.parse(backend.now) : ({ "title": "Connecting", "artist": "", "album": "", "held": "", "playing": false, "verb": "play", "volume": -1, "upNext": [], "status": { "label": "Connecting", "problem": false, "details": "", "icon": "" }, "banner": "" })
+    readonly property var nowv: backend.now ? JSON.parse(backend.now) : ({ "title": "Connecting", "artist": "", "album": "", "held": "", "playing": false, "verb": "play", "volume": -1, "upNext": [], "status": { "label": "Connecting", "problem": false, "details": "", "icon": "" }, "banner": "", "down": false })
     readonly property var inst: backend.instrument ? JSON.parse(backend.instrument) : null
     readonly property var albumsv: backend.albums ? JSON.parse(backend.albums) : ({ "rows": [], "note": "Loading albums" })
     readonly property var albumv: backend.album ? JSON.parse(backend.album) : ({ "title": "", "uri": "", "rows": [] })
@@ -146,9 +146,50 @@ ApplicationWindow {
         }
     }
 
+    // Type to search (the GNOME pattern, done by hand: Qt Quick has no key-capture
+    // widget). A printable key nobody else took - a focused text field takes its own
+    // - brings the Search page forward with the key already in the field,
+    // remembering the page and the focused item for Escape.
+    property int searchReturnTab: -1
+    property Item searchReturnFocus: null
+    function startSearch(text) {
+        if (tabs.currentIndex !== 2) {
+            searchReturnTab = tabs.currentIndex
+            searchReturnFocus = win.activeFocusItem
+            tabs.currentIndex = 2
+        }
+        searchField.forceActiveFocus()
+        if (text !== "") searchField.insert(searchField.length, text)
+    }
+    function stopSearch() {
+        searchField.text = ""
+        if (searchReturnTab >= 0) {
+            tabs.currentIndex = searchReturnTab
+            if (searchReturnFocus) searchReturnFocus.forceActiveFocus(); else body.forceActiveFocus()
+        } else {
+            body.forceActiveFocus()
+        }
+        searchReturnTab = -1
+        searchReturnFocus = null
+    }
+    // Keyboard proof (DJQ_FOCUS_LOG): every focus move, by accessible name.
+    onActiveFocusItemChanged: if (backend.env("DJQ_FOCUS_LOG") !== "" && activeFocusItem)
+        console.log("djq-focus:", activeFocusItem.Accessible.name || activeFocusItem.toString(), "enabled=" + activeFocusItem.enabled)
+    Shortcut { sequences: [StandardKey.Find]; onActivated: win.startSearch("") }
+
     ColumnLayout {
+        id: body
         anchors.fill: parent
         spacing: 0
+        focus: true
+        Keys.onPressed: (event) => {
+            const t = event.text
+            if (t.length === 1 && t.charCodeAt(0) > 32 && t.charCodeAt(0) !== 127
+                    && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
+                win.startSearch(t)
+                event.accepted = true
+            }
+        }
         // The server banner: a problem, said in words, with what still works.
         Pane {
             visible: win.nowv.banner !== ""
@@ -300,6 +341,7 @@ ApplicationWindow {
                         rows: win.nowv.upNext
                         empty: "Nothing queued"
                         emptySub: "The queue ends after this track."
+                        down: win.nowv.down
                         onActivated: (r) => backend.command("play " + r.pos)
                     }
                     Item { Layout.preferredHeight: 12 }
@@ -330,6 +372,7 @@ ApplicationWindow {
                             objectName: "albumsList"
                             rows: win.albumsv.rows
                             chevron: true
+                            down: win.nowv.down
                             onActivated: (r) => backend.openAlbum(r.uri, r.title)
                         }
                         Item { Layout.preferredHeight: 12 }
@@ -350,6 +393,7 @@ ApplicationWindow {
                         id: searchField
                         placeholderText: "Artists, albums, songs"
                         Accessible.name: "Search the library"
+                        Keys.onEscapePressed: win.stopSearch()
                         Layout.fillWidth: true
                         onTextChanged: searchDelay.restart()
                         Timer { id: searchDelay; interval: 250; onTriggered: backend.searchFor(searchField.text) }
@@ -375,6 +419,7 @@ ApplicationWindow {
                     }
                     Rows {
                         visible: !!win.searchv && win.searchv.hits.length > 0
+                        down: win.nowv.down
                         rows: win.searchv ? win.searchv.hits.map(h => ({ "title": h.title, "sub": h.sub, "uri": h.uri, "glyph": h.kind === "artist" ? "☺" : h.kind === "album" ? "◎" : "♪" })) : []
                         onActivated: (r) => backend.playUri(r.uri)
                     }
@@ -418,6 +463,7 @@ ApplicationWindow {
                 }
                 Rows {
                     rows: win.albumv.rows
+                    down: win.nowv.down
                     onActivated: (r) => backend.playUri(r.uri)
                 }
                 Item { Layout.preferredHeight: 12 }

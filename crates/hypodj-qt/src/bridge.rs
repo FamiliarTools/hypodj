@@ -184,6 +184,7 @@ pub fn now_json(now: &NowPlaying, queue: &[QueueItem]) -> Value {
                 "title": it.title,
                 "sub": join(it.artist.as_deref(), view::queue_availability(it)).unwrap_or_default(),
                 "pos": it.pos,
+                "onDisk": view::queue_on_disk(it),
             })
         })
         .collect();
@@ -198,6 +199,8 @@ pub fn now_json(now: &NowPlaying, queue: &[QueueItem]) -> Value {
         "upNext": up_next,
         "status": { "label": st.label, "problem": st.problem, "details": st.details.join("\n"), "icon": st.icon },
         "banner": banner.unwrap_or_default(),
+        // The server is down: Rows keeps only on-disk rows enabled.
+        "down": view::server_down(now.server.as_deref()),
     })
 }
 
@@ -355,6 +358,7 @@ impl qobject::Backend {
                 let mut cur: Value = serde_json::from_str(&self.now.to_string()).unwrap_or(v.clone());
                 cur["status"] = v["status"].clone();
                 cur["banner"] = v["banner"].clone();
+                cur["down"] = json!(false);
                 self.set_now(q(&cur.to_string()));
             }
             Msg::Albums { rows, note } => {
@@ -365,6 +369,7 @@ impl qobject::Backend {
                             "title": a.title,
                             "sub": join(a.artist.as_deref(), a.availability().as_deref()).unwrap_or_default(),
                             "uri": a.uri,
+                            "onDisk": a.on_disk(),
                         })
                     })
                     .collect();
@@ -378,6 +383,7 @@ impl qobject::Backend {
                             "title": s.title,
                             "sub": join(s.artist.as_deref(), s.availability).unwrap_or_default(),
                             "uri": s.uri,
+                            "onDisk": s.on_disk(),
                         })
                     })
                     .collect();

@@ -10,6 +10,10 @@ Frame {
     property bool chevron: false
     property string empty: ""
     property string emptySub: ""
+    // The server is down: only rows whose onDisk is true stay enabled. A disabled
+    // delegate is greyed by the host style, takes no focus (Tab skips it) and
+    // cannot be clicked.
+    property bool down: false
     signal activated(var row)
     Layout.fillWidth: true
     padding: 0
@@ -25,6 +29,13 @@ Frame {
                 required property int index
                 Layout.fillWidth: true
                 hoverEnabled: !modelData.inert
+                enabled: !!modelData.inert || !box.down || modelData.onDisk === true
+                opacity: enabled ? 1 : 0.45
+                // An ItemDelegate takes no Tab focus by default (a view owns it);
+                // these rows are the list, so each is a Tab stop, Enter activates.
+                focusPolicy: modelData.inert ? Qt.NoFocus : Qt.StrongFocus
+                Keys.onReturnPressed: if (!modelData.inert) box.activated(modelData)
+                Keys.onEnterPressed: if (!modelData.inert) box.activated(modelData)
                 Accessible.name: modelData.title + (modelData.sub ? ", " + modelData.sub : "")
                 contentItem: RowLayout {
                     spacing: 12
