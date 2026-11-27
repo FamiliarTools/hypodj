@@ -87,7 +87,7 @@ pub struct HeardRow {
     /// rows is diagnosable rather than invisible.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub at_unix: u64,
-    /// `session` | `heard` | `miss` | `mark`.
+    /// `session` | `heard` | `miss` | `mark` | `tune`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ev: String,
     /// `icy` | `recognize` | `mark`.
@@ -194,6 +194,15 @@ pub struct HeardRow {
     /// capture) because [`HeardRow`] derives `Eq` and an `f64` cannot live on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shazam_offset_ms: Option<i64>,
+    /// On a `tune` row: how this stream came to be playing - `saved` (a station he
+    /// keeps in Navidrome), `suggested` (a `stations suggest` / `radio beyond` pick),
+    /// `continuation` (the drain-edge station) or `direct` (a bare url nobody saved).
+    /// The one field that lets `heard report` say whether the PICK works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// On a closing `tune` row: seconds the stream was actually PLAYING, start to leave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dwell_secs: Option<u64>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -457,7 +466,7 @@ pub fn read_session(path: &Path) -> (Vec<HeardRow>, usize) {
 /// Sync, using `std::fs` throughout: the caller runs it in `spawn_blocking`.
 pub fn read_for(dir: &Path, view: HeardView) -> (Vec<HeardRow>, usize) {
     match view {
-        HeardView::Marks => {
+        HeardView::Marks | HeardView::Report => {
             let (mut rows, mut unreadable) = (Vec::new(), 0usize);
             for name in session_files(dir) {
                 let (r, u) = read_session(&dir.join(name));
@@ -798,6 +807,9 @@ pub enum HeardView {
     /// Mark rows only, oldest first - the two-week answer to whether the CHOOSING is
     /// the conversion step.
     Marks,
+    /// The discovery experiment's numbers, per tune-in ORIGIN, across every retained
+    /// session ([`render_report`]).
+    Report,
 }
 
 /// What a `heard` request ASKS FOR, as opposed to which view it renders.
@@ -1025,6 +1037,7 @@ pub fn render(
 ) -> Vec<String> {
     match q.view {
         HeardView::Marks => render_marks(rows, tape_ids),
+        HeardView::Report => render_report(rows, unreadable, &[], None),
         HeardView::All => render_all(rows, unreadable, tape_ids),
         HeardView::Recent => render_recent(rows, unreadable, q, tape_ids),
     }
@@ -1047,6 +1060,14 @@ fn render_all(rows: &[HeardRow], unreadable: usize, tape_ids: &[String]) -> Vec<
     for r in rows.iter().filter(|r| r.ev != "session") {
         out.push(match r.ev.as_str() {
             "mark" => mark_line(r, tape_ids),
+            "tune" => format!(
+                "{}  [tune {}] {} ({}{})",
+                hhmm(r),
+                r.kind.as_deref().unwrap_or("?"),
+                r.station.as_deref().or(r.url.as_deref()).unwrap_or(""),
+                r.origin.as_deref().unwrap_or("direct"),
+                r.dwell_secs.map(|d| format!(", {}", human_secs(d))).unwrap_or_default()
+            ),
             "miss" => format!(
                 "{}  [{}] {}",
                 hhmm(r),
@@ -1177,6 +1198,397 @@ fn mark_line(row: &HeardRow, tape_ids: &[String]) -> String {
         line.push_str(&format!("  [no tape: {why}]"));
     }
     line
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tune rows: when a stream starts and when it is left
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What is playing now, as the tune tracker samples it: a stream entry that is actually
+/// PLAYING (paused or stopped is `None` - a paused stream is not being listened to).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuneSubject {
+    /// The queue id: a re-add of the same url is a new tune-in.
+    pub qid: u64,
+    pub url: String,
+    pub station: Option<String>,
+    /// `saved` | `suggested` | `continuation` | `direct`.
+    pub origin: String,
+}
+
+#[derive(Debug, Clone)]
+struct OpenTune {
+    subject: TuneSubject,
+    started_unix: u64,
+}
+
+/// The pure state machine behind the `tune` rows. The handler samples "what stream is
+/// playing" on every change notification and on a slow poll, and feeds it here; this
+/// turns the sequence of samples into exactly one `start` row per tune-in and one `stop`
+/// row (with the seconds played) when it is left, whatever the reason - another track,
+/// another station, pause, stop, clear.
+///
+/// Sampling rather than hooking each mutation is deliberate: there are a dozen ways the
+/// deck leaves a stream (skip, delete, clear, EOF, a plan, MPRIS) and a hook in each is
+/// a hook somebody forgets. A sample is wrong by at most one poll period, which against
+/// a dwell measured in minutes is noise.
+#[derive(Debug, Default)]
+pub struct TuneTracker {
+    open: Option<OpenTune>,
+}
+
+impl TuneTracker {
+    /// Whether the tracker currently holds an open tune for this qid (so the caller can
+    /// skip resolving an origin it already knows).
+    pub fn is_open_for(&self, qid: u64) -> bool {
+        self.open.as_ref().is_some_and(|o| o.subject.qid == qid)
+    }
+
+    /// Feed one sample at `now_unix`; returns the rows to append (zero, one or two).
+    pub fn observe(&mut self, now_unix: u64, current: Option<TuneSubject>) -> Vec<HeardRow> {
+        let mut out = Vec::new();
+        let same = match (&self.open, &current) {
+            (Some(o), Some(c)) => o.subject.qid == c.qid && o.subject.url == c.url,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            // The station label often arrives after the start (ICY, identity); keep the
+            // newest so the closing row names it.
+            if let (Some(o), Some(c)) = (self.open.as_mut(), current) {
+                if c.station.is_some() {
+                    o.subject.station = c.station;
+                }
+            }
+            return out;
+        }
+        if let Some(o) = self.open.take() {
+            out.push(tune_row(
+                now_unix,
+                "stop",
+                &o.subject,
+                Some(now_unix.saturating_sub(o.started_unix)),
+            ));
+        }
+        if let Some(c) = current {
+            out.push(tune_row(now_unix, "start", &c, None));
+            self.open = Some(OpenTune { subject: c, started_unix: now_unix });
+        }
+        out
+    }
+}
+
+fn tune_row(at_unix: u64, kind: &str, s: &TuneSubject, dwell: Option<u64>) -> HeardRow {
+    HeardRow {
+        at_unix,
+        ev: "tune".to_string(),
+        src: Some("tune".to_string()),
+        kind: Some(kind.to_string()),
+        station: s.station.clone(),
+        url: Some(s.url.clone()),
+        origin: Some(s.origin.clone()),
+        dwell_secs: dwell,
+        ..Default::default()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wants: a mark on an unowned track, kept as something to acquire later
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The wants file name, INSIDE the ledger directory. Deliberately not `.jsonl`: the
+/// session sweep and every reader take `*.jsonl` as session files, and a wants file must
+/// neither be read as listening nor be swept away as an old session.
+pub const WANTS_FILE: &str = "wants.ndjson";
+
+/// One want: a track he marked and does not own. hypodj fetches nothing; this is the
+/// list an acquisition (by hand, today) reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Want {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub at: String,
+    #[serde(default)]
+    pub at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The verbatim subject text the mark recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isrc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The tape segment the press kept, when it kept one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tape: Option<String>,
+}
+
+/// The want a finished mark row implies, or `None`. Only a resolved, UNOWNED TRACK is a
+/// want: an owned one was starred instead, an ambiguous press names two candidates and
+/// neither is chosen, and a show or a bare moment names no track to acquire.
+pub fn want_for_mark(row: &HeardRow) -> Option<Want> {
+    if row.ev != "mark" || row.owned || row.ambiguous || row.kind.as_deref() != Some("track") {
+        return None;
+    }
+    let raw = row.raw.clone().filter(|r| !r.trim().is_empty());
+    if raw.is_none() && row.title.is_none() {
+        return None;
+    }
+    Some(Want {
+        at: if row.at.is_empty() { format_local(row.at_unix) } else { row.at.clone() },
+        at_unix: row.at_unix,
+        artist: row.artist.clone(),
+        title: row.title.clone(),
+        raw,
+        album: row.album.clone(),
+        isrc: row.isrc.clone(),
+        station: row.station.clone(),
+        url: row.url.clone(),
+        tape: row.tape.clone(),
+    })
+}
+
+/// Append one want line. Sync, `std::fs`: the caller runs it in `spawn_blocking`. A plain
+/// `O_APPEND` of one short line, like the ledger, never a rewrite.
+pub fn append_want(dir: &Path, want: &Want) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let line = serde_json::to_string(want).map_err(std::io::Error::other)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(WANTS_FILE))?;
+    writeln!(f, "{line}")
+}
+
+/// Every parseable want, oldest first. Sync: `spawn_blocking` territory.
+pub fn read_wants(dir: &Path) -> Vec<Want> {
+    let Ok(text) = std::fs::read_to_string(dir.join(WANTS_FILE)) else {
+        return Vec::new();
+    };
+    text.lines().filter_map(|l| serde_json::from_str::<Want>(l).ok()).collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The report: the discovery experiment's numbers, split by origin
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The per-origin aggregate behind one report line.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OriginStats {
+    pub tunes: usize,
+    /// Seconds played per tune-in (closed ones, plus a session-end lower bound).
+    pub dwells: Vec<u64>,
+    pub marks: usize,
+    pub identified: usize,
+    pub unowned: usize,
+    pub artists: std::collections::BTreeSet<String>,
+    /// station key -> the distinct days it was tuned.
+    pub station_days: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl OriginStats {
+    pub fn hours(&self) -> f64 {
+        self.dwells.iter().sum::<u64>() as f64 / 3600.0
+    }
+
+    pub fn median_dwell_secs(&self) -> Option<u64> {
+        if self.dwells.is_empty() {
+            return None;
+        }
+        let mut d = self.dwells.clone();
+        d.sort_unstable();
+        let n = d.len();
+        Some(if n % 2 == 1 { d[n / 2] } else { (d[n / 2 - 1] + d[n / 2]) / 2 })
+    }
+
+    pub fn marks_per_hour(&self) -> Option<f64> {
+        let h = self.hours();
+        (h > 0.0).then(|| self.marks as f64 / h)
+    }
+
+    /// Stations tuned on more than one day, over stations tuned at all.
+    pub fn returned(&self) -> (usize, usize) {
+        let again = self.station_days.values().filter(|d| d.len() > 1).count();
+        (again, self.station_days.len())
+    }
+}
+
+/// Fold rows (oldest first, sessions concatenated) into per-origin stats, plus the count
+/// of marks and identified tracks that fell OUTSIDE any tune-in (the ledger before tune
+/// rows existed, or a library song). Attribution is by time inside one session: a row
+/// belongs to the tune open when it was written. A `session` row closes whatever was
+/// open at the previous row's stamp, because a daemon that died wrote no `stop`.
+pub fn aggregate(rows: &[HeardRow]) -> (std::collections::BTreeMap<String, OriginStats>, usize, usize) {
+    use std::collections::BTreeMap;
+    let mut by: BTreeMap<String, OriginStats> = BTreeMap::new();
+    let (mut loose_marks, mut loose_tracks) = (0usize, 0usize);
+    // (origin, started_unix)
+    let mut open: Option<(String, u64)> = None;
+    let mut last_unix = 0u64;
+    let close_dangling = |open: &mut Option<(String, u64)>, by: &mut BTreeMap<String, OriginStats>, at: u64| {
+        if let Some((o, start)) = open.take() {
+            by.entry(o).or_default().dwells.push(at.saturating_sub(start));
+        }
+    };
+    for r in rows {
+        match r.ev.as_str() {
+            "session" => close_dangling(&mut open, &mut by, last_unix),
+            "tune" => {
+                let origin = r.origin.clone().unwrap_or_else(|| "direct".to_string());
+                match r.kind.as_deref() {
+                    Some("start") => {
+                        close_dangling(&mut open, &mut by, r.at_unix);
+                        let st = by.entry(origin.clone()).or_default();
+                        st.tunes += 1;
+                        let key = r
+                            .url
+                            .as_deref()
+                            .map(crate::beyond::url_key)
+                            .or_else(|| r.station.clone())
+                            .unwrap_or_default();
+                        let day = r.at.get(..10).map(str::to_string).unwrap_or_else(|| {
+                            format_local(r.at_unix).get(..10).unwrap_or("").to_string()
+                        });
+                        st.station_days.entry(key).or_default().insert(day);
+                        open = Some((origin, r.at_unix));
+                    }
+                    Some("stop") => {
+                        if let Some((o, start)) = open.take() {
+                            let dwell = r.dwell_secs.unwrap_or_else(|| r.at_unix.saturating_sub(start));
+                            by.entry(o).or_default().dwells.push(dwell);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "mark" => match &open {
+                Some((o, _)) => by.entry(o.clone()).or_default().marks += 1,
+                None => loose_marks += 1,
+            },
+            "heard" if r.kind.as_deref() == Some("track") => match &open {
+                Some((o, _)) => {
+                    let st = by.entry(o.clone()).or_default();
+                    st.identified += 1;
+                    if !r.owned {
+                        st.unowned += 1;
+                    }
+                    if let Some(a) = r.artist.as_deref().filter(|a| !a.trim().is_empty()) {
+                        st.artists.insert(a.trim().to_lowercase());
+                    }
+                }
+                None => loose_tracks += 1,
+            },
+            _ => {}
+        }
+        if r.at_unix > 0 {
+            last_unix = r.at_unix;
+        }
+    }
+    close_dangling(&mut open, &mut by, last_unix);
+    (by, loose_marks, loose_tracks)
+}
+
+/// Below this many closed suggested tune-ins the decision rule says "not yet".
+pub const REPORT_MIN_TUNES: usize = 5;
+
+/// The section 2 decision rule, fixed in advance: suggested stations reaching at least
+/// HALF the hand-picked (`saved`) dwell AND mark rate means the stream design is the
+/// product; suggested failing while saved works means the want is curation by people.
+pub fn decision(saved: Option<&OriginStats>, suggested: Option<&OriginStats>) -> String {
+    let (Some(sv), Some(sg)) = (saved, suggested) else {
+        return format!(
+            "decision: not yet - needs tune-ins of both origins (saved and suggested), at least {REPORT_MIN_TUNES} each"
+        );
+    };
+    if sv.dwells.len() < REPORT_MIN_TUNES || sg.dwells.len() < REPORT_MIN_TUNES {
+        return format!(
+            "decision: not yet - {} saved and {} suggested tune-ins; the rule needs {REPORT_MIN_TUNES} of each",
+            sv.dwells.len(),
+            sg.dwells.len()
+        );
+    }
+    let dwell_ok = match (sv.median_dwell_secs(), sg.median_dwell_secs()) {
+        (Some(a), Some(b)) => b * 2 >= a,
+        _ => false,
+    };
+    let marks_ok = match (sv.marks_per_hour(), sg.marks_per_hour()) {
+        (Some(a), Some(b)) => b * 2.0 >= a,
+        (None, _) | (Some(_), None) => false,
+    };
+    if dwell_ok && marks_ok {
+        "decision: suggested stations reach half the hand-picked dwell and mark rate - the stream (design B) is the product".to_string()
+    } else {
+        "decision: suggested stations fall short of half the hand-picked dwell or mark rate - the want is curation by PEOPLE (build NTS-shaped)".to_string()
+    }
+}
+
+fn origin_line(origin: &str, st: &OriginStats) -> String {
+    let median = st
+        .median_dwell_secs()
+        .map(|s| format!("{:.1} min", s as f64 / 60.0))
+        .unwrap_or_else(|| "-".to_string());
+    let mph = st.marks_per_hour().map(|m| format!("{m:.2}/h")).unwrap_or_else(|| "-".to_string());
+    let unowned = if st.identified == 0 {
+        "-".to_string()
+    } else {
+        format!("{}%", (st.unowned * 100 + st.identified / 2) / st.identified)
+    };
+    let (again, stations) = st.returned();
+    format!(
+        "{origin}: {} tune-ins, {:.1} h, median dwell {median}, {} marks ({mph}), {} identified ({unowned} unowned, {} artists), returned to {again} of {stations} stations on a later day",
+        st.tunes,
+        st.hours(),
+        st.marks,
+        st.identified,
+        st.artists.len(),
+    )
+}
+
+/// Render the report. PURE over the rows and the wants; `wants_owned` is how many wants
+/// the handler found in the library NOW (`None` when it could not ask).
+pub fn render_report(
+    rows: &[HeardRow],
+    unreadable: usize,
+    wants: &[Want],
+    wants_owned: Option<(usize, usize)>,
+) -> Vec<String> {
+    let (by, loose_marks, loose_tracks) = aggregate(rows);
+    let mut out = Vec::new();
+    let sessions = rows.iter().filter(|r| r.ev == "session").count();
+    out.push(format!(
+        "report: {sessions} retained session(s){}",
+        if unreadable > 0 { format!(", {unreadable} unreadable row(s)") } else { String::new() }
+    ));
+    if by.is_empty() {
+        out.push("no tune rows yet - a stream played on a daemon with tune tracking writes them".to_string());
+    }
+    // saved and suggested first (the experiment's two arms), then the rest.
+    let mut order: Vec<&String> = by.keys().collect();
+    order.sort_by_key(|k| match k.as_str() {
+        "saved" => 0,
+        "suggested" => 1,
+        _ => 2,
+    });
+    for k in order {
+        out.push(origin_line(k, &by[k]));
+    }
+    if loose_marks + loose_tracks > 0 {
+        out.push(format!(
+            "outside any tune-in (before tune rows, or library songs): {loose_marks} marks, {loose_tracks} identified tracks"
+        ));
+    }
+    out.push(decision(by.get("saved"), by.get("suggested")));
+    match wants_owned {
+        Some((owned, checked)) => out.push(format!(
+            "wants: {} recorded; {owned} of the {checked} checked are in the library now",
+            wants.len()
+        )),
+        None => out.push(format!("wants: {} recorded (library not checked)", wants.len())),
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1834,5 +2246,115 @@ mod tests {
         let (a, b) = (session_file_name(a, 7), session_file_name(b, 7));
         assert_eq!(a, "2026-08-04-0905-7.jsonl");
         assert!(a < b, "lexical order must be chronological order");
+    }
+
+    // ── tune rows, wants, report ─────────────────────────────────────────────
+
+    fn subj(qid: u64, url: &str, origin: &str) -> TuneSubject {
+        TuneSubject { qid, url: url.to_string(), station: None, origin: origin.to_string() }
+    }
+
+    #[test]
+    fn tune_tracker_opens_once_and_closes_with_the_seconds_played() {
+        let mut t = TuneTracker::default();
+        assert!(t.observe(100, None).is_empty());
+        let rows = t.observe(100, Some(subj(1, "https://a/s", "suggested")));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ev, "tune");
+        assert_eq!(rows[0].kind.as_deref(), Some("start"));
+        assert_eq!(rows[0].origin.as_deref(), Some("suggested"));
+        // Repeated samples of the same thing write nothing; a late label is kept.
+        let mut labelled = subj(1, "https://a/s", "suggested");
+        labelled.station = Some("Groove Salad".into());
+        assert!(t.observe(130, Some(labelled)).is_empty());
+        // Pause (None) leaves it.
+        let rows = t.observe(700, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind.as_deref(), Some("stop"));
+        assert_eq!(rows[0].dwell_secs, Some(600));
+        assert_eq!(rows[0].station.as_deref(), Some("Groove Salad"));
+        // A switch is a stop then a start in one sample.
+        t.observe(800, Some(subj(2, "https://a/s", "saved")));
+        let rows = t.observe(900, Some(subj(3, "https://b/s", "saved")));
+        assert_eq!(rows.iter().map(|r| r.kind.clone().unwrap()).collect::<Vec<_>>(), vec!["stop", "start"]);
+        assert_eq!(rows[0].dwell_secs, Some(100));
+    }
+
+    #[test]
+    fn only_an_unowned_resolved_track_mark_is_a_want() {
+        let mut m = HeardRow { ev: "mark".into(), kind: Some("track".into()), raw: Some("A - B".into()), artist: Some("A".into()), title: Some("B".into()), ..Default::default() };
+        let w = want_for_mark(&m).expect("unowned track is a want");
+        assert_eq!(w.artist.as_deref(), Some("A"));
+        m.owned = true;
+        assert!(want_for_mark(&m).is_none(), "owned is starred, not wanted");
+        m.owned = false;
+        m.ambiguous = true;
+        assert!(want_for_mark(&m).is_none());
+        m.ambiguous = false;
+        m.kind = Some("moment".into());
+        assert!(want_for_mark(&m).is_none());
+    }
+
+    #[test]
+    fn wants_round_trip_and_are_not_sessions() {
+        let dir = test_dir("wants");
+        let w = Want { at_unix: 5, raw: Some("X - Y".into()), ..Default::default() };
+        append_want(&dir, &w).unwrap();
+        append_want(&dir, &w).unwrap();
+        assert_eq!(read_wants(&dir).len(), 2);
+        assert!(session_files(&dir).is_empty(), "the wants file must never read as a session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tune(at: u64, kind: &str, origin: &str, url: &str, dwell: Option<u64>, day: &str) -> HeardRow {
+        HeardRow {
+            at: format!("{day}T20:00:00+00:00"),
+            at_unix: at,
+            ev: "tune".into(),
+            kind: Some(kind.into()),
+            origin: Some(origin.into()),
+            url: Some(url.into()),
+            dwell_secs: dwell,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn report_splits_by_origin_and_attributes_marks_in_time() {
+        let mut rows = vec![HeardRow { ev: "session".into(), at_unix: 1, ..Default::default() }];
+        rows.push(tune(10, "start", "saved", "https://nts/1", None, "2026-11-20"));
+        rows.push(HeardRow { ev: "heard".into(), at_unix: 20, kind: Some("track".into()), artist: Some("Q".into()), ..Default::default() });
+        rows.push(HeardRow { ev: "mark".into(), at_unix: 30, kind: Some("track".into()), ..Default::default() });
+        rows.push(tune(3610, "stop", "saved", "https://nts/1", Some(3600), "2026-11-20"));
+        rows.push(tune(4000, "start", "suggested", "https://rb/x", None, "2026-11-20"));
+        rows.push(tune(4300, "stop", "suggested", "https://rb/x", Some(300), "2026-11-20"));
+        // A second session: saved station again on a later day, daemon died mid-tune.
+        rows.push(HeardRow { ev: "session".into(), at_unix: 90000, ..Default::default() });
+        rows.push(tune(90010, "start", "saved", "http://nts/1/", None, "2026-11-21"));
+        rows.push(HeardRow { ev: "mark".into(), at_unix: 90100, ..Default::default() });
+        let (by, loose_marks, _) = aggregate(&rows);
+        let saved = &by["saved"];
+        assert_eq!(saved.tunes, 2);
+        assert_eq!(saved.dwells, vec![3600, 90]);
+        assert_eq!(saved.marks, 2);
+        assert_eq!(saved.identified, 1);
+        assert_eq!(saved.returned(), (1, 1), "same station, two days, url spelling folded");
+        let sug = &by["suggested"];
+        assert_eq!((sug.tunes, sug.marks), (1, 0));
+        assert_eq!(sug.median_dwell_secs(), Some(300));
+        assert_eq!(loose_marks, 0);
+        let lines = render_report(&rows, 0, &[], Some((0, 0)));
+        assert!(lines.iter().any(|l| l.starts_with("saved: 2 tune-ins")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("suggested: 1 tune-ins")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("decision: not yet")), "{lines:?}");
+    }
+
+    #[test]
+    fn the_decision_rule_yields_one_of_its_two_outcomes() {
+        let st = |dw: u64, marks: usize| OriginStats { tunes: 5, dwells: vec![dw; 5], marks, ..Default::default() };
+        let good = decision(Some(&st(3600, 5)), Some(&st(2000, 3)));
+        assert!(good.contains("design B"), "{good}");
+        let bad = decision(Some(&st(3600, 5)), Some(&st(300, 0)));
+        assert!(bad.contains("curation by PEOPLE"), "{bad}");
     }
 }

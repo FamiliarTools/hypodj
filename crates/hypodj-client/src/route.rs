@@ -165,9 +165,9 @@ pub const ROUTED_VERBS: &[VerbSpec] = &[
     VerbSpec { word: "favorite", args: &[], help: "favorite the current track" },
     VerbSpec { word: "favourite", args: &[], help: "favorite the current track" },
     VerbSpec { word: "star", args: &[], help: "favorite the current track" },
-    VerbSpec { word: "radio", args: &["on", "off", "random", "status", "this"], help: "endless radio from what is playing" },
+    VerbSpec { word: "radio", args: &["on", "off", "random", "status", "this", "beyond"], help: "endless radio from what is playing" },
     VerbSpec { word: "mark", args: &["this", "current", "previous", "prev", "last"], help: "mark what is playing" },
-    VerbSpec { word: "heard", args: &["all", "marks", "keep", "drop"], help: "what played tonight" },
+    VerbSpec { word: "heard", args: &["all", "marks", "report", "keep", "drop"], help: "what played tonight" },
     VerbSpec { word: "clear", args: &[], help: "clear the queue (asks first)" },
     VerbSpec { word: "help", args: &[], help: "show help" },
     VerbSpec { word: "sleep", args: &["off", "cancel", "status", "list"], help: "sleep timer status" },
@@ -285,7 +285,7 @@ fn route_two(verb: &str, arg: &str, args: &[String]) -> Action {
         // The radio keywords the daemon's parser accepts, passed through verbatim.
         // A seed URI is deliberately NOT routed here: `radio song/<id>` is a machine
         // gesture the TUI emits as a raw command line, not something typed at the CLI.
-        "radio" if matches!(arg, "on" | "off" | "random" | "status") => {
+        "radio" if matches!(arg, "on" | "off" | "random" | "status" | "beyond") => {
             Action::Command(format!("radio {arg}"))
         }
         // "radio this", "radio it", "radio current" - the natural phrasings of the
@@ -302,7 +302,7 @@ fn route_two(verb: &str, arg: &str, args: &[String]) -> Action {
         // gesture, which the daemon spells `mark this`.
         "mark" if is_filler_noun(arg) => Action::Command("mark this".into()),
         // The heard views the daemon's parser accepts, passed through verbatim.
-        "heard" if matches!(arg, "all" | "marks") => Action::Command(format!("heard {arg}")),
+        "heard" if matches!(arg, "all" | "marks" | "report") => Action::Command(format!("heard {arg}")),
         // Explicit mode values: `random on`, `repeat off`, `single 1`.
         m if Mode::from_word(m).is_some() => match arg {
             "on" | "1" => Action::Command(format!("{m} 1")),
@@ -586,6 +586,7 @@ mod tests {
         assert_eq!(r("radio on"), Action::Command("radio on".into()));
         assert_eq!(r("radio off"), Action::Command("radio off".into()));
         assert_eq!(r("radio status"), Action::Command("radio status".into()));
+        assert_eq!(r("radio beyond"), Action::Command("radio beyond".into()));
         // The natural phrasings of the bare gesture collapse to `radio this`.
         assert_eq!(r("radio this"), Action::Command("radio this".into()));
         assert_eq!(r("radio it"), Action::Command("radio this".into()));

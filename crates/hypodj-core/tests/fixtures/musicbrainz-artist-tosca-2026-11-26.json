@@ -1,0 +1,49 @@
+{
+ "artists": [
+  {
+   "name": "Tosca",
+   "score": 100,
+   "disambiguation": "downtempo electro, Richard Dorfmeister & Rupert Huber",
+   "tags": [
+    {
+     "count": 2,
+     "name": "electronic"
+    },
+    {
+     "count": 5,
+     "name": "downtempo"
+    },
+    {
+     "count": 5,
+     "name": "chillout"
+    },
+    {
+     "count": 2,
+     "name": "electronica"
+    },
+    {
+     "count": 2,
+     "name": "ambient techno"
+    },
+    {
+     "count": 2,
+     "name": "trip hop"
+    },
+    {
+     "count": 0,
+     "name": "dance and electronica"
+    },
+    {
+     "count": 0,
+     "name": "experimental music"
+    }
+   ]
+  },
+  {
+   "name": "Tosca",
+   "score": 80,
+   "disambiguation": "Italian pop singer",
+   "tags": null
+  }
+ ]
+}

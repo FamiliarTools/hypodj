@@ -25,6 +25,8 @@ usage:
   djc heard                the last session: marks first, unowned only, deduped
   djc heard all            every row, owned included, no cap (redirect it to a file)
   djc heard marks          every mark you pressed, across the retained sessions
+  djc heard report         tune-ins split by origin (saved / suggested): dwell, marks
+                           per hour, unowned share, return rate, wants now owned
   djc heard limit <n>      the last session, capped at n unowned rows
   djc heard keep <n>       pin tape segment n so the sweep never evicts it
   djc heard drop <n>       release that pin again
@@ -46,6 +48,10 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
         eprintln!("{USAGE}");
         return Ok(false);
     };
+    // The report looks wants up in the library: a bounded few seconds, not instant.
+    if line == "heard report" {
+        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+    }
     match conn.command(&line) {
         Ok(pairs) => {
             let mut printed = 0usize;
@@ -88,6 +94,7 @@ fn verb_line(words: &[String]) -> Option<String> {
     match first {
         "all" | "--all" | "-a" if rest.is_empty() => Some("heard all".to_string()),
         "marks" | "--marks" | "-m" if rest.is_empty() => Some("heard marks".to_string()),
+        "report" | "--report" | "-r" if rest.is_empty() => Some("heard report".to_string()),
         "limit" | "--limit" | "-n" if rest.len() == 1 => match rest[0].parse::<usize>() {
             // A zero limit renders a coverage line and no rows, which reads as an empty
             // evening - the one thing this surface must never do. It is a usage error.

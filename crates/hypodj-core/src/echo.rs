@@ -87,6 +87,8 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::SimilarToCurrent => format!("action playnow similar_current {count}"),
             Selector::Starred => format!("action playnow starred {count}"),
             Selector::Instrumental => format!("action playnow instrumental {count}"),
+            Selector::Station(None) => format!("action playnow station current {count}"),
+            Selector::Station(Some(l)) => format!("action playnow station {} {count}", dsl_value(l)?),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -215,6 +217,7 @@ pub fn describe_action(raw: &RawPlan) -> String {
                 Selector::Exact(_) => "tracks".to_string(),
                 Selector::Starred => "favorite (starred) tracks".to_string(),
                 Selector::Instrumental => "measured-instrumental tracks".to_string(),
+                Selector::Station(_) => "stations".to_string(),
             };
             format!("add {count} {sel} to the END of the queue (append-only)")
         }
@@ -247,6 +250,12 @@ pub fn describe_action(raw: &RawPlan) -> String {
                 Selector::Exact(_) => "tracks".to_string(),
                 Selector::Starred => "favorite (starred) tracks".to_string(),
                 Selector::Instrumental => "measured-instrumental tracks".to_string(),
+                Selector::Station(lane) => {
+                    return format!(
+                        "tune in NOW to a station you have not saved, for {} (probed first; nothing is saved)",
+                        lane.as_deref().map(|l| format!("the {l} lane")).unwrap_or_else(|| "the lane you are in".to_string())
+                    );
+                }
             };
             format!("play {count} {sel} NOW (enqueue + start playback)")
         }
@@ -534,6 +543,10 @@ mod tests {
         assert_round_trip(&imm(Action::PlayNow { selector: Selector::Starred, count: 20 }));
         assert_round_trip(&imm(Action::Enqueue { selector: Selector::Instrumental, count: 5 }));
         assert_round_trip(&imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 }));
+        // A suggested station tunes in by lane, or by the lane he is in.
+        assert_round_trip(&imm(Action::PlayNow { selector: Selector::Station(None), count: 1 }));
+        assert_round_trip(&imm(Action::PlayNow { selector: Selector::Station(Some("ambient".into())), count: 1 }));
+        assert_round_trip(&imm(Action::PlayNow { selector: Selector::Station(Some("deep house".into())), count: 1 }));
         // PlayNow (library enqueue-then-start) round-trips its query/genre/radio DSL.
         assert_round_trip(&imm(Action::PlayNow {
             selector: Selector::Query("at the door".into()),

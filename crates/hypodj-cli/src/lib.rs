@@ -432,7 +432,18 @@ fn explicit_nl(words: &[String]) -> Option<Action> {
 /// returns `mark_result`, the one sentence a human reads. Dropping it would make
 /// `djc mark` succeed in silence, which is the precise bug the gesture exists to end.
 fn run_verb(conn: &mut MpdConn, line: &str) -> Result<(), MpdError> {
+    // `radio beyond` asks two station indexes and probes the picks before it answers:
+    // seconds, not the instant the default read timeout is sized for.
+    if line.starts_with("radio beyond") {
+        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+    }
     let pairs = conn.command(line)?;
+    if line.starts_with("radio beyond") {
+        // The outcome the journal recorded ("played \"NTS Low Key\""), verbatim.
+        if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "radio") {
+            println!("{v}");
+        }
+    }
     if let Some(spoken) = render::render_command(line, &pairs, stdout_ansi()) {
         println!("{spoken}");
     }

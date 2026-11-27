@@ -40,6 +40,7 @@ pub mod reach;
 pub mod recognize;
 pub mod resume;
 pub mod scrobble;
+pub mod beyond;
 pub mod station_identity;
 pub mod station_meta;
 pub mod store;
