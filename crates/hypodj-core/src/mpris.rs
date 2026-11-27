@@ -34,6 +34,7 @@ use mpris_server::{
 
 use crate::handler::{CurrentItem, HypodjHandler};
 use crate::model::{QueueEntry, Song};
+use crate::mpd::{MpdCommand, MpdHandler};
 use crate::player::{PlayState, StreamMeta};
 use crate::subsonic::SubsonicClient;
 
@@ -391,13 +392,13 @@ impl PlayerInterface for HypodjMpris {
         Ok(())
     }
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
-        // Relative seek: MPRIS Seek is an offset. We have no cheap current
-        // position here, so treat the offset as a best-effort absolute nudge from
-        // zero when negative-clamped. Absolute positioning is SetPosition.
+        // Relative seek: MPRIS Seek is an OFFSET from the playhead (SetPosition is
+        // the absolute one). Both go through `seekcur`, so they share its settle,
+        // its playhead base and its continuation re-arm with every MPD client.
         let secs = (offset.as_micros() as f64) / 1_000_000.0;
         let h = self.handler.clone();
         self.dispatch(async move {
-            let _ = h.seek_head(secs.max(0.0)).await;
+            let _ = h.handle(MpdCommand::SeekCur { secs, relative: true }).await;
         });
         Ok(())
     }
@@ -405,7 +406,7 @@ impl PlayerInterface for HypodjMpris {
         let secs = (position.as_micros() as f64) / 1_000_000.0;
         let h = self.handler.clone();
         self.dispatch(async move {
-            let _ = h.seek_head(secs.max(0.0)).await;
+            let _ = h.handle(MpdCommand::SeekCur { secs: secs.max(0.0), relative: false }).await;
         });
         Ok(())
     }
