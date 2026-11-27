@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use adw::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 
 use hypodj_client::config::{self, Env};
 use hypodj_client::model::{NowPlaying, QueueItem};
@@ -46,6 +46,7 @@ struct App {
     albums_nav: adw::NavigationView,
     albums_list: gtk::ListBox,
     albums_note: gtk::Label,
+    albums_status: adw::StatusPage,
     // Search.
     search_list: gtk::ListBox,
     search_status: adw::StatusPage,
@@ -57,6 +58,14 @@ struct App {
     /// rather than left answering for a token that is already gone.
     plan_dialog: RefCell<Option<adw::AlertDialog>>,
     cover_avg: Cell<Option<[u8; 3]>>,
+    /// The music server is down: only rows the mirror holds stay active.
+    down: Cell<bool>,
+    /// Every browse row with its on-disk answer, so a server state change re-gates
+    /// them in place (Up Next is rebuilt on every snapshot and gates itself).
+    gated: RefCell<Vec<(glib::WeakRef<adw::ActionRow>, Option<bool>)>>,
+    /// Where type-to-search came from: the page and the focused widget, restored
+    /// on Escape.
+    search_return: RefCell<Option<(String, Option<glib::WeakRef<gtk::Widget>>)>>,
 }
 
 pub fn activate(app: &adw::Application) {
@@ -86,8 +95,45 @@ pub fn activate(app: &adw::Application) {
             }
         });
     }
+    wire_search(&ui);
     ui.window.present();
     screenshot_hook(&ui);
+}
+
+/// Type-to-search and its way back: the first captured key brings the Search page
+/// forward (remembering the page and the focused widget), Escape clears the entry
+/// and returns to both. Escape on a Search page reached by its tab just clears.
+fn wire_search(ui: &Rc<App>) {
+    {
+        let ui = ui.clone();
+        ui.search_entry.clone().connect_search_started(move |e| {
+            let page = ui.stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+            if page != "search" {
+                let focus = gtk::prelude::GtkWindowExt::focus(&ui.window).map(|w| w.downgrade());
+                *ui.search_return.borrow_mut() = Some((page, focus));
+                ui.stack.set_visible_child_name("search");
+            }
+            if !e.has_focus() {
+                e.grab_focus();
+                e.set_position(-1);
+            }
+        });
+    }
+    {
+        let ui = ui.clone();
+        ui.search_entry.clone().connect_stop_search(move |e| {
+            e.set_text("");
+            if let Some((page, focus)) = ui.search_return.take() {
+                ui.stack.set_visible_child_name(&page);
+                match focus.and_then(|w| w.upgrade()) {
+                    Some(w) => {
+                        w.grab_focus();
+                    }
+                    None => gtk::prelude::GtkWindowExt::set_focus(&ui.window, None::<&gtk::Widget>),
+                }
+            }
+        });
+    }
 }
 
 fn label(classes: &[&str]) -> gtk::Label {
@@ -136,11 +182,13 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
 
     let prev = gtk::Button::from_icon_name("media-skip-backward-symbolic");
     prev.set_tooltip_text(Some("Previous"));
+    prev.update_property(&[gtk::accessible::Property::Label("Previous")]);
     let play = gtk::Button::from_icon_name("media-playback-start-symbolic");
     play.set_tooltip_text(Some("Play"));
     play.add_css_class("pill");
     let next = gtk::Button::from_icon_name("media-skip-forward-symbolic");
     next.set_tooltip_text(Some("Next"));
+    next.update_property(&[gtk::accessible::Property::Label("Next")]);
     for b in [&prev, &next] {
         b.add_css_class("circular");
         b.add_css_class("flat");
@@ -201,7 +249,13 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
     albums_col.set_margin_bottom(24);
     albums_col.set_margin_start(12);
     albums_col.set_margin_end(12);
+    let albums_status = adw::StatusPage::builder()
+        .icon_name("media-optical-cd-audio-symbolic")
+        .title("Loading Albums")
+        .vexpand(true)
+        .build();
     albums_col.append(&albums_note);
+    albums_col.append(&albums_status);
     albums_col.append(&albums_list);
     let albums_root = adw::NavigationPage::builder()
         .title("Albums")
@@ -244,6 +298,27 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
         .policy(adw::ViewSwitcherPolicy::Wide)
         .build();
     let header = adw::HeaderBar::builder().title_widget(&switcher).build();
+    // Back lives at the start of the header bar (HIG), shown only on a pushed album
+    // page; the primary menu only on the top level.
+    let back = gtk::Button::from_icon_name("go-previous-symbolic");
+    back.set_tooltip_text(Some("Back to Albums"));
+    back.update_property(&[gtk::accessible::Property::Label("Back to Albums")]);
+    back.set_action_name(Some("win.back"));
+    back.set_visible(false);
+    header.pack_start(&back);
+    let primary = gio::Menu::new();
+    let standard = gio::Menu::new();
+    standard.append(Some("_Keyboard Shortcuts"), Some("win.show-help-overlay"));
+    standard.append(Some("_About HypoDJ"), Some("app.about"));
+    primary.append_section(None, &standard);
+    let menu_button = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&primary)
+        .tooltip_text("Main Menu")
+        .primary(true)
+        .build();
+    menu_button.update_property(&[gtk::accessible::Property::Label("Main Menu")]);
+    header.pack_end(&menu_button);
     // The status: icon + short words in a flat menu button; the popover carries
     // the full server and store sentences the label had to drop.
     let server = gtk::Label::new(None);
@@ -295,6 +370,7 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
     reply_close.add_css_class("circular");
     reply_close.set_valign(gtk::Align::Start);
     reply_close.set_tooltip_text(Some("Dismiss"));
+    reply_close.update_property(&[gtk::accessible::Property::Label("Dismiss")]);
     let reply_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     reply_box.add_css_class("card");
     reply_box.set_margin_start(12);
@@ -347,6 +423,24 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
     bp.add_setter(&server, "visible", Some(&false.to_value()));
     bp.add_setter(&inner_pad, "orientation", Some(&gtk::Orientation::Vertical.to_value()));
     window.add_breakpoint(bp);
+    window.set_help_overlay(Some(&shortcuts_window()));
+    install_actions(app, &window, &stack, &albums_nav, &search_entry);
+    {
+        // Back and the primary menu follow the page: back on a pushed album page,
+        // the menu only on the top level.
+        let sync = {
+            let (stack, nav, back, menu) = (stack.clone(), albums_nav.clone(), back.clone(), menu_button.clone());
+            move || {
+                let deep = stack.visible_child_name().as_deref() == Some("albums")
+                    && nav.visible_page().and_then(|p| p.tag()).as_deref() != Some("albums");
+                back.set_visible(deep);
+                menu.set_visible(!deep);
+            }
+        };
+        let s2 = sync.clone();
+        stack.connect_visible_child_notify(move |_| s2());
+        albums_nav.connect_visible_page_notify(move |_| sync());
+    }
 
     let css = gtk::CssProvider::new();
     gtk::style_context_add_provider_for_display(
@@ -403,6 +497,10 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
         });
     }
 
+    // Type to search (HIG): typing anywhere not already taken by a text field
+    // lands in the search entry, which brings its page forward.
+    search_entry.set_key_capture_widget(Some(&window));
+
     App {
         tx,
         window,
@@ -427,13 +525,103 @@ fn build(app: &adw::Application, tx: Sender<Req>) -> App {
         albums_nav,
         albums_list,
         albums_note,
+        albums_status,
         search_list,
         search_status,
         search_entry,
         art_file: RefCell::new(None),
         plan_dialog: RefCell::new(None),
         cover_avg: Cell::new(None),
+        down: Cell::new(false),
+        gated: RefCell::new(Vec::new()),
+        search_return: RefCell::new(None),
     }
+}
+
+/// The window actions and the standard accelerators: Ctrl+F search, Ctrl+? the
+/// shortcuts window, Ctrl+W close, Ctrl+Q quit, Alt+Left back.
+fn install_actions(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    stack: &adw::ViewStack,
+    nav: &adw::NavigationView,
+    search_entry: &gtk::SearchEntry,
+) {
+    let back = gio::ActionEntry::builder("back")
+        .activate({
+            let nav = nav.clone();
+            move |_: &adw::ApplicationWindow, _, _| {
+                nav.pop();
+            }
+        })
+        .build();
+    let search = gio::ActionEntry::builder("search")
+        .activate({
+            let (stack, entry) = (stack.clone(), search_entry.clone());
+            move |_: &adw::ApplicationWindow, _, _| {
+                stack.set_visible_child_name("search");
+                entry.grab_focus();
+            }
+        })
+        .build();
+    window.add_action_entries([back, search]);
+    let about = gio::ActionEntry::builder("about")
+        .activate({
+            let window = window.clone();
+            move |_: &adw::Application, _, _| about_dialog().present(Some(&window))
+        })
+        .build();
+    let quit = gio::ActionEntry::builder("quit")
+        .activate(|a: &adw::Application, _, _| a.quit())
+        .build();
+    app.add_action_entries([about, quit]);
+    app.set_accels_for_action("win.search", &["<Control>f"]);
+    app.set_accels_for_action("win.show-help-overlay", &["<Control>question"]);
+    app.set_accels_for_action("window.close", &["<Control>w"]);
+    app.set_accels_for_action("app.quit", &["<Control>q"]);
+    app.set_accels_for_action("win.back", &["<Alt>Left"]);
+}
+
+fn about_dialog() -> adw::AboutDialog {
+    adw::AboutDialog::builder()
+        .application_name("HypoDJ")
+        .application_icon("hypodj")
+        .developer_name("Guilherme Fontes")
+        .version(env!("CARGO_PKG_VERSION"))
+        .website("https://github.com/FamiliarTools/hypodj")
+        .issue_url("https://github.com/FamiliarTools/hypodj/issues")
+        .license_type(gtk::License::Custom)
+        .license("Functional Source License, Version 1.1, MIT Future License (FSL-1.1-MIT)")
+        .comments("A listening companion: your Subsonic library, played by a daemon you can talk to.")
+        .build()
+}
+
+/// The Ctrl+? window. GtkShortcutsWindow is the GTK 4.16 way (AdwShortcutsDialog
+/// needs libadwaita 1.8).
+fn shortcuts_window() -> gtk::ShortcutsWindow {
+    let ui = r#"<interface>
+  <object class="GtkShortcutsWindow" id="w">
+    <property name="modal">1</property>
+    <child>
+      <object class="GtkShortcutsSection">
+        <property name="section-name">main</property>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">General</property>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Search</property><property name="accelerator">&lt;Control&gt;f</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Close Search</property><property name="accelerator">Escape</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Back</property><property name="accelerator">&lt;Alt&gt;Left</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Keyboard Shortcuts</property><property name="accelerator">&lt;Control&gt;question</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Main Menu</property><property name="accelerator">F10</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Close Window</property><property name="accelerator">&lt;Control&gt;w</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="title">Quit</property><property name="accelerator">&lt;Control&gt;q</property></object></child>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
+</interface>"#;
+    gtk::Builder::from_string(ui).object("w").expect("static shortcuts ui")
 }
 
 fn clear(list: &gtk::ListBox) {
@@ -468,6 +656,28 @@ impl App {
     fn say(&self, text: &str) {
         self.reply_text.set_text(text);
         self.reply.set_reveal_child(true);
+    }
+
+    /// Register a browse row and gate it now: insensitive rows are skipped by
+    /// keyboard focus and cannot be activated.
+    fn gate(&self, r: &adw::ActionRow, on_disk: Option<bool>) {
+        r.set_sensitive(view::row_active(self.down.get(), on_disk));
+        self.gated.borrow_mut().push((r.downgrade(), on_disk));
+    }
+
+    fn regate(&self) {
+        self.prune_gated();
+        let down = self.down.get();
+        for (w, on_disk) in self.gated.borrow().iter() {
+            if let Some(r) = w.upgrade() {
+                r.set_sensitive(view::row_active(down, *on_disk));
+            }
+        }
+    }
+
+    /// Drop rows that left the tree (a cleared list, a popped album page).
+    fn prune_gated(&self) {
+        self.gated.borrow_mut().retain(|(w, _)| w.upgrade().is_some_and(|r| r.parent().is_some()));
     }
 
     fn restyle(&self) {
@@ -552,6 +762,10 @@ impl App {
         self.server_icon.set_icon_name(Some(st.icon));
         self.server_details.set_text(&st.details.join("\n"));
         let problem = st.problem;
+        let down = view::server_down(now.server.as_deref());
+        if down != self.down.replace(down) {
+            self.regate();
+        }
         self.banner.set_revealed(problem);
         if problem {
             self.banner.set_title(&glib::markup_escape_text(&format!(
@@ -632,6 +846,7 @@ impl App {
             let tx = self.tx.clone();
             let pos = it.pos;
             r.set_activatable(true);
+            r.set_sensitive(view::row_active(down, view::queue_on_disk(it)));
             r.connect_activated(move |_| {
                 let _ = tx.send(Req::Command(format!("play {pos}")));
             });
@@ -642,8 +857,17 @@ impl App {
 
     fn albums(self: &Rc<Self>, rows: Vec<AlbumRow>, note: Option<String>) {
         clear(&self.albums_list);
+        self.prune_gated();
+        // No rows is an empty state (HIG placeholder), with the reason as its text.
+        let empty = rows.is_empty();
+        self.albums_status.set_visible(empty);
+        self.albums_list.set_visible(!empty);
+        if empty {
+            self.albums_status.set_title(if note.is_some() { "No Albums Available" } else { "No Albums" });
+            self.albums_status.set_description(note.as_deref().map(|n| glib::markup_escape_text(n)).as_deref());
+        }
         self.albums_note.set_text(note.as_deref().unwrap_or(""));
-        self.albums_note.set_visible(note.is_some());
+        self.albums_note.set_visible(note.is_some() && !empty);
         for a in rows {
             let r = row(&a.title, join(a.artist.as_deref(), a.availability().as_deref()).as_deref());
             r.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
@@ -652,6 +876,7 @@ impl App {
             r.connect_activated(move |_| {
                 let _ = tx.send(Req::Album { uri: uri.clone(), title: title.clone() });
             });
+            self.gate(&r, a.on_disk());
             self.albums_list.append(&r);
         }
     }
@@ -675,6 +900,7 @@ impl App {
             r.connect_activated(move |_| {
                 let _ = tx.send(Req::PlayUri(u.clone()));
             });
+            self.gate(&r, s.on_disk());
             list.append(&r);
         }
         let col = gtk::Box::new(gtk::Orientation::Vertical, 18);
@@ -682,22 +908,11 @@ impl App {
         col.set_margin_bottom(24);
         col.set_margin_start(12);
         col.set_margin_end(12);
-        // The outer header bar belongs to the view switcher, so the pushed page
-        // carries its own back affordance and title.
-        let back = gtk::Button::from_icon_name("go-previous-symbolic");
-        back.add_css_class("flat");
-        back.set_tooltip_text(Some("Back to Albums"));
-        {
-            let nav = self.albums_nav.clone();
-            back.connect_clicked(move |_| {
-                nav.pop();
-            });
-        }
+        // Back is the header bar's (win.back); the page carries its title.
         let heading = label(&["title-2"]);
         heading.set_text(title);
         heading.set_hexpand(true);
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        top.append(&back);
         top.append(&heading);
         top.append(&play_all);
         col.append(&top);
@@ -740,6 +955,8 @@ impl App {
                             HitKind::Song | HitKind::Album | HitKind::Artist => Req::PlayUri(uri.clone()),
                         });
                     });
+                    // A hit carries no on-disk answer, so offline it is inactive.
+                    self.gate(&r, None);
                     self.search_list.append(&r);
                 }
             }
@@ -787,6 +1004,28 @@ fn screenshot_hook(ui: &Rc<App>) {
     }
     if let Ok(a) = std::env::var("DJG_ASK") {
         ui.send(Req::Ask(a));
+    }
+    // Keyboard proof: log every focus move as the focused row's title (or widget
+    // type), so a scripted Tab / Down run shows which rows focus landed on.
+    if std::env::var("DJG_FOCUS_LOG").is_ok() {
+        ui.window.connect_focus_widget_notify(|w| {
+            let Some(f) = gtk::prelude::GtkWindowExt::focus(w) else { return };
+            let row = f.ancestor(adw::ActionRow::static_type()).and_downcast::<adw::ActionRow>();
+            match row {
+                Some(r) => eprintln!("djg-focus: row {:?} sensitive={}", r.title(), r.is_sensitive()),
+                None => eprintln!("djg-focus: {}", f.type_().name()),
+            }
+        });
+    }
+    if let Ok(a) = std::env::var("DJG_ACTION") {
+        let ui2 = ui.clone();
+        glib::timeout_add_seconds_local_once(2, move || {
+            let (group, name) = a.split_once('.').unwrap_or(("win", a.as_str()));
+            let _ = match group {
+                "app" => ui2.window.application().map(|ap| ap.activate_action(name, None)).is_some(),
+                _ => gtk::prelude::WidgetExt::activate_action(&ui2.window, &a, None).is_ok(),
+            };
+        });
     }
     let settle = std::env::var("DJG_SETTLE").ok().and_then(|v| v.parse().ok()).unwrap_or(6u32);
     if page == "album" {

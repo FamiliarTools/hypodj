@@ -1,5 +1,5 @@
 #!/usr/bin/env nix-shell
-#! nix-shell -i bash -p bash xorg-server xwininfo dbus gawk coreutils gnugrep
+#! nix-shell -i bash -p bash xorg-server xwininfo xdotool dbus gawk coreutils gnugrep
 # Headless, SILENT proof screenshots for djq (docs/gui/screens/qt/).
 #
 # Everything this starts is private and torn down on exit:
@@ -66,7 +66,7 @@ for _ in $(seq 50); do
   sleep 0.2
 done
 
-Xvfb "$DISP" -screen 0 1280x900x24 -nolisten tcp >"$TMP/xvfb.log" 2>&1 &
+Xvfb "$DISP" -screen 0 1280x900x24 -nolisten tcp -noreset >"$TMP/xvfb.log" 2>&1 &
 PIDS+=($!)
 sleep 1
 
@@ -95,6 +95,8 @@ mpc 'setvol 60'
 
 shot() { # name page [extra env...]
   local name=$1 page=$2
+  # ONLY="a b": re-take just those shots.
+  if [ -n "${ONLY:-}" ] && [[ " $ONLY " != *" $name "* ]]; then return 0; fi
   shift 2
   env -i PATH="$PATH" HOME="$TMP/home" XDG_RUNTIME_DIR="$TMP/run" DISPLAY="$DISP" \
     QT_QPA_PLATFORM=xcb QT_QUICK_BACKEND=software QT_FORCE_STDERR_LOGGING=1 \
@@ -107,7 +109,21 @@ shot() { # name page [extra env...]
   local pid=$!
   sleep 3
   DISPLAY=$DISP xwininfo -root -tree | grep -i hypodj | head -1 || echo "no djq window on $DISP" >&2
+  # KEYS: xdotool steps typed into the djq window (on the PRIVATE display only).
+  if [ -n "${KEYS:-}" ]; then
+    local wid
+    wid=$(DISPLAY=$DISP xdotool search --name '^HypoDJ$' | head -1)
+    DISPLAY=$DISP xdotool windowfocus --sync "$wid"
+    local step
+    IFS=';' read -ra steps <<<"$KEYS"
+    for step in "${steps[@]}"; do
+      # shellcheck disable=SC2086
+      DISPLAY=$DISP xdotool $step
+      sleep 0.4
+    done
+  fi
   wait "$pid" || true
+  grep -a 'djq-focus' "$TMP/djq-$name.log" || true
   echo "$OUT/$name.png"
 }
 
@@ -116,6 +132,11 @@ shot playing-narrow playing DJQ_WIDTH=360
 shot albums albums DJQ_SETTLE=20
 shot album album DJQ_SETTLE=25
 shot search search DJQ_SEARCH=love DJQ_SETTLE=10
+KEYS="type lov" shot type-to-search playing DJQ_SETTLE=7
+# Online every row is a Tab stop (the offline run below must skip the greyed ones).
+KEYS="key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab" \
+  shot queue-keys playing DJQ_SETTLE=12 DJQ_FOCUS_LOG=1
+KEYS="type lov;key Escape" shot type-to-search-escape playing DJQ_SETTLE=7
 shot ask-question playing "DJQ_ASK=what is downloaded" DJQ_SETTLE=8
 shot ask-action playing "DJQ_ASK=play something calmer" DJQ_SETTLE=15
 # The chrome is whatever style the host sets: the same window under a dark host
@@ -128,8 +149,16 @@ shot playing-dark playing QT_QUICK_CONTROLS_STYLE=Material QT_QUICK_CONTROLS_MAT
 # queued so the long-title layout is on screen. Port 6695 (the first daemon also
 # holds 6692, its side channel at port + 1), never 6600.
 PORT2=6695
+# The offline world needs something held: wait (bounded) for the first mirror to
+# finish at least one song before copying it.
+for _ in $(seq 120); do
+  [ "$(mpd 'playlistinfo' | grep -c '^X-Offline: 1')" -ge 2 ] && break
+  sleep 1
+done
+sleep 2 # let the last finished song's sidecar land before the copy
 mkdir -p "$TMP/store2" "$TMP/state2"
 cp -a "$TMP/store/." "$TMP/store2/" 2>/dev/null || true
+cp -a "$TMP/state/." "$TMP/state2/" 2>/dev/null || true
 SLUG=an-extraordinarily-long-stream-path-that-a-queue-row-has-to-shorten-rather-than-overflow-the-window.mp3
 LONG="The Extraordinarily Long Name Of A Late Night Community Radio Stream That Never Ends - Live From The Harbour Wall Until Dawn"
 cat >"$TMP/config2.toml" <<EOC
@@ -161,6 +190,12 @@ for _ in $(seq 50); do
   sleep 0.2
 done
 PORT=$PORT2
+# First the restored queue (held and unheld songs mixed): Tab through the window;
+# the focus log names every row focus landed on, and no disabled row may appear.
+echo "offline queue X-Offline: $(mpd 'playlistinfo' | grep -c 'X-Offline: 1') held, $(mpd 'playlistinfo' | grep -c 'X-Offline: 0') not"
+KEYS="key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab;key Tab" \
+  shot unreachable-queue playing DJQ_SETTLE=14 DJQ_FOCUS_LOG=1
+shot unreachable-album album DJQ_SETTLE=16
 mpc 'clear'
 mpc "add \"http://127.0.0.1:9/$SLUG\""
 mpc 'play 0'

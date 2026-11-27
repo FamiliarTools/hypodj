@@ -29,11 +29,20 @@ daemon (audio null, MPRIS off, throwaway store capped at ~120 MB, port 6690) on 
 private Xvfb `:93`, with `env -i`, a private HOME / XDG_RUNTIME_DIR and its own
 D-Bus. Screens: `screens/`.
 
+## Keyboard and offline
+
+- Type to search: typing anywhere outside a text field opens Search with the key
+  already in the entry; Escape clears it and returns to the page and widget focus
+  came from. Ctrl+F, Ctrl+? (shortcuts window), Ctrl+W, Ctrl+Q, Alt+Left, F10.
+  djq does the same by hand (Qt Quick has no key-capture widget).
+- Offline rows: with the server down (`view::server_down`), only rows the mirror
+  holds stay active (`view::row_active`); the rest are greyed, insensitive and
+  skipped by keyboard focus. Album tracks carry `X-Offline` from the daemon.
+- HIG review and its fixes: `hig-review.md`.
+
 ## Not yet
 
 - Flatpak: `flatpak/tech.familiartools.HypoDJ.yml` is an untested draft.
 - The Qt shell is `djq` (`qt.md`); both shells share `crates/hypodj-app`.
-- Album track rows show availability only once the daemon emits `X-Offline` on
-  `lsinfo album/<id>`; the queue already does.
 - MPRIS / media keys come from the daemon; app-side breathing motion, AT-SPI audit,
   appstream metadata are follow-ups. The icon id is `hypodj` (agents/w16-logo).
