@@ -39,6 +39,8 @@ pub struct TrackFeatures {
     pub voice: Option<f32>,
     /// Measured tempo, when the offline extractor found one.
     pub bpm: Option<f32>,
+    /// Measured key on the Camelot wheel, for [`crate::graph::edge`].
+    pub camelot: Option<crate::graph::Camelot>,
     /// `true` when `energy` came from audio analysis rather than the genre lexicon.
     pub measured: bool,
 }
@@ -46,7 +48,7 @@ pub struct TrackFeatures {
 impl TrackFeatures {
     /// Metadata-shaped features: no measurement behind them.
     pub fn heuristic(energy: f32, valence: f32) -> Self {
-        TrackFeatures { energy, valence, embedding: None, voice: None, bpm: None, measured: false }
+        TrackFeatures { energy, valence, embedding: None, voice: None, bpm: None, camelot: None, measured: false }
     }
 }
 

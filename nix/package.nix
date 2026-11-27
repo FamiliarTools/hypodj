@@ -74,6 +74,9 @@ rustPlatform.buildRustPackage {
     wrapProgram $out/bin/hypodj-mir \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
       --prefix PATH : ${lib.makeBinPath [ essentia-extractor ]}
+    # The TF heads helper hypodj-mir runs under --tf-python (the module's
+    # services.hypodj.features.models points --tf-script here).
+    install -Dm444 tools/mir/mir_tf.py $out/share/hypodj/mir_tf.py
   '';
 
   meta = {

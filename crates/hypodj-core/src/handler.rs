@@ -5245,26 +5245,33 @@ impl HypodjHandler {
         //   WHICH picks lead the append (harmless + byte-identical when no pull is set).
         // - `Exact`/`Genre` name a definite user/plan-specified ordered list; a live
         //   pull must NEVER silently reorder that observable list, so they are left as-is.
-        let songs = match selector {
+        //
+        // THE GRAPH WALK (design sensing-and-graph Part 2): every selector the pull
+        // may reorder is then emitted as a greedy walk from the queue tail by
+        // `graph::edge`, so the batch is smooth as a SEQUENCE, not only apt per
+        // track. It only permutes what was already going to be appended, and with
+        // no measured features it is the identity. Explicit lists are never walked.
+        let (songs, walk) = match selector {
             Selector::Query(q) => match lexicon_pull(q, LEXICON_PULL_STRENGTH, Instant::now()) {
                 Some(pull) => {
                     self.pulls.lock().unwrap().add(pull, Instant::now());
-                    self.pull_rerank(songs)
+                    (self.pull_rerank(songs), true)
                 }
-                None => songs,
+                None => (songs, false),
             },
             Selector::Calmer(_) => {
                 let pull = Pull::new("calmer", vec![-1.0, 0.0], LEXICON_PULL_STRENGTH, Instant::now());
                 self.pulls.lock().unwrap().add(pull, Instant::now());
-                self.pull_rerank(songs)
+                (self.pull_rerank(songs), true)
             }
             Selector::Similar(_) | Selector::SimilarToCurrent | Selector::Radio => {
-                self.pull_rerank(songs)
+                (self.pull_rerank(songs), true)
             }
             Selector::Exact(_) | Selector::Genre(_) | Selector::Starred | Selector::Instrumental => {
-                songs
+                (songs, false)
             }
         };
+        let songs = if walk { self.graph_walk(songs) } else { songs };
         let n = songs.len();
         for s in songs {
             self.enqueue_song(s).await;
@@ -5498,6 +5505,27 @@ impl HypodjHandler {
     /// A snapshot of the held curation exclusions (one short lock).
     fn held_excludes(&self) -> Vec<crate::plan::CurateFilter> {
         self.state.lock().unwrap().excludes.clone()
+    }
+
+    /// Order a resolved batch as a [`crate::graph::walk`] from the queue's last
+    /// library song (what the batch is appended after). Identity when fewer than
+    /// two candidates carry measured features. Pure work on clones; the state lock
+    /// is held only to clone the tail.
+    fn graph_walk(&self, songs: Vec<Song>) -> Vec<Song> {
+        if songs.len() <= 1 {
+            return songs;
+        }
+        let tail = {
+            let st = self.state.lock().unwrap();
+            st.queue.iter().rev().find_map(|item| match &item.entry {
+                QueueEntry::Song(s) => Some(s.clone()),
+                QueueEntry::Stream { .. } => None,
+            })
+        };
+        let store = self.feature_store();
+        let prev = tail.and_then(|s| store.features(&s));
+        let feats: Vec<Option<TrackFeatures>> = songs.iter().map(|s| store.features(s)).collect();
+        crate::graph::walk(prev.as_ref(), songs, &feats)
     }
 
     /// Apply the active latent-field pulls to a resolved candidate list, biasing the

@@ -411,6 +411,51 @@ for his listening witness of the engine as built (task 01m85g3y).
 - Whole-workspace build and test, the Nix package build, and feature-less tests
   still skipping cleanly in the sandbox.
 
+## As built (first slice)
+
+- `crates/hypodj-core/src/graph.rs`: `edge(a, b)` (tempo octave-folded,
+  saturating at a 12% ratio; Camelot steps over 7; measured-energy difference;
+  embedding cosine as `(1 - cos) / 2`), equal weights, every term `0..=1`. A term
+  missing on either side reads 0.5, the middle of its range, not 0: a 0 would make
+  an unanalysed track the perfect neighbour and pull it to the front of a
+  half-analysed batch. The genre-lexicon energy never enters it.
+- `graph::walk` orders the batch by `rank - 2 * edge(prev, cand)` from the queue's
+  last library song, at the one seam in `plan_enqueue` after `pull_rerank`, for
+  exactly the selectors the pull may reorder (mood `Query`, `Calmer`, `Similar`,
+  `SimilarToCurrent`, `Radio`). `rank` is the incoming position, which already
+  carries similarity, behaviour and the pull. Fewer than two measured candidates:
+  the walk returns its input untouched, so with no features every existing test
+  is unchanged.
+- The kill criterion is `graph::kill_criterion`, run by the `graph-eval` bin.
+
+### Running the kill criterion
+
+On synthetic data (exercises the harness; NOT evidence about the library):
+
+```
+nix develop --command cargo run -j4 -p hypodj-daemon --bin graph-eval -- --synthetic
+```
+
+On the real library, once `hypodj-mir` has filled the features dir (read-only:
+the features dir and `getSong` / `getSimilarSongs2`):
+
+```
+nix develop --command cargo run -j4 -p hypodj-daemon --bin graph-eval -- \
+  --config /run/user/1000/hypodj/config.toml \
+  --features ~/.local/state/hypodj/features --seeds 50 --pool 20
+```
+
+Synthetic result (seed `0x5eed`, 50 seeds, pool 20 in the bin, 12 in the
+pinned test): the edge leg wins every seed; the calmer leg wins 78% in the test
+(76% in the bin),
+just under the bar. The synthetic library draws energy independently of tempo,
+key and timbre, so the three other terms are pure noise against the descent: the
+worst case, not a forecast. The real library decides.
+
+Exit 0 is PASS, exit 2 is the kill criterion firing. Only measured seeds and
+candidates count; a seed with fewer than three measured candidates is skipped,
+so the printed `seeds evaluated` is the real denominator.
+
 ## What needs Guilherme
 
 - The two open decisions from `docs/design/audio-features/design.md` that gate

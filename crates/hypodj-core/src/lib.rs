@@ -22,6 +22,7 @@ pub mod executor;
 pub mod fade;
 pub mod find_rank;
 pub mod features;
+pub mod graph;
 pub mod handler;
 pub mod heard;
 pub mod intelligence;

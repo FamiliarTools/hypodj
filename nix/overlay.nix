@@ -18,4 +18,9 @@ final: prev: {
   hypodj-gtk = final.callPackage ./gtk.nix {
     cargoVersion = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package.version;
   };
+  # The hypodj-mir learned-heads inputs for services.hypodj.features.models:
+  # the MTG models (CC BY-NC-SA 4.0) and the essentia-tensorflow Python env. Lazy:
+  # nothing is fetched unless the features timer is enabled with models on.
+  hypodj-mir-models = final.callPackage ./mir-models.nix { };
+  hypodj-mir-tf-python = final.callPackage ./essentia-tensorflow.nix { };
 }
