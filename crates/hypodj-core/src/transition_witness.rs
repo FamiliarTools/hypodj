@@ -609,10 +609,62 @@ pub(crate) const CAUSES: &[&str] = &[
     "radio-start-while-playing",
     // Also emits the `undo-head-change` row: the undo of this same edit.
     "plan-remove-current",
+    // Seeks within the playing track: the level must come straight back.
+    "seek-forward",
+    "seek-back",
+    "seek-relative",
+    "seek-during-fade",
+    "seek-during-xf",
     "pause",
     "stop",
     "clear",
 ];
+
+/// The seek causes, boxed out of [`run_cause`] so its future stays within the test
+/// thread's stack.
+async fn run_seek_cause(port: u16, cause: &str, lx: Option<Arc<Listen>>) -> Vec<Row> {
+    let row = |s: &[Sample]| {
+        dump(cause, s);
+        classify(cause, s)
+    };
+    match cause {
+        "seek-forward" => {
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
+            r.play(0).await;
+            vec![row(&r.record(async { Box::pin(r.h.handle(MpdCommand::SeekCur { secs: 4.0, relative: false })).await; }).await)]
+        }
+        "seek-back" => {
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
+            r.play(0).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            vec![row(&r.record(async { Box::pin(r.h.handle(MpdCommand::Seek { song_pos: 0, secs: 0.2 })).await; }).await)]
+        }
+        "seek-relative" => {
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
+            r.play(0).await;
+            vec![row(&r.record(async { Box::pin(r.h.handle(MpdCommand::SeekCur { secs: 2.0, relative: true })).await; }).await)]
+        }
+        // A seek while a volume glide (down and back up) is still moving the level.
+        "seek-during-fade" => {
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
+            r.play(0).await;
+            vec![row(&r.record(async {
+                Box::pin(r.h.handle(MpdCommand::SetVol(60))).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Box::pin(r.h.handle(MpdCommand::SetVol(100))).await;
+                Box::pin(r.h.handle(MpdCommand::SeekCur { secs: 3.0, relative: false })).await;
+            }).await)]
+        }
+        "seek-during-xf" => {
+            let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
+            r.play(0).await;
+            r.h.handle(MpdCommand::Next).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            vec![row(&r.record(async { Box::pin(r.h.handle(MpdCommand::SeekCur { secs: 2.0, relative: false })).await; }).await)]
+        }
+        other => panic!("unknown witness cause {other}"),
+    }
+}
 
 async fn run_cause(port: u16, cause: &str, lx: Option<Arc<Listen>>) -> Vec<Row> {
     let row = |s: &[Sample]| {
@@ -725,6 +777,7 @@ async fn run_cause(port: u16, cause: &str, lx: Option<Arc<Listen>>) -> Vec<Row> 
             );
             vec![first, undo]
         }
+        c if c.starts_with("seek-") => Box::pin(run_seek_cause(port, c, lx)).await,
         // Deliberate stops: the listen harness judges these as fade-outs.
         "pause" => {
             let r = Rig::with(port, lx.clone(), &["A", "B", "C"]).await;
@@ -834,6 +887,7 @@ fn expect_of(cause: &str) -> crate::handler::listen::Expect {
     match cause {
         "move-playing-row" => Expect::Steady,
         "pause" | "stop" | "clear" => Expect::FadeOut,
+        c if c.starts_with("seek-") => Expect::Seek,
         _ => Expect::Continue,
     }
 }

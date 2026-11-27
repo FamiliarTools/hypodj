@@ -2154,12 +2154,14 @@ fn handle_cmd(
             let _ = reply.send(res);
         }
         PlayerCommand::Seek { secs, reply } => {
+            // The level goes into the option string BEFORE the seek, so the graph
+            // the seek's reset rebuilds is built from it (see `GainLine::seek`).
+            if gain.enabled {
+                gain.seek(mpv, secs, *playing);
+            }
             let res = mpv
                 .command("seek", &[&secs.to_string(), "absolute"])
                 .map_err(|e| PlayerError::Backend(e.to_string()));
-            if gain.enabled {
-                gain.rebase(mpv, *playing);
-            }
             if res.is_ok() {
                 let _ = evt_tx.blocking_send(PlayerEvent::TimePos {
                     pos: secs,
@@ -2349,6 +2351,34 @@ const GAIN_EOF_SYNC_SECS: f64 = 1.5;
 /// often, which bounds the staleness a fade can carry across a boundary.
 const GAIN_OPT_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
+/// mpv's lavfi wrapper FREES the graph on a seek's reset and rebuilds it from the
+/// option string when the new position's audio arrives (filters/f_lavfi.c
+/// `lavfi_reset`), so an `af-command` sent in between lands on a graph that is
+/// about to die. Once the playhead has run this far past the seek target (the rise,
+/// plus the quantum `audio-pts` may run ahead of the room), the rebuilt graph is
+/// playing and has finished its rise, and the live line is sent to it again. Sooner
+/// and the command could replace the rise halfway (`audio-pts` reads the target the
+/// moment the seek is issued), a step.
+const GAIN_SEEK_SETTLED_SECS: f64 = 0.15;
+
+/// The duck before a seek, seconds.
+const GAIN_SEEK_DUCK_SECS: f64 = 0.05;
+
+/// A seek waits until the playback clock is this far past its duck's end: mpv's
+/// `audio-pts` runs up to one sound-server quantum AHEAD of what is heard (85 ms on
+/// the listen rig's 4096-frame graph; at a 0.03 margin the seek still cut a
+/// relative seek mid-duck, a click, in both strict runs)...
+const GAIN_SEEK_DUCK_MARGIN_SECS: f64 = 0.1;
+/// ...but never longer than this (a stalled clock must not hold the seek).
+const GAIN_SEEK_DUCK_MAX: Duration = Duration::from_millis(500);
+
+/// A seek whose audio never arrives (a stalled stream) stops waiting after this.
+const GAIN_SEEK_GIVE_UP: Duration = Duration::from_secs(5);
+
+/// The rebuilt filter after a seek rises from silence over this long instead of
+/// starting at full level: the first post-seek sample otherwise lands as a step.
+const GAIN_SEEK_RAMP_SECS: f64 = 0.03;
+
 /// A filter instance that started this close to its stream's t = 0 is a rebuild
 /// for a NEW file (a gapless advance), not one of ours mid-file.
 const GAIN_NEW_FILE_SECS: f64 = 0.5;
@@ -2385,6 +2415,9 @@ struct GainLine {
     /// the time between the commands, not by the playhead's jitter, so an
     /// equal-dB-per-tick fade stays collinear and collapses to two knots.
     last_at: Option<std::time::Instant>,
+    /// A seek whose rebuilt graph has not yet been seen to play: (target, issued).
+    /// Until it has, a sent command may have been lost (see [`GAIN_SEEK_SETTLED_SECS`]).
+    seek_pending: Option<(f64, std::time::Instant)>,
 }
 
 fn gain_lin(db: f64) -> f64 {
@@ -2413,6 +2446,7 @@ impl GainLine {
             opt_level_db: 0.0,
             opt_written: None,
             last_at: None,
+            seek_pending: None,
         }
     }
 
@@ -2485,7 +2519,10 @@ impl GainLine {
 
     /// Rewrite the option string (the filter is rebuilt from it at once).
     fn write_option(&mut self, mpv: &libmpv2::Mpv) {
-        let expr = self.option_expr();
+        self.write_option_expr(mpv, self.option_expr());
+    }
+
+    fn write_option_expr(&mut self, mpv: &libmpv2::Mpv, expr: String) {
 
         let viz = "@viz:astats=metadata=1:reset=1";
         let g = gain_filter_string(&expr);
@@ -2586,6 +2623,20 @@ impl GainLine {
         }
         let pos: Option<f64> = mpv.get_property("audio-pts").ok().filter(|p: &f64| p.is_finite());
         let Some(pos) = pos else { return };
+        if let Some((target, at)) = self.seek_pending {
+            let idle: bool = mpv.get_property("core-idle").unwrap_or(true);
+            if (!idle && pos > target + GAIN_SEEK_SETTLED_SECS) || at.elapsed() > GAIN_SEEK_GIVE_UP {
+                // The rebuilt graph is playing: whatever was commanded while it did not
+                // exist reaches it now.
+                self.seek_pending = None;
+                // Nothing commanded since the seek: the rebuilt graph already holds
+                // the level, and touching it is a needless command.
+                if self.knots.len() >= 2 || !same_db(self.opt_level_db, self.level_db) {
+                    self.live_expr.clear();
+                    self.send(mpv, flowing);
+                }
+            }
+        }
         if self.knots.last().is_some_and(|k| pos > k.0 + 0.1) {
             self.knots.clear();
             self.last_at = None;
@@ -2600,7 +2651,7 @@ impl GainLine {
         }
     }
 
-    /// The stream timeline restarted (a new file, a seek): the knots belong to the
+    /// The stream timeline restarted (the next file of a gapless advance): the knots belong to the
     /// old one. Hold the latest level.
     fn rebase(&mut self, mpv: &libmpv2::Mpv, flowing: bool) {
         self.knots.clear();
@@ -2611,9 +2662,66 @@ impl GainLine {
 
     /// Before a load: the new file's chain is built from the option string, so it
     /// must hold exactly the latest level.
+    /// A seek: mpv frees the filter graph and rebuilds it from the option string
+    /// when the new position's audio arrives, so the level must be IN the option
+    /// string - an `af-command` here reaches only the graph being thrown away (the
+    /// silent-after-seek bug: a deck that had been ramped up by commands came back at
+    /// whatever level its option string last held, e.g. the silence a crossfade's
+    /// incoming deck was loaded at). A flowing deck ducks to silence on the live
+    /// graph first and seeks once the duck is what plays; the rebuilt instance then
+    /// holds the latest level, reached by a short rise from its own first sample.
+    /// Blocks this deck's actor for the duck (about a quarter second).
+    fn seek(&mut self, mpv: &libmpv2::Mpv, secs: f64, flowing: bool) {
+        self.knots.clear();
+        self.last_at = None;
+        if !flowing {
+            // Paused / idle: the resume path ramps from silence anyway.
+            self.seek_pending = None;
+            self.write_option(mpv);
+            return;
+        }
+        let lvl = Self::const_expr(self.level_db);
+        // Duck first: mpv throws its buffered audio away at the seek, so a seek at
+        // level is a splice from one waveform into another (a click every time, on
+        // the listen rig). The duck runs on the live graph, anchored past what is
+        // already decoded, and the seek waits until it is what plays.
+        if let Some(pos) = mpv.get_property::<f64>("audio-pts").ok().filter(|p| p.is_finite()) {
+            let a = pos + GAIN_LEAD_SECS;
+            let b = a + GAIN_SEEK_DUCK_SECS;
+            // Linear in AMPLITUDE: a linear-in-dB duck spends its length inaudible and
+            // is heard as a cut (measured: clicks at the duck's edge).
+            let duck = format!("if(lt(t,{a:.4}),{lvl},if(lt(t,{b:.4}),{lvl}*({b:.4}-t)/{GAIN_SEEK_DUCK_SECS},0))");
+            let _ = mpv.command("af-command", &["gain", "volume", &quote(&duck)]);
+            // Wait on the PLAYBACK clock, not a fixed sleep: what has been heard is
+            // the honest signal (a fixed 240 ms still cut some seeks mid-duck).
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < GAIN_SEEK_DUCK_MAX {
+                let p: f64 = mpv.get_property("audio-pts").unwrap_or(f64::NAN);
+                if !p.is_finite() || p >= b + GAIN_SEEK_DUCK_MARGIN_SECS {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        self.seek_pending = Some((secs, std::time::Instant::now()));
+        // `n*64/sample_rate` is the time since this instance started (see option_expr).
+        // A rebuild at the top of a stream (the next file of a gapless advance) takes
+        // the plain level, exactly as `option_expr` does: only a seek's rise ramps.
+        // The rise is anchored at the TARGET in stream time, not at the instance's
+        // first sample: mpv decodes from the packet before the target and trims the
+        // pre-roll after the filters, so a rise counted from the first sample was
+        // spent on trimmed audio and the seek landed at full level (a click on every
+        // seek to a mid-packet position, measured on `seekcur +2`).
+        let expr = format!(
+            "if(lt(t-n*64/sample_rate,{GAIN_NEW_FILE_SECS}),{lvl},{lvl}*min(1,max(0,(t-{secs:.4})/{GAIN_SEEK_RAMP_SECS})))"
+        );
+        self.write_option_expr(mpv, expr);
+    }
+
     fn before_load(&mut self, mpv: &libmpv2::Mpv) {
         self.knots.clear();
         self.last_at = None;
+        self.seek_pending = None;
         if !same_db(self.opt_level_db, self.level_db) || self.opt_written.is_none() {
             self.write_option(mpv);
         }

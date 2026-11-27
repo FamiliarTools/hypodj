@@ -59,6 +59,15 @@ pub(crate) const ONSET_BOUND_MS: f64 = 250.0;
 /// A fade-out at most this long is a quick transport stop the onset bound applies to.
 pub(crate) const QUICK_FADE_MS: f64 = 1000.0;
 pub(crate) const TAIL_FLOOR_DB: f64 = -60.0;
+/// Longest hole a seek may leave: the duck's silent tail (the seek waits one
+/// quantum past the duck, 100 ms, because `audio-pts` runs ahead of the room) plus
+/// mpv's refill from the new position (measured 70-160 ms over the loopback stream)
+/// and slack. Well under a beat; a deck left at silence is seconds.
+pub(crate) const SEEK_GAP_BOUND_MS: f64 = 400.0;
+/// From this long after a seek the level must be the pre-seek level again: the
+/// duck, the hole and the rise are over well before it, and so is a short glide
+/// that was in flight at the seek.
+pub(crate) const SEEK_SETTLED_MS: f64 = 1000.0;
 /// The reference must be a real signal, or the run is not a measurement.
 const REF_MIN_DBFS: f64 = -70.0;
 
@@ -187,6 +196,10 @@ pub(crate) enum Expect {
     Steady,
     /// A deliberate stop: slewed, monotonic fade to silence, then nothing.
     FadeOut,
+    /// A jump within the playing source: the stream's refill may leave a short hole
+    /// (bounded by [`SEEK_GAP_BOUND_MS`]), after which the level must be the
+    /// pre-seek level again - never a deck left at silence.
+    Seek,
 }
 
 impl Expect {
@@ -195,6 +208,7 @@ impl Expect {
             Expect::Continue => "continue",
             Expect::Steady => "steady",
             Expect::FadeOut => "fade-out",
+            Expect::Seek => "seek",
         }
     }
 }
@@ -391,6 +405,26 @@ pub(crate) fn analyse(cause: &str, expect: Expect, w: &Wav, win: &Window) -> (Au
             } else if dev > JND_DB && row.verdict == "PASS" {
                 row.verdict = "WARN";
                 row.reasons.push(format!("level deviates {dev:.1} dB (> {JND_DB} dB JND)"));
+            }
+            if row.loud_step_lu.abs() > LOUDNESS_TOL_LU || !row.loud_step_lu.is_finite() {
+                row.fail(format!("loudness step {:.1} LU (> {LOUDNESS_TOL_LU} LU)", row.loud_step_lu));
+            }
+        }
+        Expect::Seek => {
+            let fine = after(&c.fine_t, &c.fine_rel, 0.0);
+            row.gap_ms = fine.iter().filter(|v| **v < GAP_FLOOR_DB).count() as f64 * GAP_WIN_MS;
+            if row.gap_ms > SEEK_GAP_BOUND_MS {
+                row.fail(format!("gap {:.0} ms below {GAP_FLOOR_DB} dB (> {SEEK_GAP_BOUND_MS} ms seek bound)", row.gap_ms));
+            }
+            // The level once the seek has settled: every coarse window from then on
+            // must sit at the pre-seek level (a deck left at silence fails here).
+            let settled = after(&c.t, &c.rms_rel, SEEK_SETTLED_MS);
+            let dev = settled.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            if !dev.is_finite() || dev > EQUAL_GAIN_DIP_DB {
+                row.fail(format!("level {dev:.1} dB off the pre-seek level after the seek (> {EQUAL_GAIN_DIP_DB} dB)"));
+            } else if dev > JND_DB && row.verdict == "PASS" {
+                row.verdict = "WARN";
+                row.reasons.push(format!("level {dev:.1} dB off the pre-seek level (> {JND_DB} dB JND)"));
             }
             if row.loud_step_lu.abs() > LOUDNESS_TOL_LU || !row.loud_step_lu.is_finite() {
                 row.fail(format!("loudness step {:.1} LU (> {LOUDNESS_TOL_LU} LU)", row.loud_step_lu));
