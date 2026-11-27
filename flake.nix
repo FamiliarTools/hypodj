@@ -69,27 +69,12 @@
           url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf";
           hash = "sha256-ahouttFWIr88loVyBjUbqX4a8Www16dO44lw5DTpQH4=";
         };
-        # The MTG Essentia models hypodj-mir's learned heads use (voice/instrumental,
-        # relaxed, danceability on discogs-effnet; DEAM arousal/valence on MusiCNN).
-        # LICENCE: CC BY-NC-SA 4.0 (essentia.upf.edu/models) - personal,
-        # non-commercial use only. Fixed-output fetches, so nothing is downloaded
-        # unless this output is built; never part of the default build. See docs/mir.md.
-        packages.mir-models =
-          let
-            base = "https://essentia.upf.edu/models";
-            m = path: hash: {
-              name = "${baseNameOf path}";
-              path = pkgs.fetchurl { url = "${base}/${path}"; inherit hash; };
-            };
-          in
-          pkgs.linkFarm "hypodj-mir-models" [
-            (m "feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb" "sha256-PtmvUNU2fAuceVspSwDnWZ5JQyRPTL03aGnzv8h3IbE=")
-            (m "classification-heads/voice_instrumental/voice_instrumental-discogs-effnet-1.pb" "sha256-yAM1SOF8KSh0Jl22LoKgUSR3aNEDdaNadp579pXxas8=")
-            (m "classification-heads/mood_relaxed/mood_relaxed-discogs-effnet-1.pb" "sha256-LFqmZmtY/oBCmi3Gd6E16ZlZIoibWjma+H0cFfDrtx0=")
-            (m "classification-heads/danceability/danceability-discogs-effnet-1.pb" "sha256-4SUfAs3IRkReK8H7P+mWPjJyjFwADgCRiK5HyJY8tMQ=")
-            (m "feature-extractors/musicnn/msd-musicnn-1.pb" "sha256-zeoHIrzuf3MShoQ/IjPjqmmIe7XD4tzgEe/1XzjQTz4=")
-            (m "classification-heads/deam/deam-msd-musicnn-2.pb" "sha256-vrXusJCSZu63i41rsTI7EIKc8v5V48AaE/oYRvqYs3E=")
-          ];
+        # The MTG Essentia models (CC BY-NC-SA 4.0, personal use only); see
+        # nix/mir-models.nix and docs/mir.md. Never part of the default build.
+        packages.mir-models = pkgs.callPackage ./nix/mir-models.nix { };
+        # The essentia-tensorflow Python env for the learned heads (upstream wheel,
+        # ~290 MB, only fetched when built). See nix/essentia-tensorflow.nix.
+        packages.mir-tf-python = pkgs.callPackage ./nix/essentia-tensorflow.nix { };
         packages.default = self.packages.${system}.hypodj;
 
         apps.hypodj = {

@@ -249,6 +249,54 @@ let
       WantedBy = [ "default.target" ];
     };
   };
+
+  # ---- the offline feature batch (services.hypodj.features) ----
+  # hypodj-mir over the offline mirror into the daemon's features dir, as a
+  # low-priority oneshot on a timer. It only READS the store and only WRITES the
+  # features dir, which the daemon re-reads when its mtime moves.
+  fcfg = cfg.features;
+  # Same resolution as the daemon: `<state_dir>/store` and `<state_dir>/features`
+  # unless the config overrides them.
+  stateDir = if isNixos then "/var/lib/hypodj" else "%S/hypodj";
+  storeDir =
+    if fcfg.storeDir != null then fcfg.storeDir
+    else cfg.settings.store.dir or "${stateDir}/store";
+  featuresDir =
+    if fcfg.outDir != null then fcfg.outDir
+    else cfg.settings.features.dir or "${stateDir}/features";
+  mirArgs =
+    [ "${cfg.package}/bin/hypodj-mir" "--store" storeDir "--out" featuresDir
+      "--jobs" (toString fcfg.jobs) ]
+    ++ lib.optionals fcfg.models [
+      "--models" "${fcfg.modelsPackage}"
+      "--tf-python" "${fcfg.tfPython}/bin/python3"
+      "--tf-script" "${cfg.package}/share/hypodj/mir_tf.py"
+    ];
+  # A unit's ExecStart is split by systemd, not a shell; %S must stay unquoted
+  # for the specifier to expand, and none of these paths carry spaces.
+  mirExec = lib.concatStringsSep " " mirArgs;
+  # Resource bounds shared by both flavors (field VALUES, assembled per schema).
+  mirResources = {
+    Type = "oneshot";
+    ExecStart = mirExec;
+    Nice = 19;
+    IOSchedulingClass = "idle";
+    CPUSchedulingPolicy = "idle";
+    CPUQuota = fcfg.cpuQuota;
+    MemoryHigh = fcfg.memoryHigh;
+    MemoryMax = fcfg.memoryMax;
+    # The TF helper sizes its thread pool from the affinity mask; hypodj-mir
+    # narrows it per worker, this caps the whole tree.
+    Environment = [ "HYPODJ_AUDIO=null" ];
+  };
+  mirTimer = {
+    OnCalendar = fcfg.schedule;
+    # A laptop is often asleep at the scheduled time: catch up on wake.
+    Persistent = true;
+    RandomizedDelaySec = "15min";
+  };
+  mirDescription = "hypodj-mir: measure audio features of the offline mirror";
+
 in
 {
   options.services.hypodj = {
@@ -350,6 +398,80 @@ in
       };
     };
 
+    features = {
+      enable = mkEnableOption ''
+        the offline audio-feature batch: `hypodj-mir` over the offline mirror into
+        the daemon's features dir, on a timer, at idle priority, only on AC power.
+        It never runs the daemon or touches audio; it only reads the mirror
+        (docs/mir.md)
+      '';
+      schedule = mkOption {
+        type = types.str;
+        default = "*-*-* 03:30:00";
+        example = "hourly";
+        description = "systemd OnCalendar for the batch timer (Persistent, so a missed run catches up on wake).";
+      };
+      models = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Also run the learned heads (voice/instrumental, relaxed, danceability,
+          DEAM arousal/valence, the discogs-effnet embedding). Pulls
+          `modelsPackage` (MTG models, CC BY-NC-SA 4.0: personal, non-commercial
+          use only) and `tfPython` (the upstream essentia-tensorflow wheel,
+          about 290 MB). Off = the classic extractor only (bpm, key, beats,
+          loudness), no model, no TensorFlow.
+        '';
+      };
+      modelsPackage = mkOption {
+        type = types.package;
+        # callPackage'd here rather than read from the overlay, so the default
+        # resolves on Home-Manager too (where the overlay is not wired).
+        default = pkgs.callPackage ./mir-models.nix { };
+        defaultText = literalExpression "hypodj.packages.<system>.mir-models";
+        description = "The pinned MTG model files (the flake's `.#mir-models`).";
+      };
+      tfPython = mkOption {
+        type = types.package;
+        default = pkgs.callPackage ./essentia-tensorflow.nix { };
+        defaultText = literalExpression "hypodj.packages.<system>.mir-tf-python";
+        description = "A Python env with `essentia-tensorflow` (the flake's `.#mir-tf-python`).";
+      };
+      jobs = mkOption {
+        type = types.ints.between 1 4;
+        default = 2;
+        description = ''
+          Worker ceiling. hypodj-mir admits each worker by measured headroom
+          (free cores, MemAvailable) before every track, so this is only the cap.
+        '';
+      };
+      cpuQuota = mkOption {
+        type = types.str;
+        default = "200%";
+        description = "systemd CPUQuota for the whole batch tree (200% = two cores).";
+      };
+      memoryHigh = mkOption {
+        type = types.str;
+        default = "3G";
+        description = "systemd MemoryHigh (reclaim pressure starts here).";
+      };
+      memoryMax = mkOption {
+        type = types.str;
+        default = "4G";
+        description = "systemd MemoryMax (hard cap; a TF worker peaks at about 1.4 to 2.1 GiB).";
+      };
+      storeDir = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "The offline mirror to read. Default: the daemon's `<state_dir>/store` (or `settings.store.dir`).";
+      };
+      outDir = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Where to write the feature files. Default: the daemon's `<state_dir>/features` (or `settings.features.dir`).";
+      };
+    };
+
     settings = mkOption {
       type = types.attrsOf types.anything;
       default = { };
@@ -395,6 +517,49 @@ in
     # Home-Manager-only: emit the user service.
     // lib.optionalAttrs (!isNixos) {
       systemd.user.services.hypodj = hmService;
+    }
+  ))
+  # The offline feature batch: a oneshot service and its timer.
+  (mkIf (cfg.enable && fcfg.enable) (
+    lib.optionalAttrs isNixos {
+      systemd.services.hypodj-mir = {
+        description = mirDescription;
+        # Only on AC: a missed run waits for the next tick (or Persistent catch-up).
+        unitConfig.ConditionACPower = true;
+        serviceConfig = mirResources // {
+          # The same dynamic user as the daemon, so the state dir is shared.
+          DynamicUser = true;
+          User = "hypodj";
+          StateDirectory = "hypodj";
+          StateDirectoryMode = "0700";
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          PrivateTmp = true;
+          PrivateNetwork = true;
+          NoNewPrivileges = true;
+        };
+      };
+      systemd.timers.hypodj-mir = {
+        wantedBy = [ "timers.target" ];
+        timerConfig = mirTimer;
+      };
+    }
+    // lib.optionalAttrs (!isNixos) {
+      systemd.user.services.hypodj-mir = {
+        Unit = {
+          Description = mirDescription;
+          ConditionACPower = true;
+        };
+        Service = mirResources // {
+          # %S/hypodj exists once the daemon ran; the batch creates `features/`.
+          StateDirectory = "hypodj";
+        };
+      };
+      systemd.user.timers.hypodj-mir = {
+        Unit.Description = "Timer for hypodj-mir";
+        Timer = mirTimer;
+        Install.WantedBy = [ "timers.target" ];
+      };
     }
   ))
   # The GNOME search provider: the Shell finds the provider .ini and the .desktop

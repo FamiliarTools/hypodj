@@ -28,6 +28,12 @@ path = "src/bin/play_probe.rs"
 name = "hypodj-mir"
 path = "src/bin/mir.rs"
 
+# The node graph's kill criterion (docs/design/sensing-and-graph/design.md):
+# synthetic now, or the real feature store + live getSimilarSongs2 (read-only).
+[[bin]]
+name = "graph-eval"
+path = "src/bin/graph_eval.rs"
+
 [features]
 # Passthroughs for the OPTIONAL model path. Off by default, so a plain
 # `cargo build -p hypodj-daemon` pulls NO llama/candle/ort. `llm` is the seam +

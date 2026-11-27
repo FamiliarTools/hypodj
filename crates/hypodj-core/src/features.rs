@@ -544,6 +544,10 @@ impl FileFeatureStore {
             embedding: ff.embedding.clone(),
             voice: ff.scalars.voice,
             bpm: ff.scalars.bpm,
+            camelot: match (&ff.scalars.key, &ff.scalars.scale) {
+                (Some(k), Some(s)) => crate::graph::Camelot::parse(k, s),
+                _ => None,
+            },
             measured: true,
         })
     }

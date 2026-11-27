@@ -43,12 +43,38 @@ loadavg, MemAvailable minus a 3 GiB reserve over the measured per-worker peak),
 
 With the learned heads add `--models DIR --tf-python PY --tf-script
 tools/mir/mir_tf.py`. The TF helper needs the `essentia-tensorflow` wheel, which
-is not in nixpkgs; today it runs from a venv through nix-ld:
+is not in nixpkgs; the flake packages it as `.#mir-tf-python`
+(`nix/essentia-tensorflow.nix`: the upstream cp314 manylinux wheel, about 290 MB,
+patched with autoPatchelfHook, so no venv and no nix-ld). The package installs the
+helper at `share/hypodj/mir_tf.py`:
 
 ```
-python3 -m venv /tmp/mir-venv && /tmp/mir-venv/bin/pip install essentia-tensorflow
-LD_LIBRARY_PATH=$NIX_LD_LIBRARY_PATH hypodj-mir ... --tf-python /tmp/mir-venv/bin/python3
+nix build .#mir-tf-python .#mir-models
+hypodj-mir ... --models ./result-1 --tf-python ./result/bin/python3 \
+  --tf-script $(dirname $(readlink -f $(which hypodj-mir)))/../share/hypodj/mir_tf.py
 ```
+
+### As a timer (declarative)
+
+`services.hypodj.features` in the NixOS / Home-Manager module runs the batch as a
+oneshot `hypodj-mir.service` on `hypodj-mir.timer` (default `03:30` daily,
+`Persistent`, so a laptop asleep at that time catches up on wake), reading
+`<state_dir>/store` and writing `<state_dir>/features` (both follow
+`settings.store.dir` / `settings.features.dir`, or `storeDir` / `outDir`):
+
+```nix
+services.hypodj.features = {
+  enable = true;
+  models = true;   # learned heads: MTG models (CC BY-NC-SA 4.0) + the TF env
+};
+```
+
+The unit runs at `Nice=19`, `CPUSchedulingPolicy=idle`, `IOSchedulingClass=idle`,
+`CPUQuota=200%` (two cores), `MemoryHigh=3G` / `MemoryMax=4G`, only on AC
+(`ConditionACPower=true`), and `hypodj-mir` still admits each worker by measured
+headroom inside those bounds. `models = false` is the classic extractor only.
+On NixOS it runs as the daemon's dynamic user with no network. Watch a run with
+`journalctl --user -u hypodj-mir` (Home-Manager).
 
 ## Models and licence
 
@@ -78,5 +104,4 @@ Extrapolated to the 422-track mirror: about 3 CPU-hours with the heads.
   shown, not yet a `CurateFilter`.
 - Similar re-rank by the embedding (0ginfsh item 1), PullField voice/bpm axes,
   transition planner reading beats/key.
-- A packaged TF environment, the systemd timer, `download` for songs outside the
-  mirror.
+- `download` for songs outside the mirror.
