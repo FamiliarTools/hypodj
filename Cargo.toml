@@ -15,6 +15,7 @@ members = [
     "crates/hypodj-app",
     "crates/hypodj-gtk",
     "crates/hypodj-qt",
+    "crates/hypodj-sense",
 ]
 
 [workspace.package]
@@ -56,3 +57,10 @@ opt-level = 0
 # C++ crate is optimized; the workspace stays opt-level 0.
 [profile.dev.package.llama-cpp-sys-2]
 opt-level = 3
+
+# dj-sense's synthetic-video test renders and face-scans 1800 frames; at
+# opt-level 0 the cascade alone takes minutes. Only these two crates.
+[profile.dev.package.rustface]
+opt-level = 3
+[profile.dev.package.hypodj-sense]
+opt-level = 2

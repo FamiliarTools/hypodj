@@ -19,7 +19,7 @@
         pkgs = import nixpkgs {
           inherit system;
           config.allowUnfreePredicate = p:
-            builtins.elem (nixpkgs.lib.getName p) [ "hypodj" "hypodj-clients" "hypodj-gtk" "hypodj-qt" ];
+            builtins.elem (nixpkgs.lib.getName p) [ "hypodj" "hypodj-clients" "hypodj-gtk" "hypodj-qt" "dj-sense" ];
         };
 
         # The released semver, read from the workspace manifest so the derivation
@@ -90,6 +90,18 @@
             (m "feature-extractors/musicnn/msd-musicnn-1.pb" "sha256-zeoHIrzuf3MShoQ/IjPjqmmIe7XD4tzgEe/1XzjQTz4=")
             (m "classification-heads/deam/deam-msd-musicnn-2.pb" "sha256-vrXusJCSZu63i41rsTI7EIKc8v5V48AaE/oYRvqYs3E=")
           ];
+        # dj-sense's face model: SeetaFace frontal detector v1.0 as shipped by
+        # rustface (BSD-2-Clause), 1.2 MB. Fixed-output fetch, pinned commit.
+        packages.dj-sense-model = pkgs.fetchurl {
+          name = "seeta_fd_frontal_v1.0.bin";
+          url = "https://raw.githubusercontent.com/atomashpolskiy/rustface/fa3d5b5d576c91d1c8a099af381e0f0906a0d3a3/model/seeta_fd_frontal_v1.0.bin";
+          hash = "sha256-xGGdBm7TXoTZqOhChgsN/1Z6ugy7E5iBB1U4dh2z/10=";
+        };
+        # dj-sense: head tempo-lock from a video file (sensing slice 1). No libmpv.
+        packages.dj-sense = pkgs.callPackage ./nix/sense.nix {
+          inherit cargoVersion;
+          model = self.packages.${system}.dj-sense-model;
+        };
         packages.default = self.packages.${system}.hypodj;
 
         apps.hypodj = {
@@ -115,6 +127,10 @@
         apps.djq = {
           type = "app";
           program = "${self.packages.${system}.hypodj-qt}/bin/djq";
+        };
+        apps.dj-sense = {
+          type = "app";
+          program = "${self.packages.${system}.dj-sense}/bin/dj-sense";
         };
         apps.default = self.apps.${system}.dj;
 
@@ -164,6 +180,8 @@
           CARGO_BUILD_JOBS = "2";
           PKG_CONFIG_PATH = "${pkgs.mpv-unwrapped.dev}/lib/pkgconfig";
           QMAKE = "${qtEnv}/bin/qmake";
+          # dj-sense finds its face model here (tests skip without it).
+          DJ_SENSE_MODEL = "${self.packages.${system}.dj-sense-model}";
           # A devshell-built djq finds its QML imports and platform plugins here
           # (the package gets them from wrapQtAppsHook instead).
           QML_IMPORT_PATH = "${qtEnv}/lib/qt-6/qml";
