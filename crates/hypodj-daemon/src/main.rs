@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
     // keep the Shazam endpoint safe. The plan-timer wheel it arms on is wired below.
     handler.set_recognize_config(cfg.recognize.auto, cfg.recognize.interval_secs);
     handler.set_stream_configs(cfg.streams.clone());
+    handler.set_discovery(&cfg.discovery);
     // The handler's own Arc, WEAKLY: the `mark` gesture's no-ICY branch spawns a
     // one-shot recognition, and `tokio::spawn` needs an owned 'static handle the &self
     // MPD dispatch does not have. Weak so it can never keep the handler alive (the same
@@ -406,6 +407,10 @@ async fn main() -> anyhow::Result<()> {
                     cfg.recognize.interval_secs,
                 );
                 handler.set_heard_ledger(ledger, root.clone(), cfg.heard.dedupe_window_secs);
+                // `tune` rows: one per stream tune-in and one when it is left, with the
+                // seconds played and how the stream came to play (saved / suggested /
+                // continuation / direct). What `heard report` splits by.
+                hypodj_core::handler::HypodjHandler::spawn_tune_tracker(&handler);
                 tracing::info!(dir = %root.display(), "heard ledger open");
             }
         }

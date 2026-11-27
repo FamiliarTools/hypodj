@@ -61,6 +61,34 @@ pub struct Config {
     /// means the tier is simply empty.
     #[serde(default, rename = "stream")]
     pub streams: Vec<StreamConfig>,
+    /// `[discovery]`: where `stations suggest` asks. Both default to the real services;
+    /// they exist so an isolated daemon can point a source at a dead address and prove
+    /// the verb degrades instead of hanging (`docs/design/discovery/design.md`).
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
+}
+
+/// The two outbound sources of [`crate::beyond`].
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryConfig {
+    #[serde(default = "d_radio_browser_base")]
+    pub radio_browser: String,
+    #[serde(default = "d_nts_mixtapes")]
+    pub nts_mixtapes: String,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        DiscoveryConfig { radio_browser: d_radio_browser_base(), nts_mixtapes: d_nts_mixtapes() }
+    }
+}
+
+fn d_radio_browser_base() -> String {
+    crate::beyond::RADIO_BROWSER_BASE.to_string()
+}
+
+fn d_nts_mixtapes() -> String {
+    crate::beyond::NTS_MIXTAPES_URL.to_string()
 }
 
 /// One `[[stream]]` entry: how to NAME and DRAW a raw stream the outside catalogues

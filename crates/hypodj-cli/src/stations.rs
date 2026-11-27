@@ -48,6 +48,7 @@ pub fn run(conn: &mut MpdConn, words: &[String]) -> Result<bool, MpdError> {
         Some("import") => import(conn, &words[1..]),
         Some("rm") if words.len() == 2 => rm(conn, &words[1]),
         Some("list") if words.len() == 1 => list(conn),
+        Some("suggest") => suggest(conn, &words[1..]),
         _ => {
             eprintln!("{USAGE}");
             Ok(false)
@@ -60,6 +61,7 @@ usage:
   djc stations import [PATH ...] [--dry-run]  save every .pls under PATH as a station
   djc stations list                           list the saved stations
   djc stations rm <name>                      remove one saved station
+  djc stations suggest [LANE]                 stations you have not saved, for a lane
 
 With no PATH, import reads $HYPODJ_STATIONS_DIR. A PATH may be a directory (its
 .pls files, not recursive) or individual .pls files. Importing is idempotent: a
@@ -78,6 +80,61 @@ fn list(conn: &mut MpdConn) -> Result<bool, MpdError> {
     }
     println!("{} station{}", saved.len(), if saved.len() == 1 { "" } else { "s" });
     Ok(true)
+}
+
+/// `djc stations suggest [LANE]` - READ-ONLY. The daemon picks (NTS mixtapes + Radio
+/// Browser), drops what is saved, probes each url and answers; this prints it. With no
+/// LANE the daemon derives one from what is playing. `djc add <url>` plays a row;
+/// `djc radio beyond` plays the top one.
+fn suggest(conn: &mut MpdConn, lane: &[String]) -> Result<bool, MpdError> {
+    let line = if lane.is_empty() {
+        "stations suggest".to_string()
+    } else {
+        format!("stations suggest {}", quote_arg(&lane.join(" ")))
+    };
+    // Sources plus probes can take several seconds; the default read timeout is for
+    // instant verbs.
+    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(60)));
+    match conn.command(&line) {
+        Ok(pairs) => {
+            for line in render_suggest(&pairs) {
+                println!("{line}");
+            }
+            Ok(true)
+        }
+        Err(MpdError::Ack(msg)) => {
+            println!("no suggestion: {msg}");
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The printed form of a `stations suggest` reply. Pure, so it is tested without a
+/// socket: the lane and any missing source first, one block per row, the drops last.
+fn render_suggest(pairs: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut n = 0usize;
+    for (k, v) in pairs {
+        match k.as_str() {
+            "lane" => out.push(format!("lane: {v}")),
+            "missing" => out.push(format!("missing: {v}")),
+            "suggest" => out.push(v.clone()),
+            "file" => {
+                n += 1;
+                out.push(format!("{n:>2}. {v}"));
+            }
+            "Title" => out.push(format!("    {v}")),
+            "X-Source" => out.push(format!("    source: {v}")),
+            "X-Lane" => out.push(format!("    lane: {v}")),
+            "X-About" => out.push(format!("    about: {v}")),
+            "X-Bitrate" => out.push(format!("    {v} kbps")),
+            "X-Votes" => out.push(format!("    {v} votes")),
+            "dropped" => out.push(format!("dropped (probe): {v}")),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// `djc stations rm <name>` - the undo half. A gesture that writes to the user's server
@@ -1122,5 +1179,22 @@ mod import_over_a_socket {
             vec!["station", "add", "http://a/?v=1&x=2", "A \"quoted\" name"]
         );
         assert_eq!(split_args("lsinfo \"Stations\""), vec!["lsinfo", "Stations"]);
+    }
+
+    #[test]
+    fn suggest_reply_prints_lane_rows_and_drops() {
+        let p = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let out = render_suggest(&[
+            p("lane", "ambient [ambient, drone] as asked"),
+            p("missing", "Radio Browser unreachable (timed out); showing NTS only"),
+            p("file", "https://s.example/a"),
+            p("Title", "NTS Slow Focus"),
+            p("X-Source", "nts"),
+            p("dropped", "X: not audio (text/html)"),
+        ]);
+        assert_eq!(out[0], "lane: ambient [ambient, drone] as asked");
+        assert!(out[1].starts_with("missing: "));
+        assert_eq!(out[2], " 1. https://s.example/a");
+        assert_eq!(out.last().unwrap(), "dropped (probe): X: not audio (text/html)");
     }
 }

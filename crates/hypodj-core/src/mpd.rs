@@ -397,6 +397,10 @@ pub enum RadioCmd {
     Off,
     /// `radio status` - report the live arm + mode + the seed the walk would use.
     Status,
+    /// `radio beyond [lane]` - suggest stations for the lane and tune in to the top
+    /// one. Runs as `Action::PlayNow { Selector::Station }` through the journaled
+    /// action path, so it is undoable like any plan.
+    Beyond(Option<String>),
 }
 
 /// A parsed `station` subcommand (the NAMED, idempotent saved-station write surface).
@@ -414,6 +418,10 @@ pub enum StationCmd {
     /// `station rm <name>` - delete the saved station carrying that name. The undo half
     /// of `add`: a gesture that writes to the user's server is removable by the same tool.
     Rm { name: String },
+    /// `stations suggest [lane]` - READ-ONLY: stations he has not saved, for a lane
+    /// (the words given, else derived from what he is listening to), each url probed
+    /// before it is shown. Writes nothing anywhere.
+    Suggest { lane: Option<String> },
 }
 
 /// Parse a `station` request. EXACTLY the arities the two shapes need
@@ -425,6 +433,10 @@ pub enum StationCmd {
 /// survives whole.
 fn parse_station(args: &[String], line: &str) -> MpdCommand {
     match args.first().map(|s| s.as_str()) {
+        // The lane may be several words (`deep house`), quoted or not.
+        Some("suggest") => MpdCommand::Station(StationCmd::Suggest {
+            lane: (args.len() > 1).then(|| args[1..].join(" ")).filter(|l| !l.trim().is_empty()),
+        }),
         Some("add") if args.len() == 3 => MpdCommand::Station(StationCmd::Add {
             url: args[1].clone(),
             name: args[2].clone(),
@@ -586,6 +598,9 @@ fn parse_heard(args: &[String], line: &str) -> MpdCommand {
         Some("marks") if args.len() == 1 => {
             MpdCommand::Heard(HeardQuery { view: HeardView::Marks, ..base })
         }
+        Some("report") if args.len() == 1 => {
+            MpdCommand::Heard(HeardQuery { view: HeardView::Report, ..base })
+        }
         Some("limit") if args.len() == 2 => match args[1].parse::<usize>() {
             Ok(n) if n > 0 => MpdCommand::Heard(HeardQuery { limit: n, ..base }),
             _ => MpdCommand::Unsupported(line.to_string()),
@@ -613,6 +628,10 @@ fn parse_heard(args: &[String], line: &str) -> MpdCommand {
 /// other uri shape, and any second argument is a loud (no-op-safe)
 /// [`MpdCommand::Unsupported`] ACK rather than a silently wrong start.
 fn parse_radio(args: &[String], line: &str) -> MpdCommand {
+    if args.first().is_some_and(|a| a == "beyond") {
+        let lane = (args.len() > 1).then(|| args[1..].join(" ")).filter(|l| !l.trim().is_empty());
+        return MpdCommand::Radio(RadioCmd::Beyond(lane));
+    }
     if args.len() > 1 {
         return MpdCommand::Unsupported(line.to_string());
     }
@@ -1017,6 +1036,13 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "similar_current" => (Selector::SimilarToCurrent, 2),
                 "starred" => (Selector::Starred, 2),
                 "instrumental" => (Selector::Instrumental, 2),
+                // `playnow station <lane|current>`: tune in to a suggested station.
+                // PlayNow only - a stream is tuned, never queued behind music.
+                "station" => {
+                    let lane = toks.get(2)?.clone();
+                    let lane = (!lane.eq_ignore_ascii_case("current")).then_some(lane);
+                    (Selector::Station(lane), 3)
+                }
                 _ => return None,
             };
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
@@ -1659,7 +1685,10 @@ pub fn parse(line: &str) -> MpdCommand {
         },
         "continuation" => parse_continuation(&args, line),
         "radio" => parse_radio(&args, line),
+        // `stations` is the plural a human types for the read-only `suggest`; the
+        // write shapes (`add`/`rm`) keep their singular verb.
         "station" => parse_station(&args, line),
+        "stations" if args.first().is_some_and(|a| a == "suggest") => parse_station(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),

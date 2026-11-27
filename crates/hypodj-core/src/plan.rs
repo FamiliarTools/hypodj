@@ -787,6 +787,12 @@ pub enum Selector {
     /// not a candidate, and when none qualify the action fails naming how many
     /// songs are measured. Carries no id, so it is model-safe.
     Instrumental,
+    /// A STATION he has not saved, picked for a lane (`None` = the lane of what he is
+    /// listening to) by [`crate::beyond`], probed, and tuned in. Only meaningful under
+    /// `PlayNow`: the handler appends ONE stream entry and starts it, so the journal
+    /// snapshot and undo (remove the row, restore the deck) cover it like any play-now.
+    /// Carries no id, so it is model-safe.
+    Station(Option<String>),
 }
 
 /// The numeric clamps, sourced from the SAME [`FadeConfig`] knobs the fade

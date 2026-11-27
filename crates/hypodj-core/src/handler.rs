@@ -2520,6 +2520,8 @@ fn selector_phrase(sel: &Selector) -> String {
         Selector::Exact(_) => "those tracks".to_string(),
         Selector::Starred => "your favorites".to_string(),
         Selector::Instrumental => "instrumental tracks".to_string(),
+        Selector::Station(Some(l)) => format!("a station for {l}"),
+        Selector::Station(None) => "a station for the lane you are in".to_string(),
     }
 }
 
@@ -2910,6 +2912,40 @@ fn is_loopback_http_url(url: &str) -> bool {
 /// hit (it is `builder().build().unwrap()` under the hood), so the old
 /// `unwrap_or_else(|_| Client::new())` was not even a graceful degrade - it was an
 /// unbounded client OR a panic. Expect is the honest choice: bounded, or nothing.
+/// The longest a tune-in or a leave can go unrecorded when no change notification
+/// arrives (a pause from a path that does not notify). Against dwell measured in
+/// minutes, a few seconds of slack is noise.
+pub const TUNE_POLL_SECS: u64 = 5;
+
+/// How many of the newest wants `heard report` looks up in the library per ask: one
+/// bounded search each, so the report stays a few seconds at most.
+pub const REPORT_WANTS_CHECKED: usize = 20;
+
+/// What `stations suggest` found, before rendering.
+pub(crate) struct SuggestReport {
+    pub lane: crate::beyond::Lane,
+    pub rows: Vec<crate::beyond::Suggestion>,
+    pub missing: Vec<String>,
+    pub dropped: Vec<String>,
+    pub candidates: usize,
+}
+
+/// A reqwest error in a few words (timeout / connect / the error's own text, without
+/// the url, which the caller already names).
+fn short_reqwest_error(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        "timed out".to_string()
+    } else if e.is_connect() {
+        "could not connect".to_string()
+    } else {
+        let mut text = e.to_string();
+        if let Some(u) = e.url() {
+            text = text.replace(&format!(" for url ({u})"), "");
+        }
+        text
+    }
+}
+
 fn build_cover_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -2996,6 +3032,20 @@ pub struct HypodjHandler {
     /// separate cache from the uncached `searchall` / `station` paths: a 60s-stale NAME
     /// is harmless, while a stale list there would break `add station/<name>`.
     saved_stations_cache: TtlLru<String, Vec<Station>>,
+    /// `stations suggest` (crate::beyond): the source catalogue client (bounded, with
+    /// the descriptive User-Agent Radio Browser asks for) ...
+    discovery_http: reqwest::Client,
+    /// ... and the probe client every candidate url is fetched through before it is
+    /// shown. Headers only: the response is dropped as soon as its type is read.
+    probe_http: reqwest::Client,
+    /// `(radio_browser_base, nts_mixtapes_url)` from `[discovery]`.
+    discovery_urls: Mutex<(String, String)>,
+    /// `url_key`s of every station a suggestion SHOWED this run, so a tune-in to one of
+    /// them is recorded as `suggested` however it was added (`radio beyond`, or `add`
+    /// of the url a human read off the list).
+    suggested_urls: Mutex<std::collections::HashSet<String>>,
+    /// artist (lowercase) -> the lane word its MusicBrainz tags imply, or `None`.
+    artist_lane_cache: Mutex<HashMap<String, Option<String>>>,
     /// Recognized (artist, title) -> the confident library counterpart, or `None` for a
     /// cached NEGATIVE. Caching the misses is what bounds the unattended cost: the auto
     /// cadence re-identifying an unmatchable long mix searches once an hour, not once
@@ -3738,6 +3788,26 @@ impl HypodjHandler {
             nts_catalogue_cache: TtlLru::new(4, Duration::from_secs(3600)),
             stream_configs: Mutex::new(Vec::new()),
             saved_stations_cache: TtlLru::new(1, Duration::from_secs(60)),
+            discovery_http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(6))
+                .redirect(reqwest::redirect::Policy::limited(4))
+                .user_agent(crate::beyond::USER_AGENT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            probe_http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .user_agent(crate::beyond::USER_AGENT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            discovery_urls: Mutex::new((
+                crate::beyond::RADIO_BROWSER_BASE.to_string(),
+                crate::beyond::NTS_MIXTAPES_URL.to_string(),
+            )),
+            suggested_urls: Mutex::new(std::collections::HashSet::new()),
+            artist_lane_cache: Mutex::new(HashMap::new()),
             library_match_cache: TtlLru::new(64, Duration::from_secs(3600)),
             plan_pending: Arc::new(Mutex::new(Vec::new())),
             journal: Journal::new(),
@@ -3980,6 +4050,16 @@ impl HypodjHandler {
                 }
             }
             // Play a library song NOW: enqueue-then-start; name the started track.
+            Action::PlayNow { selector: Selector::Station(lane), .. } => {
+                match self.tune_beyond(lane.as_deref()).await {
+                    Ok(name) => PlanOutcome::Played {
+                        n: 1,
+                        title: Some(format!("\"{name}\"")),
+                        selector: selector_phrase(&Selector::Station(lane.clone())),
+                    },
+                    Err(e) => PlanOutcome::Failed(e),
+                }
+            }
             Action::PlayNow { selector, count } => {
                 match self.plan_play_now(selector, *count).await {
                     Ok(0) => {
@@ -5190,6 +5270,11 @@ impl HypodjHandler {
                 store.refresh();
                 calmer_rerank(store.as_ref(), &seed, pool, want)
             }
+            // A station is TUNED (PlayNow), never queued behind music: the stream would
+            // sit unplayed after the songs, which is not what anyone asked for.
+            Selector::Station(_) => {
+                return Err("a station is tuned in with playnow, never queued".to_string());
+            }
             Selector::Instrumental => {
                 let store = self.feature_store();
                 store.refresh();
@@ -5261,9 +5346,11 @@ impl HypodjHandler {
             Selector::Similar(_) | Selector::SimilarToCurrent | Selector::Radio => {
                 self.pull_rerank(songs)
             }
-            Selector::Exact(_) | Selector::Genre(_) | Selector::Starred | Selector::Instrumental => {
-                songs
-            }
+            Selector::Exact(_)
+            | Selector::Genre(_)
+            | Selector::Starred
+            | Selector::Instrumental
+            | Selector::Station(_) => songs,
         };
         let n = songs.len();
         for s in songs {
@@ -7303,6 +7390,21 @@ impl HypodjHandler {
         let tape_cut = row.cut.clone();
         let ambiguous = row.ambiguous;
         let age = row.subject_age_secs;
+        // WANTS: a resolved, unowned track becomes one line in the wants file beside
+        // the ledger. Nothing is fetched - the list is what an acquisition reads later.
+        // The std lock is released before the await (the dir is cloned out first).
+        let mut wanted = false;
+        let wants_dir = self.heard_dir.lock().unwrap().clone();
+        if let (Some(want), Some(dir)) = (crate::heard::want_for_mark(&row), wants_dir) {
+            match tokio::task::spawn_blocking(move || crate::heard::append_want(&dir, &want)).await {
+                Ok(Ok(())) => {
+                    wanted = true;
+                    sentence.push_str(" - added to your wants");
+                }
+                Ok(Err(e)) => tracing::warn!(error = %e, "wants: append failed; the want is lost"),
+                Err(e) => tracing::warn!(error = %e, "wants: append task failed"),
+            }
+        }
         if recorded {
             self.append_heard(row);
         } else {
@@ -7314,7 +7416,8 @@ impl HypodjHandler {
             .pair("mark_kind", kind)
             .pair("mark_starred", if starred { "1" } else { "0" })
             .pair("mark_ambiguous", if ambiguous { "1" } else { "0" })
-            .pair("mark_recorded", if recorded { "1" } else { "0" });
+            .pair("mark_recorded", if recorded { "1" } else { "0" })
+            .pair("mark_want", if wanted { "1" } else { "0" });
         if let Some(a) = age {
             b = b.pair("mark_subject_age", a.to_string());
         }
@@ -8165,6 +8268,9 @@ impl HypodjHandler {
             ..q
         };
         let view = q.view;
+        if view == crate::heard::HeardView::Report {
+            return self.heard_report(dir).await;
+        }
         let read = tokio::task::spawn_blocking(move || {
             // ONE blocking hop for both halves: the ledger text and the tape's own
             // chronological order, which is the single source of the `[n]` numbering the
@@ -8201,6 +8307,48 @@ impl HypodjHandler {
                     tape_ids.len()
                 ),
             );
+        }
+        b.build()
+    }
+
+    /// `heard report`: the discovery experiment's numbers per tune-in origin across every
+    /// retained session, plus the wants and how many of them are owned NOW (a bounded
+    /// library lookup over the newest [`REPORT_WANTS_CHECKED`] - read-only, no star).
+    async fn heard_report(&self, dir: PathBuf) -> MpdResponse {
+        let read = tokio::task::spawn_blocking(move || {
+            let ledger = crate::heard::read_for(&dir, crate::heard::HeardView::Report);
+            let wants = crate::heard::read_wants(&dir);
+            (ledger, wants)
+        })
+        .await;
+        let ((rows, unreadable), wants) = match read {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "heard report: read task failed");
+                return ack(ACK_ERROR_UNKNOWN, "heard", "could not read the ledger");
+            }
+        };
+        let mut checked = 0usize;
+        let mut owned = 0usize;
+        for w in wants.iter().rev().take(REPORT_WANTS_CHECKED) {
+            let (artist, title) = match (&w.artist, &w.title) {
+                (Some(a), Some(t)) => (Some(a.clone()), Some(t.clone())),
+                _ => w.raw.as_deref().map(crate::heard::split_icy_title).unwrap_or((None, None)),
+            };
+            let (Some(artist), Some(title)) = (artist, title) else { continue };
+            checked += 1;
+            let track = crate::recognize::RecognizedTrack {
+                artist: Some(artist),
+                title: Some(title),
+                ..Default::default()
+            };
+            if self.lookup_library_match(&track).await.is_some() {
+                owned += 1;
+            }
+        }
+        let mut b = MpdResponse::pairs();
+        for line in crate::heard::render_report(&rows, unreadable, &wants, Some((owned, checked))) {
+            b = b.pair("heard", line);
         }
         b.build()
     }
@@ -10051,6 +10199,390 @@ impl HypodjHandler {
         self.heard_ledger.lock().unwrap().is_some()
     }
 
+    // ── discovery beyond the library (crate::beyond) ────────────────────────
+
+    /// Register the `[discovery]` source urls, plumbed once at daemon startup.
+    pub fn set_discovery(&self, cfg: &crate::config::DiscoveryConfig) {
+        *self.discovery_urls.lock().unwrap() = (cfg.radio_browser.clone(), cfg.nts_mixtapes.clone());
+    }
+
+    /// The lane `stations suggest` searches: the words he gave, else the genre of the
+    /// song playing, else of the last finished song, else the commonest genre of his
+    /// starred set. `Err` names why none resolved, so the reply can ask for a word.
+    async fn resolve_lane(&self, asked: Option<&str>) -> Result<crate::beyond::Lane, String> {
+        use crate::beyond::{Lane, LaneSource};
+        if let Some(a) = asked {
+            return Lane::from_text(a, LaneSource::Asked)
+                .ok_or_else(|| format!("\"{a}\" names no lane a station index could match"));
+        }
+        let (playing, last) = {
+            let st = self.state.lock().unwrap();
+            let playing = st.current().and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
+                QueueEntry::Song(s) => Some(s.clone()),
+                QueueEntry::Stream { .. } => None,
+            });
+            (playing, st.last_finished.clone())
+        };
+        let label = |s: &Song| match &s.artist {
+            Some(a) if !a.trim().is_empty() => format!("{a} - {}", s.title),
+            _ => s.title.clone(),
+        };
+        // The song's own genre, else (most of a genre-less library) its ARTIST's
+        // MusicBrainz tags - one cached lookup, so the lane follows what is playing.
+        for (song, playing_now) in [(&playing, true), (&last, false)] {
+            let Some(s) = song else { continue };
+            let genre = match s.genre.clone().filter(|g| !g.trim().is_empty()) {
+                Some(g) => Some((g, String::new())),
+                None => match s.artist.as_deref() {
+                    Some(a) => self.artist_lane_word(a).await.map(|g| (g, " via MusicBrainz tags".to_string())),
+                    None => None,
+                },
+            };
+            let Some((g, via)) = genre else { continue };
+            let src = if playing_now {
+                LaneSource::Playing(format!("{}{via}", label(s)))
+            } else {
+                LaneSource::LastFinished(format!("{}{via}", label(s)))
+            };
+            if let Some(l) = Lane::from_text(&g, src) {
+                return Ok(l);
+            }
+        }
+        if let Ok(starred) = self.client.starred_songs().await {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for s in &starred {
+                if let Some(g) = s.genre.as_deref().filter(|g| !g.trim().is_empty()) {
+                    *counts.entry(crate::beyond::normalize_tag(g)).or_default() += 1;
+                }
+            }
+            let mut top: Vec<(String, usize)> = counts.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            if let Some(l) = top.first().and_then(|(g, _)| Lane::from_text(g, LaneSource::Starred)) {
+                return Ok(l);
+            }
+        }
+        Err("no lane: nothing playing or recently finished carries a genre, and neither do your starred songs - name one: stations suggest <lane>".to_string())
+    }
+
+    /// The lane word MusicBrainz tags imply for `artist`, cached per artist for the run
+    /// (a miss is cached too, so a genre-less artist costs one call, never one per ask).
+    async fn artist_lane_word(&self, artist: &str) -> Option<String> {
+        let key = artist.trim().to_lowercase();
+        if let Some(hit) = self.artist_lane_cache.lock().unwrap().get(&key) {
+            return hit.clone();
+        }
+        let url = crate::beyond::musicbrainz_artist_url(crate::beyond::MUSICBRAINZ_BASE, artist);
+        let word = match self.discovery_http.get(&url).send().await {
+            Ok(r) if r.status().is_success() => match r.text().await {
+                Ok(body) => crate::beyond::mb_lane_word(&body, artist),
+                Err(_) => return None,
+            },
+            // Transient (503 is MusicBrainz's rate answer): not cached, so a later ask retries.
+            _ => return None,
+        };
+        self.artist_lane_cache.lock().unwrap().insert(key, word.clone());
+        word
+    }
+
+    /// The NTS mixtapes body, cache-first when it is the real catalogue (the same cache
+    /// and validity gate station identity uses), fetched fresh for an override.
+    async fn nts_mixtapes_body(&self, url: &str) -> Result<String, String> {
+        let cacheable = url == crate::beyond::NTS_MIXTAPES_URL;
+        if cacheable {
+            if let Some(json) = self.nts_catalogue_cache.get(&NTS_CATALOGUE_CACHE_KEY.to_string()) {
+                return Ok(json);
+            }
+        }
+        let resp = self
+            .discovery_http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("NTS unreachable ({})", short_reqwest_error(&e)))?;
+        if !resp.status().is_success() {
+            return Err(format!("NTS answered {}", resp.status()));
+        }
+        let text = resp.text().await.map_err(|e| format!("NTS body unreadable ({})", short_reqwest_error(&e)))?;
+        if cacheable && crate::station_identity::is_valid_nts_catalogue(&text) {
+            self.nts_catalogue_cache.put(NTS_CATALOGUE_CACHE_KEY.to_string(), text.clone());
+        }
+        Ok(text)
+    }
+
+    /// Radio Browser candidates for every lane tag, one polite sequential GET per tag.
+    /// The FIRST failure stops the loop: an unreachable server would only fail again.
+    async fn radio_browser_candidates(
+        &self,
+        base: &str,
+        lane: &crate::beyond::Lane,
+    ) -> (Vec<crate::beyond::Suggestion>, Option<String>) {
+        let mut out = Vec::new();
+        for tag in &lane.tags {
+            let url = crate::beyond::rb_search_url(base, tag);
+            let res = match self.discovery_http.get(&url).send().await {
+                Ok(r) if r.status().is_success() => match r.text().await {
+                    Ok(t) => crate::beyond::rb_candidates(&t, tag),
+                    Err(e) => Err(format!("Radio Browser body unreadable ({})", short_reqwest_error(&e))),
+                },
+                Ok(r) => Err(format!("Radio Browser answered {}", r.status())),
+                Err(e) => Err(format!("Radio Browser unreachable ({})", short_reqwest_error(&e))),
+            };
+            match res {
+                Ok(mut rows) => out.append(&mut rows),
+                Err(why) => return (out, Some(why)),
+            }
+        }
+        (out, None)
+    }
+
+    /// Fetch `url` and read only its headers: `Ok` when it answers 2xx with an audio
+    /// type right now, else why not. The body is never read.
+    async fn probe_stream(client: reqwest::Client, url: String) -> Result<(), String> {
+        let resp = client.get(&url).send().await.map_err(|e| short_reqwest_error(&e))?;
+        if !resp.status().is_success() {
+            return Err(format!("answered {}", resp.status()));
+        }
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        drop(resp);
+        if crate::beyond::is_audio_type(ct.as_deref()) {
+            Ok(())
+        } else {
+            Err(format!("not audio ({})", ct.unwrap_or_else(|| "no content type".to_string())))
+        }
+    }
+
+    /// `stations suggest [lane]`, as data. READ-ONLY: Navidrome is only READ (to drop
+    /// what is already saved) and Radio Browser's click counter is never called.
+    /// `Err` only when NO source answered, which the verb ACKs - an empty OK would read
+    /// as "nothing in this lane".
+    pub(crate) async fn suggest_stations(&self, asked: Option<&str>) -> Result<SuggestReport, String> {
+        let lane = self.resolve_lane(asked).await?;
+        let (rb_base, nts_url) = self.discovery_urls.lock().unwrap().clone();
+        let (nts, (rb, rb_err), saved) = tokio::join!(
+            async {
+                let body = self.nts_mixtapes_body(&nts_url).await?;
+                crate::beyond::nts_candidates(&body, &lane)
+            },
+            self.radio_browser_candidates(&rb_base, &lane),
+            self.client.get_internet_radio_stations(),
+        );
+        let mut missing = Vec::new();
+        let nts = match nts {
+            Ok(v) => v,
+            Err(why) => {
+                if rb_err.is_some() && rb.is_empty() {
+                    return Err(format!(
+                        "no station source answered: {why}; {}",
+                        rb_err.unwrap_or_default()
+                    ));
+                }
+                missing.push(format!("{why}; showing Radio Browser only"));
+                Vec::new()
+            }
+        };
+        if let Some(why) = rb_err {
+            missing.push(if rb.is_empty() {
+                format!("{why}; showing NTS only")
+            } else {
+                format!("{why}; some lane tags were not searched")
+            });
+        }
+        let saved_urls: Vec<String> = match saved {
+            Ok(list) => list.into_iter().map(|s| s.stream_url).collect(),
+            Err(e) => {
+                missing.push(format!("saved stations unknown ({e}); a row may be one you already keep"));
+                Vec::new()
+            }
+        };
+        let ranked = crate::beyond::rank(nts, rb, &saved_urls);
+        let candidates = ranked.len();
+        // Probe the head concurrently, keep rank order.
+        let mut set = tokio::task::JoinSet::new();
+        for (i, s) in ranked.iter().take(crate::beyond::PROBE_TOP).enumerate() {
+            let client = self.probe_http.clone();
+            let url = s.url.clone();
+            set.spawn(async move { (i, Self::probe_stream(client, url).await) });
+        }
+        let mut verdicts: Vec<Option<Result<(), String>>> = vec![None; ranked.len().min(crate::beyond::PROBE_TOP)];
+        while let Some(j) = set.join_next().await {
+            if let Ok((i, r)) = j {
+                verdicts[i] = Some(r);
+            }
+        }
+        let mut rows = Vec::new();
+        let mut dropped = Vec::new();
+        for (s, v) in ranked.into_iter().zip(verdicts) {
+            match v {
+                Some(Ok(())) if rows.len() < crate::beyond::SHOW_MAX => rows.push(s),
+                Some(Ok(())) => {}
+                Some(Err(why)) => dropped.push(format!("{}: {why}", s.name)),
+                None => dropped.push(format!("{}: probe did not finish", s.name)),
+            }
+        }
+        {
+            let mut seen = self.suggested_urls.lock().unwrap();
+            for s in &rows {
+                seen.insert(crate::beyond::url_key(&s.url));
+            }
+        }
+        Ok(SuggestReport { lane, rows, missing, dropped, candidates })
+    }
+
+    /// The `stations suggest` reply: one `lane:` line, any `missing:` lines, then rows
+    /// shaped like Find's station hits with the RAW stream url as `file:` (so `add` of
+    /// that line plays it), then a `dropped:` line per probe failure.
+    async fn handle_suggest(&self, lane: Option<String>) -> MpdResponse {
+        match self.suggest_stations(lane.as_deref()).await {
+            Err(why) => ack(ACK_ERROR_UNKNOWN, "stations", &why),
+            Ok(rep) => {
+                let mut b = MpdResponse::pairs().pair("lane", rep.lane.describe());
+                for m in &rep.missing {
+                    b = b.pair("missing", m.clone());
+                }
+                if rep.rows.is_empty() {
+                    b = b.pair(
+                        "suggest",
+                        format!(
+                            "no unsaved station in this lane answered with audio ({} candidates)",
+                            rep.candidates
+                        ),
+                    );
+                }
+                for s in &rep.rows {
+                    b = b
+                        .pair("file", s.url.clone())
+                        .pair("Title", s.name.clone())
+                        .pair("X-Source", s.source.as_str())
+                        .pair("X-Lane", s.matched.join(", "));
+                    if let Some(host) = stream_host(&s.url) {
+                        b = b.pair("X-StreamHost", host.to_string());
+                    }
+                    if !s.about.trim().is_empty() {
+                        b = b.pair("X-About", s.about.clone());
+                    }
+                    if s.bitrate > 0 {
+                        b = b.pair("X-Bitrate", s.bitrate.to_string());
+                    }
+                    if s.votes > 0 {
+                        b = b.pair("X-Votes", s.votes.to_string());
+                    }
+                }
+                for d in &rep.dropped {
+                    b = b.pair("dropped", d.clone());
+                }
+                b.build()
+            }
+        }
+    }
+
+    /// The `Selector::Station` arm of `Action::PlayNow`: suggest, then append the top
+    /// probed row as ONE stream entry and start it. Reached only through
+    /// `run_action_outcome`, which snapshots before and journals after, so the tune-in
+    /// is undoable (row removed, deck restored) like any play-now.
+    async fn tune_beyond(&self, lane: Option<&str>) -> Result<String, String> {
+        let rep = self.suggest_stations(lane).await?;
+        let Some(top) = rep.rows.into_iter().next() else {
+            return Err(format!(
+                "no unsaved station for {} answered with audio",
+                rep.lane.label
+            ));
+        };
+        let (idx, id) = {
+            let mut st = self.state.lock().unwrap();
+            let id = st.next_id;
+            st.next_id += 1;
+            st.queue.push(QueueItem::queued(
+                id,
+                QueueEntry::Stream { url: top.url.clone(), title: top.name.clone() },
+            ));
+            st.playlist_version += 1;
+            (st.queue.len() - 1, id)
+        };
+        self.notify_change();
+        self.disarm_continuation_warm().await;
+        if let Err(e) = self.declare_play(idx, Cause::Gesture).await {
+            let mut st = self.state.lock().unwrap();
+            if let Some(pos) = st.queue.iter().position(|it| it.id == id) {
+                st.queue.remove(pos);
+                st.playlist_version += 1;
+            }
+            drop(st);
+            self.notify_change();
+            return Err(format!("could not start {}: {e}", top.name));
+        }
+        Ok(top.name)
+    }
+
+    /// How the stream at `url` came to play, for its `tune` row.
+    async fn tune_origin(&self, url: &str, continuation: bool) -> String {
+        if continuation {
+            return "continuation".to_string();
+        }
+        if self.suggested_urls.lock().unwrap().contains(&crate::beyond::url_key(url)) {
+            return "suggested".to_string();
+        }
+        if self.saved_station_for(url).await.is_some() {
+            return "saved".to_string();
+        }
+        "direct".to_string()
+    }
+
+    /// One tune-tracker sample: what stream is PLAYING now, fed to the pure tracker,
+    /// whose rows go to the ledger. Off the spine; the origin lookup may await.
+    async fn tune_sample(&self, t: &mut crate::heard::TuneTracker) {
+        let playing = self.reported_play_state() == PlayState::Playing;
+        let cur = if playing {
+            let st = self.state.lock().unwrap();
+            st.current().and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
+                QueueEntry::Stream { url, .. } => Some((
+                    it.id,
+                    url.clone(),
+                    station_label(&st, QueueId(it.id)),
+                    st.continuation_active == Some(it.id),
+                )),
+                QueueEntry::Song(_) => None,
+            })
+        } else {
+            None
+        };
+        let subject = match cur {
+            None => None,
+            Some((qid, url, station, cont)) => {
+                let origin = if t.is_open_for(qid) { String::new() } else { self.tune_origin(&url, cont).await };
+                Some(crate::heard::TuneSubject { qid, url, station, origin })
+            }
+        };
+        for row in t.observe(crate::store::now_unix(), subject) {
+            self.append_heard(row);
+        }
+    }
+
+    /// Spawn the TUNE TRACKER: it samples on every change notification and at least
+    /// every [`TUNE_POLL_SECS`], and exits when the handler is dropped.
+    pub fn spawn_tune_tracker(this: &Arc<Self>) {
+        let weak = Arc::downgrade(this);
+        tokio::spawn(async move {
+            let mut t = crate::heard::TuneTracker::default();
+            loop {
+                let Some(h) = weak.upgrade() else { break };
+                let changed = h.changed.clone();
+                let notified = changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                h.tune_sample(&mut t).await;
+                drop(h);
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = tokio::time::sleep(Duration::from_secs(TUNE_POLL_SECS)) => {}
+                }
+            }
+        });
+    }
+
     /// Register THE TAPE root and its budget, plumbed once at daemon startup like
     /// [`Self::set_heard_ledger`]. Absent (disabled, no state dir, or a path mpv would
     /// mangle) every press behaves exactly as it did before the tape existed.
@@ -10858,6 +11390,7 @@ impl HypodjHandler {
                 }
                 station_result_pairs(outcome, name, url, prev_url.as_deref())
             }
+            StationCmd::Suggest { lane } => self.handle_suggest(lane).await,
             StationCmd::Rm { name } => {
                 let name = name.trim();
                 let stations = match self.client.get_internet_radio_stations().await {
@@ -10903,6 +11436,15 @@ impl HypodjHandler {
     async fn handle_radio(&self, cmd: RadioCmd) -> MpdResponse {
         match cmd {
             RadioCmd::Start(seed) => self.start_radio(seed).await,
+            // `radio beyond`: the SAME journaled action an agent's plan would run, so a
+            // human's tune-in is undoable exactly like the agent's and there is one path.
+            RadioCmd::Beyond(lane) => {
+                let action = Action::PlayNow { selector: Selector::Station(lane), count: 1 };
+                match self.run_action_outcome(&action, "wire:radio beyond").await {
+                    PlanOutcome::Failed(e) => ack(ACK_ERROR_UNKNOWN, "radio", &e),
+                    out => MpdResponse::pairs().pair("radio", out.render()).build(),
+                }
+            }
             RadioCmd::On => {
                 // ARM ONLY: no resolve, no fetch, no queue change - "keep going from
                 // what I already queued". The mode force is what makes the verb work on
