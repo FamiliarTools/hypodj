@@ -1623,6 +1623,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "strsim",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",

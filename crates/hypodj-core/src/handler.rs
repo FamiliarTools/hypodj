@@ -2957,6 +2957,9 @@ fn build_cover_http_client() -> reqwest::Client {
 
 pub struct HypodjHandler {
     client: Arc<SubsonicClient>,
+    /// The whole-library name index behind the `searchall` typo fallback, filled
+    /// and refreshed by [`crate::fuzzy::run`]; empty until the first build lands.
+    fuzzy: Arc<crate::fuzzy::Slot>,
     player: PlayerHandle,
     state: Arc<Mutex<State>>,
     /// Fired when a subsystem changes, to wake `idle`.
@@ -3760,6 +3763,7 @@ impl HypodjHandler {
         init_state.vol_dither_state = wall.rotate_left(32) | 1;
         Self {
             client,
+            fuzzy: Arc::default(),
             player,
             state: Arc::new(Mutex::new(init_state)),
             changed: Arc::new(Notify::new()),
@@ -9946,6 +9950,11 @@ impl HypodjHandler {
     /// Absent (a raw handler, a disabled store, a store that failed to open) every
     /// seam below no-ops and playback is byte-identical to a store-less build.
     /// Plumb the server reachability slot the heartbeat writes.
+    /// The fuzzy name index slot, for the daemon to hand to [`crate::fuzzy::run`].
+    pub fn fuzzy_slot(&self) -> Arc<crate::fuzzy::Slot> {
+        self.fuzzy.clone()
+    }
+
     pub fn set_server_reach(&self, reach: Arc<crate::reach::ServerReach>) {
         *self.server_reach.lock().unwrap() = Some(reach);
     }
@@ -16823,19 +16832,12 @@ impl HypodjHandler {
         if query.trim().is_empty() {
             return MpdResponse::ok();
         }
-        let hits = match self.client.search3(&query).await {
-            Ok(h) => h,
-            Err(e) => return ack(ACK_ERROR_UNKNOWN, "searchall", &e.to_string()),
-        };
-        let mut songs: Vec<_> = hits
-            .songs
-            .into_iter()
-            .filter(|s| tag_matches(s, "any", &query, false))
-            .collect();
-        // Same sets, re-ordered: precision first, then the server's own habit
-        // counters (starred, play counts), then server order. See `find_rank`.
-        let (mut artists, mut albums) = (hits.artists, hits.albums);
-        crate::find_rank::rank(&query, &mut artists, &mut albums, &mut songs);
+        let index = self.fuzzy.get();
+        let crate::fuzzy::Augmented { artists, albums, songs, approx } =
+            match searchall_hits(&self.client, index.as_deref(), &query).await {
+                Ok(h) => h,
+                Err(e) => return ack(ACK_ERROR_UNKNOWN, "searchall", &e.to_string()),
+            };
 
         // The FOURTH result kind: the user's own saved internet radio stations, which
         // search3 does not index at all (Subsonic has no station-search endpoint), so
@@ -16872,6 +16874,7 @@ impl HypodjHandler {
             &albums,
             stations.as_deref(),
             &songs,
+            &approx,
         ))
     }
 
@@ -17400,6 +17403,32 @@ fn station_upsert(stations: &[Station], url: &str, name: &str) -> StationUpsert 
     }
 }
 
+/// The library half of `searchall`: search3, the song tag post-filter, the fuzzy
+/// typo fallback, then the precision-first re-rank. Public so `fuzzy-bench` measures
+/// exactly the path the daemon serves.
+pub async fn searchall_hits(
+    client: &SubsonicClient,
+    index: Option<&crate::fuzzy::FuzzyIndex>,
+    query: &str,
+) -> Result<crate::fuzzy::Augmented, crate::subsonic::SubsonicError> {
+    let hits = client.search3(query).await?;
+    let songs: Vec<_> = hits
+        .songs
+        .into_iter()
+        .filter(|s| tag_matches(s, "any", query, false))
+        .collect();
+    // TYPO FALLBACK: a kind with too few server hits gets approximate hits from the
+    // local name index appended AFTER the real ones (never replacing them), each
+    // flagged `X-Approximate: 1`. A kind the server answered well is untouched, so a
+    // correct query costs nothing. See `fuzzy`.
+    let mut out = crate::fuzzy::augment(query, hits.artists, hits.albums, songs, index);
+    // Same sets, re-ordered: precision first (an approximate hit by its fuzzy score,
+    // below every real band), then the server's own habit counters (starred, play
+    // counts), then server order. See `find_rank`.
+    crate::find_rank::rank(query, &mut out.artists, &mut out.albums, &mut out.songs, &out.approx);
+    Ok(out)
+}
+
 /// Assemble the whole `searchall` frame: the `X-Hits` count preamble, then one block per
 /// hit in the kind order the client renders. PURE, so the wire contract (which kinds are
 /// claimed, in which order, and what a missing kind looks like) is testable with no
@@ -17419,28 +17448,43 @@ fn search_all_pairs(
     albums: &[Album],
     stations: Option<&[Station]>,
     songs: &[Song],
+    approx: &HashMap<String, f64>,
 ) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
-    pairs.push(("X-Hits".to_string(), format!("artist {} {}", artists.len(), SEARCH3_ARTIST_CAP)));
-    pairs.push(("X-Hits".to_string(), format!("album {} {}", albums.len(), SEARCH3_ALBUM_CAP)));
+    // `X-Hits` counts SERVER hits only: approximate rows are not what the server
+    // returned against its cap, and a client reading "artist 0" must still learn the
+    // server found nothing. The approximate rows are marked on the row itself.
+    let real = |ids: &mut dyn Iterator<Item = &str>| ids.filter(|id| !approx.contains_key(*id)).count();
+    let n_artists = real(&mut artists.iter().map(|a| a.id.0.as_str()));
+    let n_albums = real(&mut albums.iter().map(|a| a.id.0.as_str()));
+    let n_songs = real(&mut songs.iter().map(|s| s.id.0.as_str()));
+    let flag = |pairs: &mut Vec<(String, String)>, id: &str| {
+        if approx.contains_key(id) {
+            pairs.push(("X-Approximate".to_string(), "1".to_string()));
+        }
+    };
+    pairs.push(("X-Hits".to_string(), format!("artist {} {}", n_artists, SEARCH3_ARTIST_CAP)));
+    pairs.push(("X-Hits".to_string(), format!("album {} {}", n_albums, SEARCH3_ALBUM_CAP)));
     // TWO tokens, no cap: the station match runs handler-side over the FULL saved set,
     // so there is no server cap to report and claiming one would be a lie.
     if let Some(st) = stations {
         pairs.push(("X-Hits".to_string(), format!("station {}", st.len())));
     }
-    pairs.push(("X-Hits".to_string(), format!("song {} {}", songs.len(), SEARCH3_SONG_CAP)));
+    pairs.push(("X-Hits".to_string(), format!("song {} {}", n_songs, SEARCH3_SONG_CAP)));
     // Artist and album blocks are byte-identical in shape to what lsinfo already emits,
     // so the client parses them with machinery it already has.
     for a in artists {
         pairs.push(("directory".to_string(), format!("artist/{}", a.id.0)));
         pairs.push(("Artist".to_string(), a.name.clone()));
         pairs.push(("X-AlbumCount".to_string(), a.album_count.to_string()));
+        flag(&mut pairs, &a.id.0);
     }
     for al in albums {
         pairs.push(("directory".to_string(), format!("album/{}", al.id.0)));
         pairs.push(("Album".to_string(), al.name.clone()));
         pairs.push(("Artist".to_string(), al.artist.clone()));
         pairs.push(("X-SongCount".to_string(), al.song_count.to_string()));
+        flag(&mut pairs, &al.id.0);
     }
     // Stations sit BETWEEN albums and songs: an ordinary query matches zero of them, so
     // the top of the list stays byte-identical to what it always was, and a handful of
@@ -17450,6 +17494,7 @@ fn search_all_pairs(
     }
     for s in songs {
         pairs.extend(browse_song_pairs(s));
+        flag(&mut pairs, &s.id.0);
     }
     pairs
 }
@@ -26479,7 +26524,7 @@ mod tests {
             st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
             st("2", "NTS Radio Live 1 - London", "http://stream-relay-geo.ntslive.net/stream"),
         ];
-        let pairs = search_all_pairs(&artists, &albums, Some(&stations), &[]);
+        let pairs = search_all_pairs(&artists, &albums, Some(&stations), &[], &HashMap::new());
 
         // The tally preamble: the station kind sits THIRD, between album and song, and
         // carries TWO tokens (no server cap, because the match is handler-side).
@@ -26507,18 +26552,38 @@ mod tests {
     }
 
     #[test]
+    fn search_all_pairs_flags_approximate_rows_and_counts_only_server_hits() {
+        let a = |id: &str, name: &str| Artist {
+            id: ArtistId(id.into()),
+            name: name.into(),
+            album_count: 1,
+            starred: false,
+            cover_art: None,
+        };
+        let artists = vec![a("real", "Massive"), a("fz", "Massive Attack")];
+        let approx: HashMap<String, f64> = [("fz".to_string(), 0.8)].into();
+        let pairs = search_all_pairs(&artists, &[], None, &[], &approx);
+        assert!(pairs.contains(&("X-Hits".into(), "artist 1 20".into())), "{pairs:?}");
+        let flags: Vec<usize> =
+            pairs.iter().enumerate().filter(|(_, (k, _))| k == "X-Approximate").map(|(i, _)| i).collect();
+        assert_eq!(flags.len(), 1);
+        let block_start = pairs.iter().position(|(_, v)| v == "artist/fz").unwrap();
+        assert!(flags[0] > block_start, "the flag sits inside the approximate block");
+    }
+
+    #[test]
     fn search_all_pairs_omits_the_station_kind_when_the_list_is_unavailable() {
         // A station-list fetch failure must NOT ACK the whole searchall and must NOT
         // claim `station 0` - absence of a claim beats a false claim about a set we
         // never saw. Artists/albums/songs still come back.
-        let pairs = search_all_pairs(&[], &[], None, &[]);
+        let pairs = search_all_pairs(&[], &[], None, &[], &HashMap::new());
         let hits: Vec<&str> =
             pairs.iter().filter(|(k, _)| k == "X-Hits").map(|(_, v)| v.as_str()).collect();
         assert_eq!(hits, vec!["artist 0 20", "album 0 50", "song 0 200"]);
         assert!(!pairs.iter().any(|(_, v)| v.starts_with("station")), "{pairs:?}");
 
         // A successful fetch that matched NOTHING is different, and says so.
-        let pairs = search_all_pairs(&[], &[], Some(&[]), &[]);
+        let pairs = search_all_pairs(&[], &[], Some(&[]), &[], &HashMap::new());
         let hits: Vec<&str> =
             pairs.iter().filter(|(k, _)| k == "X-Hits").map(|(_, v)| v.as_str()).collect();
         assert_eq!(hits, vec!["artist 0 20", "album 0 50", "station 0", "song 0 200"]);

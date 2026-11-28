@@ -26,16 +26,29 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Precision {
     /// A name field equals the query (case and punctuation folded).
-    Exact = 0,
+    Exact,
     /// Every query word appears as a whole word across the name fields.
     ///
     /// Deliberately ONE band whether the words lead the title or not: measured on the
     /// real library, a separate "starts with" band put `Love We Battle` (5 plays)
     /// above `Let Love Rumpel` (42 plays) for `love`, which is the opposite of what
     /// the person typing meant.
-    Words = 1,
+    Words,
     /// Anything else the server matched (substring, other fields, its own index).
-    Loose = 2,
+    Loose,
+    /// Not a server match at all: an approximate hit from the local fuzzy index
+    /// (`crate::fuzzy`), carrying `1000 - round(score * 1000)` so a closer spelling
+    /// sorts first. Below every real band, and the score is part of the PRIMARY key,
+    /// so habit only breaks ties between equally close spellings and a starred but
+    /// distant name can never outrank the one actually typed.
+    Approx(u16),
+}
+
+impl Precision {
+    /// The band for a fuzzy score in `[0, 1]`.
+    pub fn approx(score: f64) -> Precision {
+        Precision::Approx((1000.0 - (score.clamp(0.0, 1.0) * 1000.0).round()) as u16)
+    }
 }
 
 /// Lowercase, keep alphanumerics, collapse everything else to single spaces.
@@ -99,7 +112,17 @@ fn sort_by_key<T>(items: &mut Vec<T>, mut key: impl FnMut(&T) -> (Precision, f64
 }
 
 /// Re-rank one `searchall` reply in place. Pure; the sets are unchanged, only order.
-pub fn rank(query: &str, artists: &mut Vec<Artist>, albums: &mut Vec<Album>, songs: &mut Vec<Song>) {
+///
+/// `approx` maps the id of every APPROXIMATE (fuzzy, non-server) hit to its fuzzy
+/// score; those rows take [`Precision::approx`] instead of a text band.
+pub fn rank(
+    query: &str,
+    artists: &mut Vec<Artist>,
+    albums: &mut Vec<Album>,
+    songs: &mut Vec<Song>,
+    approx: &HashMap<String, f64>,
+) {
+    let band = |id: &str, real: Precision| approx.get(id).map_or(real, |s| Precision::approx(*s));
     // Artist play weight is the sum of that artist's song plays IN THIS REPLY: the
     // only artist-level play signal the row carries for free.
     let mut artist_plays: HashMap<String, u32> = HashMap::new();
@@ -111,10 +134,10 @@ pub fn rank(query: &str, artists: &mut Vec<Artist>, albums: &mut Vec<Album>, son
     }
     sort_by_key(artists, |a| {
         let plays = artist_plays.get(&fold(&a.name)).copied().unwrap_or(0);
-        (precision(query, &[&a.name]), habit(a.starred, plays))
+        (band(&a.id.0, precision(query, &[&a.name])), habit(a.starred, plays))
     });
     sort_by_key(albums, |a| {
-        (precision(query, &[&a.name, &a.artist]), habit(a.starred, a.play_count.unwrap_or(0)))
+        (band(&a.id.0, precision(query, &[&a.name, &a.artist])), habit(a.starred, a.play_count.unwrap_or(0)))
     });
     sort_by_key(songs, |s| {
         let fields = [s.title.as_str(), s.artist.as_deref().unwrap_or("")];
@@ -122,7 +145,7 @@ pub fn rank(query: &str, artists: &mut Vec<Artist>, albums: &mut Vec<Album>, son
         if s.user_rating.unwrap_or(0) >= 4 {
             h += 1.0;
         }
-        (precision(query, &fields), h)
+        (band(&s.id.0, precision(query, &fields)), h)
     });
 }
 
@@ -183,7 +206,7 @@ mod tests {
             song("loved", "Creep On Me", "X", Some(900), true),
             song("exact", "Creep", "Radiohead", None, false),
         ];
-        rank("creep", &mut vec![], &mut vec![], &mut songs);
+        rank("creep", &mut vec![], &mut vec![], &mut songs, &HashMap::new());
         assert_eq!(ids_s(&songs), ["exact", "loved"]);
     }
 
@@ -193,7 +216,7 @@ mod tests {
             song("loose", "Songs about Bjork", "Other", Some(500), true),
             song("art", "Joga", "Björk", None, false),
         ];
-        rank("björk", &mut vec![], &mut vec![], &mut songs);
+        rank("björk", &mut vec![], &mut vec![], &mut songs, &HashMap::new());
         assert_eq!(ids_s(&songs), ["art", "loose"]);
     }
 
@@ -203,7 +226,7 @@ mod tests {
             song("lead", "Love We Battle", "A", Some(5), false),
             song("rumpel", "Let Love Rumpel", "Kalabrese", Some(42), false),
         ];
-        rank("love", &mut vec![], &mut vec![], &mut songs);
+        rank("love", &mut vec![], &mut vec![], &mut songs, &HashMap::new());
         assert_eq!(ids_s(&songs), ["rumpel", "lead"]);
     }
 
@@ -214,7 +237,7 @@ mod tests {
             song("some", "Intro", "B", Some(3), false),
             song("star", "Intro", "C", Some(1), true),
         ];
-        rank("intro", &mut vec![], &mut vec![], &mut songs);
+        rank("intro", &mut vec![], &mut vec![], &mut songs, &HashMap::new());
         assert_eq!(ids_s(&songs), ["star", "some", "cold"]);
     }
 
@@ -225,7 +248,7 @@ mod tests {
             song("2", "Night B", "x", None, false),
             song("3", "Night C", "x", None, false),
         ];
-        rank("night", &mut vec![], &mut vec![], &mut songs);
+        rank("night", &mut vec![], &mut vec![], &mut songs, &HashMap::new());
         assert_eq!(ids_s(&songs), ["1", "2", "3"]);
     }
 
@@ -236,7 +259,7 @@ mod tests {
             album("cold", "Blue", "A", None, false),
             album("warm", "Blue", "B", Some(10), false),
         ];
-        rank("blue", &mut vec![], &mut albums, &mut vec![]);
+        rank("blue", &mut vec![], &mut albums, &mut vec![], &HashMap::new());
         let ids: Vec<_> = albums.iter().map(|a| a.id.0.as_str()).collect();
         assert_eq!(ids, ["warm", "cold", "loose"]);
     }
@@ -246,12 +269,12 @@ mod tests {
         let mut artists = vec![artist("a", "Air Supply", false), artist("b", "Air", false)];
         let mut songs = vec![song("s", "La Femme d'Argent", "Air", Some(40), false)];
         // "air" exactly equals "Air", which wins on precision regardless.
-        rank("air", &mut artists, &mut vec![], &mut songs);
+        rank("air", &mut artists, &mut vec![], &mut songs, &HashMap::new());
         assert_eq!(artists[0].id.0, "b");
         // With equal precision, the played one leads.
         let mut artists = vec![artist("x", "Air Supply", false), artist("y", "Air France", false)];
         let mut songs = vec![song("s", "T", "Air France", Some(2), false)];
-        rank("air", &mut artists, &mut vec![], &mut songs);
+        rank("air", &mut artists, &mut vec![], &mut songs, &HashMap::new());
         assert_eq!(artists[0].id.0, "y");
     }
 
@@ -262,9 +285,24 @@ mod tests {
             song("2", "b", "y", None, true),
             song("3", "c", "z", Some(9), false),
         ];
-        rank("q", &mut vec![], &mut vec![], &mut songs);
+        rank("q", &mut vec![], &mut vec![], &mut songs, &HashMap::new());
         let mut ids = ids_s(&songs);
         ids.sort();
         assert_eq!(ids, ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn habit_never_lifts_an_approximate_hit_over_a_closer_one() {
+        // A starred, heavily played song that is a FARTHER spelling, a never played
+        // closer spelling, and one real (server) loose hit.
+        let mut songs = vec![
+            song("far", "Hyperactive", "X", Some(500), true),
+            song("near", "Hyperion", "Y", Some(0), false),
+            song("real", "Something Hyper", "Z", Some(0), false),
+        ];
+        let approx: HashMap<String, f64> = [("far".to_string(), 0.62), ("near".to_string(), 0.81)].into();
+        rank("hyperon", &mut vec![], &mut vec![], &mut songs, &approx);
+        let ids: Vec<&str> = songs.iter().map(|s| s.id.0.as_str()).collect();
+        assert_eq!(ids, ["real", "near", "far"]);
     }
 }

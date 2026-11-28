@@ -413,6 +413,8 @@ struct Block {
     album_uri: Option<String>,
     artist_uri: Option<String>,
     host: String,
+    /// `X-Approximate: 1`: not a server match but a fuzzy "did you mean" hit.
+    approx: bool,
 }
 
 impl Block {
@@ -445,6 +447,7 @@ impl Block {
             album_uri: None,
             artist_uri: None,
             host: String::new(),
+            approx: false,
         })
     }
 
@@ -464,6 +467,7 @@ impl Block {
             // fitter. It is what distinguishes "NTS Infinite Mixtapes 1" from
             // "NTS Radio Live 1" at a glance.
             "X-StreamHost" => self.host = v.to_string(),
+            "X-Approximate" => self.approx = v == "1",
             "Time" => self.secs = v.parse().ok(),
             _ => {}
         }
@@ -488,7 +492,7 @@ fn flush_block(
             format!("{n} {one}s")
         }
     };
-    let (trailer, bucket): (String, &mut Vec<FindRow>) = match b.kind {
+    let (mut trailer, bucket): (String, &mut Vec<FindRow>) = match b.kind {
         FindKind::Artist => (b.count.map(|n| plural(n, "album")).unwrap_or_default(), artists),
         FindKind::Album => {
             let mut t = b.artist.clone();
@@ -515,6 +519,11 @@ fn flush_block(
             (t, songs)
         }
     };
+    // An approximate (fuzzy) hit says so in the trailer, which the renderer never
+    // truncates before the label: the spelling was not what was typed.
+    if b.approx {
+        trailer = if trailer.is_empty() { "did you mean?".into() } else { format!("did you mean?   {trailer}") };
+    }
     bucket.push(FindRow {
         kind: b.kind,
         // A block with no name falls back to its uri rather than rendering a blank
@@ -1009,5 +1018,22 @@ mod tests {
             }
             assert!(*a != '#' && *a != '~', "clashes with a queue mark in the same gutter");
         }
+    }
+
+    #[test]
+    fn an_approximate_row_says_did_you_mean() {
+        let p = pairs(&[
+            ("X-Hits", "artist 0 20"),
+            ("directory", "artist/a1"),
+            ("Artist", "Massive Attack"),
+            ("X-AlbumCount", "2"),
+            ("X-Approximate", "1"),
+            ("file", "song/s1"),
+            ("Title", "Teardrop"),
+        ]);
+        let hits = parse_searchall_hits(&p);
+        assert_eq!(hits.rows[0].label, "Massive Attack");
+        assert_eq!(hits.rows[0].trailer, "did you mean?   2 albums");
+        assert_eq!(hits.rows[1].trailer, "", "a server row carries no marker");
     }
 }
