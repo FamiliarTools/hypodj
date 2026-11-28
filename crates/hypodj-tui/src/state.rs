@@ -403,6 +403,17 @@ pub fn step_active(len: usize, sel: usize, delta: i32, active: impl Fn(usize) ->
         }
         i += dir;
     }
+    // Nothing active at or beyond the target: settle on the active row nearest the
+    // target between it and the cursor, so a long step toward a greyed tail still
+    // moves as far as it can instead of standing still.
+    let from = sel.min(len - 1) as i64;
+    let mut i = target - dir;
+    while i != from && (0..=last).contains(&i) {
+        if active(i as usize) {
+            return i as usize;
+        }
+        i -= dir;
+    }
     sel.min(len - 1)
 }
 
@@ -3245,6 +3256,14 @@ impl TuiState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn step_active_lands_on_the_nearest_active_row_short_of_a_greyed_target() {
+        assert_eq!(step_active(10, 0, 5, |i| i == 2), 2);
+        assert_eq!(step_active(10, 9, -5, |i| i == 7), 7);
+        assert_eq!(step_active(10, 0, 5, |i| i == 0), 0);
+        assert_eq!(step_active(10, 0, 5, |i| i == 6), 6);
+    }
 
     /// Every key `?` advertises for a view must DO something in that view: pressed in a
     /// prepared state, it either returns an intent or changes what the user can see.

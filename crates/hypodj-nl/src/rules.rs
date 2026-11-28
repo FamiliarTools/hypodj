@@ -269,8 +269,8 @@ fn rules_body(
     // 0a. a NAMED listening need ("waking up music", "end of day", "calm not
     // eerie"). Before the negation guard because "not eerie" is part of the need,
     // not a negation of the ask; any OTHER negation still falls through to it.
-    if let Some(plans) = mood(text) {
-        return Ok(plans);
+    if let Some(res) = mood(text) {
+        return res;
     }
 
     // 0. the negation / contrast guard: only the mode grammar parses its own
@@ -436,81 +436,130 @@ const DARK_WORDS: &[&str] = &[
     "ominous", "sad", "gloomy", "depressing",
 ];
 
-/// Words that make an utterance a DIFFERENT, harder ask than a named need: a fade,
-/// a stop, a timer, a curation. The mood rule never swallows one of them (it would
-/// drop the part of the ask it cannot express), so they fall through.
-const NOT_A_MOOD: &[&str] = &[
-    "fade", "stop", "pause", "sleep", "skip", "remove", "drop", "wind", "at", "in", "after",
-    "until", "every", "shuffle", "repeat", "favorites", "favourites", "favorite", "favourite",
-    "starred",
+/// Every word a mood ask may carry besides its need phrase and its "not <dark>"
+/// qualifiers. A CLOSED frame on purpose, like [`INSTRUMENTAL_FRAME`]: the mood
+/// rule owns an utterance only when NOTHING is left over once the need is read, so
+/// a title ("play Waking Up by OneRepublic", "play the song Late Night"), a genre
+/// ("upbeat jazz"), an artist, a second clause ("clear the queue, then focus
+/// music"), a timer or a fade all fall through to the rules that can express them.
+/// "the" is deliberately absent: "play the album Unwind" names a thing, so the
+/// phrases that need it ("end of the day") carry it themselves.
+const MOOD_FRAME: &[&str] = &[
+    "play", "put", "on", "queue", "add", "enqueue", "append", "start", "give", "me", "some",
+    "something", "music", "tracks", "track", "songs", "song", "stuff", "please", "a", "few",
+    "couple", "of", "for", "to", "i", "i'd", "want", "like", "need", "just",
 ];
 
-/// Which need a phrase names, if any. Phrase matches over the lowercased text; the
-/// calm-not-dark shape is read from the word list.
-fn mood_need(low: &str, wv: &[&str]) -> Option<Mood> {
-    let has = |p: &str| low.contains(p);
-    let negated_dark = wv.windows(2).any(|w| {
-        matches!(w[0], "not" | "no" | "nothing" | "never" | "without") && DARK_WORDS.contains(&w[1])
-    });
-    let warm = wv.iter().any(|w| matches!(*w, "warm" | "cozy" | "cosy"));
-    if wv.contains(&"calm") && (negated_dark || warm) {
-        return Some(Mood::CalmWarm);
+/// The need phrases, as word sequences, longest first within each need so the
+/// longer reading consumes its words. Verb-like single words ("unwind",
+/// "concentrate") need a "to" in front: bare, they read as a title ("play
+/// Concentrate").
+const MOOD_PHRASES: &[(&[&str], Mood)] = &[
+    (&["music", "for", "the", "morning"], Mood::Wake),
+    (&["morning", "music"], Mood::Wake),
+    (&["wake", "up", "music"], Mood::Wake),
+    (&["wake-up", "music"], Mood::Wake),
+    (&["to", "wake", "up"], Mood::Wake),
+    (&["waking", "up"], Mood::Wake),
+    (&["for", "waking"], Mood::Wake),
+    (&["the", "end", "of", "the", "day"], Mood::Unwind),
+    (&["end", "of", "the", "day"], Mood::Unwind),
+    (&["end", "of", "day"], Mood::Unwind),
+    (&["end-of-day"], Mood::Unwind),
+    (&["after", "work"], Mood::Unwind),
+    (&["help", "me", "unwind"], Mood::Unwind),
+    (&["to", "unwind"], Mood::Unwind),
+    (&["to", "decompress"], Mood::Unwind),
+    (&["music", "for", "working"], Mood::Focus),
+    (&["for", "working"], Mood::Focus),
+    (&["work", "music"], Mood::Focus),
+    (&["working", "music"], Mood::Focus),
+    (&["to", "work", "to"], Mood::Focus),
+    (&["focus", "music"], Mood::Focus),
+    (&["to", "focus"], Mood::Focus),
+    (&["coding", "music"], Mood::Focus),
+    (&["for", "coding"], Mood::Focus),
+    (&["to", "code", "to"], Mood::Focus),
+    (&["to", "concentrate"], Mood::Focus),
+    (&["the", "middle", "of", "the", "night"], Mood::Night),
+    (&["middle", "of", "the", "night"], Mood::Night),
+    (&["late", "night"], Mood::Night),
+    (&["late-night"], Mood::Night),
+    (&["night", "music"], Mood::Night),
+    (&["pick", "me", "up"], Mood::Lift),
+    (&["pick-me-up"], Mood::Lift),
+    (&["cheer", "me", "up"], Mood::Lift),
+    (&["upbeat"], Mood::Lift),
+];
+
+/// Words that negate (rather than qualify) when they are not the "not <dark>"
+/// shape. Left over in a mood frame they make the ask a negation of the need
+/// ("I want no upbeat music"), which is refused, never played.
+const MOOD_NEGATORS: &[&str] = &["not", "no", "nothing", "never", "without"];
+
+/// Read the need off `wv` and return it with the words it did not account for:
+/// the need phrase and every "[but] not <dark word>" qualifier are consumed. The
+/// calm-not-dark shape wins over a phrase so "calm, not eerie" stays CalmWarm.
+fn mood_need<'a>(wv: &[&'a str]) -> Option<(Mood, Vec<&'a str>)> {
+    let mut used = vec![false; wv.len()];
+    let mut negated_dark = false;
+    for i in 0..wv.len().saturating_sub(1) {
+        if MOOD_NEGATORS.contains(&wv[i]) && DARK_WORDS.contains(&wv[i + 1]) {
+            negated_dark = true;
+            used[i] = true;
+            used[i + 1] = true;
+            if i > 0 && wv[i - 1] == "but" {
+                used[i - 1] = true;
+            }
+        }
     }
-    if has("waking up") || has("wake up music") || has("wake-up music") || has("to wake up")
-        || has("morning music") || has("music for the morning") || has("for waking")
-    {
-        return Some(Mood::Wake);
-    }
-    if has("end of day") || has("end of the day") || has("end-of-day") || has("after work")
-        || has("unwind") || has("decompress")
-    {
-        return Some(Mood::Unwind);
-    }
-    if has("music for working") || has("for working") || has("work music") || has("working music") || has("to work to")
-        || has("focus music") || has("music to focus") || has("coding music") || has("music for coding")
-        || has("to code to") || has("concentrate")
-    {
-        return Some(Mood::Focus);
-    }
-    if has("late night") || has("late-night") || has("night music") || has("middle of the night") {
-        return Some(Mood::Night);
-    }
-    if has("upbeat") || has("pick me up") || has("pick-me-up") || has("cheer me up") {
-        return Some(Mood::Lift);
-    }
-    None
+    let calm = wv.iter().position(|w| *w == "calm");
+    let warm = wv.iter().position(|w| matches!(*w, "warm" | "cozy" | "cosy"));
+    let need = if let (Some(c), true) = (calm, negated_dark || warm.is_some()) {
+        used[c] = true;
+        if let Some(w) = warm {
+            used[w] = true;
+        }
+        Mood::CalmWarm
+    } else {
+        let (phrase, need, at) = MOOD_PHRASES.iter().find_map(|(p, m)| {
+            wv.windows(p.len())
+                .enumerate()
+                .find(|(i, win)| win == p && !used[*i..*i + p.len()].iter().any(|u| *u))
+                .map(|(i, _)| (*p, *m, i))
+        })?;
+        used[at..at + phrase.len()].iter_mut().for_each(|u| *u = true);
+        need
+    };
+    let rest = wv.iter().zip(&used).filter(|(_, u)| !**u).map(|(w, _)| *w).collect();
+    Some((need, rest))
 }
 
-/// Does the mood rule own this utterance? For [`crate::daemon_first`].
+/// Does the mood rule own this utterance? For [`crate::daemon_first`]. A refused
+/// negated need ("no upbeat music") is not owned: the daemon would refuse it too.
 pub fn is_mood_ask(utterance: &str) -> bool {
-    mood(utterance).is_some()
+    matches!(mood(utterance), Some(Ok(_)))
 }
 
 /// "waking up music" / "end of day" / "calm not eerie" / "queue 3 tracks for
 /// working" -> one immediate [`Selector::Mood`] selection. A queue verb appends;
-/// anything else is a request to HEAR it, so it plays now. `None` when the
-/// utterance names no need, carries a negation other than "not <dark word>", or
-/// mixes in an ask this rule cannot express (a fade, a timer, a vocal filter).
-fn mood(text: &str) -> Option<Vec<RawPlan>> {
-    let low = text.to_lowercase();
+/// anything else is a request to HEAR it, so it plays now. The WHOLE utterance must
+/// be the mood ask: once the need phrase and its "not <dark>" qualifiers are read,
+/// every remaining word must sit in [`MOOD_FRAME`], else `None` and the other rules
+/// see it. A leftover negator over an otherwise clean frame ("I want no upbeat
+/// music") is `Some(Err)`: it negates the need and is refused, not played.
+fn mood(text: &str) -> Option<Result<Vec<RawPlan>, NlError>> {
     let wd = words(text);
     let wv: Vec<&str> = wd.iter().map(String::as_str).collect();
-    if wv.iter().any(|w| NOT_A_MOOD.contains(w) || VOICE_WORDS.contains(w)) {
+    let (need, rest) = mood_need(&wv)?;
+    let framed = |w: &&str| MOOD_FRAME.contains(w) || w.parse::<u32>().is_ok();
+    if !rest.iter().all(|w| framed(w) || MOOD_NEGATORS.contains(w)) {
         return None;
     }
-    let need = mood_need(&low, &wv)?;
-    // Every negation must be the "not <dark word>" qualifier the need already holds.
-    let rest: Vec<&str> = wv
-        .iter()
-        .enumerate()
-        .filter(|(i, w)| {
-            let next_dark = wv.get(i + 1).is_some_and(|n| DARK_WORDS.contains(n));
-            !(next_dark && matches!(**w, "not" | "no" | "nothing" | "never" | "without" | "but"))
-        })
-        .map(|(_, w)| *w)
-        .collect();
-    if negation(&rest).is_some() {
-        return None;
+    if let Some(neg) = rest.iter().find(|w| MOOD_NEGATORS.contains(w)) {
+        return Some(Err(NlError::Ambiguous(format!(
+            "\"{neg}\" negates the ask; say what to do rather than what not to (e.g. \"sleep off\", \"clear filters\")"
+        ))));
     }
     let count = leading_count(&wv).unwrap_or(DEFAULT_ENQUEUE_COUNT);
     let selector = Selector::Mood(need);
@@ -518,7 +567,7 @@ fn mood(text: &str) -> Option<Vec<RawPlan>> {
         Some("queue" | "add" | "enqueue" | "append") => Action::Enqueue { selector, count },
         _ => Action::PlayNow { selector, count },
     };
-    Some(vec![plan(RawTrigger::Immediate, action, true)])
+    Some(Ok(vec![plan(RawTrigger::Immediate, action, true)]))
 }
 
 /// "play my favorites" -> PlayNow{Starred}; "queue|add my favorites" ->

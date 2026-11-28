@@ -126,6 +126,61 @@ mod question_tests {
     }
 
     #[test]
+    fn mood_owns_only_a_whole_mood_ask_and_titles_fall_through() {
+        use hypodj_core::plan::{Action, Selector};
+        use chrono::TimeZone;
+        let ctx = NlContext {
+            current: None,
+            now: tokio::time::Instant::now(),
+            now_civil: chrono::Utc.with_ymd_and_hms(2026, 7, 15, 5, 30, 0).unwrap(),
+            tz: chrono::FixedOffset::east_opt(0).unwrap(),
+            queue_len: 0,
+            queue_rows: vec![],
+            library_artists: vec![],
+        };
+        for u in [
+            "play Waking Up by OneRepublic",
+            "play Late Night Tales",
+            "play upbeat jazz",
+            "play Night Music by Stephen Sondheim",
+            "play something upbeat by Daft Punk",
+            "play the album Unwind",
+            "play Unwind by Hans",
+            "play Concentrate",
+            "play Upbeat Girl",
+            "play the song Late Night",
+            "what is the morning music",
+            "clear the queue, then focus music",
+            "I want no upbeat music",
+        ] {
+            assert!(!rules::is_mood_ask(u), "{u}");
+            let got = rules::translate_rules(u, &ctx);
+            let is_mood = got.as_ref().is_ok_and(|ps| {
+                ps.iter().any(|p| matches!(&p.action,
+                    Action::PlayNow { selector: Selector::Mood(_), .. }
+                        | Action::Enqueue { selector: Selector::Mood(_), .. }))
+            });
+            assert!(!is_mood, "{u} -> {got:?}");
+        }
+        assert!(matches!(rules::translate_rules("I want no upbeat music", &ctx), Err(NlError::Ambiguous(_))));
+        assert!(is_question("what is the morning music") || rules::translate_rules("what is the morning music", &ctx)
+            .map_or(true, |ps| ps.iter().all(|p| !matches!(p.action, Action::PlayNow { .. } | Action::Enqueue { .. }))));
+        for u in [
+            "waking up music", "end of day", "calm not eerie", "music for working", "late night",
+            "upbeat", "play calm music, no dark", "something for the end of the day",
+            "queue 3 tracks for working", "something calm but not creepy", "music to concentrate",
+        ] {
+            assert!(rules::is_mood_ask(u), "{u}");
+            assert!(daemon_first(u), "{u}");
+        }
+        assert!(!rules::is_mood_ask("wake me at 7"));
+        assert!(matches!(
+            rules::translate_rules("wake me at 7", &ctx).as_deref(),
+            Ok([p]) if matches!(p.action, Action::Wake { .. })
+        ));
+    }
+
+    #[test]
     fn instrumental_asks_go_to_the_daemon_first() {
         for u in ["no vocals", "instrumental only", "queue 3 instrumentals", "what's offline"] {
             assert!(daemon_first(u), "{u}");

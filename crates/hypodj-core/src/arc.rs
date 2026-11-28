@@ -355,6 +355,12 @@ pub fn load_saved(dir: &Path) -> Vec<SavedArc> {
 
 /// Save `arc` (upsert + bound) atomically. Sync: `spawn_blocking` territory.
 pub fn save_arc(dir: &Path, arc: SavedArc) -> std::io::Result<()> {
+    // One process-wide lock over the read-merge-write: two concurrent saves would
+    // each read the same old list and the later rename would drop the other's arc.
+    // A std Mutex is right here - this runs on a blocking thread, never across an
+    // await. A poisoned lock still serializes; the file itself is atomic.
+    static SAVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     std::fs::create_dir_all(dir)?;
     let arcs = upsert(load_saved(dir), arc);
     let bytes = serde_json::to_vec_pretty(&arcs).map_err(std::io::Error::other)?;
@@ -488,6 +494,24 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].name, "Warm Room");
         assert_eq!(back[0].kept_ids(), vec!["a", "b"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_saves_of_distinct_names_all_land() {
+        let dir = std::env::temp_dir().join(format!("hypodj-arc-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let arc = SavedArc { name: format!("arc {i}"), saved_unix: i, summary: String::new(), tracks: vec![] };
+                    save_arc(&dir, arc).unwrap();
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(load_saved(&dir).len(), 16);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
