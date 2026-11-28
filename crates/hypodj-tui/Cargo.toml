@@ -33,6 +33,9 @@ hypodj-build-info = { path = "../hypodj-build-info" }
 # compose() at print time for `dj-gui --version`.
 hypodj-build-info = { path = "../hypodj-build-info" }
 hypodj-client = { path = "../hypodj-client" }
+# The offline row rules (server_down / row_active / queue_on_disk) shared with djg and
+# djq. GUI-free: it depends only on hypodj-client.
+hypodj-app = { path = "../hypodj-app" }
 hypodj-style = { path = "../hypodj-style", features = ["ratatui"] }
 hypodj-nl = { path = "../hypodj-nl", optional = true, default-features = false, features = ["cc"] }
 ratatui.workspace = true

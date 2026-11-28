@@ -463,6 +463,25 @@ def judge(spec, state, outdir, steps):
                 if got < want:
                     ok = False
                     notes.append(f"{sz}: {got} lines match /{rx}/, want >= {want}")
+        # Style-marked frames (`NNN.WxH.rows`, see pump.rs frame_dump): each line is
+        # led by `>` (cursor row), `~` (greyed row) or a space, then a space.
+        if chk.get("rows_require_re") or chk.get("rows_forbid_re"):
+            for sz in fr:
+                p = outdir / f"{n:03d}.{sz}.rows"
+                if not p.exists():
+                    ok = False
+                    notes.append(f"{sz}: no style-marked frame {p.name}")
+                    continue
+                text = p.read_text()
+                for rx in chk.get("rows_require_re", []):
+                    if not re.search(rx, text, re.I | re.M):
+                        ok = False
+                        notes.append(f"{sz}: no marked row matches /{rx}/")
+                for rx in chk.get("rows_forbid_re", []):
+                    m = re.search(rx, text, re.I | re.M)
+                    if m:
+                        ok = False
+                        notes.append(f"{sz}: forbidden marked row /{rx}/ matched {m.group(0)[:60]!r}")
         for expr in chk.get("truth", []):
             good, why = eval_truth(expr, truth)
             ok &= good

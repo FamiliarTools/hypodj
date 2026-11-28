@@ -59,12 +59,13 @@ pub const GRID_THUMB: u32 = 96;
 /// current cell area every frame (cheap); the expensive fetch+decode happens once.
 pub struct AlbumArt {
     img: RgbImage,
-    /// The last sixel payload, keyed by the pixel geometry it was encoded for.
+    /// The last sixel payload, keyed by the pixel geometry it was encoded for: the
+    /// full image size plus the visible row band `(top, height)` of a cropped slice.
     ///
     /// Encoding is the expensive part and the pane geometry rarely changes, so this
     /// turns a per-frame cost into a per-resize one. It also makes the payload STRING
     /// STABLE, which is what lets the frame diff decide when to re-send it.
-    sixel: std::cell::RefCell<Option<(u32, u32, std::sync::Arc<str>)>>,
+    sixel: std::cell::RefCell<Option<((u32, u32, u32, u32), std::sync::Arc<str>)>>,
     /// The ranked cover palette, extracted once at decode time. Shared by the sigil
     /// (DECORATION) and the waveform (INFO) so the visual system reads from one source.
     pub palette: crate::album_color::Palette,
@@ -131,13 +132,36 @@ impl AlbumArt {
     /// pane is the whole mechanism behind the redraw policy: the payload is the symbol
     /// of one cell, so an identical string means the frame diff emits nothing at all.
     pub fn sixel(&self, px_w: u32, px_h: u32) -> std::sync::Arc<str> {
-        if let Some((w, h, payload)) = self.sixel.borrow().as_ref() {
-            if *w == px_w && *h == px_h {
+        self.sixel_rows(px_w, px_h, 0, px_h)
+    }
+
+    /// The sixel payload for ONLY the pixel rows `top..top + vis_h` of this cover drawn
+    /// at `px_w x px_h`. A sixel is cell-anchored and the terminal cannot clip it, so a
+    /// cover half scrolled out of a box is drawn by encoding just the band still in view
+    /// - at full resolution - rather than falling back to coarse cell art. The image is
+    /// scaled to the FULL size first and cropped after, so the visible band is exactly
+    /// the pixels it would have been unscrolled, not a re-fit of the slice.
+    pub fn sixel_rows(&self, px_w: u32, px_h: u32, top: u32, vis_h: u32) -> std::sync::Arc<str> {
+        let key = (px_w, px_h, top, vis_h);
+        if let Some((k, payload)) = self.sixel.borrow().as_ref() {
+            if *k == key {
                 return payload.clone();
             }
         }
-        let payload: std::sync::Arc<str> = encode_sixel(&self.img, px_w, px_h).into();
-        *self.sixel.borrow_mut() = Some((px_w, px_h, payload.clone()));
+        let vis_h = vis_h.min(px_h.saturating_sub(top));
+        let payload: std::sync::Arc<str> = if top == 0 && vis_h == px_h {
+            encode_sixel(&self.img, px_w, px_h)
+        } else if px_w == 0 || vis_h == 0 {
+            String::new()
+        } else {
+            let scaled =
+                image::imageops::resize(&self.img, px_w, px_h, image::imageops::FilterType::Triangle);
+            let band = image::imageops::crop_imm(&scaled, 0, top, px_w, vis_h).to_image();
+            // Already at size, so this resize is the identity.
+            encode_sixel(&band, px_w, vis_h)
+        }
+        .into();
+        *self.sixel.borrow_mut() = Some((key, payload.clone()));
         payload
     }
 }

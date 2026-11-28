@@ -136,7 +136,7 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 is_dir: true,
                 song_count: None,
                 artist: None,
-                album_uri: None, artist_uri: None,
+                album_uri: None, artist_uri: None, on_disk: None,
             }),
             "file" => rows.push(BrowseRow {
                 label: path_tail(v).to_string(),
@@ -144,7 +144,7 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 is_dir: false,
                 song_count: None,
                 artist: None,
-                album_uri: None, artist_uri: None,
+                album_uri: None, artist_uri: None, on_disk: None,
             }),
             "playlist" => rows.push(BrowseRow {
                 label: v.clone(),
@@ -152,12 +152,20 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 is_dir: false,
                 song_count: None,
                 artist: None,
-                album_uri: None, artist_uri: None,
+                album_uri: None, artist_uri: None, on_disk: None,
             }),
             "Album" | "Genre" => {
                 if let Some(last) = rows.last_mut() {
                     if last.is_dir {
                         last.label = v.clone();
+                    }
+                }
+            }
+            // Per-track "the mirror holds this" on album listings (`held_song_rows`).
+            "X-Offline" => {
+                if let Some(last) = rows.last_mut() {
+                    if !last.is_dir {
+                        last.on_disk = Some(v == "1");
                     }
                 }
             }
@@ -371,6 +379,44 @@ pub struct BrowseRow {
     /// The artist browse uri on a song row (`X-ArtistUri`), so "go to artist" from a
     /// drilled listing is a real jump instead of a name search.
     pub artist_uri: Option<String>,
+    /// Whether the mirror holds this SONG row, from the daemon's per-track
+    /// `X-Offline` on album listings; `None` when the daemon did not say. Album dir
+    /// rows answer from [`Browse::held`] instead.
+    pub on_disk: Option<bool>,
+}
+
+/// Move `sel` by `delta` over `len` rows, landing only on rows `active` accepts: a
+/// step onto an inactive row keeps going the same way, and when nothing active lies
+/// that way the cursor stays put. With every row active this is the plain clamped
+/// move, so online behaviour is unchanged.
+pub fn step_active(len: usize, sel: usize, delta: i32, active: impl Fn(usize) -> bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let last = len as i64 - 1;
+    let target = (sel as i64 + delta as i64).clamp(0, last);
+    let dir: i64 = if delta >= 0 { 1 } else { -1 };
+    let mut i = target;
+    while (0..=last).contains(&i) {
+        if active(i as usize) {
+            return i as usize;
+        }
+        i += dir;
+    }
+    sel.min(len - 1)
+}
+
+/// Where a cursor on an inactive row should rest: the nearest active row below it,
+/// else above it, else where it is (nothing is active).
+pub fn snap_active(len: usize, sel: usize, active: impl Fn(usize) -> bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let sel = sel.min(len - 1);
+    if active(sel) {
+        return sel;
+    }
+    (sel..len).chain((0..sel).rev()).find(|&i| active(i)).unwrap_or(sel)
 }
 
 /// A self-contained browse list with its own cursor, scroll offset, nav stack, and
@@ -425,6 +471,27 @@ impl Browse {
         }
     }
 
+    /// Whether the mirror holds row `i`: an album dir row from `store albums` (any held
+    /// track makes it playable offline), a song row from its own `X-Offline`.
+    pub fn on_disk(&self, i: usize) -> Option<bool> {
+        let r = self.rows.get(i)?;
+        if r.is_dir && r.uri.starts_with("album/") {
+            return self.held_known.then(|| self.held.get(&r.uri).copied().unwrap_or(0) > 0);
+        }
+        r.on_disk
+    }
+
+    /// Whether row `i` is playable and focusable: every row online, only what the
+    /// mirror holds while the server is down (the rule djg and djq share).
+    pub fn active(&self, i: usize, down: bool) -> bool {
+        hypodj_app::view::row_active(down, self.on_disk(i))
+    }
+
+    /// Put a cursor that rests on an inactive row onto the nearest active one.
+    pub fn snap(&mut self, down: bool) {
+        self.selected = snap_active(self.rows.len(), self.selected, |i| self.active(i, down));
+    }
+
     /// Is this level a cover grid? Every row a directory and at least one an album:
     /// the Albums A-Z root and the smart lists qualify, an opened album (songs) never.
     pub fn is_album_grid(&self) -> bool {
@@ -437,7 +504,28 @@ impl Browse {
     /// rows, as a grid of covers does everywhere else); `dy` moves a whole row, and a
     /// step down into a SHORTER last row lands on its last cell rather than doing
     /// nothing, so the bottom of the grid is always reachable with `j`.
-    pub fn grid_move(&mut self, dx: i32, dy: i32) {
+    /// The grid move ([`Self::grid_move_raw`]) that never lands on an inactive cover: a step onto one
+    /// keeps going in reading order the way the step went, and stays put when nothing
+    /// active lies that way.
+    pub fn grid_move_active(&mut self, dx: i32, dy: i32, down: bool) {
+        let from = self.selected;
+        self.grid_move_raw(dx, dy);
+        if self.selected == from || self.active(self.selected, down) {
+            return;
+        }
+        let dir: i64 = if dy > 0 || (dy == 0 && dx > 0) { 1 } else { -1 };
+        let mut i = self.selected as i64;
+        while (0..self.rows.len() as i64).contains(&i) {
+            if self.active(i as usize, down) {
+                self.selected = i as usize;
+                return;
+            }
+            i += dir;
+        }
+        self.selected = from;
+    }
+
+    fn grid_move_raw(&mut self, dx: i32, dy: i32) {
         if self.rows.is_empty() {
             self.selected = 0;
             return;
@@ -473,14 +561,8 @@ impl Browse {
         self.loaded = true;
     }
 
-    fn move_selection(&mut self, delta: i32) {
-        if self.rows.is_empty() {
-            self.selected = 0;
-            return;
-        }
-        let last = self.rows.len() - 1;
-        let next = self.selected as i32 + delta;
-        self.selected = next.clamp(0, last as i32) as usize;
+    fn move_selection(&mut self, delta: i32, down: bool) {
+        self.selected = step_active(self.rows.len(), self.selected, delta, |i| self.active(i, down));
     }
 }
 
@@ -1229,6 +1311,7 @@ impl TuiState {
         } else if self.selected >= self.queue.len() {
             self.selected = self.queue.len() - 1;
         }
+        self.snap_cursors();
     }
 
     /// Update only the now-playing card, leaving the queue (and cursor) untouched.
@@ -1236,6 +1319,7 @@ impl TuiState {
     pub fn apply_now(&mut self, now: NowPlaying) {
         self.now = now;
         self.now_at = Some(Instant::now());
+        self.snap_cursors();
     }
 
     /// The playhead as of `at`: the reported `elapsed` plus the time since it was
@@ -1531,6 +1615,11 @@ impl TuiState {
                     self.card = None;
                     self.card_scroll.reset();
                 }
+                // Help ABOUT the card, drawn over it; closing help returns to the card.
+                KeyCode::Char('?') => {
+                    self.help_open = true;
+                    self.help.reset();
+                }
                 code => {
                     self.card_scroll.on_key(code);
                 }
@@ -1576,6 +1665,22 @@ impl TuiState {
         None
     }
 
+    /// What the `?` overlay is about: the info card when one is open (help is drawn
+    /// over it), otherwise the current view.
+    pub fn help_view(&self) -> keymap::HelpView {
+        use keymap::HelpView;
+        if self.card.is_some() {
+            return HelpView::Info;
+        }
+        match self.screen {
+            Screen::Queue => HelpView::Queue,
+            Screen::Albums => HelpView::Albums,
+            Screen::Playlists => HelpView::Lists,
+            Screen::Dj => HelpView::Dj,
+            Screen::Find => HelpView::Find,
+        }
+    }
+
     /// The Albums cover grid's 2D cursor: Left/Right step a cell, j/k and Up/Down a
     /// row. Claimed HERE, before the keymap, because in the list Left/Right mean
     /// back/drill and j/k move over `active_browse()` - and only the Albums browse is
@@ -1591,17 +1696,10 @@ impl TuiState {
         {
             return None;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let (dx, dy) = match key.code {
-            KeyCode::Left if !ctrl => (-1, 0),
-            KeyCode::Right if !ctrl => (1, 0),
-            KeyCode::Char('j') | KeyCode::Down if !ctrl => (0, 1),
-            KeyCode::Char('k') | KeyCode::Up if !ctrl => (0, -1),
-            KeyCode::Char('n') if ctrl => (0, 1),
-            KeyCode::Char('p') if ctrl => (0, -1),
-            _ => return None,
-        };
-        self.albums.grid_move(dx, dy);
+        // Read from the same table the `?` overlay renders, so the two cannot drift.
+        let (dx, dy) = keymap::grid_step(key)?;
+        let down = self.server_down();
+        self.albums.grid_move_active(dx, dy, down);
         Some(())
     }
 
@@ -1694,6 +1792,10 @@ impl TuiState {
             // `r` starts an ENDLESS radio from the selected row (the daemon resolves a
             // bare `radio` from what is playing, so an unseedable screen still has a
             // meaning - but never a silent one; see `radio_selected`).
+            Act::Radio | Act::PlaySel | Act::Enqueue if !self.selection_active() => {
+                self.set_status("not on disk - the server is unreachable, so only what is held plays");
+                None
+            }
             Act::Radio => self.radio_selected(),
             // `s` stars the SELECTED row; C-s stars the CURRENT playing track.
             Act::FavSelected => self.favorite_selected(),
@@ -1806,6 +1908,7 @@ impl TuiState {
         }
         self.last_search.clear();
         self.screen = screen;
+        self.snap_cursors();
         Some(Intent::ShowScreen(screen))
     }
 
@@ -1843,12 +1946,15 @@ impl TuiState {
             self.find.selected = 0;
             return;
         }
+        let down = self.server_down();
         match self.active_browse() {
-            Some(b) if !b.rows.is_empty() => b.selected = 0,
+            Some(b) if !b.rows.is_empty() => {
+                b.selected = step_active(b.rows.len(), 0, 0, |i| b.active(i, down));
+            }
             Some(_) => {}
             None => {
                 if !self.queue.is_empty() {
-                    self.selected = 0;
+                    self.selected = step_active(self.queue.len(), 0, 0, |i| self.queue_active(i));
                 }
             }
         }
@@ -1863,12 +1969,24 @@ impl TuiState {
             self.find.selected = self.find.hits.rows.len().saturating_sub(1);
             return;
         }
+        let down = self.server_down();
         match self.active_browse() {
-            Some(b) if !b.rows.is_empty() => b.selected = b.rows.len() - 1,
+            Some(b) if !b.rows.is_empty() => {
+                let last = b.rows.len() - 1;
+                b.selected = step_active(b.rows.len(), last, 0, |i| b.active(i, down));
+                if !b.active(b.selected, down) {
+                    b.selected = step_active(b.rows.len(), last, -1, |i| b.active(i, down));
+                }
+            }
             Some(_) => {}
             None => {
                 if !self.queue.is_empty() {
-                    self.selected = self.queue.len() - 1;
+                    let last = self.queue.len() - 1;
+                    let mut i = step_active(self.queue.len(), last, 0, |i| self.queue_active(i));
+                    if !self.queue_active(i) {
+                        i = step_active(self.queue.len(), last, -1, |i| self.queue_active(i));
+                    }
+                    self.selected = i;
                 }
             }
         }
@@ -2694,17 +2812,60 @@ impl TuiState {
             self.find.move_selection(delta);
             return;
         }
+        let down = self.server_down();
         if let Some(b) = self.active_browse() {
-            b.move_selection(delta);
+            b.move_selection(delta, down);
             return;
         }
-        if self.queue.is_empty() {
-            self.selected = 0;
+        self.selected = step_active(self.queue.len(), self.selected, delta, |i| self.queue_active(i));
+    }
+
+    /// Whether the music server is unusable right now, so only what is on disk can
+    /// play. The rule djg and djq use, read from the same `server` word.
+    pub fn server_down(&self) -> bool {
+        hypodj_app::view::server_down(self.now.server.as_deref())
+    }
+
+    /// Whether queue row `i` is playable and focusable (see [`Browse::active`]).
+    pub fn queue_active(&self, i: usize) -> bool {
+        let down = self.server_down();
+        self.queue
+            .get(i)
+            .is_some_and(|it| hypodj_app::view::row_active(down, hypodj_app::view::queue_on_disk(it)))
+    }
+
+    /// Rest every cursor on an active row. Called whenever what is active can change
+    /// under a still hand: a snapshot (the server went away or came back), a listing
+    /// landing, a view switch. Online it is a no-op.
+    pub fn snap_cursors(&mut self) {
+        let down = self.server_down();
+        if !down {
             return;
         }
-        let last = self.queue.len() - 1;
-        let next = self.selected as i32 + delta;
-        self.selected = next.clamp(0, last as i32) as usize;
+        self.selected = snap_active(self.queue.len(), self.selected, |i| self.queue_active(i));
+        self.albums.snap(down);
+        self.playlists.snap(down);
+        self.find.drill.snap(down);
+    }
+
+    /// Whether the row under the cursor of the active list may be played. Offline an
+    /// inactive row can only fail, so the play gestures refuse it in words instead.
+    fn selection_active(&mut self) -> bool {
+        let down = self.server_down();
+        if !down {
+            return true;
+        }
+        if self.screen == Screen::Find && !self.find.drilling {
+            return true;
+        }
+        if self.screen == Screen::Dj {
+            return true;
+        }
+        let sel = self.selected;
+        match self.active_browse() {
+            Some(b) => b.rows.is_empty() || b.active(b.selected, down),
+            None => self.queue.is_empty() || self.queue_active(sel),
+        }
     }
 
     fn key_command(&mut self, key: KeyEvent) -> Option<Intent> {
@@ -3084,6 +3245,180 @@ impl TuiState {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every key `?` advertises for a view must DO something in that view: pressed in a
+    /// prepared state, it either returns an intent or changes what the user can see.
+    /// This is the drift guard for [`keymap::VIEW_KEYS`], whose rows describe dispatch
+    /// arms written by hand (the ask line, the query line, the card's scroll).
+    #[test]
+    fn view_keys_each_do_something_in_their_view() {
+        use crate::keymap::{HelpView, KeyMatch, VIEW_KEYS};
+        fn prepared(view: HelpView) -> TuiState {
+            let mut s = TuiState::new();
+            match view {
+                HelpView::Dj => {
+                    s.screen = Screen::Dj;
+                    s.dj_input = "ab".into();
+                }
+                HelpView::Find => {
+                    s.screen = Screen::Find;
+                    s.find.query = "ab".into();
+                    s.find.history = vec!["x".into(), "y".into(), "z".into()];
+                    s.find.history_pos = Some(1);
+                    s.find.hits.rows = vec![crate::find::FindRow {
+                        kind: crate::find::FindKind::Song,
+                        label: "Sweden".into(),
+                        uri: "song/s1".into(),
+                        trailer: String::new(),
+                        song_count: None,
+                        album_uri: None,
+                        artist_uri: None,
+                        artist: None,
+                    }];
+                }
+                HelpView::Info => {
+                    s.card = Some(vec![("title".into(), "Loro".into())]);
+                    s.card_scroll.max.set(30);
+                    s.card_scroll.scroll = 15;
+                }
+                _ => {}
+            }
+            s
+        }
+        fn seen(s: &TuiState) -> String {
+            format!(
+                "{:?}|{}|{}|{:?}|{:?}|{}|{}|{}",
+                s.screen,
+                s.dj_input,
+                s.find.query,
+                s.find.focus,
+                s.find.history_pos,
+                s.card.is_some(),
+                s.card_scroll.scroll,
+                s.help_open
+            )
+        }
+        let mut checked = 0;
+        for v in VIEW_KEYS {
+            for m in v.matchers {
+                let key = match *m {
+                    KeyMatch::Char(c) => ch(c),
+                    KeyMatch::Ctrl(c) => KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+                    KeyMatch::Code(code) => KeyEvent::new(code, KeyModifiers::NONE),
+                };
+                let mut s = prepared(v.view);
+                let before = seen(&s);
+                let intent = s.handle_key(key);
+                assert!(
+                    intent.is_some() || seen(&s) != before,
+                    "{:?} key {m:?} ({}) does nothing in its own view",
+                    v.view,
+                    v.keys
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 10, "the table is exercised: {checked}");
+    }
+
+    /// Offline, only what the mirror holds is active: the cursor rests on and steps
+    /// between held rows, skipping the rest, and a play gesture on an inactive row is
+    /// refused in words. Online nothing changes.
+    #[test]
+    fn offline_the_cursor_skips_rows_the_mirror_does_not_hold() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        let row = |uri: &str| BrowseRow {
+            label: uri.into(), uri: uri.into(), is_dir: true, song_count: Some(3),
+            artist: None, album_uri: None, artist_uri: None, on_disk: None,
+        };
+        s.albums.apply(
+            vec![row("album/a"), row("album/b"), row("album/c"), row("album/d")],
+            "albums".into(),
+            "Albums".into(),
+        );
+        s.albums.held_known = true;
+        s.albums.held = [("album/b".to_string(), 3), ("album/d".to_string(), 1)].into_iter().collect();
+
+        // Online: every row is active, plain moves.
+        s.handle_key(ch('j'));
+        assert_eq!(s.albums.selected, 1);
+        s.albums.selected = 0;
+
+        // The server goes away: the cursor rests on the first held album.
+        s.apply_now(NowPlaying { server: Some("unreachable".into()), ..NowPlaying::default() });
+        assert_eq!(s.albums.selected, 1, "snapped off the stream-only row");
+        s.handle_key(ch('j'));
+        assert_eq!(s.albums.selected, 3, "j skips album/c");
+        s.handle_key(ch('j'));
+        assert_eq!(s.albums.selected, 3, "nothing held below: stays");
+        s.handle_key(ch('k'));
+        assert_eq!(s.albums.selected, 1, "k skips album/c back");
+        s.handle_key(ch('g'));
+        assert_eq!(s.albums.selected, 1, "top is the first held row");
+        s.handle_key(ch('G'));
+        assert_eq!(s.albums.selected, 3, "bottom is the last held row");
+
+        // Song rows answer from their own X-Offline.
+        let rows = parse_browse(&[
+            ("file".into(), "song/1".into()), ("X-Offline".into(), "0".into()),
+            ("file".into(), "song/2".into()), ("X-Offline".into(), "1".into()),
+            ("file".into(), "song/3".into()),
+        ]);
+        assert_eq!(rows.iter().map(|r| r.on_disk).collect::<Vec<_>>(), vec![Some(false), Some(true), None]);
+
+        // Nothing held at all: the cursor stays and Enter refuses instead of failing.
+        s.albums.held.clear();
+        s.albums.selected = 0;
+        assert_eq!(s.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), None);
+        assert!(
+            s.status_msg.as_deref().is_some_and(|m| m.contains("not on disk")),
+            "refused in words: {:?}",
+            s.status_msg
+        );
+    }
+
+    #[test]
+    fn offline_the_queue_cursor_skips_stream_only_rows() {
+        let mut s = TuiState::new();
+        let q = |pos: usize, held: Option<&str>| QueueItem {
+            pos,
+            title: format!("t{pos}"),
+            artist: None,
+            uri: Some(format!("song/{pos}")),
+            album_uri: None,
+            artist_uri: None,
+            details: held.map(|h| vec![("X-Offline".to_string(), h.to_string())]).unwrap_or_default(),
+        };
+        s.apply_snapshot(
+            NowPlaying { server: Some("no-network".into()), ..NowPlaying::default() },
+            vec![q(0, Some("0")), q(1, Some("1")), q(2, None), q(3, Some("1"))],
+        );
+        assert_eq!(s.selected, 1, "snapped onto the first held track");
+        s.handle_key(ch('j'));
+        assert_eq!(s.selected, 3, "unknown availability while down is inactive too");
+    }
+
+    /// The grid keys the help advertises are the ones `key_grid` dispatches from.
+    #[test]
+    fn grid_keys_each_move_the_cover_cursor() {
+        use crate::keymap::{KeyMatch, GRID_KEYS};
+        for g in GRID_KEYS {
+            for m in g.matchers {
+                let key = match *m {
+                    KeyMatch::Char(c) => ch(c),
+                    KeyMatch::Ctrl(c) => KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+                    KeyMatch::Code(code) => KeyEvent::new(code, KeyModifiers::NONE),
+                };
+                assert_eq!(crate::keymap::grid_step(key), Some(g.step), "{m:?}");
+            }
+        }
+        // A Ctrl-arrow is not a grid key.
+        assert_eq!(
+            crate::keymap::grid_step(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)),
+            None
+        );
+    }
 
     #[test]
     fn stream_to_stream_drops_the_previous_stations_cover() {
@@ -3711,7 +4046,7 @@ mod tests {
         s.find.drill.rows = vec![crate::state::BrowseRow {
             label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None,
             artist: None,
-            album_uri: None, artist_uri: None,
+            album_uri: None, artist_uri: None, on_disk: None,
         }];
         // `h` must NOT emit a BrowseBack: the drill sits at depth 0 with an empty
         // stack, so that would re-fetch `lsinfo ""` - the whole artist root.
@@ -3745,8 +4080,8 @@ mod tests {
             FindRow { kind: FindKind::Song, label: "b".into(), uri: "song/2".into(), trailer: String::new(), song_count: None, album_uri: None, artist_uri: None, artist: None, },
         ];
         s.find.drill.rows = vec![
-            crate::state::BrowseRow { label: "x".into(), uri: "song/8".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
-            crate::state::BrowseRow { label: "y".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
+            crate::state::BrowseRow { label: "x".into(), uri: "song/8".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, },
+            crate::state::BrowseRow { label: "y".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, },
         ];
         s.find.drilling = true;
         s.handle_key(ch('j'));
@@ -3764,7 +4099,7 @@ mod tests {
         s.screen = Screen::Find;
         s.find.hits.rows = vec![];
         s.find.drill.rows = vec![
-            crate::state::BrowseRow { label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
+            crate::state::BrowseRow { label: "Sweden".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, },
         ];
         s.find.drilling = true;
         assert_eq!(s.active_labels(), vec!["Sweden".to_string()]);
@@ -3832,8 +4167,8 @@ mod tests {
         let mut s = TuiState::new();
         s.screen = Screen::Albums;
         s.albums.rows = vec![
-            BrowseRow { label: "one".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
-            BrowseRow { label: "two".into(), uri: "song/2".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, },
+            BrowseRow { label: "one".into(), uri: "song/1".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, },
+            BrowseRow { label: "two".into(), uri: "song/2".into(), is_dir: false, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, },
         ];
         let t0 = Instant::now();
         assert_eq!(
@@ -4402,7 +4737,7 @@ mod tests {
                 song_count: Some(3),
                 artist: None,
                 album_uri: None,
-                artist_uri: None,
+                artist_uri: None, on_disk: None,
             })
             .collect()
     }
@@ -4472,7 +4807,7 @@ mod tests {
             song_count: None,
             artist: None,
             album_uri: None,
-            artist_uri: None,
+            artist_uri: None, on_disk: None,
         }];
         assert!(!b.is_album_grid());
         assert!(!Browse::new("albums/all", "Albums").is_album_grid(), "empty is not a grid");
@@ -4489,8 +4824,8 @@ mod tests {
         s.selected = 2; // the queue cursor sits on song/33 and must not be touched
         s.screen = Screen::Albums;
         s.albums.rows = vec![
-            BrowseRow { label: "Sun Ra".into(), uri: "album/a1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, },
-            BrowseRow { label: "Takuya Nakamura".into(), uri: "album/a2".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, },
+            BrowseRow { label: "Sun Ra".into(), uri: "album/a1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, },
+            BrowseRow { label: "Takuya Nakamura".into(), uri: "album/a2".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, },
         ];
         s.albums.selected = 1;
         assert_eq!(
@@ -4508,7 +4843,7 @@ mod tests {
             is_dir: true,
             song_count: None,
             artist: None,
-            album_uri: None, artist_uri: None,
+            album_uri: None, artist_uri: None, on_disk: None,
         });
         s.albums.selected = 2;
         assert_eq!(s.handle_key(ch('s')), None);
@@ -4528,7 +4863,7 @@ mod tests {
             is_dir: false,
             song_count: None,
             artist: None,
-            album_uri: None, artist_uri: None,
+            album_uri: None, artist_uri: None, on_disk: None,
         }];
         assert_eq!(s.handle_key(ch('s')), None);
         assert_eq!(
@@ -4774,7 +5109,7 @@ mod tests {
     }
 
     fn brow(label: &str, uri: &str, is_dir: bool) -> BrowseRow {
-        BrowseRow { label: label.into(), uri: uri.into(), is_dir, song_count: None, artist: None, album_uri: None, artist_uri: None, }
+        BrowseRow { label: label.into(), uri: uri.into(), is_dir, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, }
     }
 
     #[test]
@@ -4891,13 +5226,13 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[0],
-            BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, }
+            BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true, song_count: None, artist: None, album_uri: None, artist_uri: None, on_disk: None, }
         );
         assert_eq!(
             rows[1],
             // The credit is folded into the label the eye reads AND kept raw: the
             // composed "T - A" is a display string, so "go to artist" needs "A" alone.
-            BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: Some("A".into()), album_uri: None, artist_uri: None, }
+            BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false, song_count: None, artist: Some("A".into()), album_uri: None, artist_uri: None, on_disk: None, }
         );
         assert_eq!(
             rows[2],
@@ -4907,7 +5242,7 @@ mod tests {
                 is_dir: false,
                 song_count: None,
                 artist: None,
-                album_uri: None, artist_uri: None,
+                album_uri: None, artist_uri: None, on_disk: None,
             }
         );
     }
@@ -5136,7 +5471,7 @@ mod tests {
                 is_dir: false,
                 song_count: None,
                 artist: Some("C418".into()),
-                album_uri: Some("album/drill".into()), artist_uri: None,
+                album_uri: Some("album/drill".into()), artist_uri: None, on_disk: None,
             }];
             s
         };

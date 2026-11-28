@@ -8935,15 +8935,23 @@ content_type = "audio/flac"
     /// Like [`settle`] but stops as soon as `done` holds, REPORTING whether it ever
     /// did. Callers that must restore state before they can fail (a tempdir left
     /// read-only on purpose) use this and assert afterwards.
+    ///
+    /// The wait is bounded by PROGRESS, never by a wall-clock budget: what it waits
+    /// for is `spawn_blocking` work on real pool threads, which a loaded `nix build`
+    /// sandbox can delay arbitrarily, so a fixed ~0.4 s window (the old 2000 x 200 us)
+    /// flaked the doCheck while proving nothing about the loop. The virtual clock is
+    /// still never advanced here. The ceiling below is only a hang guard that turns a
+    /// genuinely stuck loop into a failure instead of a hung test binary.
     async fn settle_reached(mut done: impl FnMut() -> bool) -> bool {
-        for _ in 0..2000 {
+        const HANG_GUARD: usize = 300_000; // ~60 s of parks; only a broken loop gets here
+        for _ in 0..HANG_GUARD {
             if done() {
                 return true;
             }
             tokio::task::yield_now().await;
             std::thread::sleep(Duration::from_micros(200));
         }
-        false
+        done()
     }
 
     /// Like [`settle`] but stops as soon as `done` holds, and FAILS LOUDLY if it

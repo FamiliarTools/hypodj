@@ -29,3 +29,20 @@ truth = ["status.state == play", "currentsong.Album == Held Harbour"]
 name = "the screen names what is playing"
 severity = "S0"
 screen_require_any = ["Held Harbour", "Low Tide"]
+
+[[check]]
+name = "offline, rows the mirror does not hold are greyed and the cursor rests on a held one"
+at = 2
+severity = "S1"
+when = ["blocked", "no_network"]
+sizes = ["80x24", "60x20"]
+rows_require_re = ["^> .*Held Harbour"]
+rows_forbid_re = ["^> .*stream only", "^  .*stream only"]
+
+[[check]]
+name = "online, nothing is greyed: every album row is active"
+at = 2
+severity = "S1"
+when = ["online"]
+sizes = ["80x24", "60x20"]
+rows_forbid_re = ["^~ .*(on disk|stream only)"]

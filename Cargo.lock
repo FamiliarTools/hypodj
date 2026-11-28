@@ -838,6 +838,7 @@ name = "dj-gui"
 version = "0.3.0"
 dependencies = [
  "crossterm",
+ "hypodj-app",
  "hypodj-build-info",
  "hypodj-client",
  "hypodj-nl",

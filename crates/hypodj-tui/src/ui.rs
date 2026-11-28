@@ -589,22 +589,27 @@ fn render_info_card(f: &mut Frame, region: Rect, state: &TuiState) {
     // to exactly the rect those cells occupy. The cells stay the fallback and the
     // layout: nothing else on the card moves.
     //
-    // Only while the whole cover is in view. A sixel is cell-anchored and cannot be
-    // clipped by a scroll, so once `j` scrolls the top rows away the cell art takes the
-    // rect back, and since those cells change from skipped to drawn, the diff overwrites
-    // the image pixels. This is a second image inside the overlay, not under it: the
-    // Now Playing cover stays pinned and covered exactly as before, and its own re-send
-    // on close is untouched.
-    if let Some(a) = &state.card_art {
-        if scroll == 0 && inner_h as usize >= ART_ROWS {
+    // Scrolled, only the band of the cover still in view is sent. A sixel is
+    // cell-anchored and cannot be clipped by the terminal, so the visible rows are
+    // cropped out of the full-size image and encoded on their own, anchored at the
+    // first inner row: the cover stays sharp while `j` scrolls it away, and the cell
+    // art is only what a terminal with no image protocol (or unknown cell pixels) sees.
+    // This is a second image inside the overlay, not under it: the Now Playing cover
+    // stays pinned and covered exactly as before, and its own re-send on close is
+    // untouched.
+    // Not while help is drawn over the card: an image cannot sit under a popup.
+    if let Some(a) = state.card_art.as_ref().filter(|_| !state.help_open) {
+        let s = scroll as usize;
+        let vis_rows = ART_ROWS.saturating_sub(s).min(inner_h as usize);
+        if vis_rows > 0 {
             let inner_x = popup.x + 1;
             let rect = Rect {
                 x: inner_x + (full_w.saturating_sub(art_cols) / 2) as u16,
                 y: popup.y + 1,
                 width: art_cols as u16,
-                height: ART_ROWS as u16,
+                height: vis_rows as u16,
             };
-            let _ = paint_sixel(f, rect, a, state.sixel_cell_px);
+            let _ = paint_sixel_rows(f, rect, a, state.sixel_cell_px, s as u16, ART_ROWS as u16);
         }
     }
 }
@@ -633,16 +638,52 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     let desc_style = base.quiet();
 
     // Widest keys column across all rows, so the description column aligns.
-    let key_w = keymap::KEYMAP.iter().map(|b| b.keys.len()).max().unwrap_or(6).min(18);
+    let key_w = keymap::KEYMAP
+        .iter()
+        .map(|b| b.keys.len())
+        .chain(keymap::VIEW_KEYS.iter().map(|v| v.keys.len()))
+        .chain(keymap::GRID_KEYS.iter().map(|g| g.keys.len()))
+        .max()
+        .unwrap_or(6)
+        .min(18);
+    let row = |keys: &str, desc: String| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("{:<kw$} ", keys, kw = key_w), key_style),
+            Span::styled(desc, desc_style),
+        ])
+    };
 
+    // THE CURRENT VIEW FIRST. Every row comes from a table - the view's own keys
+    // (`VIEW_KEYS`), the cover grid's cursor (`GRID_KEYS`, the table `key_grid`
+    // dispatches from) and the shared rows scoped to this view - so the section is as
+    // derived as the global table below it and cannot drift from the bindings.
+    let view = state.help_view();
     let mut lines: Vec<Line> = Vec::new();
-    let groups = grouped();
+    lines.push(Line::from(Span::styled(format!("{} keys", view.title()), head)));
+    if view == keymap::HelpView::Albums {
+        for g in keymap::GRID_KEYS {
+            lines.push(row(g.keys, format!("{} (cover grid)", g.help)));
+        }
+    }
+    for v in keymap::VIEW_KEYS.iter().filter(|v| v.view == view) {
+        lines.push(row(v.keys, v.help.to_string()));
+    }
+    let in_view = |b: &keymap::Binding| view.scope() == Some(b.scope);
+    for b in keymap::KEYMAP.iter().filter(|b| in_view(b)) {
+        lines.push(row(b.keys, b.help.to_string()));
+    }
+    lines.push(Line::from(""));
+
+    // THEN EVERYTHING ELSE, grouped. Rows already shown above are left out; rows for
+    // OTHER views stay, tagged, so every binding is still reachable from any view.
+    let groups: Vec<(keymap::Group, Vec<&'static keymap::Binding>)> = grouped()
+        .into_iter()
+        .map(|(g, rows)| (g, rows.into_iter().filter(|b| !in_view(b)).collect::<Vec<_>>()))
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect();
     let mid = groups.len().div_ceil(2);
-    // Two columns of groups: left half then right half, interleaved row by row would be
-    // complex; instead stack groups but flow them into two side-by-side blocks by
-    // rendering left-group block then right-group block per band. MVP: single stacked
-    // column of groups is clamped to the region; to honor "two-column" we split the
-    // GROUPS into two vertical columns joined per line.
+    // Two columns of groups: the GROUPS are split into two vertical columns joined per
+    // line.
     let (left, right) = groups.split_at(mid);
     let render_col = |cols: &[(keymap::Group, Vec<&'static keymap::Binding>)]| -> Vec<Line<'static>> {
         let mut out: Vec<Line> = Vec::new();
@@ -657,10 +698,7 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
                     keymap::Scope::Queue => format!("{} [queue]", b.help),
                     keymap::Scope::Browse => format!("{} [browse]", b.help),
                 };
-                out.push(Line::from(vec![
-                    Span::styled(format!("{:<kw$} ", b.keys, kw = key_w), key_style),
-                    Span::styled(desc, desc_style),
-                ]));
+                out.push(row(b.keys, desc));
             }
             out.push(Line::from(""));
         }
@@ -691,7 +729,7 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
             lines.push(Line::from(spans));
         }
     } else {
-        lines = render_col(&groups);
+        lines.extend(render_col(&groups));
     }
 
     let popup = centered_popup(region, &lines);
@@ -2384,11 +2422,49 @@ mod tests {
     fn help_overlay_labels_screen_specific_bindings() {
         // Global keys carry no tag; a browse-scoped binding is marked so the overlay
         // does not imply it works everywhere.
+        // On Queue the queue-only rows lead, untagged; the browse rows stay, tagged.
         let mut s = TuiState::new();
         s.help_open = true;
-        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        let out = render_to_lines_sized(&s, 100, 60).join("\n");
         assert!(out.contains("[browse]"), "browse-scoped binding tagged:\n{out}");
+        assert!(!out.contains("[queue]"), "queue rows are the view section here:\n{out}");
+        // On Albums it is the other way round.
+        s.screen = crate::state::Screen::Albums;
+        let out = render_to_lines_sized(&s, 100, 60).join("\n");
         assert!(out.contains("[queue]"), "queue-scoped binding tagged:\n{out}");
+        assert!(!out.contains("[browse]"), "browse rows are the view section here:\n{out}");
+    }
+
+    /// `?` leads with the CURRENT view's keys, then the global table - for every view,
+    /// and for the info card. Every advertised row is a table row, so this also proves
+    /// each view section is non-empty and drawn first.
+    #[test]
+    fn help_leads_with_the_current_views_keys() {
+        use crate::keymap::HelpView;
+        let cases: [(crate::state::Screen, bool, HelpView, &str); 6] = [
+            (crate::state::Screen::Queue, false, HelpView::Queue, "jump to the playing song"),
+            (crate::state::Screen::Albums, false, HelpView::Albums, "previous cover (cover grid)"),
+            (crate::state::Screen::Playlists, false, HelpView::Lists, "drill into a directory"),
+            (crate::state::Screen::Dj, false, HelpView::Dj, "send the ask"),
+            (crate::state::Screen::Find, false, HelpView::Find, "walk the query history"),
+            (crate::state::Screen::Queue, true, HelpView::Info, "close the card"),
+        ];
+        for (screen, card, view, want) in cases {
+            let mut s = TuiState::new();
+            s.screen = screen;
+            if card {
+                s.card = Some(vec![("title".into(), "Loro".into())]);
+            }
+            assert_eq!(s.help_view(), view);
+            s.help_open = true;
+            let lines = render_to_lines_sized(&s, 120, 90);
+            let head = format!("{} keys", view.title());
+            let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
+            let h = at(&head).unwrap_or_else(|| panic!("{head} heading:\n{}", lines.join("\n")));
+            let w = at(want).unwrap_or_else(|| panic!("{want:?} on {head}:\n{}", lines.join("\n")));
+            let g = at("Playback").expect("the global table follows");
+            assert!(h < w && w < g, "{head}: view keys first, then global ({h} {w} {g})");
+        }
     }
 
     /// A queue-song menu with NO album uri, so the popup carries both a live and a
@@ -2954,7 +3030,7 @@ mod tests {
             label: "Minecraft - Volume Alpha".into(), uri: "album/9".into(),
             is_dir: true, song_count: Some(24),
             artist: None,
-            album_uri: None, artist_uri: None,
+            album_uri: None, artist_uri: None, on_disk: None,
         }];
         let out = render_to_lines(&s).join("\n");
         assert!(out.contains("find> c418"), "the query that produced this branch stays visible:\n{out}");
@@ -3598,7 +3674,11 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     let mut items: Vec<ListItem> = state
         .queue
         .iter()
-        .map(|it| {
+        .enumerate()
+        .map(|(i, it)| {
+            // Offline, a row the mirror does not hold is greyed and the cursor skips
+            // it (`TuiState::queue_active`).
+            let base = if state.queue_active(i) { Style::default() } else { inactive_style() };
             // The searchable label (matches active_labels for the Queue screen).
             let label = match &it.artist {
                 Some(a) => format!("{} - {}", it.title, a),
@@ -3612,8 +3692,8 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
             let avail = it.details.iter().find(|(k, _)| k == "X-Offline").map(|(_, v)| {
                 if v == "1" { "on disk" } else { "stream only" }
             });
-            let mut spans = vec![Span::raw(lead.clone())];
-            spans.extend(match_spans(&label, query, Style::default(), hit_style()));
+            let mut spans = vec![Span::styled(lead.clone(), base)];
+            spans.extend(match_spans(&label, query, base, hit_style()));
             if let Some(w) = avail {
                 push_column(&mut spans, lead.chars().count() + label.chars().count(), w, width);
             }
@@ -3641,6 +3721,11 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
         ls.select(Some(state.selected));
     }
     f.render_stateful_widget(list, area, &mut ls);
+}
+
+/// A row that cannot play right now (offline and not on disk): quiet ink, dimmed.
+fn inactive_style() -> Style {
+    Style::default().quiet().add_modifier(ratatui::style::Modifier::DIM)
 }
 
 /// Split a body region into its one-line header and the rows under it. The body is
@@ -3682,10 +3767,15 @@ fn render_browse(
     // rows of an opened album.
     let album_map = if markers { state.queued_by_album() } else { Default::default() };
     let queued_uris = if markers { state.queued_uris() } else { Default::default() };
+    let down = state.server_down();
     let items: Vec<ListItem> = browse
         .rows
         .iter()
-        .map(|r| {
+        .enumerate()
+        .map(|(i, r)| {
+            // Offline, a row the mirror does not hold is greyed and the cursor skips
+            // it (`Browse::active`, the rule djg and djq share).
+            let base = if browse.active(i, down) { Style::default() } else { inactive_style() };
             // Gutter glyph: for an album dir row, full/partial from queued vs total;
             // for a song row (opened album), `#` when already queued. Two-char gutter
             // (glyph + space) so it never collides with the REVERSED cursor bar.
@@ -3699,8 +3789,8 @@ fn render_browse(
             } else {
                 ' '
             };
-            let mut spans = vec![Span::raw(format!("{glyph} "))];
-            spans.extend(match_spans(&r.label, query, Style::default(), hit_style()));
+            let mut spans = vec![Span::styled(format!("{glyph} "), base)];
+            spans.extend(match_spans(&r.label, query, base, hit_style()));
             // An album row says whether it plays offline, as a right-aligned column.
             // No trailing `/` on directories: that was the filesystem speaking.
             if let Some(words) = availability_words(browse, r) {
@@ -3826,6 +3916,8 @@ fn render_album_grid(f: &mut Frame, area: Rect, state: &TuiState) {
             let (text, style) = if i == browse.selected {
                 let pad = (cap_w as usize).saturating_sub(cap.chars().count());
                 (format!("{cap}{}", " ".repeat(pad)), Style::default().reverse())
+            } else if !browse.active(i, state.server_down()) {
+                (cap, inactive_style())
             } else {
                 (cap, Style::default())
             };
@@ -4498,6 +4590,14 @@ fn sixel_payload(
     art: &crate::art::AlbumArt,
     cell_px: Option<(u16, u16)>,
 ) -> Option<std::sync::Arc<str>> {
+    let (cw, ch) = sixel_payload_gate(f, rect, cell_px)?;
+    let payload = art.sixel(rect.width as u32 * cw as u32, rect.height as u32 * ch as u32);
+    (!payload.is_empty()).then_some(payload)
+}
+
+/// The cell pixel size when a sixel may be drawn into `rect` at all: the protocol is
+/// on, the cell size is known, and the rect neither truncates nor scrolls the screen.
+fn sixel_payload_gate(f: &Frame, rect: Rect, cell_px: Option<(u16, u16)>) -> Option<(u16, u16)> {
     use crate::art::{art_mode, ArtMode};
 
     if matches!(art_mode(), ArtMode::Sextant | ArtMode::Half) {
@@ -4514,21 +4614,35 @@ fn sixel_payload(
     if rect.x + rect.width > area.width || rect.y + rect.height >= area.height {
         return None;
     }
-    let payload = art.sixel(rect.width as u32 * cw as u32, rect.height as u32 * ch as u32);
-    (!payload.is_empty()).then_some(payload)
+    Some((cw, ch))
 }
 
-/// Draw an unpinned sixel (the info card's cover) into `rect`; false leaves the cells
-/// as the caller drew them.
-fn paint_sixel(
+/// Draw an unpinned sixel (the info card's cover) for a cover of `full_rows` cell rows of which only `rect` is in
+/// view, the first `skip_rows` having scrolled off above it: encodes just that band.
+fn paint_sixel_rows(
     f: &mut Frame,
     rect: Rect,
     art: &crate::art::AlbumArt,
     cell_px: Option<(u16, u16)>,
+    skip_rows: u16,
+    full_rows: u16,
 ) -> bool {
-    let Some(payload) = sixel_payload(f, rect, art, cell_px) else {
+    let full = Rect { height: full_rows, ..rect };
+    // The geometry gate (protocol on, cell size known, the visible rect on screen) is
+    // the same as an unscrolled cover's; only the encoded band differs.
+    if sixel_payload_gate(f, rect, cell_px).is_none() {
         return false;
-    };
+    }
+    let (cw, ch) = cell_px.unwrap_or((0, 0));
+    let payload = art.sixel_rows(
+        full.width as u32 * cw as u32,
+        full.height as u32 * ch as u32,
+        skip_rows as u32 * ch as u32,
+        rect.height as u32 * ch as u32,
+    );
+    if payload.is_empty() {
+        return false;
+    }
     write_sixel_cells(f, rect, payload.to_string());
     true
 }
@@ -4604,10 +4718,12 @@ mod sixel_render_tests {
         assert!(card.2.contains("\"1;1;168;170"), "a square 168x170 px card cover, even on a one-row card");
     }
 
-    /// Scrolled, the cover is partly out of view and a cell-anchored sixel cannot be
-    /// clipped, so the cell art takes the rect back.
+    /// Scrolled, the cover is partly out of view. A cell-anchored sixel cannot be
+    /// clipped by the terminal, so the card sends ONLY the visible band of the cover,
+    /// at native pixels and anchored at the first inner row - never the pixelated cell
+    /// art, which is only for a terminal with no image protocol.
     #[test]
-    fn a_scrolled_info_card_falls_back_to_cell_art() {
+    fn a_scrolled_info_card_keeps_the_visible_part_of_the_cover_sharp() {
         let mut terminal = Terminal::new(TestBackend::new(129, 16)).unwrap();
         let mut s = TuiState::new();
         s.sixel_cell_px = Some((8, 17));
@@ -4615,10 +4731,41 @@ mod sixel_render_tests {
         s.card_art = Some(crate::art::AlbumArt::for_test_solid([200, 40, 40]));
         terminal.draw(|f| render(f, &s)).unwrap();
         assert!(s.card_scroll.max.get() > 0, "the card scrolls at this height");
-        assert_eq!(payloads(&terminal).len(), 1, "unscrolled: the cover is a sixel");
-        s.card_scroll.scroll = 1;
+        let top = payloads(&terminal);
+        assert_eq!(top.len(), 1, "unscrolled: the cover is a sixel");
+        // A 129x16 terminal: the 14-row inner box shows all 10 cover rows.
+        assert!(top[0].2.contains("\"1;1;168;170"), "the whole cover at native size");
+
+        s.card_scroll.scroll = 3;
         terminal.draw(|f| render(f, &s)).unwrap();
-        assert!(payloads(&terminal).is_empty(), "scrolled: no sixel inside the card");
+        let p = payloads(&terminal);
+        assert_eq!(p.len(), 1, "scrolled: still one sharp sixel, not cell art");
+        assert_eq!((p[0].0, p[0].1), (top[0].0, top[0].1), "anchored at the first inner row");
+        // 7 of 10 rows visible: 7 x 17 = 119 px tall, same 168 px width.
+        assert!(p[0].2.contains("\"1;1;168;119"), "only the visible band is encoded");
+        // No sextant cell art painted where the cover is.
+        let row = (top[0].1..top[0].1 + 7)
+            .map(|y| terminal.backend().buffer()[(top[0].0 + 1, y)].symbol().to_string())
+            .collect::<String>();
+        assert!(row.trim().is_empty(), "the band is skipped cells under the image: {row:?}");
+
+        // Scrolled past the cover entirely: nothing to draw.
+        s.card_scroll.scroll = 10;
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert!(payloads(&terminal).is_empty(), "no cover rows in view, no sixel");
+    }
+
+    /// Without an image protocol (no cell pixel size) the card falls back to cell art.
+    #[test]
+    fn an_info_card_without_an_image_protocol_uses_cell_art() {
+        let mut terminal = Terminal::new(TestBackend::new(129, 16)).unwrap();
+        let mut s = TuiState::new();
+        s.sixel_cell_px = None;
+        s.card = Some((0..12).map(|i| (format!("k{i}"), format!("v{i}"))).collect());
+        s.card_art = Some(crate::art::AlbumArt::for_test_solid([200, 40, 40]));
+        s.card_scroll.scroll = 3;
+        terminal.draw(|f| render(f, &s)).unwrap();
+        assert!(payloads(&terminal).is_empty(), "no protocol, no sixel");
     }
 
     fn art() -> crate::art::AlbumArt {
