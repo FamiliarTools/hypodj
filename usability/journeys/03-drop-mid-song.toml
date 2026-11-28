@@ -121,3 +121,12 @@ name = "transport word matches the daemon ninety seconds after due"
 at = 19
 severity = "S0"
 transport_matches = true
+
+[[check]]
+name = "after the drop, the albums it cannot play are greyed and the cursor left them for a held one"
+at = 11
+severity = "S1"
+when = ["blocked", "no_network"]
+sizes = ["80x24", "60x20"]
+rows_require_re = ["^~ .*Stream Summit", "^> .*Held Harbour"]
+rows_forbid_re = ["^> .*stream only"]

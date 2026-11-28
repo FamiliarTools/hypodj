@@ -47,7 +47,7 @@ use crate::journal::{
     Snapshot, UndoRefusal, WorldKey,
 };
 use crate::intelligence::{
-    lexicon_pull, pull_reweight, FeatureStore, MetadataStore, Pull, PullField, TrackFeatures,
+    lexicon_pull, pull_reweight, FeatureStore, MOOD_SELECT_WEIGHT, MetadataStore, Pull, PullField, TrackFeatures,
     LEXICON_PULL_STRENGTH,
 };
 use crate::model::{
@@ -514,6 +514,11 @@ struct State {
     /// A behavioral pick signal ([`crate::intelligence::Behavior`]). EPHEMERAL,
     /// and capped at [`SESSION_SKIPS_CAP`] ids (cleared wholesale past it).
     session_skips: std::collections::HashMap<SongId, u32>,
+    /// A NAMED listening need he asked for ("end of day") and when, so the autofill
+    /// walk keeps leaning toward it for [`MOOD_HOLD`] instead of snapping back to the
+    /// clock's guess at the next drain. Set only when a [`Selector::Mood`] ask is
+    /// committed and appended something. EPHEMERAL, like the pull field.
+    held_mood: Option<(crate::intelligence::Mood, Instant)>,
     /// The clock instant of the most recent autofill FETCH attempt (stamped BEFORE the
     /// fetch), or `None` until the first. The DEGENERATE-INPUT FUSE: a true-drain within
     /// [`AUTOFILL_MIN_INTERVAL`] of this stamp is a pathological instant-EOF spiral (a
@@ -1418,6 +1423,7 @@ impl Default for State {
             excludes: Vec::new(),
             excludes_gen: 0,
             session_skips: std::collections::HashMap::new(),
+            held_mood: None,
         }
     }
 }
@@ -2520,6 +2526,7 @@ fn selector_phrase(sel: &Selector) -> String {
         Selector::Exact(_) => "those tracks".to_string(),
         Selector::Starred => "your favorites".to_string(),
         Selector::Instrumental => "instrumental tracks".to_string(),
+        Selector::Mood(m) => format!("{} music", m.label()),
         Selector::Station(Some(l)) => format!("a station for {l}"),
         Selector::Station(None) => "a station for the lane you are in".to_string(),
     }
@@ -2957,6 +2964,9 @@ fn build_cover_http_client() -> reqwest::Client {
 
 pub struct HypodjHandler {
     client: Arc<SubsonicClient>,
+    /// The whole-library name index behind the `searchall` typo fallback, filled
+    /// and refreshed by [`crate::fuzzy::run`]; empty until the first build lands.
+    fuzzy: Arc<crate::fuzzy::Slot>,
     player: PlayerHandle,
     state: Arc<Mutex<State>>,
     /// Fired when a subsystem changes, to wake `idle`.
@@ -3416,6 +3426,11 @@ const AUTOFILL_ALBUM_CANDIDATES: usize = 4;
 /// immediately); it stops HONESTLY (no timer, no poller) rather than hammering the
 /// server. A healthy batch is tens of minutes of playback, so the fuse never trips in
 /// normal use; the hard ceiling is <= 1 fetch per this interval in ANY execution.
+/// How long a named need ("end of day") keeps steering the autofill walk before the
+/// time-of-day habit takes the lean back. Long enough for an evening, short enough
+/// that tomorrow morning is not "end of day".
+const MOOD_HOLD: Duration = Duration::from_secs(2 * 3600);
+
 const AUTOFILL_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Bound on [`State::session_skips`]: a long session cannot grow it without limit.
@@ -3643,6 +3658,22 @@ fn merge_keyword_hits(per_keyword: Vec<Vec<Song>>, want: usize) -> Vec<Song> {
 /// key, with `SongId` as the tiebreak so equal-energy ties never reorder
 /// nondeterministically). No network, no clock, no lock - unit-testable in
 /// isolation with a fabricated pool and a fake store.
+/// Features that carry a SIGNAL: measured ones, or the lexicon's when the song has
+/// a genre to read. A genre-less, unanalysed song's neutral default is not evidence.
+fn signal_features(store: &dyn FeatureStore, song: &Song) -> Option<TrackFeatures> {
+    let f = store.features(song)?;
+    let has_genre = song.genre.as_deref().is_some_and(|g| !g.trim().is_empty());
+    (f.measured || has_genre).then_some(f)
+}
+
+/// `songs` in a fresh random order per call (hash of a per-call [`RandomState`]).
+fn shuffled(songs: Vec<Song>) -> Vec<Song> {
+    let rs = RandomState::new();
+    let mut keyed: Vec<(u64, Song)> = songs.into_iter().map(|s| (rs.hash_one(&s.id.0), s)).collect();
+    keyed.sort_by_key(|(k, _)| *k);
+    keyed.into_iter().map(|(_, s)| s).collect()
+}
+
 fn calmer_rerank(
     store: &dyn FeatureStore,
     seed: &Song,
@@ -3760,6 +3791,7 @@ impl HypodjHandler {
         init_state.vol_dither_state = wall.rotate_left(32) | 1;
         Self {
             client,
+            fuzzy: Arc::default(),
             player,
             state: Arc::new(Mutex::new(init_state)),
             changed: Arc::new(Notify::new()),
@@ -5270,6 +5302,22 @@ impl HypodjHandler {
                 store.refresh();
                 calmer_rerank(store.as_ref(), &seed, pool, want)
             }
+            Selector::Mood(mood) => {
+                let pool = self.mood_pool(want).await?;
+                let store = self.feature_store();
+                store.refresh();
+                // Shuffle, then let behavior order the ties, then rank by closeness to
+                // the need: in a metadata-only library many songs share a lexicon
+                // bucket, and without the shuffle a repeated ask would replay them.
+                let pool = self.behavior_rerank(shuffled(pool));
+                let mut songs =
+                    self.tod_rank(pool, mood.target(), MOOD_SELECT_WEIGHT, None, 0);
+                songs.truncate(want);
+                if !songs.is_empty() {
+                    self.state.lock().unwrap().held_mood = Some((*mood, Instant::now()));
+                }
+                songs
+            }
             // A station is TUNED (PlayNow), never queued behind music: the stream would
             // sit unplayed after the songs, which is not what anyone asked for.
             Selector::Station(_) => {
@@ -5352,6 +5400,9 @@ impl HypodjHandler {
             Selector::Similar(_) | Selector::SimilarToCurrent | Selector::Radio => {
                 (self.pull_rerank(songs), true)
             }
+            // Already ranked toward its own target; a lingering pull would argue with
+            // the need he just named. Walked so the batch is smooth as a sequence.
+            Selector::Mood(_) => (songs, true),
             Selector::Exact(_)
             | Selector::Genre(_)
             | Selector::Starred
@@ -5587,6 +5638,133 @@ impl HypodjHandler {
                 .collect()
         };
         crate::intelligence::behavior_rerank(songs, &ev)
+    }
+
+    /// The candidate pool behind a [`Selector::Mood`] ask: songs around what is
+    /// playing (when anything is), his starred songs (taste), and a random spread
+    /// (range), de-duplicated, minus the seed and anything a held filter keeps out.
+    /// A failing leg is tolerated while another delivered; only an empty pool with
+    /// an error surfaces the error, so an outage never reads as an empty library.
+    async fn mood_pool(&self, want: usize) -> Result<Vec<Song>, String> {
+        let fetch = want.saturating_mul(4).clamp(20, 200) as i32;
+        let mut pool: Vec<Song> = Vec::new();
+        let mut first_err: Option<String> = None;
+        let seed = self.similar_seed_id();
+        if let Some(id) = &seed {
+            pool.extend(self.client.similar(id, Some(fetch)).await.unwrap_or_default());
+        }
+        match self.client.starred_songs().await {
+            Ok(v) => pool.extend(v),
+            Err(e) => first_err = Some(e.to_string()),
+        }
+        match self.client.random_songs(Some(fetch)).await {
+            Ok(v) => pool.extend(v),
+            Err(e) => {
+                first_err.get_or_insert(e.to_string());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        pool.retain(|s| Some(&s.id) != seed.as_ref() && seen.insert(s.id.clone()));
+        let pool = drop_excluded(&self.held_excludes(), pool);
+        if pool.is_empty() {
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+        }
+        Ok(pool)
+    }
+
+    /// Rank `songs` toward `target` via [`crate::intelligence::tod_rerank`]. A song
+    /// whose features are only the lexicon's NEUTRAL default (no measurement and no
+    /// genre) carries no signal, so it contributes none rather than a fake 0.5.
+    /// `band` (with the local UTC offset) marks songs he last played in that part of
+    /// the day; `None` marks none.
+    fn tod_rank(
+        &self,
+        songs: Vec<Song>,
+        target: [f32; 2],
+        weight: f32,
+        band: Option<crate::intelligence::TimeBand>,
+        offset_secs: i32,
+    ) -> Vec<Song> {
+        if songs.len() <= 1 {
+            return songs;
+        }
+        let store = self.feature_store();
+        let feats: Vec<Option<TrackFeatures>> = songs.iter().map(|s| signal_features(store.as_ref(), s)).collect();
+        let in_band: Vec<bool> = songs
+            .iter()
+            .map(|s| {
+                band.is_some_and(|b| {
+                    s.played
+                        .as_deref()
+                        .and_then(|p| crate::intelligence::local_hour_of(p, offset_secs))
+                        .is_some_and(|h| crate::intelligence::TimeBand::from_hour(h) == b)
+                })
+            })
+            .collect();
+        crate::intelligence::tod_rerank(songs, &feats, &in_band, target, weight)
+    }
+
+    /// Where the continuation leans right now: the held named need while it is
+    /// fresh, else the time-of-day habit target for the current local band, learned
+    /// from the last-played stamps of `pool` and of the queue (what he actually
+    /// played at which hour). Returns `(target, band for the habit bonus, offset,
+    /// human label)`.
+    fn continuation_lean(
+        &self,
+        pool: &[Song],
+    ) -> ([f32; 2], Option<crate::intelligence::TimeBand>, i32, String) {
+        use crate::intelligence::{HabitModel, TimeBand};
+        let (held, queue_songs): (Option<_>, Vec<Song>) = {
+            let st = self.state.lock().unwrap();
+            let songs = st
+                .queue
+                .iter()
+                .filter_map(|q| match &q.entry {
+                    QueueEntry::Song(s) => Some(s.clone()),
+                    QueueEntry::Stream { .. } => None,
+                })
+                .collect();
+            (st.held_mood, songs)
+        };
+        if let Some((m, at)) = held {
+            if Instant::now().saturating_duration_since(at) < MOOD_HOLD {
+                return (m.target(), None, 0, format!("{} (asked)", m.label()));
+            }
+        }
+        let local = crate::clock::civil_now().with_timezone(&chrono::Local);
+        let offset = chrono::Offset::fix(local.offset()).local_minus_utc();
+        let band = TimeBand::from_hour(chrono::Timelike::hour(&local));
+        let store = self.feature_store();
+        let mut habit = HabitModel::new();
+        for s in pool.iter().chain(queue_songs.iter()) {
+            let Some(h) = s.played.as_deref().and_then(|p| crate::intelligence::local_hour_of(p, offset)) else {
+                continue;
+            };
+            if let Some(f) = signal_features(store.as_ref(), s) {
+                habit.observe(h, &f);
+            }
+        }
+        let target = habit.target(band);
+        let label = format!(
+            "{} {} ({} heard then)",
+            band.name(),
+            band.prior().label(),
+            habit.samples(band)
+        );
+        (target, Some(band), offset, label)
+    }
+
+    /// The autofill candidates nudged toward [`Self::continuation_lean`] at
+    /// [`crate::intelligence::TOD_WEIGHT`].
+    fn continuation_rerank(&self, songs: Vec<Song>) -> Vec<Song> {
+        if songs.len() <= 1 {
+            return songs;
+        }
+        let (target, band, offset, label) = self.continuation_lean(&songs);
+        tracing::info!(lean = %label, energy = target[0], valence = target[1], "autofill: leaning the continuation");
+        self.tod_rank(songs, target, crate::intelligence::TOD_WEIGHT, band, offset)
     }
 
     /// A snapshot of the held curation exclusions (one short lock).
@@ -9946,6 +10124,11 @@ impl HypodjHandler {
     /// Absent (a raw handler, a disabled store, a store that failed to open) every
     /// seam below no-ops and playback is byte-identical to a store-less build.
     /// Plumb the server reachability slot the heartbeat writes.
+    /// The fuzzy name index slot, for the daemon to hand to [`crate::fuzzy::run`].
+    pub fn fuzzy_slot(&self) -> Arc<crate::fuzzy::Slot> {
+        self.fuzzy.clone()
+    }
+
     pub fn set_server_reach(&self, reach: Arc<crate::reach::ServerReach>) {
         *self.server_reach.lock().unwrap() = Some(reach);
     }
@@ -13446,6 +13629,12 @@ impl HypodjHandler {
                 return 0;
             }
         };
+        // 2b. THE LEAN (task xs0zurq): nudge the similar order toward the need he
+        //     named (held for MOOD_HOLD) or, failing that, toward what he plays at this
+        //     time of day. Bounded by TOD_WEIGHT so similarity still leads, and the
+        //     identity when no candidate carries a usable signal. Applies to both the
+        //     album candidates and the track walk below.
+        let fetched = self.continuation_rerank(fetched);
         // 3a. ALBUM MODE: the user is playing records, so append a RECORD - a whole
         //     album, in disc/track order - instead of compiling a mixtape out of other
         //     people's albums. The similar-track fetch above is reused as the SUGGESTION
@@ -16823,19 +17012,12 @@ impl HypodjHandler {
         if query.trim().is_empty() {
             return MpdResponse::ok();
         }
-        let hits = match self.client.search3(&query).await {
-            Ok(h) => h,
-            Err(e) => return ack(ACK_ERROR_UNKNOWN, "searchall", &e.to_string()),
-        };
-        let mut songs: Vec<_> = hits
-            .songs
-            .into_iter()
-            .filter(|s| tag_matches(s, "any", &query, false))
-            .collect();
-        // Same sets, re-ordered: precision first, then the server's own habit
-        // counters (starred, play counts), then server order. See `find_rank`.
-        let (mut artists, mut albums) = (hits.artists, hits.albums);
-        crate::find_rank::rank(&query, &mut artists, &mut albums, &mut songs);
+        let index = self.fuzzy.get();
+        let crate::fuzzy::Augmented { artists, albums, songs, approx } =
+            match searchall_hits(&self.client, index.as_deref(), &query).await {
+                Ok(h) => h,
+                Err(e) => return ack(ACK_ERROR_UNKNOWN, "searchall", &e.to_string()),
+            };
 
         // The FOURTH result kind: the user's own saved internet radio stations, which
         // search3 does not index at all (Subsonic has no station-search endpoint), so
@@ -16872,6 +17054,7 @@ impl HypodjHandler {
             &albums,
             stations.as_deref(),
             &songs,
+            &approx,
         ))
     }
 
@@ -17400,6 +17583,32 @@ fn station_upsert(stations: &[Station], url: &str, name: &str) -> StationUpsert 
     }
 }
 
+/// The library half of `searchall`: search3, the song tag post-filter, the fuzzy
+/// typo fallback, then the precision-first re-rank. Public so `fuzzy-bench` measures
+/// exactly the path the daemon serves.
+pub async fn searchall_hits(
+    client: &SubsonicClient,
+    index: Option<&crate::fuzzy::FuzzyIndex>,
+    query: &str,
+) -> Result<crate::fuzzy::Augmented, crate::subsonic::SubsonicError> {
+    let hits = client.search3(query).await?;
+    let songs: Vec<_> = hits
+        .songs
+        .into_iter()
+        .filter(|s| tag_matches(s, "any", query, false))
+        .collect();
+    // TYPO FALLBACK: a kind with too few server hits gets approximate hits from the
+    // local name index appended AFTER the real ones (never replacing them), each
+    // flagged `X-Approximate: 1`. A kind the server answered well is untouched, so a
+    // correct query costs nothing. See `fuzzy`.
+    let mut out = crate::fuzzy::augment(query, hits.artists, hits.albums, songs, index);
+    // Same sets, re-ordered: precision first (an approximate hit by its fuzzy score,
+    // below every real band), then the server's own habit counters (starred, play
+    // counts), then server order. See `find_rank`.
+    crate::find_rank::rank(query, &mut out.artists, &mut out.albums, &mut out.songs, &out.approx);
+    Ok(out)
+}
+
 /// Assemble the whole `searchall` frame: the `X-Hits` count preamble, then one block per
 /// hit in the kind order the client renders. PURE, so the wire contract (which kinds are
 /// claimed, in which order, and what a missing kind looks like) is testable with no
@@ -17419,28 +17628,43 @@ fn search_all_pairs(
     albums: &[Album],
     stations: Option<&[Station]>,
     songs: &[Song],
+    approx: &HashMap<String, f64>,
 ) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
-    pairs.push(("X-Hits".to_string(), format!("artist {} {}", artists.len(), SEARCH3_ARTIST_CAP)));
-    pairs.push(("X-Hits".to_string(), format!("album {} {}", albums.len(), SEARCH3_ALBUM_CAP)));
+    // `X-Hits` counts SERVER hits only: approximate rows are not what the server
+    // returned against its cap, and a client reading "artist 0" must still learn the
+    // server found nothing. The approximate rows are marked on the row itself.
+    let real = |ids: &mut dyn Iterator<Item = &str>| ids.filter(|id| !approx.contains_key(*id)).count();
+    let n_artists = real(&mut artists.iter().map(|a| a.id.0.as_str()));
+    let n_albums = real(&mut albums.iter().map(|a| a.id.0.as_str()));
+    let n_songs = real(&mut songs.iter().map(|s| s.id.0.as_str()));
+    let flag = |pairs: &mut Vec<(String, String)>, id: &str| {
+        if approx.contains_key(id) {
+            pairs.push(("X-Approximate".to_string(), "1".to_string()));
+        }
+    };
+    pairs.push(("X-Hits".to_string(), format!("artist {} {}", n_artists, SEARCH3_ARTIST_CAP)));
+    pairs.push(("X-Hits".to_string(), format!("album {} {}", n_albums, SEARCH3_ALBUM_CAP)));
     // TWO tokens, no cap: the station match runs handler-side over the FULL saved set,
     // so there is no server cap to report and claiming one would be a lie.
     if let Some(st) = stations {
         pairs.push(("X-Hits".to_string(), format!("station {}", st.len())));
     }
-    pairs.push(("X-Hits".to_string(), format!("song {} {}", songs.len(), SEARCH3_SONG_CAP)));
+    pairs.push(("X-Hits".to_string(), format!("song {} {}", n_songs, SEARCH3_SONG_CAP)));
     // Artist and album blocks are byte-identical in shape to what lsinfo already emits,
     // so the client parses them with machinery it already has.
     for a in artists {
         pairs.push(("directory".to_string(), format!("artist/{}", a.id.0)));
         pairs.push(("Artist".to_string(), a.name.clone()));
         pairs.push(("X-AlbumCount".to_string(), a.album_count.to_string()));
+        flag(&mut pairs, &a.id.0);
     }
     for al in albums {
         pairs.push(("directory".to_string(), format!("album/{}", al.id.0)));
         pairs.push(("Album".to_string(), al.name.clone()));
         pairs.push(("Artist".to_string(), al.artist.clone()));
         pairs.push(("X-SongCount".to_string(), al.song_count.to_string()));
+        flag(&mut pairs, &al.id.0);
     }
     // Stations sit BETWEEN albums and songs: an ordinary query matches zero of them, so
     // the top of the list stays byte-identical to what it always was, and a handful of
@@ -17450,6 +17674,7 @@ fn search_all_pairs(
     }
     for s in songs {
         pairs.extend(browse_song_pairs(s));
+        flag(&mut pairs, &s.id.0);
     }
     pairs
 }
@@ -19087,6 +19312,45 @@ mod tests {
             vec![SongId("seed".into()), SongId("a1".into()), SongId("a2".into()), SongId("a3".into())],
             "the appended songs are real library tracks (present in the scrobble/seed id surface)"
         );
+    }
+
+    // THE LEAN (task xs0zurq): a held named need nudges the autofill order toward
+    // its target, and with no usable signal (genre-less, unanalysed) the order is the
+    // server's, byte for byte. Fake clock: the hold is measured on the tokio clock.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_leans_toward_a_held_need_and_is_inert_without_signal() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().set_current(Some(0));
+        arm_autofill(&h);
+        let genre = |id: &str, g: &str| Song { genre: Some(g.into()), ..autofill_song(id) };
+        // A 21-deep batch: metal first, ambient second, the rest carry no genre.
+        let mut batch = vec![genre("metal", "Metal"), genre("ambient", "Ambient")];
+        batch.extend((0..19).map(|i| autofill_song(&format!("x{i}"))));
+        h.state.lock().unwrap().held_mood = Some((crate::intelligence::Mood::Night, Instant::now()));
+        h.push_autofill_batch(Ok(batch));
+        h.advance_on_eof(EofSignal::default()).await;
+        let ids = h.queue_song_ids();
+        assert_eq!(&ids[1..3], &[SongId("ambient".into()), SongId("metal".into())], "the night lean swaps the neighbours");
+        assert_eq!(ids[3], SongId("x0".into()), "the signal-less rest keep the server's order");
+
+        // Past the hold the lean falls back to the clock: with a genre-less batch that
+        // is the identity whatever the hour.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().set_current(Some(0));
+        arm_autofill(&h);
+        h.state.lock().unwrap().held_mood = Some((crate::intelligence::Mood::Night, Instant::now()));
+        tokio::time::advance(MOOD_HOLD + Duration::from_secs(1)).await;
+        let plain: Vec<Song> = (0..5).map(|i| autofill_song(&format!("y{i}"))).collect();
+        h.push_autofill_batch(Ok(plain));
+        h.advance_on_eof(EofSignal::default()).await;
+        let ids = h.queue_song_ids();
+        let want: Vec<SongId> = std::iter::once("seed".to_string())
+            .chain((0..5).map(|i| format!("y{i}")))
+            .map(SongId)
+            .collect();
+        assert_eq!(ids, want);
     }
 
     // CONTINUOUS re-autofill: the appended songs themselves drain and re-fetch on each
@@ -26479,7 +26743,7 @@ mod tests {
             st("1", "NTS 4 To The Floor", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
             st("2", "NTS Radio Live 1 - London", "http://stream-relay-geo.ntslive.net/stream"),
         ];
-        let pairs = search_all_pairs(&artists, &albums, Some(&stations), &[]);
+        let pairs = search_all_pairs(&artists, &albums, Some(&stations), &[], &HashMap::new());
 
         // The tally preamble: the station kind sits THIRD, between album and song, and
         // carries TWO tokens (no server cap, because the match is handler-side).
@@ -26507,18 +26771,38 @@ mod tests {
     }
 
     #[test]
+    fn search_all_pairs_flags_approximate_rows_and_counts_only_server_hits() {
+        let a = |id: &str, name: &str| Artist {
+            id: ArtistId(id.into()),
+            name: name.into(),
+            album_count: 1,
+            starred: false,
+            cover_art: None,
+        };
+        let artists = vec![a("real", "Massive"), a("fz", "Massive Attack")];
+        let approx: HashMap<String, f64> = [("fz".to_string(), 0.8)].into();
+        let pairs = search_all_pairs(&artists, &[], None, &[], &approx);
+        assert!(pairs.contains(&("X-Hits".into(), "artist 1 20".into())), "{pairs:?}");
+        let flags: Vec<usize> =
+            pairs.iter().enumerate().filter(|(_, (k, _))| k == "X-Approximate").map(|(i, _)| i).collect();
+        assert_eq!(flags.len(), 1);
+        let block_start = pairs.iter().position(|(_, v)| v == "artist/fz").unwrap();
+        assert!(flags[0] > block_start, "the flag sits inside the approximate block");
+    }
+
+    #[test]
     fn search_all_pairs_omits_the_station_kind_when_the_list_is_unavailable() {
         // A station-list fetch failure must NOT ACK the whole searchall and must NOT
         // claim `station 0` - absence of a claim beats a false claim about a set we
         // never saw. Artists/albums/songs still come back.
-        let pairs = search_all_pairs(&[], &[], None, &[]);
+        let pairs = search_all_pairs(&[], &[], None, &[], &HashMap::new());
         let hits: Vec<&str> =
             pairs.iter().filter(|(k, _)| k == "X-Hits").map(|(_, v)| v.as_str()).collect();
         assert_eq!(hits, vec!["artist 0 20", "album 0 50", "song 0 200"]);
         assert!(!pairs.iter().any(|(_, v)| v.starts_with("station")), "{pairs:?}");
 
         // A successful fetch that matched NOTHING is different, and says so.
-        let pairs = search_all_pairs(&[], &[], Some(&[]), &[]);
+        let pairs = search_all_pairs(&[], &[], Some(&[]), &[], &HashMap::new());
         let hits: Vec<&str> =
             pairs.iter().filter(|(k, _)| k == "X-Hits").map(|(_, v)| v.as_str()).collect();
         assert_eq!(hits, vec!["artist 0 20", "album 0 50", "station 0", "song 0 200"]);

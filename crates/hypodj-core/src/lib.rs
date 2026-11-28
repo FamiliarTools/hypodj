@@ -21,6 +21,7 @@ pub mod event;
 pub mod executor;
 pub mod fade;
 pub mod find_rank;
+pub mod fuzzy;
 pub mod features;
 pub mod graph;
 pub mod handler;

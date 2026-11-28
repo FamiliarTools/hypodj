@@ -154,6 +154,15 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
+    // The fuzzy name index behind the searchall typo fallback: built in the
+    // background (searchall is server-only until it lands), then rebuilt after a
+    // rescan moves getScanStatus's count or every few hours.
+    tokio::spawn(hypodj_core::fuzzy::run(
+        handler.fuzzy_slot(),
+        client.clone(),
+        hypodj_core::clock::TokioClock,
+    ));
+
     // The background scrobbler (feature 1) shares the SAME client. The director
     // spine feeds it every player event alongside the inline queue-advance.
     let scrobbler = Arc::new(hypodj_core::scrobble::Scrobbler::new(client.clone()));

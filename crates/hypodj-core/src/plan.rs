@@ -793,6 +793,13 @@ pub enum Selector {
     /// snapshot and undo (remove the row, restore the deck) cover it like any play-now.
     /// Carries no id, so it is model-safe.
     Station(Option<String>),
+    /// A NAMED listening need ("waking up music", "end of day", "calm not eerie"):
+    /// candidates from around what is playing plus a random spread, ranked by
+    /// closeness to the need's [`crate::intelligence::Mood::target`] over the
+    /// feature store (measured where analysed, the genre lexicon where not). Also
+    /// HOLDS the need for the autofill walk for a while, so the continuation keeps
+    /// leaning the same way. Carries no id, so it is model-safe.
+    Mood(crate::intelligence::Mood),
 }
 
 /// The numeric clamps, sourced from the SAME [`FadeConfig`] knobs the fade

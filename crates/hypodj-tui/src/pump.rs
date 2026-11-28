@@ -205,19 +205,52 @@ fn truth(host: &str, port: u16, world_file: Option<&Path>) -> String {
 }
 
 fn frame_text(state: &TuiState, w: u16, h: u16) -> String {
+    frame_dump(state, w, h).0
+}
+
+/// The frame as plain text, plus the same lines each led by a two-character STYLE
+/// mark, so a journey can check what plain text cannot carry: `>` when the row holds
+/// the cursor (a run of reversed cells), `~` when most of its ink is dimmed (a greyed,
+/// inactive row), else a space; then a space and the text.
+fn frame_dump(state: &TuiState, w: u16, h: u16) -> (String, String) {
+    use ratatui::style::Modifier;
     let mut term = Terminal::new(TestBackend::new(w, h)).expect("test backend");
     let _ = term.draw(|f| super::ui::render(f, state));
     let buf = term.backend().buffer();
     let mut out = String::with_capacity((w as usize + 1) * h as usize);
+    let mut marked = String::with_capacity((w as usize + 3) * h as usize);
     for y in 0..h {
         let mut line = String::new();
+        let (mut ink, mut dim, mut rev) = (0, 0, 0);
         for x in 0..w {
-            line.push_str(buf[(x, y)].symbol());
+            let c = &buf[(x, y)];
+            line.push_str(c.symbol());
+            if c.modifier.contains(Modifier::REVERSED) {
+                rev += 1;
+            }
+            if !c.symbol().trim().is_empty() {
+                ink += 1;
+                if c.modifier.contains(Modifier::DIM) {
+                    dim += 1;
+                }
+            }
         }
-        out.push_str(line.trim_end());
+        let line = line.trim_end();
+        let mark = if rev >= 3 {
+            '>'
+        } else if ink > 0 && dim * 2 > ink {
+            '~'
+        } else {
+            ' '
+        };
+        out.push_str(line);
         out.push('\n');
+        marked.push(mark);
+        marked.push(' ');
+        marked.push_str(line);
+        marked.push('\n');
     }
-    out
+    (out, marked)
 }
 
 /// Fold inbound traffic until it has been quiet for [`QUIET`], bounded by
@@ -275,7 +308,11 @@ pub fn run(args: &[String]) -> Result<(), MpdError> {
     let mut dump = |n: usize, label: &str, state: &mut TuiState, extra: String| -> Result<(), MpdError> {
         let (settled, took) = settle(&workers, state);
         for (w, h) in SIZES {
-            std::fs::write(outdir.join(format!("{n:03}.{w}x{h}.txt")), frame_text(state, w, h))
+            let (text, marked) = frame_dump(state, w, h);
+            std::fs::write(outdir.join(format!("{n:03}.{w}x{h}.txt")), text)
+                .map_err(|e| MpdError::Io(e.to_string()))?;
+            // Not `.txt`: the harness reads `NNN.*x*.txt` as the frames themselves.
+            std::fs::write(outdir.join(format!("{n:03}.{w}x{h}.rows")), marked)
                 .map_err(|e| MpdError::Io(e.to_string()))?;
         }
         std::fs::write(outdir.join(format!("{n:03}.truth.json")), truth(&host, port, world_file.as_deref()))

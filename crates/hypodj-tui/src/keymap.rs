@@ -242,6 +242,99 @@ pub const KEYMAP: &[Binding] = &[
     Binding { matchers: &[Char('q')], keys: "q", group: General, scope: Scope::Global, act: Quit, help: "quit" },
 ];
 
+/// What the `?` help is ABOUT: the view (or the info card) it was opened from. The
+/// overlay leads with this context's own keys, then the global table, so the keys that
+/// are special HERE are the first thing read rather than tags buried in a long list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpView {
+    Queue,
+    Albums,
+    Lists,
+    Dj,
+    Find,
+    Info,
+}
+
+impl HelpView {
+    pub fn title(&self) -> &'static str {
+        match self {
+            HelpView::Queue => "Queue",
+            HelpView::Albums => "Albums",
+            HelpView::Lists => "Lists",
+            HelpView::Dj => "DJ",
+            HelpView::Find => "Find",
+            HelpView::Info => "Info",
+        }
+    }
+
+    /// The [`KEYMAP`] scope whose rows belong to this view's section: the queue-only
+    /// rows on Queue, the browse-only rows on every browsing view.
+    pub fn scope(&self) -> Option<Scope> {
+        match self {
+            HelpView::Queue => Some(Scope::Queue),
+            HelpView::Albums | HelpView::Lists | HelpView::Find => Some(Scope::Browse),
+            HelpView::Dj | HelpView::Info => None,
+        }
+    }
+}
+
+/// A key a view claims in its OWN dispatch, before (or instead of) [`KEYMAP`]: the DJ
+/// ask line, the Find query line, the info card's scroll. Listed here so the help
+/// overlay reads them from a table rather than from prose; the `view_keys_*` tests in
+/// state.rs press every matcher in its view and fail if one does nothing, so a row
+/// cannot outlive the dispatch arm it describes. An empty `matchers` is a gesture, not
+/// a key (typing text), and is documented only.
+pub struct ViewKey {
+    pub view: HelpView,
+    pub matchers: &'static [KeyMatch],
+    pub keys: &'static str,
+    pub help: &'static str,
+}
+
+pub const VIEW_KEYS: &[ViewKey] = &[
+    ViewKey { view: HelpView::Dj, matchers: &[], keys: "type", help: "ask the DJ in your own words" },
+    ViewKey { view: HelpView::Dj, matchers: &[Code(KeyCode::Enter)], keys: "enter", help: "send the ask" },
+    ViewKey { view: HelpView::Dj, matchers: &[Code(KeyCode::Backspace)], keys: "backspace", help: "delete a character" },
+    ViewKey { view: HelpView::Dj, matchers: &[Code(KeyCode::Esc)], keys: "esc", help: "leave to the Queue" },
+    ViewKey { view: HelpView::Dj, matchers: &[], keys: "?", help: "this help (on an empty line)" },
+    ViewKey { view: HelpView::Find, matchers: &[], keys: "type", help: "write a library query" },
+    ViewKey { view: HelpView::Find, matchers: &[Code(KeyCode::Enter)], keys: "enter", help: "run the query" },
+    ViewKey { view: HelpView::Find, matchers: &[Code(KeyCode::Up), Code(KeyCode::Down)], keys: "up / down", help: "walk the query history" },
+    ViewKey { view: HelpView::Find, matchers: &[Code(KeyCode::Tab)], keys: "tab", help: "switch between query and results" },
+    ViewKey { view: HelpView::Find, matchers: &[Code(KeyCode::Esc)], keys: "esc", help: "out of a drill, then off the query line" },
+    ViewKey { view: HelpView::Info, matchers: &[Char('j'), Code(KeyCode::Down), Char('k'), Code(KeyCode::Up)], keys: "j / k", help: "scroll a line" },
+    ViewKey { view: HelpView::Info, matchers: &[Code(KeyCode::PageDown), Code(KeyCode::PageUp), Char(' ')], keys: "pgdn / pgup", help: "scroll a page" },
+    ViewKey { view: HelpView::Info, matchers: &[Char('i'), Code(KeyCode::Esc), Char('q')], keys: "i / esc / q", help: "close the card" },
+    ViewKey { view: HelpView::Info, matchers: &[Char('?')], keys: "?", help: "this help" },
+];
+
+/// The Albums COVER GRID's 2D cursor. A table rather than a match so the dispatch
+/// (`TuiState::key_grid`) and the help overlay read the same rows: what `?` says the
+/// grid does is what the grid does.
+pub struct GridKey {
+    pub matchers: &'static [KeyMatch],
+    pub keys: &'static str,
+    pub step: (i32, i32),
+    pub help: &'static str,
+}
+
+pub const GRID_KEYS: &[GridKey] = &[
+    GridKey { matchers: &[Code(KeyCode::Left)], keys: "left", step: (-1, 0), help: "previous cover" },
+    GridKey { matchers: &[Code(KeyCode::Right)], keys: "right", step: (1, 0), help: "next cover" },
+    GridKey { matchers: &[Char('j'), Code(KeyCode::Down), Ctrl('n')], keys: "j / down / C-n", step: (0, 1), help: "cover row below" },
+    GridKey { matchers: &[Char('k'), Code(KeyCode::Up), Ctrl('p')], keys: "k / up / C-p", step: (0, -1), help: "cover row above" },
+];
+
+/// The grid step for `key`, if it is a grid key. A `Code` matcher never fires with
+/// Ctrl held, so a Ctrl-arrow keeps whatever meaning the shared table gives it.
+pub fn grid_step(key: KeyEvent) -> Option<(i32, i32)> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    GRID_KEYS
+        .iter()
+        .find(|g| g.matchers.iter().any(|m| !(ctrl && matches!(m, Code(_))) && m.matches(key)))
+        .map(|g| g.step)
+}
+
 /// Resolve a key event to its Act, honoring the readline-first ordering (a Ctrl chord
 /// is matched as `Ctrl`, so a plain `p`/`n`/`s` never shadows `C-p`/`C-n`/`C-s`). The
 /// `_screen` is accepted for scope gating; screen-specific no-ops stay guarded in the

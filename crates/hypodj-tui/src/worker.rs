@@ -851,7 +851,7 @@ fn held_rows(on_disk: &[HeldAlbum]) -> Vec<BrowseRow> {
                 song_count: Some(a.songs),
                 artist: None,
                 album_uri: None,
-                artist_uri: None,
+                artist_uri: None, on_disk: None,
             })
         })
         .collect()

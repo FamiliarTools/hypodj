@@ -1022,6 +1022,7 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "similar_current" => (Selector::SimilarToCurrent, 2),
                 "starred" => (Selector::Starred, 2),
                 "instrumental" => (Selector::Instrumental, 2),
+                "mood" => (Selector::Mood(crate::intelligence::Mood::parse(toks.get(2)?)?), 3),
                 _ => return None,
             };
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
@@ -1036,6 +1037,7 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
                 "similar_current" => (Selector::SimilarToCurrent, 2),
                 "starred" => (Selector::Starred, 2),
                 "instrumental" => (Selector::Instrumental, 2),
+                "mood" => (Selector::Mood(crate::intelligence::Mood::parse(toks.get(2)?)?), 3),
                 // `playnow station <lane|current>`: tune in to a suggested station.
                 // PlayNow only - a stream is tuned, never queued behind music.
                 "station" => {

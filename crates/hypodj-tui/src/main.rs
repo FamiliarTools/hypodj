@@ -868,6 +868,9 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
                     }
                 }
             }
+            // Offline, a fresh listing must not leave the cursor on a row that cannot
+            // play.
+            state.snap_cursors();
         }
     }
 }
@@ -1249,7 +1252,7 @@ mod tests {
             song_count: Some(3),
             artist: None,
             album_uri: None,
-            artist_uri: None,
+            artist_uri: None, on_disk: None,
         };
         apply_resp(&tx, &mut state, snap("unreachable"));
         state.albums.apply(vec![row("album/held")], "albums/all".into(), "Albums".into());

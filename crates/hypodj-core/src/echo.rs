@@ -75,6 +75,7 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::SimilarToCurrent => format!("action enqueue similar_current {count}"),
             Selector::Starred => format!("action enqueue starred {count}"),
             Selector::Instrumental => format!("action enqueue instrumental {count}"),
+            Selector::Mood(m) => format!("action enqueue mood {} {count}", m.name()),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -87,6 +88,7 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::SimilarToCurrent => format!("action playnow similar_current {count}"),
             Selector::Starred => format!("action playnow starred {count}"),
             Selector::Instrumental => format!("action playnow instrumental {count}"),
+            Selector::Mood(m) => format!("action playnow mood {} {count}", m.name()),
             Selector::Station(None) => format!("action playnow station current {count}"),
             Selector::Station(Some(l)) => format!("action playnow station {} {count}", dsl_value(l)?),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
@@ -217,6 +219,7 @@ pub fn describe_action(raw: &RawPlan) -> String {
                 Selector::Exact(_) => "tracks".to_string(),
                 Selector::Starred => "favorite (starred) tracks".to_string(),
                 Selector::Instrumental => "measured-instrumental tracks".to_string(),
+                Selector::Mood(m) => format!("{} tracks", m.label()),
                 Selector::Station(_) => "stations".to_string(),
             };
             format!("add {count} {sel} to the END of the queue (append-only)")
@@ -250,6 +253,7 @@ pub fn describe_action(raw: &RawPlan) -> String {
                 Selector::Exact(_) => "tracks".to_string(),
                 Selector::Starred => "favorite (starred) tracks".to_string(),
                 Selector::Instrumental => "measured-instrumental tracks".to_string(),
+                Selector::Mood(m) => format!("{} tracks", m.label()),
                 Selector::Station(lane) => {
                     return format!(
                         "tune in NOW to a station you have not saved, for {} (probed first; nothing is saved)",

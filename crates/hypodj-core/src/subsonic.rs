@@ -827,6 +827,28 @@ impl SubsonicClient {
         })
     }
 
+    /// One page of EVERY song: search3 with the empty query (Navidrome lists the
+    /// whole library for `""`), artists and albums off. Feeds the fuzzy name index.
+    pub async fn all_songs_page(&self, count: i32, offset: i32) -> Result<Vec<Song>, SubsonicError> {
+        let res = self
+            .inner
+            .search3("\"\"", Some(0), None, Some(0), None, Some(count), Some(offset), None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(res.song.into_iter().map(map_song).collect())
+    }
+
+    /// `getScanStatus` as (scanning, item count). The count moving is how the fuzzy
+    /// index learns a rescan changed the library without re-fetching it to compare.
+    pub async fn scan_status(&self) -> Result<(bool, Option<i64>), SubsonicError> {
+        let s = self
+            .inner
+            .get_scan_status()
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok((s.scanning, s.count))
+    }
+
     // ── cover art (feature 2) ──────────────────────────────────────────────
 
     /// Build a `getCoverArt` URL for a cover id, with auth baked in exactly like

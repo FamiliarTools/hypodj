@@ -1,0 +1,42 @@
+id = "contextual-help"
+goal = "Ask for help on the view you are in and read that view's keys first: the Albums cover grid, the Queue, and the info card."
+start = "{state}"
+states = ["online"]
+# Each view's help is one key away; three views, open and close each.
+min_steps = 7
+step_budget = 8
+script = [
+  "mpd findadd album \"Held Harbour\"",
+  "key 2",
+  "wait 6",
+  "key ?",
+  "snap albums-help",
+  "key Esc",
+  "key 1",
+  "key ?",
+  "snap queue-help",
+  "key Esc",
+  "key i",
+  "key ?",
+  "snap info-help",
+]
+
+[[check]]
+name = "on Albums, help leads with the Albums keys, cover grid included, before the global table"
+at = 4
+severity = "S1"
+sizes = ["129x40"]
+screen_require_re = ["Albums keys.*previous cover \\(cover grid\\).*Playback"]
+
+[[check]]
+name = "on Queue, help leads with the Queue keys"
+at = 8
+severity = "S1"
+screen_require_re = ["Queue keys.*jump to the playing song.*(Playback|View)"]
+
+[[check]]
+name = "help over the info card is about the card"
+at = 12
+severity = "S1"
+sizes = ["129x40", "80x24"]
+screen_require_re = ["Info keys.*close the card"]

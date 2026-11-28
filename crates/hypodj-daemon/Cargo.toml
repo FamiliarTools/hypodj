@@ -34,6 +34,13 @@ path = "src/bin/mir.rs"
 name = "graph-eval"
 path = "src/bin/graph_eval.rs"
 
+# The fuzzy searchall fallback measured on the spike's 36 flawed queries plus a
+# nonsense precision set, against the LIVE server (read-only): hits@5, latency,
+# index memory. Run: cargo run --release -j4 --bin fuzzy-bench -- <config.toml>
+[[bin]]
+name = "fuzzy-bench"
+path = "src/bin/fuzzy_bench.rs"
+
 [features]
 # Passthroughs for the OPTIONAL model path. Off by default, so a plain
 # `cargo build -p hypodj-daemon` pulls NO llama/candle/ort. `llm` is the seam +

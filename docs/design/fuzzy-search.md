@@ -85,3 +85,32 @@ for non-Latin); index freshness after a Navidrome rescan.
 
 Reproduce: `fetch.py out.json` then `bench.py out.json` in `crates/hypodj-core/benches-spike/`
 (needs `/run/user/1000/hypodj/config.toml`; reads credentials in-process, prints none).
+
+## Implemented (approach c, `crates/hypodj-core/src/fuzzy.rs`)
+
+`searchall` runs search3 as before; a kind with fewer than 3 server hits gets up to 5
+approximate hits appended after the real ones, each flagged `X-Approximate: 1` (`X-Hits`
+still counts server hits only). Scoring is the spike's formula over a trigram posting-list
+prefilter (256 candidates per kind), cut-off 0.5. The fuzzy score enters `find_rank` as
+`Precision::Approx`, a band below every real one keyed by the score, so habit only breaks
+ties between equally close spellings. The index is built in the background at daemon start
+and rebuilt when a finished rescan moves `getScanStatus` count (polled every 10 min) or
+after 6 h; each kind is capped at 100k entries. dj-gui Find shows "did you mean?" in the
+trailer, djg/djq "Did you mean?" in the subtitle.
+
+Measured with `cargo run --release --bin fuzzy-bench -- <config>` on the same live library
+(137 artists / 263 albums / 1956 songs):
+
+| | value |
+|---|---|
+| hits@5 baseline (search3 + find_rank) | 12/36 |
+| hits@5 with fuzzy | 36/36 (lowest intended score 0.55) |
+| local augment + rank | median 0.14 ms, max 0.47 ms (rerun 0.15 / 0.50) |
+| whole library path (incl. search3) | median 107 ms, p90 185 ms; rerun median 140 ms, p90 499 ms (server-bound, varies with Navidrome load) |
+| index heap (counting allocator, incl. stored rows) | 2.7 MB |
+| index fetch + build | 4.5 to 11.6 s (network paging), background only |
+| nonsense precision (10 queries) | 0 approximate rows; best raw score 0.37 |
+
+The baseline is 12 here vs the spike's 15. The spike scored raw search3 order; this scores
+the served path (song tag post-filter, then `find_rank`). Which 3 queries differ was not
+investigated.

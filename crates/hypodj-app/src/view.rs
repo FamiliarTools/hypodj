@@ -195,7 +195,7 @@ pub fn search_hits(pairs: &[(String, String)]) -> Vec<Hit> {
     let mut out: Vec<Hit> = Vec::new();
     for b in &blocks {
         let (k, uri) = (&b[0].0, &b[0].1);
-        let hit = if k == "file" {
+        let mut hit = if k == "file" {
             Hit {
                 kind: HitKind::Song,
                 title: find(b, "Title").unwrap_or(uri).to_string(),
@@ -219,6 +219,13 @@ pub fn search_hits(pairs: &[(String, String)]) -> Vec<Hit> {
         } else {
             continue;
         };
+        // A fuzzy "did you mean" hit (`X-Approximate: 1`) says so in its subtitle.
+        if find(b, "X-Approximate") == Some("1") {
+            hit.subtitle = Some(match hit.subtitle.take() {
+                Some(s) => format!("Did you mean? {s}"),
+                None => "Did you mean?".into(),
+            });
+        }
         out.push(hit);
     }
     out.sort_by_key(|h| match h.kind {
@@ -443,6 +450,20 @@ mod tests {
         ]);
         let kinds: Vec<_> = search_hits(&pairs).iter().map(|h| h.kind).collect();
         assert_eq!(kinds, vec![HitKind::Artist, HitKind::Album, HitKind::Song]);
+    }
+
+    #[test]
+    fn an_approximate_hit_says_did_you_mean() {
+        let pairs = p(&[
+            ("directory", "artist/4"),
+            ("Artist", "Massive Attack"),
+            ("X-Approximate", "1"),
+            ("directory", "artist/5"),
+            ("Artist", "Massive"),
+        ]);
+        let hits = search_hits(&pairs);
+        assert_eq!(hits[0].subtitle.as_deref(), Some("Did you mean? artist"));
+        assert_eq!(hits[1].subtitle.as_deref(), Some("artist"));
     }
 
     #[test]
