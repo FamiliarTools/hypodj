@@ -17,7 +17,7 @@
 //!
 //! ## Why the perceptual dB domain
 //!
-//! Loudness is compressive (Stevens ~0.67; +10 dB ~ 2x loud), so a LINEAR
+//! Loudness is compressive (Stevens exponent ~0.67 on sound pressure; +10 dB ~ 2x loud), so a LINEAR
 //! amplitude ramp feels fast-then-plunge - the startle curve the fade design
 //! forbids. We operate in dB: an equal-dB-per-step schedule is
 //! exponential-amplitude, perceptually smooth. The sink ([`VolumeSink`]) speaks
