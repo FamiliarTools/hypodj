@@ -93,7 +93,7 @@ pub fn is_question(utterance: &str) -> bool {
 /// can answer ("no vocals"): a client translator has no selector for it and would
 /// guess a free-text "instrumental" query instead of reading P(voice).
 pub fn daemon_first(utterance: &str) -> bool {
-    is_question(utterance) || rules::is_instrumental_ask(utterance)
+    is_question(utterance) || rules::is_instrumental_ask(utterance) || rules::is_mood_ask(utterance)
 }
 
 /// Is this plan "do nothing"? A translator's way of saying it did not understand,
@@ -105,6 +105,25 @@ pub fn is_noop(raw: &hypodj_core::plan::RawPlan) -> bool {
 #[cfg(test)]
 mod question_tests {
     use super::*;
+
+    #[test]
+    fn mood_asks_go_to_the_daemon_first_and_harder_asks_do_not_match() {
+        for u in ["waking up music", "end of day", "calm not eerie", "music for working"] {
+            assert!(daemon_first(u), "{u}");
+        }
+        // A negation that is not the "not <dark>" qualifier, a timer, a fade, a vocal
+        // filter: none is a named need, so none is swallowed as one.
+        for u in [
+            "calm, not my favorites",
+            "end of day music in 10 minutes",
+            "fade out at the end of the day",
+            "coding music no vocals",
+            "calm not loud",
+            "play some jazz",
+        ] {
+            assert!(!rules::is_mood_ask(u), "{u}");
+        }
+    }
 
     #[test]
     fn instrumental_asks_go_to_the_daemon_first() {
@@ -161,6 +180,7 @@ mod question_tests {
 mod tests {
     use super::*;
     use chrono::{FixedOffset, TimeZone, Utc};
+    use hypodj_core::intelligence::Mood;
     use hypodj_core::model::SongId;
     use hypodj_core::nl::{NlSource, Translator};
     use hypodj_core::plan::{
@@ -930,6 +950,13 @@ mod tests {
             ("single mode", ok(vec![mode(PlayMode::Single, true)])),
             ("consume", ok(vec![mode(PlayMode::Consume, true)])),
             ("no vocals", ok(vec![imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 })])),
+            ("waking up music", ok(vec![imm(Action::PlayNow { selector: Selector::Mood(Mood::Wake), count: 5 })])),
+            ("end of day", ok(vec![imm(Action::PlayNow { selector: Selector::Mood(Mood::Unwind), count: 5 })])),
+            ("something for the end of the day", ok(vec![imm(Action::PlayNow { selector: Selector::Mood(Mood::Unwind), count: 5 })])),
+            ("calm not eerie", ok(vec![imm(Action::PlayNow { selector: Selector::Mood(Mood::CalmWarm), count: 5 })])),
+            ("something calm but not creepy", ok(vec![imm(Action::PlayNow { selector: Selector::Mood(Mood::CalmWarm), count: 5 })])),
+            ("queue 3 tracks for working", ok(vec![imm(Action::Enqueue { selector: Selector::Mood(Mood::Focus), count: 3 })])),
+            ("music for working", ok(vec![imm(Action::PlayNow { selector: Selector::Mood(Mood::Focus), count: 5 })])),
             ("instrumental only", ok(vec![imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 })])),
             ("play something instrumental", ok(vec![imm(Action::PlayNow { selector: Selector::Instrumental, count: 5 })])),
             ("queue 3 instrumental tracks", ok(vec![imm(Action::Enqueue { selector: Selector::Instrumental, count: 3 })])),

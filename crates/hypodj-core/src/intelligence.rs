@@ -17,6 +17,8 @@
 //! Everything here is PURE: no clock, no I/O, no network, no model, no lock. Fully
 //! deterministic and unit-testable.
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::Song;
 
 /// Per-track mood/energy features. `energy` is the load-bearing v1 signal
@@ -785,6 +787,369 @@ pub fn behavior_rerank<T>(candidates: Vec<T>, behavior: &[Behavior]) -> Vec<T> {
     });
     let mut src: Vec<Option<T>> = candidates.into_iter().map(Some).collect();
     keyed.into_iter().filter_map(|(i, _)| src[i].take()).collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Listening intelligence (task xs0zurq): time-of-day habits and named needs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A listening NEED, named by the human ("waking up music", "end of day", "calm not
+/// eerie") or implied by the clock. Each is a TARGET point on the
+/// [`feature_axes`] plane `[energy, valence]`, so it composes with whatever the
+/// [`FeatureStore`] knows: measured energy where a song was analysed, the genre
+/// lexicon where it was not, and a neutral `0.5` where neither says anything. A
+/// target ranks candidates by closeness; it never filters, so a library with no
+/// usable signal degrades to the incoming order rather than to nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Mood {
+    /// Gentle but bright: easing into the day, not a jolt.
+    Wake,
+    /// Steady, middle energy that stays out of the way of work.
+    Focus,
+    /// End of the day: settling, still warm.
+    Unwind,
+    /// Calm AND warm - the "calm not eerie" ask: low energy that is not dark.
+    CalmWarm,
+    /// Late night: the lowest energy, neutral colour.
+    Night,
+    /// A lift: energetic and bright.
+    Lift,
+}
+
+impl Mood {
+    pub const ALL: [Mood; 6] =
+        [Mood::Wake, Mood::Focus, Mood::Unwind, Mood::CalmWarm, Mood::Night, Mood::Lift];
+
+    /// The DSL token (`enqueue mood <token> N`). Round-trips through [`Mood::parse`].
+    pub fn name(self) -> &'static str {
+        match self {
+            Mood::Wake => "wake",
+            Mood::Focus => "focus",
+            Mood::Unwind => "unwind",
+            Mood::CalmWarm => "calm_warm",
+            Mood::Night => "night",
+            Mood::Lift => "lift",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Mood> {
+        Mood::ALL.into_iter().find(|m| m.name().eq_ignore_ascii_case(s))
+    }
+
+    /// The human phrase, for echoes and outcomes.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mood::Wake => "waking-up",
+            Mood::Focus => "focus",
+            Mood::Unwind => "end-of-day",
+            Mood::CalmWarm => "calm, warm (not eerie)",
+            Mood::Night => "late-night",
+            Mood::Lift => "upbeat",
+        }
+    }
+
+    /// The `[energy, valence]` target. Placed against the lexicon's buckets (calm
+    /// 0.20, mid 0.50, energetic 0.85; dark 0.30, neutral 0.50, bright 0.70) so a
+    /// metadata-only library still separates them.
+    pub fn target(self) -> [f32; 2] {
+        match self {
+            Mood::Wake => [0.40, 0.70],
+            Mood::Focus => [0.50, 0.50],
+            Mood::Unwind => [0.30, 0.65],
+            Mood::CalmWarm => [0.20, 0.70],
+            Mood::Night => [0.15, 0.50],
+            Mood::Lift => [0.80, 0.70],
+        }
+    }
+}
+
+/// A part of the local day. Boundaries are local wall-clock hours, half-open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TimeBand {
+    /// 05:00 to 11:00.
+    Morning,
+    /// 11:00 to 14:00.
+    Midday,
+    /// 14:00 to 18:00.
+    Afternoon,
+    /// 18:00 to 22:00.
+    Evening,
+    /// 22:00 to 05:00.
+    Night,
+}
+
+impl TimeBand {
+    pub const ALL: [TimeBand; 5] =
+        [TimeBand::Morning, TimeBand::Midday, TimeBand::Afternoon, TimeBand::Evening, TimeBand::Night];
+
+    /// The band a local hour (`0..24`, taken modulo 24) falls in. Total.
+    pub fn from_hour(hour: u32) -> TimeBand {
+        match hour % 24 {
+            5..=10 => TimeBand::Morning,
+            11..=13 => TimeBand::Midday,
+            14..=17 => TimeBand::Afternoon,
+            18..=21 => TimeBand::Evening,
+            _ => TimeBand::Night,
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TimeBand::Morning => "morning",
+            TimeBand::Midday => "midday",
+            TimeBand::Afternoon => "afternoon",
+            TimeBand::Evening => "evening",
+            TimeBand::Night => "night",
+        }
+    }
+
+    /// The need this part of the day implies before any history is known: the
+    /// PRIOR the habit model starts from and shrinks toward when evidence is thin.
+    pub fn prior(self) -> Mood {
+        match self {
+            TimeBand::Morning => Mood::Wake,
+            TimeBand::Midday | TimeBand::Afternoon => Mood::Focus,
+            TimeBand::Evening => Mood::Unwind,
+            TimeBand::Night => Mood::Night,
+        }
+    }
+}
+
+/// How many observations a band needs before its own mean outweighs the prior:
+/// the shrinkage constant `k` in `w = n / (n + k)`.
+pub const HABIT_PRIOR_WEIGHT: f32 = 8.0;
+
+/// Per-band running sums of what was played in that part of the day.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BandStats {
+    n: u32,
+    energy: f32,
+    valence: f32,
+}
+
+/// The time-of-day HABIT model: for each [`TimeBand`], the mean `[energy, valence]`
+/// of what he played then, shrunk toward the band's [`TimeBand::prior`] while the
+/// evidence is thin. PURE and order-independent (sums only), so it is rebuilt from
+/// whatever history is at hand on each ask instead of being a second store that
+/// can drift: the server's last-played stamps (a Subsonic signal, read back from the
+/// scrobbles) and the local session's own plays.
+///
+/// HONEST LIMIT: a last-played stamp is ONE time per song (the latest), so a song
+/// heard every morning and once last night reads as a night song until it is played
+/// in the morning again. It is a sample of habits, not a play log.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HabitModel {
+    bands: [BandStats; 5],
+}
+
+impl HabitModel {
+    pub fn new() -> Self {
+        HabitModel::default()
+    }
+
+    /// Record one play at local `hour` of a track with features `f`.
+    pub fn observe(&mut self, hour: u32, f: &TrackFeatures) {
+        let b = &mut self.bands[TimeBand::from_hour(hour).index()];
+        b.n = b.n.saturating_add(1);
+        b.energy += f.energy.clamp(0.0, 1.0);
+        b.valence += f.valence.clamp(0.0, 1.0);
+    }
+
+    /// Observations recorded in `band`.
+    pub fn samples(&self, band: TimeBand) -> u32 {
+        self.bands[band.index()].n
+    }
+
+    /// The `[energy, valence]` target for `band`: `(1 - w) * prior + w * mean` with
+    /// `w = n / (n + HABIT_PRIOR_WEIGHT)`. With no samples it is exactly the prior.
+    pub fn target(&self, band: TimeBand) -> [f32; 2] {
+        let prior = band.prior().target();
+        let b = self.bands[band.index()];
+        if b.n == 0 {
+            return prior;
+        }
+        let n = b.n as f32;
+        let w = n / (n + HABIT_PRIOR_WEIGHT);
+        let mean = [b.energy / n, b.valence / n];
+        [(1.0 - w) * prior[0] + w * mean[0], (1.0 - w) * prior[1] + w * mean[1]]
+    }
+}
+
+/// The local wall-clock hour of an RFC 3339 stamp (the shape `Song::played` carries),
+/// at a fixed `offset_secs` east of UTC. `None` for an unparseable stamp. PURE: the
+/// caller resolves the local offset once, so this never reads the system timezone.
+pub fn local_hour_of(raw: &str, offset_secs: i32) -> Option<u32> {
+    use chrono::Timelike;
+    let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    let off = chrono::FixedOffset::east_opt(offset_secs)?;
+    Some(dt.with_timezone(&off).hour())
+}
+
+/// The weight a time-of-day lean gets in the AUTOFILL order, in units of the whole
+/// incoming-rank span. Smaller than [`BEHAVIOR_WEIGHT`] on purpose: the clock is a
+/// guess about the room, so it nudges the similarity order and never replaces it.
+pub const TOD_WEIGHT: f32 = 0.20;
+
+/// The weight a NAMED need gets when it is the selector itself ("waking up
+/// music"): large enough that closeness to the target decides the order and the
+/// incoming order only breaks ties.
+pub const MOOD_SELECT_WEIGHT: f32 = 4.0;
+
+/// The bonus for a candidate he last played in the CURRENT part of the day ("you
+/// play this in the evening"), added on top of the closeness term.
+pub const HABIT_BAND_BONUS: f32 = 0.10;
+
+/// Closeness of `f` to `target` in `0..=1`: 1 at the target, 0 at the far corner.
+pub fn mood_closeness(f: &TrackFeatures, target: [f32; 2]) -> f32 {
+    let de = f.energy - target[0];
+    let dv = f.valence - target[1];
+    (1.0 - (de * de + dv * dv).sqrt() / std::f32::consts::SQRT_2).clamp(0.0, 1.0)
+}
+
+/// PURE. Re-rank `candidates` toward `target`, keyed
+/// `incoming_rank + weight * (closeness - mean_closeness) + HABIT_BAND_BONUS * in_band`.
+/// `feats` and `in_band` are parallel to `candidates`. A candidate with no features
+/// contributes a zero closeness term (no signal is not a guess), so when NOTHING has
+/// features and nothing is in band the result is the incoming order, byte for byte:
+/// the graceful fallback the empty feature store needs. Ties keep incoming order.
+pub fn tod_rerank<T>(
+    candidates: Vec<T>,
+    feats: &[Option<TrackFeatures>],
+    in_band: &[bool],
+    target: [f32; 2],
+    weight: f32,
+) -> Vec<T> {
+    let n = candidates.len();
+    if n <= 1 || feats.len() != n || in_band.len() != n {
+        return candidates;
+    }
+    let close: Vec<Option<f32>> =
+        feats.iter().map(|f| f.as_ref().map(|f| mood_closeness(f, target))).collect();
+    let known: Vec<f32> = close.iter().flatten().copied().collect();
+    let mean = if known.is_empty() { 0.0 } else { known.iter().sum::<f32>() / known.len() as f32 };
+    let last = (n - 1) as f32;
+    let mut keyed: Vec<(usize, f32)> = (0..n)
+        .map(|i| {
+            let c = close[i].map_or(0.0, |c| c - mean);
+            let b = if in_band[i] { HABIT_BAND_BONUS } else { 0.0 };
+            (i, (last - i as f32) / last + weight * c + b)
+        })
+        .collect();
+    keyed.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+    });
+    let mut src: Vec<Option<T>> = candidates.into_iter().map(Some).collect();
+    keyed.into_iter().filter_map(|(i, _)| src[i].take()).collect()
+}
+
+#[cfg(test)]
+mod habit_tests {
+    use super::*;
+
+    fn f(e: f32, v: f32) -> TrackFeatures {
+        TrackFeatures::heuristic(e, v)
+    }
+
+    #[test]
+    fn bands_cover_the_whole_day() {
+        assert_eq!(TimeBand::from_hour(4), TimeBand::Night);
+        assert_eq!(TimeBand::from_hour(5), TimeBand::Morning);
+        assert_eq!(TimeBand::from_hour(10), TimeBand::Morning);
+        assert_eq!(TimeBand::from_hour(11), TimeBand::Midday);
+        assert_eq!(TimeBand::from_hour(14), TimeBand::Afternoon);
+        assert_eq!(TimeBand::from_hour(18), TimeBand::Evening);
+        assert_eq!(TimeBand::from_hour(22), TimeBand::Night);
+        assert_eq!(TimeBand::from_hour(23), TimeBand::Night);
+        assert_eq!(TimeBand::from_hour(0), TimeBand::Night);
+        assert_eq!(TimeBand::from_hour(29), TimeBand::Morning);
+    }
+
+    #[test]
+    fn mood_tokens_round_trip() {
+        for m in Mood::ALL {
+            assert_eq!(Mood::parse(m.name()), Some(m));
+        }
+        assert_eq!(Mood::parse("eerie"), None);
+    }
+
+    #[test]
+    fn an_empty_model_is_the_prior_and_evidence_pulls_it() {
+        let mut h = HabitModel::new();
+        assert_eq!(h.target(TimeBand::Evening), Mood::Unwind.target());
+        // Eight energetic evening plays: half way from the prior to the mean.
+        for _ in 0..8 {
+            h.observe(20, &f(0.9, 0.7));
+        }
+        let t = h.target(TimeBand::Evening);
+        assert!((t[0] - (0.30 + 0.90) / 2.0).abs() < 1e-5, "{t:?}");
+        assert_eq!(h.samples(TimeBand::Evening), 8);
+        // Other bands are untouched.
+        assert_eq!(h.target(TimeBand::Morning), Mood::Wake.target());
+    }
+
+    #[test]
+    fn local_hour_honours_the_offset() {
+        assert_eq!(local_hour_of("2026-08-06T14:17:24+01:00", 0), Some(13));
+        assert_eq!(local_hour_of("2026-08-06T23:30:00Z", 3600), Some(0));
+        assert_eq!(local_hour_of("2026-07-10T11:45:09.98345312+01:00", 3600), Some(11));
+        assert_eq!(local_hour_of("not a stamp", 0), None);
+    }
+
+    #[test]
+    fn no_features_and_no_band_is_the_identity() {
+        let v = tod_rerank(vec!["a", "b", "c"], &[None, None, None], &[false; 3], [0.2, 0.7], MOOD_SELECT_WEIGHT);
+        assert_eq!(v, vec!["a", "b", "c"]);
+        // All-equal features (every song genre-less, 0.5/0.5) is also the identity.
+        let same = vec![Some(f(0.5, 0.5)); 3];
+        let v = tod_rerank(vec!["a", "b", "c"], &same, &[false; 3], [0.2, 0.7], MOOD_SELECT_WEIGHT);
+        assert_eq!(v, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_named_need_decides_the_order() {
+        // metal, ambient-dark, folk-warm: "calm not eerie" wants the warm calm one first
+        // and the dark calm one before the metal.
+        let feats = vec![Some(f(0.85, 0.30)), Some(f(0.20, 0.30)), Some(f(0.20, 0.70))];
+        let v = tod_rerank(vec!["metal", "dark", "warm"], &feats, &[false; 3], Mood::CalmWarm.target(), MOOD_SELECT_WEIGHT);
+        assert_eq!(v, vec!["warm", "dark", "metal"]);
+    }
+
+    #[test]
+    fn the_clock_only_nudges_autofill() {
+        // At TOD_WEIGHT a far-off first candidate keeps its lead over a close last one
+        // in a long list: similarity still leads.
+        let mut feats = vec![Some(f(0.85, 0.5))];
+        feats.extend(std::iter::repeat(Some(f(0.5, 0.5))).take(8));
+        feats.push(Some(f(0.15, 0.5)));
+        let ids: Vec<usize> = (0..10).collect();
+        let v = tod_rerank(ids, &feats, &[false; 10], Mood::Night.target(), TOD_WEIGHT);
+        assert_eq!(v[0], 0);
+        // But between neighbours it swaps toward the target.
+        let v = tod_rerank(vec!["loud", "quiet"], &[Some(f(0.85, 0.5)), Some(f(0.15, 0.5))], &[false; 2], Mood::Night.target(), TOD_WEIGHT);
+        assert_eq!(v, vec!["loud", "quiet"]);
+        // In a 21-deep pool (autofill over-fetches 2x) one rank step is 0.05, so the
+        // same pair of neighbours swaps toward the target.
+        let mut feats = vec![Some(f(0.85, 0.5)), Some(f(0.15, 0.5))];
+        feats.extend(std::iter::repeat(None).take(19));
+        let v = tod_rerank((0..21).collect::<Vec<usize>>(), &feats, &[false; 21], Mood::Night.target(), TOD_WEIGHT);
+        assert_eq!(&v[..2], &[1, 0], "{v:?}");
+    }
+
+    #[test]
+    fn a_song_he_plays_at_this_hour_rises() {
+        let v = tod_rerank(vec!["a", "b"], &[None, None], &[false, true], [0.5, 0.5], TOD_WEIGHT);
+        assert_eq!(v, vec!["a", "b"], "a 0.10 bonus does not overturn a full rank step");
+        let mut band = vec![false; 21];
+        band[1] = true;
+        let v = tod_rerank((0..21).collect::<Vec<usize>>(), &vec![None; 21], &band, [0.5, 0.5], TOD_WEIGHT);
+        assert_eq!(&v[..2], &[1, 0]);
+    }
 }
 
 #[cfg(test)]

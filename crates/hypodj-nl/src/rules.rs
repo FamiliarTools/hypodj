@@ -9,6 +9,7 @@
 use chrono::{TimeZone, Utc};
 
 use hypodj_core::config::{DEFAULT_SLEEP_FADE_SECS, DEFAULT_WINDDOWN_FADE_SECS};
+use hypodj_core::intelligence::Mood;
 use hypodj_core::nl::{NlContext, NlError, NlHit, NlQuery, NlSession, NlSource, Translator};
 use hypodj_core::plan::{
     Action, CurateFilter, DaySet, FadeIntentIr, PlayMode, PosBase, QueueSelector, RawPlan,
@@ -265,6 +266,13 @@ fn rules_body(
     let toks: Vec<String> = low.split_whitespace().map(String::from).collect();
     let tv: Vec<&str> = toks.iter().map(String::as_str).collect();
 
+    // 0a. a NAMED listening need ("waking up music", "end of day", "calm not
+    // eerie"). Before the negation guard because "not eerie" is part of the need,
+    // not a negation of the ask; any OTHER negation still falls through to it.
+    if let Some(plans) = mood(text) {
+        return Ok(plans);
+    }
+
     // 0. the negation / contrast guard: only the mode grammar parses its own
     // negation ("don't shuffle"); every other rule would read the inverse.
     {
@@ -414,6 +422,98 @@ fn instrumental(wv: &[&str]) -> Option<Vec<RawPlan>> {
     }
     let count = leading_count(wv).unwrap_or(DEFAULT_ENQUEUE_COUNT);
     let selector = Selector::Instrumental;
+    let action = match wv.first().copied() {
+        Some("queue" | "add" | "enqueue" | "append") => Action::Enqueue { selector, count },
+        _ => Action::PlayNow { selector, count },
+    };
+    Some(vec![plan(RawTrigger::Immediate, action, true)])
+}
+
+/// Darkness words a calm ask may rule out ("calm not eerie"): negated, they turn a
+/// plain calm into [`Mood::CalmWarm`].
+const DARK_WORDS: &[&str] = &[
+    "eerie", "creepy", "spooky", "dark", "haunting", "unsettling", "sinister", "scary",
+    "ominous", "sad", "gloomy", "depressing",
+];
+
+/// Words that make an utterance a DIFFERENT, harder ask than a named need: a fade,
+/// a stop, a timer, a curation. The mood rule never swallows one of them (it would
+/// drop the part of the ask it cannot express), so they fall through.
+const NOT_A_MOOD: &[&str] = &[
+    "fade", "stop", "pause", "sleep", "skip", "remove", "drop", "wind", "at", "in", "after",
+    "until", "every", "shuffle", "repeat", "favorites", "favourites", "favorite", "favourite",
+    "starred",
+];
+
+/// Which need a phrase names, if any. Phrase matches over the lowercased text; the
+/// calm-not-dark shape is read from the word list.
+fn mood_need(low: &str, wv: &[&str]) -> Option<Mood> {
+    let has = |p: &str| low.contains(p);
+    let negated_dark = wv.windows(2).any(|w| {
+        matches!(w[0], "not" | "no" | "nothing" | "never" | "without") && DARK_WORDS.contains(&w[1])
+    });
+    let warm = wv.iter().any(|w| matches!(*w, "warm" | "cozy" | "cosy"));
+    if wv.contains(&"calm") && (negated_dark || warm) {
+        return Some(Mood::CalmWarm);
+    }
+    if has("waking up") || has("wake up music") || has("wake-up music") || has("to wake up")
+        || has("morning music") || has("music for the morning") || has("for waking")
+    {
+        return Some(Mood::Wake);
+    }
+    if has("end of day") || has("end of the day") || has("end-of-day") || has("after work")
+        || has("unwind") || has("decompress")
+    {
+        return Some(Mood::Unwind);
+    }
+    if has("music for working") || has("for working") || has("work music") || has("working music") || has("to work to")
+        || has("focus music") || has("music to focus") || has("coding music") || has("music for coding")
+        || has("to code to") || has("concentrate")
+    {
+        return Some(Mood::Focus);
+    }
+    if has("late night") || has("late-night") || has("night music") || has("middle of the night") {
+        return Some(Mood::Night);
+    }
+    if has("upbeat") || has("pick me up") || has("pick-me-up") || has("cheer me up") {
+        return Some(Mood::Lift);
+    }
+    None
+}
+
+/// Does the mood rule own this utterance? For [`crate::daemon_first`].
+pub fn is_mood_ask(utterance: &str) -> bool {
+    mood(utterance).is_some()
+}
+
+/// "waking up music" / "end of day" / "calm not eerie" / "queue 3 tracks for
+/// working" -> one immediate [`Selector::Mood`] selection. A queue verb appends;
+/// anything else is a request to HEAR it, so it plays now. `None` when the
+/// utterance names no need, carries a negation other than "not <dark word>", or
+/// mixes in an ask this rule cannot express (a fade, a timer, a vocal filter).
+fn mood(text: &str) -> Option<Vec<RawPlan>> {
+    let low = text.to_lowercase();
+    let wd = words(text);
+    let wv: Vec<&str> = wd.iter().map(String::as_str).collect();
+    if wv.iter().any(|w| NOT_A_MOOD.contains(w) || VOICE_WORDS.contains(w)) {
+        return None;
+    }
+    let need = mood_need(&low, &wv)?;
+    // Every negation must be the "not <dark word>" qualifier the need already holds.
+    let rest: Vec<&str> = wv
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| {
+            let next_dark = wv.get(i + 1).is_some_and(|n| DARK_WORDS.contains(n));
+            !(next_dark && matches!(**w, "not" | "no" | "nothing" | "never" | "without" | "but"))
+        })
+        .map(|(_, w)| *w)
+        .collect();
+    if negation(&rest).is_some() {
+        return None;
+    }
+    let count = leading_count(&wv).unwrap_or(DEFAULT_ENQUEUE_COUNT);
+    let selector = Selector::Mood(need);
     let action = match wv.first().copied() {
         Some("queue" | "add" | "enqueue" | "append") => Action::Enqueue { selector, count },
         _ => Action::PlayNow { selector, count },
