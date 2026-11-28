@@ -152,6 +152,12 @@ pub struct HeardRow {
     /// station-metadata cache ([`crate::station_meta`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genre: Option<String>,
+    /// On a `play` row: energy 0..=100 as the feature seam saw the track when it began
+    /// sounding (measured where analysed, the documented heuristic elsewhere). A `u8`
+    /// rather than the seam's `f32` because [`HeardRow`] derives `Eq`. Read back by
+    /// [`crate::arc`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_pct: Option<u8>,
     /// The configured recognize interval at session open, so the coverage line can name
     /// the clock it is modelling even on a session with too few samples to derive one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,7 +1063,9 @@ fn render_marks(rows: &[HeardRow], tape_ids: &[String]) -> Vec<String> {
 
 fn render_all(rows: &[HeardRow], unreadable: usize, tape_ids: &[String]) -> Vec<String> {
     let mut out = vec![coverage_line(rows, unreadable)];
-    for r in rows.iter().filter(|r| r.ev != "session") {
+    // `play` / `skip` rows are the listening-arc record ([`crate::arc`]); the queue's own
+    // `heard` rows already list those tracks here, so they are not printed twice.
+    for r in rows.iter().filter(|r| !matches!(r.ev.as_str(), "session" | "play" | "skip")) {
         out.push(match r.ev.as_str() {
             "mark" => mark_line(r, tape_ids),
             "tune" => format!(

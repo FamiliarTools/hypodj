@@ -3,6 +3,7 @@
 //! runs directly; anything else is sent to the daemon as `nl "<phrase>"`, echoed,
 //! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
 
+mod arc;
 mod completions;
 mod heard;
 mod journal;
@@ -252,6 +253,19 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
         let (host, port) = config::resolve(parsed.host, parsed.port, &env);
         let mut conn = MpdConn::connect(&host, port)?;
         if !heard::run(&mut conn, &parsed.words[1..])? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // `arc` is intercepted for the same reason as `heard`: route knows no arc verb.
+    if parsed.words.first().is_some_and(|w| w == "arc") {
+        let env = Env {
+            get: &|k| std::env::var(k).ok(),
+        };
+        let (host, port) = config::resolve(parsed.host, parsed.port, &env);
+        let mut conn = MpdConn::connect(&host, port)?;
+        if !arc::run(&mut conn, &parsed.words[1..])? {
             std::process::exit(1);
         }
         return Ok(());
