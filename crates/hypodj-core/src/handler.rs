@@ -990,6 +990,22 @@ fn spent_heard_row(it: &QueueItem) -> Option<crate::heard::HeardRow> {
     })
 }
 
+/// The `play` row for a library track that just began sounding (see [`crate::arc`]).
+fn arc_play_row(s: &Song, energy_pct: Option<u8>) -> crate::heard::HeardRow {
+    crate::heard::HeardRow {
+        kind: Some("track".to_string()),
+        artist: s.artist.clone(),
+        title: Some(s.title.clone()),
+        album: s.album.clone(),
+        genre: s.genre.clone(),
+        match_uri: Some(format!("song/{}", s.id.0)),
+        owned: true,
+        starred: s.starred,
+        energy_pct,
+        ..crate::heard::HeardRow::now("play")
+    }
+}
+
 /// One recognition HIT row. Records ownership but never a star.
 fn recognize_hit_row(
     track: &crate::recognize::RecognizedTrack,
@@ -5556,10 +5572,18 @@ impl HypodjHandler {
         if heard >= line {
             return;
         }
+        // The listening-arc record: an early skip is a "no" inside the arc, so a
+        // replay leaves this track out (crate::arc). Sent after the State lock drops.
+        let skip = crate::heard::HeardRow {
+            match_uri: Some(format!("song/{}", song.0 .0)),
+            ..crate::heard::HeardRow::now("skip")
+        };
         if st.session_skips.len() >= SESSION_SKIPS_CAP {
             st.session_skips.clear();
         }
         *st.session_skips.entry(song.0).or_insert(0) += 1;
+        drop(st);
+        self.append_heard(skip);
     }
 
     /// THE BEHAVIORAL NUDGE (task u3zgfmt): re-rank an autonomous candidate pool by
@@ -8342,6 +8366,69 @@ impl HypodjHandler {
     /// `heard report`: the discovery experiment's numbers per tune-in origin across every
     /// retained session, plus the wants and how many of them are owned NOW (a bounded
     /// library lookup over the newest [`REPORT_WANTS_CHECKED`] - read-only, no star).
+    /// The `arc` verb (task brw7b4u): read the listening sessions back out of the heard
+    /// ledger as arcs, name and keep one, replay one. Every file touch is one
+    /// `spawn_blocking` hop; the replay is ONE `Action::PlayNow { Selector::Exact }`
+    /// through [`Self::run_action_outcome`], so it is journaled and undoable like any
+    /// plan action and writes nothing to Navidrome.
+    async fn handle_arc(&self, cmd: crate::arc::ArcCmd) -> MpdResponse {
+        use crate::arc::{self as arcs, ArcCmd};
+        let Some(dir) = self.heard_dir.lock().unwrap().clone() else {
+            return ack(ACK_ERROR_UNKNOWN, "arc", "no heard ledger configured (set [heard].dir or a state directory)");
+        };
+        let read = tokio::task::spawn_blocking(move || {
+            let (rows, _) = crate::heard::read_for(&dir, crate::heard::HeardView::Marks);
+            (arcs::sessions(&rows), arcs::load_saved(&dir), dir)
+        })
+        .await;
+        let Ok((sessions, saved, dir)) = read else {
+            return ack(ACK_ERROR_UNKNOWN, "arc", "could not read the ledger");
+        };
+        let lines = |ls: Vec<String>| {
+            let mut b = MpdResponse::pairs();
+            for l in ls {
+                b = b.pair("arc", l);
+            }
+            b.build()
+        };
+        match cmd {
+            ArcCmd::Recent(limit) => lines(arcs::render_recent(&sessions, limit)),
+            ArcCmd::Saved => lines(arcs::render_saved(&saved)),
+            ArcCmd::Save { n, name } => {
+                let Some(s) = arcs::nth_recent(&sessions, n) else {
+                    return ack(ACK_ERROR_NO_EXIST, "arc", &format!("no session {n} (see: arc)"));
+                };
+                let arc = arcs::SavedArc::from_session(&name, s, crate::store::now_unix());
+                let said = format!("saved \"{}\": {}", arc.name, arc.summary);
+                match tokio::task::spawn_blocking(move || arcs::save_arc(&dir, arc)).await {
+                    Ok(Ok(())) => lines(vec![said]),
+                    _ => ack(ACK_ERROR_UNKNOWN, "arc", "could not write the saved arcs"),
+                }
+            }
+            ArcCmd::Play(name) => {
+                let ids = match arcs::find(&saved, &name) {
+                    Some(a) => a.kept_ids(),
+                    None => match name.parse::<usize>().ok().and_then(|n| arcs::nth_recent(&sessions, n)) {
+                        Some(s) => s.kept_ids(),
+                        None => return ack(ACK_ERROR_NO_EXIST, "arc", &format!("no arc named \"{name}\" (see: arc saved)")),
+                    },
+                };
+                if ids.is_empty() {
+                    return ack(ACK_ERROR_NO_EXIST, "arc", "that arc has no unskipped tracks");
+                }
+                let count = (ids.len() as u32).min(crate::plan::MAX_ENQUEUE);
+                let action = Action::PlayNow {
+                    selector: Selector::Exact(ids.into_iter().map(SongId).collect()),
+                    count,
+                };
+                match self.run_action_outcome(&action, "wire:arc play").await {
+                    PlanOutcome::Failed(e) => ack(ACK_ERROR_UNKNOWN, "arc", &e),
+                    out => lines(vec![format!("replaying \"{name}\": {}", out.render())]),
+                }
+            }
+        }
+    }
+
     async fn heard_report(&self, dir: PathBuf) -> MpdResponse {
         let read = tokio::task::spawn_blocking(move || {
             let ledger = crate::heard::read_for(&dir, crate::heard::HeardView::Report);
@@ -11040,9 +11127,22 @@ impl HypodjHandler {
         // FIRST audible frame for this entry: stamp when it started being heard. A
         // replay of the same row later re-enters here (the qid changed away and back)
         // and re-stamps, which is right - the row is spent as of the LAST time it played.
-        let mut st = self.state.lock().unwrap();
-        if let Some(it) = st.queue.iter_mut().find(|it| it.id == qid) {
-            it.played_at = Some(crate::store::now_unix());
+        let song = {
+            let mut st = self.state.lock().unwrap();
+            st.queue.iter_mut().find(|it| it.id == qid).and_then(|it| {
+                it.played_at = Some(crate::store::now_unix());
+                match &it.entry {
+                    QueueEntry::Song(s) => Some(s.clone()),
+                    QueueEntry::Stream { .. } => None,
+                }
+            })
+        };
+        // The listening-arc record (crate::arc): one `play` row per library track that
+        // STARTS sounding, written through the same spine-safe ledger channel, outside
+        // the State lock. The feature lookup is an in-memory read.
+        if let Some(s) = song {
+            let energy = self.feature_store().features(&s).map(|f| (f.energy.clamp(0.0, 1.0) * 100.0).round() as u8);
+            self.append_heard(arc_play_row(&s, energy));
         }
     }
 
@@ -15263,6 +15363,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Features => self.features_status(),
             MpdCommand::Mark(target) => self.mark(target).await,
             MpdCommand::Heard(q) => self.heard(q).await,
+            MpdCommand::Arc(cmd) => self.handle_arc(cmd).await,
 
             // The album view reads sidecars off disk, so it is the one async store
             // form; every other one answers from the published status.
@@ -23618,7 +23719,10 @@ mod tests {
         for _ in 0..2000 {
             if let Some(p) = crate::heard::newest_session(dir) {
                 let (rows, _) = crate::heard::read_session(&p);
-                if rows.len() >= at_least {
+                // The listening-arc `play` / `skip` rows (crate::arc) ride the same
+                // channel; they are not what these tests wait for.
+                let counted = rows.iter().filter(|r| !matches!(r.ev.as_str(), "play" | "skip")).count();
+                if counted >= at_least {
                     return rows;
                 }
             }

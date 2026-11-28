@@ -21,6 +21,11 @@ pub const CLI_VERBS: &[VerbSpec] = &[
         help: "what played tonight",
     },
     VerbSpec {
+        word: "arc",
+        args: &["limit", "save", "saved", "play"],
+        help: "listening sessions as arcs: name, save, replay",
+    },
+    VerbSpec {
         word: "store",
         args: &[
             "status", "show", "frontier", "pause", "resume", "now", "limit", "albums", "play",

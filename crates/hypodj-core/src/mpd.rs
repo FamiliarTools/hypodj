@@ -310,6 +310,12 @@ pub enum MpdCommand {
     /// absent from `commands`. See [`crate::heard::HeardQuery`].
     Heard(crate::heard::HeardQuery),
 
+    /// `arc` / `arc limit <n>` / `arc save <n> <name>` / `arc saved` / `arc play
+    /// <name>` - LISTENING ARCS read back from the heard ledger, named, and replayed
+    /// through the journaled plan path. A hypodj extension, absent from `commands`.
+    /// See [`crate::arc`].
+    Arc(crate::arc::ArcCmd),
+
     /// `store` / `store pause` / `store resume` / `store now` - READ BACK (and
     /// nudge) the OFFLINE AUDIO STORE.
     ///
@@ -613,6 +619,35 @@ fn parse_heard(args: &[String], line: &str) -> MpdCommand {
                 action: HeardAction::Keep { n, on: word == "keep" },
                 ..base
             }),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        _ => MpdCommand::Unsupported(line.to_string()),
+    }
+}
+
+/// Parse an `arc` request ([`crate::arc::ArcCmd`]). A save name is every remaining
+/// argument joined by one space, so both `arc save 1 "Warm Room"` and the unquoted
+/// form work. Anything else is a loud Unsupported ACK.
+fn parse_arc(args: &[String], line: &str) -> MpdCommand {
+    use crate::arc::{ArcCmd, ARC_DEFAULT_LIMIT};
+    let rest = || args[1..].join(" ").trim().to_string();
+    match args.first().map(|s| s.as_str()) {
+        None => MpdCommand::Arc(ArcCmd::Recent(ARC_DEFAULT_LIMIT)),
+        Some("limit") if args.len() == 2 => match args[1].parse::<usize>() {
+            Ok(n) if n > 0 => MpdCommand::Arc(ArcCmd::Recent(n)),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        Some("saved") if args.len() == 1 => MpdCommand::Arc(ArcCmd::Saved),
+        Some("play") if args.len() >= 2 && !rest().is_empty() => MpdCommand::Arc(ArcCmd::Play(rest())),
+        Some("save") if args.len() >= 3 => match args[1].parse::<usize>() {
+            Ok(n) if n > 0 => {
+                let name = args[2..].join(" ").trim().to_string();
+                if name.is_empty() {
+                    MpdCommand::Unsupported(line.to_string())
+                } else {
+                    MpdCommand::Arc(ArcCmd::Save { n, name })
+                }
+            }
             _ => MpdCommand::Unsupported(line.to_string()),
         },
         _ => MpdCommand::Unsupported(line.to_string()),
@@ -1670,6 +1705,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "features" => MpdCommand::Features,
         "mark" => parse_mark(&args, line),
         "heard" => parse_heard(&args, line),
+        "arc" => parse_arc(&args, line),
         "store" => parse_store(&args, line),
         // Exactly one argument, the uri. A bare `info` is a usage error rather than a
         // guess at what the user meant - there is no "current" default here, because
@@ -1919,6 +1955,25 @@ mod parse_tests {
         assert!(matches!(parse("mark next"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("mark this one"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("mark previous please"), MpdCommand::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_the_arc_verb() {
+        use crate::arc::ArcCmd;
+        assert!(matches!(parse("arc"), MpdCommand::Arc(ArcCmd::Recent(5))));
+        assert!(matches!(parse("arc limit 9"), MpdCommand::Arc(ArcCmd::Recent(9))));
+        assert!(matches!(parse("arc saved"), MpdCommand::Arc(ArcCmd::Saved)));
+        match parse("arc save 2 \"Warm Room\"") {
+            MpdCommand::Arc(ArcCmd::Save { n: 2, name }) => assert_eq!(name, "Warm Room"),
+            other => panic!("{other:?}"),
+        }
+        match parse("arc play Warm Room") {
+            MpdCommand::Arc(ArcCmd::Play(name)) => assert_eq!(name, "Warm Room"),
+            other => panic!("{other:?}"),
+        }
+        for bad in ["arc limit 0", "arc save x name", "arc save 1", "arc play", "arc nope"] {
+            assert!(matches!(parse(bad), MpdCommand::Unsupported(_)), "{bad}");
+        }
     }
 
     #[test]
